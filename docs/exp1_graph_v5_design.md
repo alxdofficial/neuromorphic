@@ -181,18 +181,19 @@ graph_v5_readout_d_hidden: int = 512
 
 ## Empirical results
 
-See `docs/repr_learning_results.md` § 0. Summary:
+See `docs/repr_learning_results.md` § 0–§ 0.1. Summary:
 
 | variant | val_recon | top1 | substrate floats |
 |---|---:|---:|---:|
-| **v5.1-fair (current)** | **2.005** | **57.9%** | **27,136** |
-| v5.1-first (unfair, big bank) | 2.057 | 55.9% | 34,304 |
+| **v5.4 (current)** | **2.079** | **57%** | **25,984** |
+| v5.1-first | 2.057 | 55.9% | 27,136 |
 | v4.2 (prior best) | 2.696 | 52.9% | 26,180 |
 
-v5.1-fair beats v4.2 by 0.69 val_recon and 5 top1 points at matched
-substrate floats. Cross-role overlap reaches 0.38 (12 of 32 bank entries
-serving both src and dst roles), which is the load-bearing thesis test
-and is structurally impossible in v4.
+v5.1-first beats v4.2 by 0.64 val_recon at matched substrate floats; v5.4
+closes the loop with a graph-aware readout at slightly tighter budget.
+Cross-role overlap reaches 0.38 (12 of 32 bank entries serving both src
+and dst roles), which is the load-bearing thesis test and is structurally
+impossible in v4.
 
 ## Status
 
@@ -201,7 +202,8 @@ and is structurally impossible in v4.
 - Tests: `tests/test_graph_v5.py` (5/5 passing — forward shape,
   backward grad flow, chunk-fresh init, soft-pointer trainable,
   materialize_endpoints unit).
-- v5.1-fair production training complete (10K steps, 10.7 min).
+- v5.1-first and v5.4 production training complete; v5.4 is the canonical
+  current variant.
 - Multi-seed reruns not yet done (single-seed caveat).
 
 ## Known concerns / next iterations

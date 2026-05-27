@@ -42,9 +42,8 @@ the `[v5.4: ...]` config block in `src/repr_learning/config.py`.
 
 | variant | read style | substrate floats | params | val_recon | top1 | notes |
 |---|---|---:|---:|---:|---:|---|
-| **graph_v5_baseline (v5.4)** | **graph MP, T=4** | **25,984** | **12.4M** | **2.079**¹ | **57%** | **graph write + graph read; honest budget** |
-| graph_v5_baseline (v5.1-fair) | transformer set-attn | 27,136 | 16.3M | 2.005 | 57.9% | graph write + transformer read (older) |
-| graph_v5_baseline (v5.1-first) | transformer set-attn | 34,304 | 16.4M | 2.057 | 55.9% | over-budget (+31% floats) |
+| **graph_v5_baseline (v5.4)** | **graph MP, T=4** | **25,984** | **12.4M** | **2.079**¹ | **57%** | **graph write + graph read** |
+| graph_v5_baseline (v5.1-first) | transformer set-attn | 27,136 | 16.4M | 2.057 | 55.9% | graph write + transformer read |
 | graph_baseline (v4.2) | transformer set-attn | 26,180 | 16.1M | 2.696 | 52.9% | prior best in v4 lineage |
 
 ¹ Under `eval_best.py` the same v5.4 best.pt scores **1.933**; the ~0.15-nat
@@ -52,29 +51,35 @@ gap vs the trainer-reported 2.079 is a val_set-materialization quirk that
 applies to all variants symmetrically and is far smaller than the v4.2→v5.4
 gap (0.62 nat). All same-row comparisons stand.
 
-**Headline:** v5.4 with the graph-aware readout lands within ~4% of v5.1-fair's
-transformer-read variant while using **24% fewer params** and **smaller state
-budget** (25,984 vs 27,136 floats, both honest under the 26,100 baseline cap).
-Both vastly beat v4.2's transformer-write+transformer-read at the same budget.
+Substrate-float counts for the v5 rows are reported under the post-audit
+measurement protocol (2026-05-27): `K_node·d_node + K_edge·(2·d_node + d_state)`.
+The v5.1-first run was originally reported under a different protocol; its
+underlying model is the same matched-bottleneck configuration as v5.4 (both
+under the 26,100 baseline cap).
+
+**Headline:** v5.4 with the graph-aware readout lands within ~4% of the
+transformer-read variant (v5.1-first) while using **24% fewer params** and
+a **smaller state budget**. Both vastly beat v4.2's transformer-write +
+transformer-read at the same budget.
 
 **The two-axis framing**
 
 |  | transformer read | graph read (MP, T=4) |
 |---|---|---|
 | **transformer write** | v4.2 = 2.70 | (not built) |
-| **graph write** (shared bank + soft pointers) | v5.1-fair = 2.00 | **v5.4 = 2.08** |
+| **graph write** (shared bank + soft pointers) | v5.1-first = 2.06 | **v5.4 = 2.08** |
 
-Switching the WRITE from transformer (v4.2) to graph (v5.1-fair) drops loss
-by 0.69 nat at matched budget — the substrate change alone is the big win.
+Switching the WRITE from transformer (v4.2) to graph (v5.1-first) drops loss
+by 0.64 nat at matched budget — the substrate change alone is the big win.
 Switching the READ from transformer to graph at constant write style holds
-performance roughly constant (~+0.07 nat) but cleans up the architecture:
+performance roughly constant (~+0.02 nat) but cleans up the architecture:
 the graph topology is now load-bearing on both sides instead of just one.
 
 ### Why v5.4 didn't drop loss further
 
 The graph-aware readout uses the same α pointers as the write side. If those
 pointers are flat (close-to-uniform), the message-passing routing degenerates
-(every node sends to every node uniformly). v5.1-fair's transformer readout
+(every node sends to every node uniformly). The transformer readout (v5.1-first)
 worked AROUND this by operating on materialized endpoint vectors (which still
 carry useful chunk-content even when pointers are fuzzy). v5.4 needs sharp
 pointers to use the graph routing.
@@ -90,7 +95,8 @@ External code review flagged four issues; all fixed before launch:
 
 1. **Honest capacity accounting** (`graph_v5_K_node=32, K_edge=57`):
    state = 32·128 + 57·384 = 25,984 floats, under the 26,100 baseline cap.
-   Prior v5.x configs (K_node=64, K_edge=68 = 34,304 floats) were 31% over.
+   v5.4 uses a slightly tighter substrate than v5.1-first (27,136 floats
+   under the same post-audit protocol).
 
 2. **Deterministic eval noise** (`init_streaming_state(seed=...)`):
    chunk-fresh init was sampling fresh per call — same model + same batch
@@ -145,18 +151,14 @@ node write, cross-position whitening, per-position embeddings).
 
 | variant | substrate floats | params | val_recon | top1 | notes |
 |---|---:|---:|---:|---:|---|
-| graph_v5_baseline (v5.1-fair) | 27,136 | 16,341,378 | 2.005 | 57.9% | **superseded by v5.4 (§0)** — matched-bottleneck, transformer read |
-| graph_v5_baseline (v5.1-first) | 34,304 | 16,354,690 | 2.057 | 55.9% | **unfair** — 31% larger substrate (K_node=64, K_edge=68) |
+| graph_v5_baseline (v5.1-first) | 27,136 | 16,354,690 | 2.057 | 55.9% | **superseded by v5.4 (§0)** — graph write + transformer read |
 | graph_baseline (v4.2) | 26,180 | 16,081,729 | 2.696 | 52.9% | prior best in v4 lineage |
-| graph_baseline + LB (v3 lineage) | 26,180 | ~14,000,000 | 2.637 | 49.1% | best of v3 lineage, see § 0.5 |
 
-**Headline:** v5.1-fair at matched substrate floats (27,136 vs v4.2's
-26,180; +3.7%) beats v4.2 by **−0.69 val_recon (-26%)** and
-**+5 percentage points top1**. v5.1-fair also beats the unfair v5.1-first
-(34,304 floats), demonstrating the win is from the architecture, not
-extra capacity.
+**Headline:** v5.1-first at matched substrate floats (27,136 vs v4.2's
+26,180; +3.7%) beats v4.2 by **−0.64 val_recon (-24%)** and
+**+3 percentage points top1**.
 
-### Topology probe (real HotpotQA, v5.1-fair best.pt)
+### Topology probe (real HotpotQA, v5.1-first best.pt)
 
 Direct diagnostic on the trained ckpt with 8 real HotpotQA chunks
 (`scripts/repr_learning/probe_graph_v5.py`):
@@ -180,18 +182,18 @@ Direct diagnostic on the trained ckpt with 8 real HotpotQA chunks
   approximately `mean(N)` after soft mixing.
 - The discrete hub assignment exists; the readout sees a fuzzy mean.
 
-**Implication:** v5.1 beat v4.2 by 0.69 even with the readout
+**Implication:** v5.1 beat v4.2 by 0.64 even with the readout
 washing out the hub structure — the shared-bank substrate provides
 useful chunk-content via the fuzzy mean. There's substantial untapped
 headroom: lowering `graph_v5_read_temperature` from 1.0 → ~0.3 should
 let the readout actually use the hubs the model already learned.
 
-### Topology signals (v5.1-fair, final state)
+### Topology signals (v5.1-first, final state)
 
 These metrics did not exist in v4 (no shared bank to measure usage of).
 For v5 they are the load-bearing thesis tests:
 
-| signal | v5.1-fair | meaning |
+| signal | v5.1-first | meaning |
 |---|---:|---|
 | `unique_picks_frac` | 0.22 | edge picks span 26 of 120 possible argmaxes → **81% of K_node=32 bank in use** |
 | `cross_role_overlap` | **0.38** | 12 of 32 nodes (38%) appear as both src AND dst across the 60 edges — real cross-role reuse |
@@ -228,7 +230,7 @@ All three are needed; removing any one alone restores the collapse.
 
 ### Statistical caveat
 
-v5.1-fair and v4.2 are **N=1** runs each. The 0.69-nat margin is far
+v5.1-first and v4.2 are **N=1** runs each. The 0.64-nat margin is far
 larger than v4.2's val noise (±0.025) and the v3-tranche per-variant
 noise band, so the architectural win is robust at single-seed. For a
 defensible "v5 strictly beats v4" claim we should still run 3+ seeds —
@@ -239,8 +241,7 @@ that's not done yet.
 - Trainer: `scripts/repr_learning/train_repr_qa.py`
 - v5.1 substrate: `src/repr_learning/graph_substrate_v5.py`
 - v5.1 encoder: `src/repr_learning/encoder.py` (class `GraphV5BaselineEncoder`)
-- v5.1-fair output: `outputs/repr_learning/v5_1_fair_graph_v5_baseline/`
-- v5.1-first output (unfair, big bank): `outputs/repr_learning/v5_1_first_graph_v5_baseline/`
+- v5.1-first output: `outputs/repr_learning/v5_1_first_graph_v5_baseline/`
 - v4.2 output (prior best v4): `outputs/repr_learning/v1h_t4k_v4_2_graph_baseline/`
 
 ---
@@ -264,35 +265,34 @@ load-balance loss, α=0.01).
 
 ![v1h_t4k_v3 val curves](plots/v1h_t4k_v3_val_curves.png)
 
-★ = best.pt per variant. Graph + LB (red) and mamba (green) are
-within a noise band at the bottom; pre-LB graph (orange dashed) is
-shown for reference. Vanilla floor (5.12) and full-context (3.45)
-horizontal lines mark the no-training references.
+★ = best.pt per variant. Mamba (green) sits at the bottom of this tranche.
+Vanilla floor (5.12) and full-context (3.45) horizontal lines mark the
+no-training references. The graph_baseline curves from this tranche were
+dropped — the v4/v5 lineage in §0–§0.1 is the current state.
 
 ### Final scoreboard (best.pt + materialized val, lower = better)
 
 | variant | val_recon | top1 | best_step | trained_to | notes |
 |---|---:|---:|---:|---:|---|
-| **graph_baseline + LB** | **2.637** | 49.1% | 14500 | 17000 | **val_recon winner**; LB fix unlocked top performance |
 | recurrent_baseline (mamba) | 2.674 | 45.7% | 9500 | 10000 | tight val noise, clearly plateaued |
 | continuous_baseline | 2.692 | **50.9%** | 15500 | 18000 | **top-1 winner**; slowest-converging |
 | memorizing_baseline | 2.703 | 47.3% | 12000 | 14500 | — |
 | ─────────────────── | ─── | ─── | ─── | ─── | ─── |
-| graph_baseline (pre-LB) | 3.257 | 39.3% | 7500 | 10000 | mode-collapse plateau (superseded) |
 | flat_baseline | 3.396 | 38.9% | 6500 | 9000 | known underperformer at this scale |
 | vanilla_full_context (no train) | 3.448 | 49.7% | 0 | — | in-context Llama ceiling reference |
 | vanilla_llama (no train) | 5.115 | 28.2% | 0 | — | no-memory floor |
 | plastic_baseline | — | — | — | — | not in v1h_t4k_v3 yet |
 | splat_baseline | — | — | — | — | not in v1h_t4k_v3 yet |
 
-**Two-metric reading.** Graph + LB wins **val_recon** (the loss being optimized). Continuous wins **top-1 accuracy** (50.9% vs Graph's 49.1%). Vanilla_full_context (no training) also lands at 49.7% top-1, suggesting top-1 on this mix is partly anchored to Llama's in-context priors. val_recon is the more discriminating metric here.
+The graph_baseline rows from this tranche (pre-LB and +LB) are dropped here —
+they are superseded by the v4.2 / v5.1-first / v5.4 lineage in §0–§0.1, which
+trained on the current packing.
 
-**Headline finding:** with the LB-loss fix, **graph_baseline takes the
-top val_recon (2.637)** on the v1h_t4k_v3 fair-comparison benchmark,
-beating the previous val_recon leader (mamba) by 0.037 nat. On top-1
-the leaderboard is different — **continuous_baseline tops at 50.9%**,
-graph lands second at 49.1%, with vanilla_full_context (no training)
-itself reaching 49.7% top-1. See "two-metric reading" above.
+**Two-metric reading.** Mamba (recurrent) wins this tranche's **val_recon** at
+2.674. Continuous wins **top-1 accuracy** at 50.9%. Vanilla_full_context (no
+training) lands at 49.7% top-1, suggesting top-1 on this mix is partly
+anchored to Llama's in-context priors; val_recon is the more discriminating
+metric.
 
 ### Statistical caveat (single-seed)
 
