@@ -633,7 +633,9 @@ def main():
                          "10 batches ≈ 1 example per family (high per-family "
                          "noise). 32 batches × BS=2 = 64 examples ≈ ~5 per family. "
                          "Bumped from old default of 10.")
-    ap.add_argument("--chunk-size", type=int, default=4096)
+    # Default chunk_size 4096→8192 (2026-05-28 tranche-3 protocol; hard datasets
+    # need the larger window to fit evidence + distractors).
+    ap.add_argument("--chunk-size", type=int, default=8192)
     ap.add_argument("--window-size", type=int, default=1024)
     ap.add_argument("--passages-per-chunk", type=int, default=0,
                     help="composite_v1 passages sampled per chunk. 0 = auto: "
@@ -645,14 +647,17 @@ def main():
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--no-hotpot", action="store_true",
                     help="Disable HotpotQA source (default: enabled)")
-    ap.add_argument("--narrative", action="store_true",
-                    help="Enable NarrativeQA source (default: DISABLED). "
-                         "Uses random window (oracle-centering removed in "
-                         "post-audit fix).")
-    ap.add_argument("--musique", action="store_true",
-                    help="Enable MuSiQue-Ans source (default: DISABLED). "
-                         "Contamination-controlled 2-4 hop QA — complements "
-                         "HotpotQA by eliminating shortcut reasoning.")
+    # 2026-05-28: hard-only protocol enables narrative + musique by default;
+    # use --no-narrative/--no-musique to disable (action='store_false').
+    ap.add_argument("--narrative", action=argparse.BooleanOptionalAction, default=True,
+                    help="Enable NarrativeQA source (default: ENABLED for "
+                         "tranche-3 hard-only protocol). Uses random window "
+                         "(oracle-centering removed in post-audit fix).")
+    ap.add_argument("--musique", action=argparse.BooleanOptionalAction, default=True,
+                    help="Enable MuSiQue-Ans source (default: ENABLED for "
+                         "tranche-3 hard-only protocol). Contamination-controlled "
+                         "2-4 hop QA — complements HotpotQA by eliminating "
+                         "shortcut reasoning.")
     ap.add_argument("--babilong", action="store_true",
                     help="Enable BABILong source (default: DISABLED). "
                          "Synthetic state-tracking, pre-formatted at the "
@@ -663,11 +668,13 @@ def main():
                          "8k for chunk=8192). Manual: 0k, 1k, 2k, 4k, 8k, "
                          "16k, 32k, 64k, 128k.")
     ap.add_argument("--mix-weights", nargs="+", type=float,
-                    default=[0.7, 0.3, 0.0, 0.0, 0.0],
+                    default=[0.30, 0.25, 0.25, 0.20, 0.0],
                     metavar="W",
                     help="Sampling weights for (composite, hotpot, narrative, "
-                         "musique, babilong). Older 3-tuple callers still work; "
-                         "missing entries default to 0.")
+                         "musique, babilong). 2026-05-28 tranche-3 hard-only "
+                         "default: 0.30/0.25/0.25/0.20/0.0 — balanced across "
+                         "the 4 hard families. Older 3-tuple callers still "
+                         "work; missing entries default to 0.")
     ap.add_argument("--composite-task-weights", nargs="+", default=None,
                     metavar="FAMILY:W",
                     help="Per-family weights inside composite_v1 (e.g. "
