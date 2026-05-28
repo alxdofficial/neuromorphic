@@ -682,6 +682,19 @@ def main():
             "Composite (mix_weights[0]) is 0. composite_v1 is the primary "
             "source and cannot be disabled."
         )
+
+    # Parse --composite-task-weights "family:weight" pairs into a dict.
+    composite_task_weights = None
+    if args.composite_task_weights:
+        composite_task_weights = {}
+        for item in args.composite_task_weights:
+            if ":" not in item:
+                raise SystemExit(
+                    f"--composite-task-weights expects 'family:weight', got {item!r}"
+                )
+            fam, w = item.split(":", 1)
+            composite_task_weights[fam.strip()] = float(w)
+        print(f"[composite] per-family weights: {composite_task_weights}")
     if args.musique and args.mix_weights[3] <= 0:
         raise SystemExit(
             "--musique is set but mix_weights[3] (MuSiQue) is 0. Either drop "
@@ -783,6 +796,7 @@ def main():
             use_babilong=args.babilong,
             babilong_config=args.babilong_config,
             mix_weights=tuple(args.mix_weights),
+            composite_task_weights=composite_task_weights,
             patience=args.patience,
             min_step_for_stop=args.min_step_for_stop,
         )
