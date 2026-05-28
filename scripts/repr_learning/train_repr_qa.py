@@ -159,6 +159,7 @@ def train_one_variant(
     use_musique: bool = False, use_babilong: bool = False,
     babilong_config: str = "4k",
     mix_weights: tuple = (0.5, 0.25, 0.25, 0.0, 0.0),
+    composite_task_weights: Optional[dict[str, float]] = None,
     patience: int = 5,                       # eval-points without improvement → stop
     min_step_for_stop: int = 2000,           # don't stop during warmup-noise era
 ) -> dict:
@@ -195,7 +196,8 @@ def train_one_variant(
         babilong_config=babilong_config,
         split="train",
         chunk_size=chunk_size, passages_per_chunk=passages_per_chunk,
-        weights=mix_weights, num_workers=0, seed=42,
+        weights=mix_weights, composite_task_weights=composite_task_weights,
+        num_workers=0, seed=42,
     )
     val_dl = make_mixed_qa_dataloader(
         cfg, tokenizer,
@@ -206,7 +208,8 @@ def train_one_variant(
         babilong_config=babilong_config,
         split="validation",
         chunk_size=chunk_size, passages_per_chunk=passages_per_chunk,
-        weights=mix_weights, num_workers=0, seed=7,
+        weights=mix_weights, composite_task_weights=composite_task_weights,
+        num_workers=0, seed=7,
     )
     # Fixes #614: drain val_dl ONCE into a fixed list so every run_val call
     # sees the same batches. Without this, in-training val and final-eval got
@@ -626,6 +629,13 @@ def main():
                     help="Sampling weights for (composite, hotpot, narrative, "
                          "musique, babilong). Older 3-tuple callers still work; "
                          "missing entries default to 0.")
+    ap.add_argument("--composite-task-weights", nargs="+", default=None,
+                    metavar="FAMILY:W",
+                    help="Per-family weights inside composite_v1 (e.g. "
+                         "'biographical:1.0' to train only on biographical, or "
+                         "'biographical:2.0 hotpot_qa:1.0' for 2:1 ratio). "
+                         "Unlisted families get weight 0 (filtered out). "
+                         "Default: None = all 9 families sampled uniformly.")
     ap.add_argument("--patience", type=int, default=5,
                     help="Stop training when best.pt hasn't updated for this "
                          "many consecutive val evals past --min-step-for-stop. "
@@ -685,6 +695,11 @@ def main():
             "(e.g. --mix-weights 0.35 0.15 0.15 0.15 0.2)."
         )
 
+    # Tranche-2 sizing (chunk=8192, 40× compression target, M=200):
+    #   graph_v5: K_node=200, K_edge=256, K_proposal=256, d_node=d_state=256
+    #     → substrate = 200·256 + 256·(2·256+256) = 51,200 + 196,608 = 247,808 floats
+    #   baselines: n_flat_codes=200, d_inner=1240 → 200·1240 = 248,000 floats (matched)
+    #   Memory tokens reaching Llama: M=200 × d_llama=2048 = 410K → 8192·2048 / 410K = 41×
     cfg = ReprConfig(
         batch_size=args.batch_size,
         fixed_window_size=args.window_size,
@@ -693,7 +708,16 @@ def main():
         warmup_steps=500,
         d_node_state=128,
         n_edges=68,
-        n_flat_codes=36,
+        n_flat_codes=200,                 # was 36 → 200 (M=K_node)
+        d_continuous=1240,                # was 725 → 1240 (substrate match)
+        d_concept_baseline=1240,
+        d_mt_value=1240,
+        d_recurrent=1240,
+        graph_v5_K_node=200,              # was 32
+        graph_v5_K_edge=256,              # was 57
+        graph_v5_K_proposal=256,          # was 80
+        graph_v5_d_node=256,              # was 128
+        graph_v5_d_state=256,             # was 128
         edge_token_packing="fused",
         b_diversity_scale=args.b_diversity_scale,
         mt_diversity_scale=args.mt_diversity_scale,

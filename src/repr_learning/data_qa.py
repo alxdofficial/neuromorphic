@@ -832,6 +832,7 @@ def make_mixed_qa_dataloader(
     chunk_size: int = 4096,
     passages_per_chunk: int = 300,           # composite_v1 only
     weights: tuple = (0.5, 0.25, 0.25, 0.0, 0.0),  # (composite, hotpot, narrative, musique, babilong)
+    composite_task_weights: Optional[dict[str, float]] = None,  # per-family inside composite_v1
     num_workers: int = 0,
     seed: int = 0,
     batch_size: Optional[int] = None,
