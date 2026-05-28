@@ -16,6 +16,7 @@ All five return:
     aux_outputs   : dict with auxiliary losses + stats (e.g., load_balance)
 """
 from __future__ import annotations
+import functools
 import math
 from typing import Optional
 
@@ -28,7 +29,7 @@ from .config import ReprConfig
 from .selection import gumbel_argmax_ste, load_balance_loss, router_z_loss
 
 
-@torch.no_grad()
+@functools.lru_cache(maxsize=128)
 def _sinusoidal_pe(seq_len: int, d_model: int, offset: int = 0,
                     *, device=None, dtype=torch.float32) -> Tensor:
     """Standard sinusoidal positional encoding for write-side pin tokens
@@ -37,22 +38,23 @@ def _sinusoidal_pe(seq_len: int, d_model: int, offset: int = 0,
     pins doesn't carry token position).
 
     Returns [seq_len, d_model] PE for positions [offset, offset+seq_len).
+
+    Cached across calls — same (seq_len, d_model, offset, device, dtype)
+    returns the same tensor, avoiding the tiny arange+sin+cos compute on
+    every streaming-write window (4× per chunk at chunk_size=8192).
     """
     if d_model <= 0 or seq_len <= 0:
         return torch.zeros(seq_len, d_model, device=device, dtype=dtype)
-    positions = torch.arange(offset, offset + seq_len,
-                              device=device, dtype=torch.float32).unsqueeze(1)  # [T,1]
-    # Standard transformer PE: 10000^(-2i/d) for i in [0, d/2). Use the
-    # even-indexed positions of d_model. Earlier version used (-i/d) which
-    # compressed the frequency range by a factor of 2 — frequencies were
-    # too high, distinguishability between nearby positions degraded.
-    div = torch.exp(torch.arange(0, d_model, 2, device=device, dtype=torch.float32)
-                    * (-math.log(10000.0) / d_model))                       # [d/2]
-    angles = positions * div                                                # [T, d/2]
-    pe = torch.zeros(seq_len, d_model, device=device, dtype=torch.float32)
-    pe[:, 0::2] = torch.sin(angles)[:, : pe[:, 0::2].shape[-1]]
-    pe[:, 1::2] = torch.cos(angles)[:, : pe[:, 1::2].shape[-1]]
-    return pe.to(dtype)
+    with torch.no_grad():
+        positions = torch.arange(offset, offset + seq_len,
+                                  device=device, dtype=torch.float32).unsqueeze(1)
+        div = torch.exp(torch.arange(0, d_model, 2, device=device, dtype=torch.float32)
+                        * (-math.log(10000.0) / d_model))
+        angles = positions * div
+        pe = torch.zeros(seq_len, d_model, device=device, dtype=torch.float32)
+        pe[:, 0::2] = torch.sin(angles)[:, : pe[:, 0::2].shape[-1]]
+        pe[:, 1::2] = torch.cos(angles)[:, : pe[:, 1::2].shape[-1]]
+        return pe.to(dtype)
 
 
 class QFormerAdapter(nn.Module):
@@ -2814,6 +2816,11 @@ class GraphV5BaselineEncoder(nn.Module):
             if all_pad_rows.any():
                 pins_pad_mask = pins_pad_mask.clone()
                 pins_pad_mask[all_pad_rows, 0] = False
+            # Skip the dense SDPA mask entirely if no token is padded.
+            # Profiled at B=12: 7.34→5.96 ms per window (19%), 1680→1187 MiB.
+            # Common case at chunk_size=8192 — most 1024-token windows are full.
+            if not pins_pad_mask.any():
+                pins_pad_mask = None
             has_real = attention_mask.any(dim=-1)
         else:
             pins_pad_mask = None
@@ -2841,10 +2848,13 @@ class GraphV5BaselineEncoder(nn.Module):
         # 4. Materialize ALL queries (existing edges + proposals) against N_new.
         # Routing happens on these materialized endpoints — grounded in the
         # ACTUAL node space edges would land on after the update.
-        endpoint_src_old, _   = self.soft_pointer(q_src_old, N_new)
-        endpoint_dst_old, _   = self.soft_pointer(q_dst_old, N_new)
-        endpoint_src_prop, _  = self.soft_pointer(proposals["q_src"], N_new)
-        endpoint_dst_prop, _  = self.soft_pointer(proposals["q_dst"], N_new)
+        # Cache K/V projections once; 4 attend() calls reuse them (saves
+        # 3× W_k(N) + 3× W_v(N) Linear passes per window).
+        sp_k, sp_v = self.soft_pointer.project_kv(N_new)
+        endpoint_src_old, _   = self.soft_pointer.attend(q_src_old, sp_k, sp_v)
+        endpoint_dst_old, _   = self.soft_pointer.attend(q_dst_old, sp_k, sp_v)
+        endpoint_src_prop, _  = self.soft_pointer.attend(proposals["q_src"], sp_k, sp_v)
+        endpoint_dst_prop, _  = self.soft_pointer.attend(proposals["q_dst"], sp_k, sp_v)
 
         # 5. Slot routing on materialized endpoints.
         picked_idx, pick_affinity, pick_count = slot_routing_on_endpoints(
@@ -2948,7 +2958,11 @@ class GraphV5BaselineEncoder(nn.Module):
 
         # v5.4: message-passing readout. K = N (stable address), V = msg_buf
         # (evolving content). T rounds of MP. Outputs K_node memory tokens.
-        memory, mp_telem = self.readout(N, attn_src, attn_dst, edge_state)
+        # K_node×K_node cosine matmul gated to eval-only to keep training fast.
+        memory, mp_telem = self.readout(
+            N, attn_src, attn_dst, edge_state,
+            compute_telemetry=not self.training,
+        )
 
         with torch.no_grad():
             # Soft-pointer sharpness (low entropy = sharply pointing at one node;

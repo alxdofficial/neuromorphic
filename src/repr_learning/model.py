@@ -700,34 +700,45 @@ class ReprLearningModel(nn.Module):
             )
 
         try:
-            out = self.decoder.llama(
+            # Selective lm_head: run base model for hidden states, then only
+            # apply lm_head to prediction positions. Profiled saving at B=12,
+            # T=224: 120→102 ms (15%), 7603→6209 MiB (1.4 GiB). Avoids the
+            # [B, T, vocab=128K] logits tensor entirely.
+            base_out = self.decoder.llama.model(
                 inputs_embeds=full_embeds,
                 attention_mask=attn_mask_full.to(torch.long),
             )
+            hidden = base_out.last_hidden_state            # [B, T_total, d_llama]
         finally:
             if hook_handle is not None:
                 hook_handle.remove()
 
-        logits = out.logits                                    # [B, T_total, vocab]
-        pred_logits_all = logits[:, :-1, :]                    # [B, T_total-1, vocab]
+        pred_hidden_all = hidden[:, :-1, :]                # [B, T_total-1, d_llama]
 
         # ---- 5. CE on content positions only ----
         if pred_mask.any():
+            # Apply lm_head only at masked positions (avoids materializing
+            # [B, T, vocab] for memory/question/pad positions).
+            sel_hidden = pred_hidden_all[pred_mask]        # [N_pred, d_llama]
+            sel_logits = self.decoder.llama.lm_head(sel_hidden)  # [N_pred, vocab]
+            sel_targets = pred_targets[pred_mask]          # [N_pred]
             loss_recon = F.cross_entropy(
-                pred_logits_all[pred_mask].float(),
-                pred_targets[pred_mask],
-                reduction="mean",
+                sel_logits.float(), sel_targets, reduction="mean",
             )
-            # Per-example CE for telemetry (per-family aggregation in trainer)
+            # Per-example CE for telemetry — compute per-row from selected
+            # logits using row indices, in a single grouped pass.
             per_example_loss = torch.zeros(B, device=device, dtype=loss_recon.dtype)
             with torch.no_grad():
-                for i in range(B):
-                    if pred_mask[i].any():
-                        per_example_loss[i] = F.cross_entropy(
-                            pred_logits_all[i, pred_mask[i]].float(),
-                            pred_targets[i, pred_mask[i]],
-                            reduction="mean",
-                        ).detach()
+                # row_idx[k] = batch index of k-th selected position
+                row_idx = pred_mask.nonzero(as_tuple=False)[:, 0]  # [N_pred]
+                per_token_nll = F.cross_entropy(
+                    sel_logits.float(), sel_targets, reduction="none",
+                ).detach()                                          # [N_pred]
+                row_sum = torch.zeros(B, device=device, dtype=per_token_nll.dtype)
+                row_cnt = torch.zeros(B, device=device, dtype=per_token_nll.dtype)
+                row_sum.scatter_add_(0, row_idx, per_token_nll)
+                row_cnt.scatter_add_(0, row_idx, torch.ones_like(per_token_nll))
+                per_example_loss = (row_sum / row_cnt.clamp_min(1)).to(loss_recon.dtype)
         else:
             loss_recon = (memory.float().sum() * 0.0
                           + self.decoder.mask_embed.float().sum() * 0.0)
@@ -816,10 +827,15 @@ class ReprLearningModel(nn.Module):
         loss = loss + 0.0 * self.decoder.mask_embed.float().sum()
 
         # ---- 7. Diagnostics: top-1 accuracy on content positions ----
+        # Reuse the already-computed sel_logits from the selective lm_head
+        # path; no need to re-materialize [B, T, vocab] just for argmax.
         with torch.no_grad():
-            preds_full = pred_logits_all.argmax(dim=-1)        # [B, T_total-1]
             n_content_total = pred_mask.float().sum().clamp(min=1.0)
-            top1_acc = ((preds_full == pred_targets) & pred_mask).float().sum() / n_content_total
+            if pred_mask.any():
+                sel_preds = sel_logits.argmax(dim=-1)          # [N_pred]
+                top1_acc = (sel_preds == sel_targets).float().sum() / n_content_total
+            else:
+                top1_acc = torch.zeros((), device=device)
 
         out = {
             "loss": loss,

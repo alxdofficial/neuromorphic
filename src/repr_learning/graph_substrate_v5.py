@@ -462,15 +462,11 @@ class EdgeGate(nn.Module):
         q_src_old: Tensor, q_dst_old: Tensor, state_old: Tensor,
         q_src_new: Tensor, q_dst_new: Tensor, state_new: Tensor,
     ) -> Tensor:
-        with torch.amp.autocast("cuda", enabled=False):
-            cos_qs = F.cosine_similarity(
-                q_src_old.float(), q_src_new.float(), dim=-1, eps=1e-6,
-            )
-            cos_qd = F.cosine_similarity(
-                q_dst_old.float(), q_dst_new.float(), dim=-1, eps=1e-6,
-            )
-        cos_qs = cos_qs.to(q_src_old.dtype)
-        cos_qd = cos_qd.to(q_src_old.dtype)
+        # cosine_similarity in autocast dtype is safe: outputs are bounded in
+        # [-1, 1] and `eps=1e-6` guards the divisor; the bf16-vs-fp32 spread
+        # at that magnitude is below the gate MLP's noise floor.
+        cos_qs = F.cosine_similarity(q_src_old, q_src_new, dim=-1, eps=1e-6)
+        cos_qd = F.cosine_similarity(q_dst_old, q_dst_new, dim=-1, eps=1e-6)
         inp = torch.cat([
             q_src_old, q_dst_old, q_src_new, q_dst_new,
             state_old, state_new,
@@ -551,6 +547,35 @@ class SoftPointer(nn.Module):
         """Current τ as a tensor (for telemetry)."""
         return self.log_tau.clamp(self.log_tau_floor, self.log_tau_ceiling).exp()
 
+    def project_kv(self, N: Tensor) -> tuple[Tensor, Tensor]:
+        """Precompute K and V projections of the node bank.
+
+        Cache once per `N` and reuse across multiple queries (src/dst/proposal/
+        proposal) to avoid redundant W_k(N) / W_v(N) Linear passes. Saves 3×
+        the projection cost when streaming_write calls soft_pointer 4 times
+        against the same N_new.
+        """
+        if self.kv_split:
+            k = self.W_k(N)
+            v = self.W_v(N)
+        else:
+            k = N
+            v = N
+        return k, v
+
+    def attend(self, q: Tensor, k: Tensor, v: Tensor) -> tuple[Tensor, Tensor]:
+        """Compute soft-pointer attention given precomputed (k, v).
+
+        Use when you have multiple q against the same N: call project_kv(N)
+        once, then attend(q_i, k, v) for each query batch.
+        """
+        d_node = q.shape[-1]
+        scores = torch.matmul(q, k.transpose(-1, -2)) * (d_node ** -0.5)
+        tau = self.log_tau.clamp(self.log_tau_floor, self.log_tau_ceiling).exp()
+        attn = (scores / tau.to(scores.dtype)).softmax(dim=-1)
+        endpoint = torch.matmul(attn, v)
+        return endpoint, attn
+
     def forward(self, q: Tensor, N: Tensor) -> tuple[Tensor, Tensor]:
         """
         q : [B, K_edge, d_node] — edge queries (src or dst)
@@ -559,19 +584,8 @@ class SoftPointer(nn.Module):
           endpoint : [B, K_edge, d_node]  — α @ V
           attn     : [B, K_edge, K_node]  — soft pointer weights
         """
-        if self.kv_split:
-            # Cast linear weights to N's dtype (autocast-safe).
-            k = self.W_k(N)
-            v = self.W_v(N)
-        else:
-            k = N
-            v = N
-        d_node = q.shape[-1]
-        scores = torch.matmul(q, k.transpose(-1, -2)) * (d_node ** -0.5)
-        tau = self.log_tau.clamp(self.log_tau_floor, self.log_tau_ceiling).exp()
-        attn = (scores / tau.to(scores.dtype)).softmax(dim=-1)
-        endpoint = torch.matmul(attn, v)
-        return endpoint, attn
+        k, v = self.project_kv(N)
+        return self.attend(q, k, v)
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -673,15 +687,19 @@ class MessagePassingReadoutV5(nn.Module):
         alpha_src: Tensor,      # [B, K_edge, K_node] — soft pointer (from soft_pointer)
         alpha_dst: Tensor,      # [B, K_edge, K_node]
         edge_state: Tensor,     # [B, K_edge, d_state]
+        compute_telemetry: bool = False,
     ) -> tuple[Tensor, dict]:
         """Returns (memory, telemetry).
         memory: [B, K_node, d_llama]
         telemetry: per-round diagnostic dict (msg_buf norms, cross-node cos, agg magnitudes)
+          - Cross-node cosine is a K_node×K_node matmul per round, ~T·B·K² FLOPs.
+            Gate via `compute_telemetry=True` (caller passes only during eval).
+            Training-mode returns zero-filled stacks of length T so downstream
+            logging keys stay present and shape-compatible.
         """
         seed = self.W_init(N)                                          # [B, K_node, d_msg]
         msg_buf = seed
 
-        # Telemetry — capture per-round stats to debug oversmoothing / collapse / vanishing.
         per_round_buf_norm: list[Tensor] = []
         per_round_agg_norm: list[Tensor] = []
         per_round_buf_cos: list[Tensor] = []
@@ -718,23 +736,31 @@ class MessagePassingReadoutV5(nn.Module):
             else:
                 msg_buf = updated
 
-            with torch.no_grad():
-                per_round_buf_norm.append(msg_buf.norm(dim=-1).mean().to(torch.float32))
-                per_round_agg_norm.append(agg.norm(dim=-1).mean().to(torch.float32))
-                # Cross-node cosine — detect oversmoothing (all nodes → same vector)
-                bn = F.normalize(msg_buf, dim=-1, eps=1e-6)
-                cos = torch.matmul(bn, bn.transpose(-1, -2))           # [B, K_node, K_node]
-                K_n = bn.shape[1]
-                off = ~torch.eye(K_n, dtype=torch.bool, device=bn.device)
-                per_round_buf_cos.append(cos[:, off].mean().to(torch.float32))
+            if compute_telemetry:
+                with torch.no_grad():
+                    per_round_buf_norm.append(msg_buf.norm(dim=-1).mean().to(torch.float32))
+                    per_round_agg_norm.append(agg.norm(dim=-1).mean().to(torch.float32))
+                    bn = F.normalize(msg_buf, dim=-1, eps=1e-6)
+                    cos = torch.matmul(bn, bn.transpose(-1, -2))           # [B, K_node, K_node]
+                    K_n = bn.shape[1]
+                    off = ~torch.eye(K_n, dtype=torch.bool, device=bn.device)
+                    per_round_buf_cos.append(cos[:, off].mean().to(torch.float32))
 
         memory = self.W_out(self.out_norm(msg_buf))                    # [B, K_node, d_llama]
 
-        telemetry = {
-            "mp_buf_norm_per_round": torch.stack(per_round_buf_norm),
-            "mp_agg_norm_per_round": torch.stack(per_round_agg_norm),
-            "mp_buf_cross_node_cos_per_round": torch.stack(per_round_buf_cos),
-        }
+        if compute_telemetry:
+            telemetry = {
+                "mp_buf_norm_per_round": torch.stack(per_round_buf_norm),
+                "mp_agg_norm_per_round": torch.stack(per_round_agg_norm),
+                "mp_buf_cross_node_cos_per_round": torch.stack(per_round_buf_cos),
+            }
+        else:
+            zero = torch.zeros(self.T, device=memory.device, dtype=torch.float32)
+            telemetry = {
+                "mp_buf_norm_per_round": zero,
+                "mp_agg_norm_per_round": zero,
+                "mp_buf_cross_node_cos_per_round": zero,
+            }
         return memory, telemetry
 
 

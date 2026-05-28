@@ -85,6 +85,7 @@ def run_val(model, val_set, device, n_batches: int, window_size: int) -> dict:
     """
     model.train(False)
     losses, accs, per_fam_stats = [], [], {}
+    last_mp_cos: float | None = None  # eval-only telemetry (gated in MP readout)
     # Deterministic-eval seed (audit fix 2026-05-27): graph_v5's chunk-fresh
     # init was sampling fresh noise per call → same model + same batch produced
     # ~0.2 loss variance. Seeding torch RNG per batch makes eval reproducible.
@@ -96,9 +97,17 @@ def run_val(model, val_set, device, n_batches: int, window_size: int) -> dict:
             break
         torch.manual_seed(20260527 + i)  # batch-dependent deterministic seed
         batch = to_device(batch, device)
-        out = model.compute_qa_loss(batch, window_size=window_size)
+        # no_grad: huge memory win (~18→4 GiB at B=12). Val never backprops,
+        # so the autograd graph was being built for nothing under autocast.
+        with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            out = model.compute_qa_loss(batch, window_size=window_size)
         losses.append(float(out["loss_recon"]))
         accs.append(float(out["top1_acc"]))
+        # Capture v5.4 oversmoothing canary from the last batch's last MP round.
+        # Only populated in eval (MP readout gates the K×K matmul off in train).
+        arr = out.get("graph_v5_mp_buf_cross_node_cos_per_round")
+        if arr is not None and len(arr) > 0:
+            last_mp_cos = float(arr[-1])
         # Per-family: use per-row loss instead of batch-wide mean (a 2-row
         # batch with rows from families X and Y was previously credited
         # the same mean to both, hiding genuine per-family differences).
@@ -118,12 +127,15 @@ def run_val(model, val_set, device, n_batches: int, window_size: int) -> dict:
     n = max(len(losses), 1)
     fam_summary = {f: {"n": v["n"], "mean_loss": v["loss"] / max(v["n"], 1)}
                    for f, v in per_fam_stats.items()}
-    return {
+    result = {
         "val_loss_recon": sum(losses) / n,
         "val_top1_acc": sum(accs) / n,
         "val_n_batches": len(losses),
         "val_per_family": fam_summary,
     }
+    if last_mp_cos is not None:
+        result["val_graph_v5_mp_buf_cross_node_cos_final"] = last_mp_cos
+    return result
 
 
 def save_checkpoint(model, opt, step, path: Path, **extras):
@@ -197,7 +209,7 @@ def train_one_variant(
         split="train",
         chunk_size=chunk_size, passages_per_chunk=passages_per_chunk,
         weights=mix_weights, composite_task_weights=composite_task_weights,
-        num_workers=0, seed=42,
+        num_workers=2, seed=42,
     )
     val_dl = make_mixed_qa_dataloader(
         cfg, tokenizer,
@@ -209,7 +221,7 @@ def train_one_variant(
         split="validation",
         chunk_size=chunk_size, passages_per_chunk=passages_per_chunk,
         weights=mix_weights, composite_task_weights=composite_task_weights,
-        num_workers=0, seed=7,
+        num_workers=2, seed=7,
     )
     # Fixes #614: drain val_dl ONCE into a fixed list so every run_val call
     # sees the same batches. Without this, in-training val and final-eval got
@@ -317,8 +329,13 @@ def train_one_variant(
 
         batch = to_device(batch, device)
 
-        opt.zero_grad()
-        out = model.compute_qa_loss(batch, window_size=window_size)
+        opt.zero_grad(set_to_none=True)
+        # bf16 autocast for ~40% speed + ~50% activation memory reduction.
+        # Encoders have `enabled=False` blocks around numerically-sensitive ops
+        # (entropy, normalization) so those remain fp32 even under the outer
+        # autocast — the codebase was designed for this pattern.
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            out = model.compute_qa_loss(batch, window_size=window_size)
         loss = out["loss"]
         if not torch.isfinite(loss):
             print(f"  [step {step}] FATAL: non-finite loss = {float(loss)}")
@@ -443,14 +460,12 @@ def train_one_variant(
                 se = float(out.get("graph_v5_edge_src_entropy", 0.0) or 0.0)
                 uq = float(out.get("graph_v5_unique_picks_frac", 0.0) or 0.0)
                 # v5.3+: learnable soft-pointer τ (should drift toward 0 if model
-                # finds sharper routing helpful). v5.4+: cross-node cos at the
-                # LAST MP round (oversmoothing canary — high = collapse).
+                # finds sharper routing helpful). v5.4+ mp_cos (oversmoothing
+                # canary) only computed during eval — see val print line.
                 tau = float(out.get("graph_v5_soft_pointer_temperature", 0.0) or 0.0)
-                mp_cos_arr = out.get("graph_v5_mp_buf_cross_node_cos_per_round")
-                mp_cos_last = float(mp_cos_arr[-1]) if mp_cos_arr is not None and len(mp_cos_arr) > 0 else 0.0
                 extra_field = (
                     f"g_n={gn:.2f} g_e={ge:.2f} src_ent={se:.2f} uniq={uq:.2f} "
-                    f"τ={tau:.3f} mp_cos={mp_cos_last:.3f}"
+                    f"τ={tau:.3f}"
                 )
                 aux_tag, aux_display = "aux", float(out["loss_aux"])
             elif "splat_aux" in out and out["splat_aux"] is not None:
@@ -470,8 +485,11 @@ def train_one_variant(
             vm = run_val(model, val_set, device, val_batches, window_size)
             val_row = {"phase": "val", "step": step, "variant": variant, **vm}
             jsonl_fp.write(json.dumps(val_row) + "\n")
+            extra = ""
+            if "val_graph_v5_mp_buf_cross_node_cos_final" in vm:
+                extra = f"  mp_cos={vm['val_graph_v5_mp_buf_cross_node_cos_final']:.3f}"
             print(f"    [val @ {step}]  recon={vm['val_loss_recon']:.4f}  "
-                  f"top1={vm['val_top1_acc']*100:.1f}%",
+                  f"top1={vm['val_top1_acc']*100:.1f}%{extra}",
                   flush=True)
             # Best-checkpoint save: only past the warmup-fluke window.
             # This is also the patience-reset signal — if best.pt updates,
@@ -708,11 +726,11 @@ def main():
             "(e.g. --mix-weights 0.35 0.15 0.15 0.15 0.2)."
         )
 
-    # Tranche-2 sizing (chunk=8192, 40× compression target, M=200):
-    #   graph_v5: K_node=200, K_edge=256, K_proposal=256, d_node=d_state=256
-    #     → substrate = 200·256 + 256·(2·256+256) = 51,200 + 196,608 = 247,808 floats
-    #   baselines: n_flat_codes=200, d_inner=1240 → 200·1240 = 248,000 floats (matched)
-    #   Memory tokens reaching Llama: M=200 × d_llama=2048 = 410K → 8192·2048 / 410K = 41×
+    # Tranche-2 sizing (chunk=8192, M=128, 64× compression):
+    #   graph_v5: K_node=128, K_edge=196, K_proposal=196, d_node=d_state=256
+    #     → substrate = 128·256 + 196·(2·256+256) = 32,768 + 150,528 = 183,296 floats ≈ 179K
+    #   baselines: n_flat_codes=128, d_inner=1398 → 128·1398 = 178,944 floats (matched)
+    #   Memory floats reaching Llama: M=128 × d_llama=2048 = 262K → 8192·2048 / 262K = 64×
     cfg = ReprConfig(
         batch_size=args.batch_size,
         fixed_window_size=args.window_size,
@@ -721,14 +739,14 @@ def main():
         warmup_steps=500,
         d_node_state=128,
         n_edges=68,
-        n_flat_codes=200,                 # was 36 → 200 (M=K_node)
-        d_continuous=1240,                # was 725 → 1240 (substrate match)
-        d_concept_baseline=1240,
-        d_mt_value=1240,
-        d_recurrent=1240,
-        graph_v5_K_node=200,              # was 32
-        graph_v5_K_edge=256,              # was 57
-        graph_v5_K_proposal=256,          # was 80
+        n_flat_codes=128,                 # was 36 → 128 (M=K_node, 64× compression)
+        d_continuous=1398,                # was 725 → 1398 (substrate match)
+        d_concept_baseline=1398,
+        d_mt_value=1398,
+        d_recurrent=1398,
+        graph_v5_K_node=128,              # was 32
+        graph_v5_K_edge=196,              # was 57
+        graph_v5_K_proposal=196,          # was 80
         graph_v5_d_node=256,              # was 128
         graph_v5_d_state=256,             # was 128
         edge_token_packing="fused",
