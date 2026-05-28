@@ -112,6 +112,13 @@ class QADataset(IterableDataset):
         worker_info = torch.utils.data.get_worker_info()
         wid = worker_info.id if worker_info is not None else 0
         rng = random.Random(self.seed + wid * 100_003 + 31)
+        # CRITICAL fix (2026-05-28): re-seed the CompositeSampler's RNG per
+        # worker too — forked workers inherit the same self.sampler.rng state
+        # set at __init__, so without this every worker produces identical
+        # (family, question_id) sequences and effective composite diversity
+        # is halved at num_workers=2. The +7 offset keeps it distinct from
+        # the evidence-shuffling RNG above.
+        self.sampler.rng = random.Random(self.seed + wid * 100_003 + 7)
 
         while True:
             chunk = self.sampler.sample_chunk(self.passages_per_chunk)
@@ -856,6 +863,7 @@ def make_mixed_qa_dataloader(
             Path(composite_passages_path), Path(composite_questions_path),
             chunk_size=chunk_size, passages_per_chunk=passages_per_chunk,
             sep_token_id=cfg.sep_token_id, pad_token_id=cfg.pad_token_id,
+            task_weights=composite_task_weights,
             seed=seed,
         ))
         src_weights.append(weights[0]); names.append("composite_v1")

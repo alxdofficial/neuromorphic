@@ -664,18 +664,45 @@ class MessagePassingReadoutV5(nn.Module):
         # Pre-norm before reading msg_buf each round (GPT-style stability).
         self.pre_norm = nn.LayerNorm(d_node)
 
-        # Shared message-construction MLP across rounds.
+        # v5.5: PER-ROUND message-construction MLPs (un-shared across rounds).
+        # Earlier versions shared one MLP across all T rounds (RNN-style param
+        # efficiency). The decode probe at v5.4 showed memory tokens producing
+        # gibberish when fed directly to lm_head — confirming the readout was
+        # the bottleneck: information was in the memory but not packaged in a
+        # Llama-readable form. Un-sharing lets each round learn a distinct
+        # message-construction stage (e.g. round 0-1 aggregate, round 2-3
+        # compose, round 4-5 format), at the cost of T× the msg_mlp params.
         d_h = d_mlp_hidden if d_mlp_hidden is not None else 2 * d_node
-        self.msg_mlp = nn.Sequential(
-            nn.Linear(d_node + d_state, d_h),
-            nn.GELU(),
-            nn.Linear(d_h, d_node),
-        )
+        self.msg_mlps = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(d_node + d_state, d_h),
+                nn.GELU(),
+                nn.Linear(d_h, d_node),
+            )
+            for _ in range(T)
+        ])
         # Small init on output linear so round-1 doesn't smash the seed in
         # the residual (msg_buf = msg_buf + agg). The model can scale it up
-        # from there.
-        nn.init.normal_(self.msg_mlp[-1].weight, std=0.02)
-        nn.init.zeros_(self.msg_mlp[-1].bias)
+        # from there. Applied identically per round.
+        for mlp in self.msg_mlps:
+            nn.init.normal_(mlp[-1].weight, std=0.02)
+            nn.init.zeros_(mlp[-1].bias)
+
+        # v5.5: post-MP FFN block — a "thinking" pass on msg_buf after the T
+        # MP rounds finish, before W_out projects to d_llama. GPT-style:
+        # LayerNorm + (Linear → GELU → Linear) with zero-init residual so it
+        # starts as identity (no effect until trained). This gives the readout
+        # an extra non-linear transformation between the graph-evolving content
+        # and the Llama-input projection — the missing piece in v5.4's readout
+        # that left memory readable to MP but not to Llama.
+        self.post_ffn_norm = nn.LayerNorm(d_node)
+        self.post_ffn = nn.Sequential(
+            nn.Linear(d_node, 4 * d_node),
+            nn.GELU(),
+            nn.Linear(4 * d_node, d_node),
+        )
+        nn.init.zeros_(self.post_ffn[-1].weight)
+        nn.init.zeros_(self.post_ffn[-1].bias)
 
         # Final output projection to Llama hidden.
         self.out_norm = nn.LayerNorm(d_node)
@@ -711,7 +738,7 @@ class MessagePassingReadoutV5(nn.Module):
             src_ctx = torch.matmul(alpha_src, norm_buf)                # [B, K_edge, d_msg]
             # Build messages: src_ctx ⊕ edge_state → d_msg
             msg_in = torch.cat([src_ctx, edge_state], dim=-1)
-            msg = self.msg_mlp(msg_in)                                 # [B, K_edge, d_msg]
+            msg = self.msg_mlps[t](msg_in)                             # [B, K_edge, d_msg]
             # Aggregate at dst — α_dst[k] is "how much each edge points at k"
             agg = torch.matmul(alpha_dst.transpose(-1, -2), msg)       # [B, K_node, d_msg]
 
@@ -746,6 +773,11 @@ class MessagePassingReadoutV5(nn.Module):
                     off = ~torch.eye(K_n, dtype=torch.bool, device=bn.device)
                     per_round_buf_cos.append(cos[:, off].mean().to(torch.float32))
 
+        # v5.5: post-MP FFN block — Transformer-style residual "thinking" pass
+        # on the final msg_buf state. Zero-init residual means this starts as
+        # identity and only contributes once trained, so it can't destabilize
+        # the seed-recovery dynamics from the T MP rounds.
+        msg_buf = msg_buf + self.post_ffn(self.post_ffn_norm(msg_buf))
         memory = self.W_out(self.out_norm(msg_buf))                    # [B, K_node, d_llama]
 
         if compute_telemetry:

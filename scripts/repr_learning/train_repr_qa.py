@@ -752,22 +752,32 @@ def main():
         max_window_size=args.chunk_size,
         max_steps=args.steps,
         warmup_steps=500,
+        # Bottleneck: 128 memory tokens × d_llama matched across all variants.
         d_node_state=128,
         n_edges=68,
-        n_flat_codes=128,                 # was 36 → 128 (M=K_node, 64× compression)
-        d_continuous=1398,                # was 725 → 1398 (substrate match)
-        d_concept_baseline=1398,
-        d_mt_value=1398,
-        d_recurrent=1398,
-        graph_v5_K_node=128,              # was 32
-        graph_v5_K_edge=196,              # was 57
-        graph_v5_K_proposal=196,          # was 80
-        graph_v5_d_node=256,              # was 128
-        graph_v5_d_state=256,             # was 128
+        n_flat_codes=128,
+        d_continuous=1398, d_concept_baseline=1398,
+        d_mt_value=1398, d_recurrent=1398,
+        # v5.5 graph sizing — target ~48M, with most of the bump going to the
+        # readout (gibberish-decode probe showed v5.4 readout was the bottleneck).
+        # See MessagePassingReadoutV5 v5.5 notes: per-round MLPs + post-MP FFN.
+        graph_v5_K_node=128, graph_v5_K_edge=196, graph_v5_K_proposal=196,
+        graph_v5_d_node=384,               # was 256
+        graph_v5_d_state=384,              # was 256
+        graph_v5_d_updater=640,            # was 384
+        graph_v5_updater_layers=5,         # was 4
+        graph_v5_n_message_rounds=6,       # was 4
+        graph_v5_mp_d_hidden=1024,         # was 256; per-round MLP hidden
+        # Baseline encoder — uniform bump to ~63M each on flat/cont/MT.
+        d_enc=768,                         # was 512
+        enc_n_layers=6,                    # was 2
+        enc_n_heads=12,                    # was 4
+        enc_ffn_dim=3072,                  # was 1024
+        # Mamba — bump to ~50M trainable (target was 40-50M for "adequately similar").
+        d_mamba=1792,                      # was 768
         edge_token_packing="fused",
         b_diversity_scale=args.b_diversity_scale,
         mt_diversity_scale=args.mt_diversity_scale,
-        d_mamba=768,
         **({"learning_rate": args.lr} if args.lr is not None else {}),
     )
 
