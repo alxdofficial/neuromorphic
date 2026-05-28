@@ -36,7 +36,12 @@ sys.path.insert(0, str(ROOT))
 
 from src.repr_learning.config import ReprConfig                        # noqa: E402
 from src.repr_learning.encoder import GraphV5BaselineEncoder           # noqa: E402
-from src.repr_learning.data_qa import HotpotQADataset, collate_qa      # noqa: E402
+from src.repr_learning.data_qa import (                                # noqa: E402
+    HotpotQADataset, MixedQADataset, QADataset, collate_qa,
+)
+
+COMPOSITE_VAL_P = ROOT / "data/wave1/composite_v1/val/passages.jsonl"
+COMPOSITE_VAL_Q = ROOT / "data/wave1/composite_v1/val/questions.jsonl"
 
 CKPT = ROOT / "outputs/repr_learning/v5_4_first_graph_v5_baseline/ckpts/graph_v5_baseline.best.pt"
 ALLOWED_UNEXPECTED = {"soft_pointer.W_v.weight"}
@@ -151,31 +156,87 @@ def generate_from_memory(llama, tokenizer, memory: torch.Tensor,
             for seq in gen_out]
 
 
+def generate_qa_answers(llama, tokenizer, memory: torch.Tensor,
+                         question_ids_list: list[list[int]], max_new_tokens: int,
+                         device) -> list[str]:
+    """Feed [memory; question_embeds] to Llama and greedy-generate the
+    answer autoregressively. This mirrors the training input format
+    (compute_qa_loss prepends memory then puts the question, then computes
+    teacher-forced CE on the answer). At inference, we generate the answer
+    instead — the honest test of "can the model actually produce the
+    answer it's being scored on."
+    """
+    B, K, D = memory.shape
+    assert len(question_ids_list) == B
+    embed_layer = llama.get_input_embeddings()
+    pieces = []
+    for i in range(B):
+        q_tensor = torch.tensor(question_ids_list[i], dtype=torch.long,
+                                 device=device).unsqueeze(0)         # [1, T_q]
+        q_emb = embed_layer(q_tensor)                                  # [1, T_q, D]
+        full = torch.cat([memory[i:i+1].to(q_emb.dtype), q_emb], dim=1)
+        pieces.append(full)
+    max_len = max(p.shape[1] for p in pieces)
+    inputs_embeds = torch.zeros(B, max_len, D, dtype=pieces[0].dtype, device=device)
+    attn = torch.zeros(B, max_len, dtype=torch.long, device=device)
+    for i, p in enumerate(pieces):
+        n = p.shape[1]
+        inputs_embeds[i, max_len - n:] = p[0]                          # left-pad
+        attn[i, max_len - n:] = 1
+    with torch.no_grad():
+        gen = llama.generate(
+            inputs_embeds=inputs_embeds, attention_mask=attn,
+            max_new_tokens=max_new_tokens, do_sample=False,
+            pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+        )
+    return [tokenizer.decode(seq.tolist(), skip_special_tokens=True) for seq in gen]
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["lmhead", "generative"], default="lmhead")
+    ap.add_argument("--mode", choices=["lmhead", "generative", "qa"], default="lmhead")
     ap.add_argument("--ckpt", type=Path, default=CKPT)
     ap.add_argument("--chunks", type=int, default=4)
     ap.add_argument("--chunk-size", type=int, default=4096)
     ap.add_argument("--top", type=int, default=8, help="(lmhead) top-K vocab tokens per memory slot")
     ap.add_argument("--max-new-tokens", type=int, default=80,
-                    help="(generative) number of tokens to generate after the starter prompt")
+                    help="(generative/qa) tokens to generate after the prompt")
+    ap.add_argument("--source", choices=["hotpot", "mixed"], default="hotpot",
+                    help="(qa) data source. mixed = composite_v1 + hotpot mix "
+                         "matching training weights [0.7, 0.3].")
     ap.add_argument("--out", type=Path, default=None,
                     help="output path; defaults depend on --mode")
     args = ap.parse_args()
     if args.out is None:
-        suffix = "decode_probe.txt" if args.mode == "lmhead" else "decode_generative.txt"
-        args.out = ROOT / "docs/plots" / f"v5_4_{suffix}"
+        suffix = {"lmhead": "decode_probe", "generative": "decode_generative",
+                  "qa": "decode_qa"}[args.mode]
+        args.out = ROOT / "docs/plots" / f"v5_4_{suffix}.txt"
 
     enc, cfg = load_encoder(args.ckpt)
     tokenizer = AutoTokenizer.from_pretrained(cfg.llama_model)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    print(f"[data] loading {args.chunks} HotpotQA val chunks @ {args.chunk_size} tokens")
-    ds = HotpotQADataset(tokenizer=tokenizer, split="validation",
-                         chunk_size=args.chunk_size,
-                         pad_token_id=tokenizer.pad_token_id or 128_001)
+    print(f"[data] loading {args.chunks} chunks from source={args.source} @ {args.chunk_size} tokens")
+    if args.source == "mixed":
+        # composite_v1 + hotpot mix matching training weights [0.7, 0.3].
+        # Direct sub-dataset construction (mirroring make_mixed_qa_dataloader).
+        comp = QADataset(
+            COMPOSITE_VAL_P, COMPOSITE_VAL_Q,
+            chunk_size=args.chunk_size, passages_per_chunk=300,
+            sep_token_id=cfg.sep_token_id, pad_token_id=cfg.pad_token_id,
+            seed=0,
+        )
+        hp = HotpotQADataset(
+            split="validation", tokenizer=tokenizer, chunk_size=args.chunk_size,
+            sep_token_id=cfg.sep_token_id, pad_token_id=cfg.pad_token_id, seed=1,
+        )
+        ds = MixedQADataset(sources=[comp, hp], weights=[0.7, 0.3], seed=0)
+    else:
+        ds = HotpotQADataset(tokenizer=tokenizer, split="validation",
+                             chunk_size=args.chunk_size,
+                             pad_token_id=tokenizer.pad_token_id or 128_001)
     it = iter(ds)
     samples = [next(it) for _ in range(args.chunks)]
     batch = collate_qa(samples, pad_token_id=tokenizer.pad_token_id or 128_001)
@@ -218,6 +279,46 @@ def main():
                 toks = decoded[b * K + k]
                 display = " | ".join(f"{t!r}" if t.strip() else f"[ws:{t!r}]" for t in toks)
                 lines.append(f"  slot {k:2d}: {display}")
+    elif args.mode == "qa":
+        # Real-question generative QA: prepend memory + the chunk's actual
+        # question, greedy-generate up to max_new_tokens, compare to gold.
+        # Mirrors compute_qa_loss input format but generates the answer
+        # autoregressively instead of teacher-forcing on the gold.
+        # Pre-collation samples store question_ids/answer_ids as already-
+        # trimmed tensors (no padding mask yet). Use them directly.
+        q_id_lists = [samples[b]["question_ids"].tolist() for b in range(B)]
+        gens = generate_qa_answers(
+            llama.to(device), tokenizer, memory,
+            question_ids_list=q_id_lists,
+            max_new_tokens=args.max_new_tokens, device=device,
+        )
+        n_exact = 0
+        n_contains = 0
+        for b in range(B):
+            lines.append(f"\n{'=' * 78}")
+            lines.append(f"CHUNK {b}  ({samples[b].get('task_family', '?')})  "
+                         f"—  context (first ~600 tokens):")
+            lines.append(ctx_text_per_chunk[b][:1500].replace("\n", " "))
+            lines.append("")
+            q_ids = q_id_lists[b]
+            a_ids = samples[b]["answer_ids"].tolist()
+            gold = tokenizer.decode(a_ids).strip()
+            pred_full = gens[b].strip()
+            # Truncate prediction at first newline or sentence end for cleaner display
+            pred_short = pred_full.split("\n")[0].split(".")[0].strip()
+            ok_exact = gold.lower() == pred_short.lower()
+            ok_contains = gold.lower() in pred_full.lower()
+            n_exact += int(ok_exact)
+            n_contains += int(ok_contains)
+            mark = "[EXACT]" if ok_exact else ("[CONTAINS]" if ok_contains else "[MISS]")
+            lines.append(f"Q:    {tokenizer.decode(q_ids).strip()}")
+            lines.append(f"Gold: {gold}")
+            lines.append(f"Pred: {pred_full}")
+            lines.append(f"      {mark}")
+        lines.append(f"\n{'=' * 78}")
+        lines.append(f"SUMMARY over {B} samples:")
+        lines.append(f"  exact match (first sentence): {n_exact}/{B}")
+        lines.append(f"  gold substring in prediction: {n_contains}/{B}")
     else:
         # generative: prepend memory + a few starter prompts, greedy-generate.
         # Multiple prompts per chunk so we can see if memory steers the
