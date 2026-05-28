@@ -714,9 +714,14 @@ class ReprLearningModel(nn.Module):
             # apply lm_head to prediction positions. Profiled saving at B=12,
             # T=224: 120→102 ms (15%), 7603→6209 MiB (1.4 GiB). Avoids the
             # [B, T, vocab=128K] logits tensor entirely.
+            # v5.5 perf: use_cache=False — QA is teacher-forced + single-pass,
+            # there is no autoregressive decode that reuses KV. Building the
+            # cache adds a noticeable per-step cost (esp. for vanilla_full_ctx
+            # where T_ctx ~= 8K).
             base_out = self.decoder.llama.model(
                 inputs_embeds=full_embeds,
                 attention_mask=attn_mask_full.to(torch.long),
+                use_cache=False,
             )
             hidden = base_out.last_hidden_state            # [B, T_total, d_llama]
         finally:
@@ -732,18 +737,19 @@ class ReprLearningModel(nn.Module):
             sel_hidden = pred_hidden_all[pred_mask]        # [N_pred, d_llama]
             sel_logits = self.decoder.llama.lm_head(sel_hidden)  # [N_pred, vocab]
             sel_targets = pred_targets[pred_mask]          # [N_pred]
-            loss_recon = F.cross_entropy(
-                sel_logits.float(), sel_targets, reduction="mean",
-            )
-            # Per-example CE for telemetry — compute per-row from selected
-            # logits using row indices, in a single grouped pass.
+            # v5.5 perf: compute CE ONCE with reduction='none' (a full vocab
+            # scan), then derive both the scalar loss (.mean()) and the
+            # per-example aggregation (scatter_add) from the same tensor.
+            # Previously we did two CE passes — one for mean, one for none.
+            per_token_nll_train = F.cross_entropy(
+                sel_logits.float(), sel_targets, reduction="none",
+            )                                              # [N_pred]
+            loss_recon = per_token_nll_train.mean()
+            # Per-example CE for telemetry — detached to avoid extra grad path
             per_example_loss = torch.zeros(B, device=device, dtype=loss_recon.dtype)
             with torch.no_grad():
-                # row_idx[k] = batch index of k-th selected position
                 row_idx = pred_mask.nonzero(as_tuple=False)[:, 0]  # [N_pred]
-                per_token_nll = F.cross_entropy(
-                    sel_logits.float(), sel_targets, reduction="none",
-                ).detach()                                          # [N_pred]
+                per_token_nll = per_token_nll_train.detach()       # [N_pred]
                 row_sum = torch.zeros(B, device=device, dtype=per_token_nll.dtype)
                 row_cnt = torch.zeros(B, device=device, dtype=per_token_nll.dtype)
                 row_sum.scatter_add_(0, row_idx, per_token_nll)
