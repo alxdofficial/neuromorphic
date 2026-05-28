@@ -86,6 +86,7 @@ def run_val(model, val_set, device, n_batches: int, window_size: int) -> dict:
     model.train(False)
     losses, accs, per_fam_stats = [], [], {}
     last_mp_cos: float | None = None  # eval-only telemetry (gated in MP readout)
+    last_v5_eval: dict[str, float] = {}  # eval-only encoder telemetry
     # Deterministic-eval seed (audit fix 2026-05-27): graph_v5's chunk-fresh
     # init was sampling fresh noise per call → same model + same batch produced
     # ~0.2 loss variance. Seeding torch RNG per batch makes eval reproducible.
@@ -108,6 +109,15 @@ def run_val(model, val_set, device, n_batches: int, window_size: int) -> dict:
         arr = out.get("graph_v5_mp_buf_cross_node_cos_per_round")
         if arr is not None and len(arr) > 0:
             last_mp_cos = float(arr[-1])
+        # v5 read-side eval-only diagnostics (entropies + reuse). Train-mode
+        # placeholders are zero; we just take the last-batch value at eval.
+        for k in ("graph_v5_edge_src_entropy",
+                  "graph_v5_unique_picks_frac",
+                  "graph_v5_cross_role_overlap",
+                  "graph_v5_endpoint_cos_mean"):
+            v = out.get(k)
+            if v is not None:
+                last_v5_eval[k] = float(v)
         # Per-family: use per-row loss instead of batch-wide mean (a 2-row
         # batch with rows from families X and Y was previously credited
         # the same mean to both, hiding genuine per-family differences).
@@ -135,6 +145,8 @@ def run_val(model, val_set, device, n_batches: int, window_size: int) -> dict:
     }
     if last_mp_cos is not None:
         result["val_graph_v5_mp_buf_cross_node_cos_final"] = last_mp_cos
+    for k, v in last_v5_eval.items():
+        result[f"val_{k}"] = v
     return result
 
 
@@ -195,6 +207,7 @@ def train_one_variant(
             lr=cfg.learning_rate,
             weight_decay=cfg.weight_decay,
             betas=(0.9, 0.95),
+            fused=torch.cuda.is_available(),
         )
     else:
         opt = None
@@ -457,15 +470,12 @@ def train_one_variant(
                 #   xrole: cross-role overlap (slots appearing as both src+dst)
                 gn = float(out.get("graph_v5_node_gate_mean_avg", 0.0) or 0.0)
                 ge = float(out.get("graph_v5_edge_gate_mean_avg", 0.0) or 0.0)
-                se = float(out.get("graph_v5_edge_src_entropy", 0.0) or 0.0)
-                uq = float(out.get("graph_v5_unique_picks_frac", 0.0) or 0.0)
                 # v5.3+: learnable soft-pointer τ (should drift toward 0 if model
-                # finds sharper routing helpful). v5.4+ mp_cos (oversmoothing
-                # canary) only computed during eval — see val print line.
+                # finds sharper routing helpful). src_ent / uniq / mp_cos are
+                # eval-only now (gated in encoder + MP readout) — see val line.
                 tau = float(out.get("graph_v5_soft_pointer_temperature", 0.0) or 0.0)
                 extra_field = (
-                    f"g_n={gn:.2f} g_e={ge:.2f} src_ent={se:.2f} uniq={uq:.2f} "
-                    f"τ={tau:.3f}"
+                    f"g_n={gn:.2f} g_e={ge:.2f} τ={tau:.3f}"
                 )
                 aux_tag, aux_display = "aux", float(out["loss_aux"])
             elif "splat_aux" in out and out["splat_aux"] is not None:
@@ -485,9 +495,14 @@ def train_one_variant(
             vm = run_val(model, val_set, device, val_batches, window_size)
             val_row = {"phase": "val", "step": step, "variant": variant, **vm}
             jsonl_fp.write(json.dumps(val_row) + "\n")
-            extra = ""
+            extra_parts = []
             if "val_graph_v5_mp_buf_cross_node_cos_final" in vm:
-                extra = f"  mp_cos={vm['val_graph_v5_mp_buf_cross_node_cos_final']:.3f}"
+                extra_parts.append(f"mp_cos={vm['val_graph_v5_mp_buf_cross_node_cos_final']:.3f}")
+            if "val_graph_v5_edge_src_entropy" in vm:
+                extra_parts.append(f"src_ent={vm['val_graph_v5_edge_src_entropy']:.2f}")
+            if "val_graph_v5_unique_picks_frac" in vm:
+                extra_parts.append(f"uniq={vm['val_graph_v5_unique_picks_frac']:.2f}")
+            extra = ("  " + "  ".join(extra_parts)) if extra_parts else ""
             print(f"    [val @ {step}]  recon={vm['val_loss_recon']:.4f}  "
                   f"top1={vm['val_top1_acc']*100:.1f}%{extra}",
                   flush=True)

@@ -2964,58 +2964,67 @@ class GraphV5BaselineEncoder(nn.Module):
             compute_telemetry=not self.training,
         )
 
+        # Read-side telemetry — the entropies and Python-loop reuse stats are
+        # diagnostic-only (never fed into loss). Gate the expensive ones behind
+        # eval mode so training only pays for the cheap accumulator averages.
         with torch.no_grad():
-            # Soft-pointer sharpness (low entropy = sharply pointing at one node;
-            # high entropy = spread / mixture). Per-edge entropy over K_node.
-            def _ent(p):
-                p = p.clamp_min(1e-8)
-                return -(p * p.log()).sum(-1)
-            edge_src_entropy = _ent(attn_src).mean().to(torch.float32)
-            edge_dst_entropy = _ent(attn_dst).mean().to(torch.float32)
-
-            # Cross-edge reuse: among the K_edge picks (argmax), how many unique
-            # bank entries are touched? Lower = more reuse. Also report fraction
-            # of pairs where (edge_i.src ≈ edge_j.dst or edge_j.src) by argmax.
-            src_argmax = attn_src.argmax(dim=-1)                # [B, K_edge]
-            dst_argmax = attn_dst.argmax(dim=-1)                # [B, K_edge]
-            all_picks = torch.cat([src_argmax, dst_argmax], dim=-1)
-            n_unique_list = [
-                torch.unique(all_picks[b]).numel() for b in range(all_picks.shape[0])
-            ]
-            n_unique = torch.tensor(n_unique_list, device=device, dtype=torch.float32)
-            unique_frac = (n_unique / float(all_picks.shape[-1])).mean()
-
-            # Cross-role reuse: how often does a slot appear as both src somewhere
-            # and dst elsewhere? Mean over batch of (|src_set ∩ dst_set| / K_node).
-            overlap_list = []
-            for b in range(all_picks.shape[0]):
-                src_set = torch.unique(src_argmax[b])
-                dst_set = torch.unique(dst_argmax[b])
-                overlap_list.append(
-                    (src_set.unsqueeze(0) == dst_set.unsqueeze(1)).any(dim=0).float().sum()
-                )
-            cross_role_overlap = torch.stack(overlap_list) / float(self.K_node)
-            cross_role_overlap = cross_role_overlap.mean().to(torch.float32)
-
-            # Endpoint cosine after materialization — if our soft pointers
-            # are sharply pointing at distinct N entries, this should look
-            # like the inter-N cosine; if everything collapses to one mixture,
-            # it will be near 1.
-            ep_bank = torch.cat([endpoint_src, endpoint_dst], dim=1)
-            ep_norm = F.normalize(ep_bank, dim=-1, eps=1e-6)
-            cos_mat = ep_norm @ ep_norm.transpose(-1, -2)
-            K2 = ep_bank.shape[1]
-            off_diag = ~torch.eye(K2, dtype=torch.bool, device=device)
-            endpoint_cos_mean = cos_mat[:, off_diag].mean().to(torch.float32)
-            endpoint_cos_max = cos_mat[:, off_diag].max().to(torch.float32)
-
+            # Cheap (per-window already accumulated during streaming_write):
             node_gate_avg = (state["node_gate_mean_accum"] / n_w).to(torch.float32)
             edge_gate_avg = (state["edge_gate_mean_accum"] / n_w).to(torch.float32)
             edge_pick_aff_avg = (state["edge_pick_affinity_accum"] / n_w).to(torch.float32)
             edge_frac_selfpick_avg = (state["edge_frac_selfpick_accum"] / n_w).to(torch.float32)
             edge_pick_entropy_avg = (state["edge_pick_entropy_accum"] / n_w).to(torch.float32)
-            # v5.3: current learned soft-pointer τ (telemetry — watch it sharpen)
             sp_temperature = self.soft_pointer.temperature.detach().to(torch.float32)
+
+            if not self.training:
+                # Soft-pointer sharpness (low entropy = sharply pointing at one node;
+                # high entropy = spread / mixture). Per-edge entropy over K_node.
+                def _ent(p):
+                    p = p.clamp_min(1e-8)
+                    return -(p * p.log()).sum(-1)
+                edge_src_entropy = _ent(attn_src).mean().to(torch.float32)
+                edge_dst_entropy = _ent(attn_dst).mean().to(torch.float32)
+
+                # Cross-edge reuse: Python loop over batch with torch.unique —
+                # ~B kernel launches per call, fine at eval, brutal in train.
+                src_argmax = attn_src.argmax(dim=-1)                # [B, K_edge]
+                dst_argmax = attn_dst.argmax(dim=-1)                # [B, K_edge]
+                all_picks = torch.cat([src_argmax, dst_argmax], dim=-1)
+                n_unique_list = [
+                    torch.unique(all_picks[b]).numel() for b in range(all_picks.shape[0])
+                ]
+                n_unique = torch.tensor(n_unique_list, device=device, dtype=torch.float32)
+                unique_frac = (n_unique / float(all_picks.shape[-1])).mean()
+
+                overlap_list = []
+                for b in range(all_picks.shape[0]):
+                    src_set = torch.unique(src_argmax[b])
+                    dst_set = torch.unique(dst_argmax[b])
+                    overlap_list.append(
+                        (src_set.unsqueeze(0) == dst_set.unsqueeze(1)).any(dim=0).float().sum()
+                    )
+                cross_role_overlap = torch.stack(overlap_list) / float(self.K_node)
+                cross_role_overlap = cross_role_overlap.mean().to(torch.float32)
+
+                # Endpoint cosine after materialization: full K_edge×K_edge matmul,
+                # same cost class as the MP K_node×K_node.
+                ep_bank = torch.cat([endpoint_src, endpoint_dst], dim=1)
+                ep_norm = F.normalize(ep_bank, dim=-1, eps=1e-6)
+                cos_mat = ep_norm @ ep_norm.transpose(-1, -2)
+                K2 = ep_bank.shape[1]
+                off_diag = ~torch.eye(K2, dtype=torch.bool, device=device)
+                endpoint_cos_mean = cos_mat[:, off_diag].mean().to(torch.float32)
+                endpoint_cos_max = cos_mat[:, off_diag].max().to(torch.float32)
+            else:
+                # Training-mode placeholders: keep keys in aux so downstream
+                # logging (jsonl row writer) doesn't blow up.
+                zero = torch.zeros((), device=device, dtype=torch.float32)
+                edge_src_entropy = zero
+                edge_dst_entropy = zero
+                unique_frac = zero
+                cross_role_overlap = zero
+                endpoint_cos_mean = zero
+                endpoint_cos_max = zero
 
         aux = {
             # No aux loss in v5 (yet) — keep the standard key as a zero so the
