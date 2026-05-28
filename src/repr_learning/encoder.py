@@ -1403,6 +1403,7 @@ class FullContextEncoder(nn.Module):
         # across windows so that finalize_memory returns the full context.
         return {
             "context_embeds": None,
+            "context_mask": None,
             "_B": batch_size,
             "_device": device,
             "_dtype": dtype,
@@ -1417,25 +1418,47 @@ class FullContextEncoder(nn.Module):
             mask = attention_mask.to(token_embeds.dtype).unsqueeze(-1)
             token_embeds = token_embeds * mask
         prev = state.get("context_embeds")
+        prev_mask = state.get("context_mask")
         if prev is None:
             new = token_embeds
+            new_mask = (
+                attention_mask if attention_mask is not None
+                else torch.ones(token_embeds.shape[0], token_embeds.shape[1],
+                                dtype=torch.bool, device=token_embeds.device)
+            )
         else:
             new = torch.cat([prev, token_embeds], dim=1)
+            window_mask = (
+                attention_mask if attention_mask is not None
+                else torch.ones(token_embeds.shape[0], token_embeds.shape[1],
+                                dtype=torch.bool, device=token_embeds.device)
+            )
+            new_mask = torch.cat([prev_mask, window_mask], dim=1)
         new_state = dict(state)
         new_state["context_embeds"] = new
+        new_state["context_mask"] = new_mask
         return new_state, {}
 
     def finalize_memory(self, state) -> tuple[Tensor, dict]:
         ctx = state.get("context_embeds")
+        mem_mask = state.get("context_mask")
         if ctx is None:
             ctx = torch.zeros(
                 state["_B"], 0, self.cfg.d_llama,
                 device=state["_device"], dtype=state["_dtype"],
             )
+            mem_mask = torch.zeros(state["_B"], 0, dtype=torch.bool,
+                                    device=state["_device"])
         aux = {
             "load_balance_loss": torch.zeros(
                 (), device=ctx.device, dtype=ctx.dtype,
             ),
+            # v5.5: surface the real-token mask so model.py can mask out the
+            # padded context positions in Llama's attention mask. Previously
+            # padded slots were zero-vectored but still attended-to, letting
+            # Llama use them as causal scratch space and contaminating the
+            # vanilla_full_context "ceiling" reference.
+            "memory_mask": mem_mask,
         }
         return ctx, aux
 
@@ -2683,6 +2706,15 @@ class GraphV5BaselineEncoder(nn.Module):
         # v5.2: K_proposal can differ from K_edge — decoupled proposal pool
         # acts as encoder-internal scratch (not bottleneck). Existing edges
         # pick from K_proposal candidates in slot routing.
+        #
+        # IMPORTANT (verified 2026-05-28 audit): the `if K_proposal != K_edge`
+        # equality check below means setting `graph_v5_K_proposal == K_edge`
+        # SILENTLY runs the LEGACY non-separate-proposal mode (K_proposal=0
+        # passed to HolisticUpdater, no proposal pool, edges built directly).
+        # If you want an equal-sized separate proposal pool, set K_proposal
+        # to something other than K_edge (e.g. K_edge + 1) — this special-
+        # case exists for backward-compat with v5.2/v5.3 configs where they
+        # were explicitly the same scalar variable.
         self.K_proposal = cfg.graph_v5_K_proposal
         self.updater = HolisticUpdater(
             d=self.d_updater,

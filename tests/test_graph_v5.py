@@ -94,8 +94,14 @@ def test_backward_grad_flow():
         # v5.3: trained soft pointer (W_v is dead in v5.4 — see ALLOWED_DEAD above)
         "soft_pointer.W_k.weight", "soft_pointer.log_tau",
         # v5.4: message-passing readout (replaces W_src/W_dst from v5.3 readout)
+        # v5.5: msg_mlp → per-round msg_mlps + post_ffn block. NOTE: the
+        # post_ffn block uses zero-init on its last linear so the residual
+        # starts as identity — at step 0 NO gradient flows through it
+        # (including post_ffn_norm and post_ffn.0). That's by design and
+        # those params start contributing once trained, so they're excluded
+        # from the at-init grad-flow assertion.
         "readout.W_init.weight",
-        "readout.msg_mlp.0.weight", "readout.msg_mlp.2.weight",
+        "readout.msg_mlps.0.0.weight", "readout.msg_mlps.0.2.weight",
         "readout.pre_norm.weight", "readout.out_norm.weight",
         "readout.W_out.weight",
     ]
@@ -166,10 +172,22 @@ def test_mp_readout_multi_round_actually_propagates():
     alpha_src = torch.softmax(torch.randn(B, K_edge, K_node) * 3, dim=-1)
     alpha_dst = torch.softmax(torch.randn(B, K_edge, K_node) * 3, dim=-1)
 
+    # v5.5: msg_mlp is now per-round, so a strict state_dict copy is incompatible
+    # across different T. Instead, build mp4 then copy the FIRST round's mlp into
+    # all of mp4's rounds so all 4 rounds use the SAME weights as mp1's only
+    # round. This isolates the "more rounds, same params" comparison.
     mp1 = MessagePassingReadoutV5(d_node, d_state, d_llama, T=1)
     mp4 = MessagePassingReadoutV5(d_node, d_state, d_llama, T=4)
-    # Copy weights so any difference is from T alone
-    mp4.load_state_dict(mp1.state_dict())
+    # Copy the round-0 mlp from mp1 into all rounds of mp4. Also copy shared
+    # non-mlp weights (W_init, pre_norm, post_ffn*, out_norm, W_out).
+    mp4.W_init.load_state_dict(mp1.W_init.state_dict())
+    mp4.pre_norm.load_state_dict(mp1.pre_norm.state_dict())
+    mp4.out_norm.load_state_dict(mp1.out_norm.state_dict())
+    mp4.W_out.load_state_dict(mp1.W_out.state_dict())
+    mp4.post_ffn_norm.load_state_dict(mp1.post_ffn_norm.state_dict())
+    mp4.post_ffn.load_state_dict(mp1.post_ffn.state_dict())
+    for r in range(4):
+        mp4.msg_mlps[r].load_state_dict(mp1.msg_mlps[0].state_dict())
 
     with torch.no_grad():
         mem1, _ = mp1(N, alpha_src, alpha_dst, edge_state)
@@ -180,9 +198,11 @@ def test_mp_readout_multi_round_actually_propagates():
 
 
 def test_mp_readout_grad_flows_evenly_across_rounds():
-    """v5.4: gradient through 4 rounds of MP shouldn't vanish exponentially.
-    Compare grad-norm of msg_mlp at T=1 vs T=4 — the ratio should be moderate.
-    Catches catastrophic vanishing from too-aggressive pre-norm or anchor."""
+    """v5.4-5.5: gradient through MP rounds shouldn't vanish exponentially.
+    v5.5: msg_mlp is now per-round (ModuleList) — measure grad of the LAST
+    round's output linear (closest to loss; gradient should always flow).
+    Compare T=1 vs T=4 to catch catastrophic vanishing from too-aggressive
+    pre-norm or anchor."""
     from src.repr_learning.graph_substrate_v5 import MessagePassingReadoutV5
     torch.manual_seed(42)
     B, K_edge, K_node = 1, 4, 8
@@ -198,8 +218,10 @@ def test_mp_readout_grad_flows_evenly_across_rounds():
         mem, _ = mp(N, alpha_src, alpha_dst, edge_state)
         loss = mem.pow(2).mean()
         loss.backward()
-        # output linear of msg_mlp — its grad summarizes message-path gradient health
-        return mp.msg_mlp[-1].weight.grad.norm().item()
+        # v5.5: per-round MLPs. Use last-round mlp — its gradient flows directly
+        # from the readout output, so it's the most sensitive test for "did
+        # gradient reach the MP path at all."
+        return mp.msg_mlps[-1][-1].weight.grad.norm().item()
 
     g1 = _measure_msg_mlp_grad_norm(T=1)
     g4 = _measure_msg_mlp_grad_norm(T=4)
@@ -229,8 +251,11 @@ def test_mp_readout_degree_normalization_smooths_hubs():
         mp_on  = MessagePassingReadoutV5(d_node, d_state, d_llama, T=1, degree_normalize=True,  anchor_strength=0.0)
         mp_on.load_state_dict(mp_off.state_dict())
 
-        _, telem_off = mp_off(N, alpha_src, alpha_dst, edge_state)
-        _, telem_on  = mp_on(N, alpha_src, alpha_dst, edge_state)
+        # v5.5: telemetry is gated behind compute_telemetry=True (train-mode
+        # default is False to avoid the K×K cosine cost). Pass it explicitly
+        # here since this test reads telem["mp_agg_norm_per_round"].
+        _, telem_off = mp_off(N, alpha_src, alpha_dst, edge_state, compute_telemetry=True)
+        _, telem_on  = mp_on(N, alpha_src, alpha_dst, edge_state, compute_telemetry=True)
 
     # With degree_normalize=False, hub gets ~16× more aggregate than mean
     # With degree_normalize=True, hub gets ~average (1× the per-edge msg)

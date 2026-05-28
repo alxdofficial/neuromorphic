@@ -606,12 +606,18 @@ def train_one_variant(
 
 def main():
     ap = argparse.ArgumentParser()
+    # Active suite (2026-05-28 tranche-3): graph_v5 + 4 baselines, plus the
+    # two frozen-Llama reference points. Retired variants (graph_baseline,
+    # plastic_baseline, splat_baseline) removed from defaults; they are still
+    # selectable via explicit --variants if needed.
     ap.add_argument("--variants", nargs="+", default=[
-        "flat_baseline", "continuous_baseline", "memorizing_baseline",
-        "recurrent_baseline", "plastic_baseline", "splat_baseline",
-        "graph_baseline",
-        "vanilla_llama",          # loss floor
-        "vanilla_full_context",   # loss ceiling
+        "graph_v5_baseline",      # primary architecture
+        "flat_baseline",
+        "continuous_baseline",
+        "memorizing_baseline",
+        "recurrent_baseline",
+        "vanilla_llama",          # loss floor (no context)
+        "vanilla_full_context",   # frozen-LM reference (sees raw context)
     ])
     ap.add_argument("--steps", type=int, default=10_000)
     ap.add_argument("--batch-size", type=int, default=2)

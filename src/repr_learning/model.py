@@ -626,6 +626,13 @@ class ReprLearningModel(nn.Module):
         pred_mask = torch.zeros(B, T_total - 1, dtype=torch.bool, device=device)
         pred_targets = torch.zeros(B, T_total - 1, dtype=torch.long, device=device)
 
+        # v5.5: optional per-slot memory mask from encoder. Used by
+        # vanilla_full_context to mark padded context positions as
+        # not-attendable (previously Llama could attend to all M slots
+        # including zero-vector pads, contaminating the ceiling reference).
+        # Compressed-memory variants don't set this — every memory slot is
+        # real content and all M positions should be attended.
+        mem_mask_from_enc = finalize_aux.get("memory_mask")
         for i in range(B):
             t_q = int(q_lens[i].item())
             t_a = int(a_lens[i].item())
@@ -633,7 +640,10 @@ class ReprLearningModel(nn.Module):
             # attn_mask_full False so Llama can't attend to those positions)
             if M > 0 and not zero_memory:
                 full_embeds[i, :M] = memory_dec[i]
-                attn_mask_full[i, :M] = True
+                if mem_mask_from_enc is not None:
+                    attn_mask_full[i, :M] = mem_mask_from_enc[i, :M].to(torch.bool)
+                else:
+                    attn_mask_full[i, :M] = True
             # Place real question
             if t_q > 0:
                 full_embeds[i, M:M + t_q] = q_embeds[i, :t_q]
