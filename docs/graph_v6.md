@@ -1,6 +1,10 @@
 # graph_v6 — soft-pointer graph memory with a relation-gated, per-token read
 
-Design doc. Supersedes graph_v5. Status: **designed, not yet built.**
+Design doc. Supersedes graph_v5. Status: **BUILT — the primary arm of the v2.1
+7-arm joint LoRA sweep** (graph_substrate_v6.py + GraphV6BaselineEncoder; per-token
+MemInject read). Float-matched at 274,944 floats (K_node=128, K_edge=196,
+d_node=d_state=384) / ~48M params; LoRA-all rank-16 q/v on the frozen Llama.
+(The "deferred / TBD" notes below predate the build and are now resolved.)
 
 ## Motivation
 

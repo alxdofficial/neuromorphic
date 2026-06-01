@@ -432,6 +432,10 @@ class FlatBaselineEncoder(nn.Module):
             n_active = int((self.code_usage_ema > 0.01 / cfg.n_nodes).sum())
         aux = {
             "load_balance_loss": load_balance_loss(scores, picks=code_id),
+            # z-loss caps unbounded growth of the selection logits (via
+            # score_log_scale) that would otherwise kill gumbel exploration and
+            # collapse the codebook. model.py already applies cfg.z_loss_coef.
+            "z_loss": router_z_loss(scores),
             "picked_ids": code_id,
             "routing_entropy": ent,
             "codes_active": torch.tensor(float(n_active)),

@@ -22,21 +22,17 @@ from typing import Optional
 import numpy as np
 
 
-# (variant_label, output_dir_under_outputs/repr_learning, jsonl_filename, color, group)
-# Order here = legend order. group is used for marker / color family in 3D.
+# (variant_label, variant_key, color, group) — the 7 live v2.1 arms. The run
+# dir is derived as f"{out_tag}_{variant_key}" and the jsonl as f"{variant_key}.jsonl",
+# matching the trainer's output layout, so pass --out-tag for a given sweep.
 VARIANTS = [
-    ("v5.4 (graph + graph MP)",
-     "v5_4_first_graph_v5_baseline", "graph_v5_baseline.jsonl", "#d62728", "graph_v5"),
-    ("v5.1-first (graph + xfmr)",
-     "v5_1_first_graph_v5_baseline", "graph_v5_baseline.jsonl", "#ff7f0e", "graph_v5"),
-    ("mamba (recurrent SSM)",
-     "v1h_t4k_v3_recurrent_baseline", "recurrent_baseline.jsonl", "#1f77b4", "baseline"),
-    ("continuous (slot-attn)",
-     "v1h_t4k_v3_continuous_baseline", "continuous_baseline.jsonl", "#2ca02c", "baseline"),
-    ("memorizing (top-K KV)",
-     "v1h_t4k_v3_memorizing_baseline", "memorizing_baseline.jsonl", "#9467bd", "baseline"),
-    ("flat (VQ codebook)",
-     "v1h_t4k_v3_flat_baseline", "flat_baseline.jsonl", "#8c564b", "baseline"),
+    ("graph_v6 (primary)",        "graph_v6_baseline",     "#d62728", "graph_v6"),
+    ("flat (VQ codebook)",        "flat_baseline",         "#8c564b", "baseline"),
+    ("continuous (slot-attn)",    "continuous_baseline",   "#2ca02c", "baseline"),
+    ("mamba (recurrent SSM)",     "recurrent_baseline",    "#1f77b4", "baseline"),
+    ("memorizing (top-K KV)",     "memorizing_baseline",   "#9467bd", "baseline"),
+    ("vanilla (no context)",      "vanilla_llama",         "#7f7f7f", "vanilla"),
+    ("vanilla (full context)",    "vanilla_full_context",  "#17becf", "vanilla"),
 ]
 
 
@@ -56,9 +52,10 @@ def _read_best_row(jsonl_path: Path) -> Optional[dict]:
     return best
 
 
-def _collect_outputs_root(out_root: Path) -> dict:
+def _collect_outputs_root(out_root: Path, out_tag: str) -> dict:
     out = OrderedDict()
-    for label, subdir, jsonl_name, color, group in VARIANTS:
+    for label, variant, color, group in VARIANTS:
+        subdir, jsonl_name = f"{out_tag}_{variant}", f"{variant}.jsonl"
         path = out_root / subdir / "jsonl" / jsonl_name
         row = _read_best_row(path)
         if row is None:
@@ -86,7 +83,7 @@ def plot_3d(data: dict, out_path: Path) -> None:
     ax = fig.add_subplot(111, projection="3d")
 
     for label, d in data.items():
-        marker = "D" if d["group"] == "graph_v5" else "o"
+        marker = "D" if d["group"] == "graph_v6" else "o"
         ax.scatter(
             [d["step"]], [d["val_recon"]], [d["top1"] * 100.0],
             c=[d["color"]], s=180, marker=marker,
@@ -176,10 +173,12 @@ def main() -> None:
     ap.add_argument("--outputs-root", type=Path,
                     default=Path("outputs/repr_learning"))
     ap.add_argument("--out-dir", type=Path, default=Path("docs/plots"))
+    ap.add_argument("--out-tag", type=str, required=True,
+                    help="Sweep tag: run dirs are <out-tag>_<variant> (e.g. v2_1).")
     args = ap.parse_args()
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
-    data = _collect_outputs_root(args.outputs_root)
+    data = _collect_outputs_root(args.outputs_root, args.out_tag)
     print(f"[loaded] {len(data)} variants")
     for label, d in data.items():
         print(f"  {label:35s}  step={d['step']:>5}  val={d['val_recon']:.3f}  "

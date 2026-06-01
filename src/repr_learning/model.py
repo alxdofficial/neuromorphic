@@ -991,6 +991,12 @@ class ReprLearningModel(nn.Module):
             out.update(splat_telemetry)
         if graph_telemetry is not None:
             out.update(graph_telemetry)
+        # flat_baseline codebook health → top-level so the trainer logs it to
+        # jsonl (codes_active = #live codes; collapse = the flat analogue of
+        # graph routing collapse).
+        for _k in ("codes_active", "routing_entropy"):
+            if _k in finalize_aux:
+                out[_k] = finalize_aux[_k]
         return out
 
     def compute_hsm_loss(

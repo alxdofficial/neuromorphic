@@ -161,6 +161,16 @@ def run_val(model, val_set, device, n_batches: int, window_size: int) -> dict:
     return result
 
 
+def _grad_group_norm(params) -> float:
+    """L2 norm of the grads of a parameter group (post-backward, pre-clip).
+    Returns 0.0 if the group has no grads. Used to split memory-mechanism vs
+    LoRA gradient magnitude for diagnosing gradient starvation."""
+    norms = [p.grad.detach().norm() for p in params if p.grad is not None]
+    if not norms:
+        return 0.0
+    return float(torch.norm(torch.stack(norms)))
+
+
 def _ckpt_metadata(model) -> dict:
     """Identity metadata pinned into every ckpt.
 
@@ -429,6 +439,16 @@ def train_one_variant(
             print(f"  [step {step}] FATAL: non-finite loss = {float(loss)}")
             break
         loss.backward()
+        # Per-module grad-norm split BEFORE clipping: separates the memory
+        # mechanism (encoder/graph write+read) from the decoder LoRA so we can
+        # SEE if the memory params are gradient-starved relative to the adapter
+        # (a global norm hides this — the #1 graph training-failure mode).
+        _gn_enc = _grad_group_norm(
+            p for n, p in model.named_parameters()
+            if p.requires_grad and not n.startswith("decoder.llama."))
+        _gn_lora = _grad_group_norm(
+            p for n, p in model.named_parameters()
+            if p.requires_grad and n.startswith("decoder.llama."))
         gn = torch.nn.utils.clip_grad_norm_(model.trainable_parameters(), cfg.grad_clip)
         opt.step()
 
@@ -441,9 +461,15 @@ def train_one_variant(
             "top1_acc": float(out["top1_acc"]),
             "n_content_positions": int(out["n_content_positions"]),
             "grad_norm": float(gn),
+            "grad_norm_memory": _gn_enc,    # encoder/graph write+read params
+            "grad_norm_lora": _gn_lora,     # decoder rank-16 q/v adapter
             "lr": lr,
             "memory_M": out["memory_shape"][1],
         }
+        # flat_baseline codebook health (codes_active = #live codes).
+        for key in ("codes_active", "routing_entropy"):
+            if key in out and out[key] is not None:
+                row[key] = float(out[key])
         # Per-component aux breakdown (unweighted). Lets us see WHICH aux
         # term is exploding when total aux spikes — previously we only had
         # the sum, and a load_balance=1392 spike was indistinguishable from
