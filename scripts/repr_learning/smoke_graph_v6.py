@@ -104,13 +104,13 @@ check("nodes not collapsed (cos mean < 0.9)", off.mean().item() < 0.9,
 print("== bottleneck width (current convention) ==")
 prod = ReprConfig()
 gv6 = prod.bottleneck_floats_graph_v6
-base_op = 128 * 1398  # operative baseline (trainer override n_flat_codes=128, d_inner=1398)
+base_op = 192 * 1432  # operative baseline (trainer override: n_flat_codes=192, per_slot=1432)
 print(f"  graph_v6 substrate (production dims K_node={prod.graph_v6_K_node}, K_edge={prod.graph_v6_K_edge}, "
       f"d_node={prod.graph_v6_d_node}, d_state={prod.graph_v6_d_state}):")
 print(f"    = {prod.graph_v6_K_node}·{prod.graph_v6_d_node} + {prod.graph_v6_K_edge}·"
       f"(2·{prod.graph_v6_d_node}+{prod.graph_v6_d_state}) = {gv6} floats")
-print(f"  baseline operative budget = 128·1398 = {base_op} floats  "
-      f"(graph_v6 = {100*gv6/base_op:.1f}% of baseline)")
+print(f"  baseline operative budget = 192·1432 = {base_op} floats  "
+      f"(graph_v6 = {100*gv6/base_op:.1f}% of baseline — matched)")
 
 nfail = sum(1 for _, ok in results if not ok)
 print(f"\n{'ALL PASS' if nfail == 0 else f'{nfail}/{len(results)} FAILED'}")

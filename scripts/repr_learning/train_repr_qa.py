@@ -225,20 +225,28 @@ def train_one_variant(
     min_delta: float = 0.01,                 # min val_recon drop to count as a real improvement
 ) -> dict:
     device = "cuda"
-    model = ReprLearningModel(cfg, variant=variant, llama_model=llama).to(device)
+    # LoRA wraps Llama's q/v in place (LoRALinear). The base `llama` is shared
+    # across variants, so when LoRA is on each variant must get its OWN fresh
+    # frozen Llama (pass None → the decoder self-loads one) — otherwise variant N
+    # would double-wrap variant N-1's LoRALinear and inherit its trained adapter.
+    # LoRA off → keep sharing the single read-only frozen Llama (fast).
+    llama_arg = None if cfg.use_llama_lora else llama
+    model = ReprLearningModel(cfg, variant=variant, llama_model=llama_arg).to(device)
     n_trainable = model.n_trainable_params()
+    # A variant is eval-only iff it has no trainable params. With LoRA-all on, the
+    # two vanilla references DO train (their ~1.7M LoRA) — they become the LoRA'd
+    # floor (no context) and ceiling (full context), not frozen reference points.
+    is_eval_only = (n_trainable == 0)
     print(f"\n{'='*78}")
     print(f"Variant: {variant}  ({n_trainable:,} trainable, {n_steps} steps)")
     print(f"{'='*78}")
 
-    is_vanilla = variant in ("vanilla_llama", "vanilla_full_context")
-
-    # vanilla_* variants have no trainable encoder params:
-    #   - vanilla_llama: no memory at all (loss floor reference)
-    #   - vanilla_full_context: passes raw context embeddings as memory (loss ceiling)
-    # Both just establish reference points for the variant comparison;
-    # training them is wasted compute. Treat as eval-only.
-    if not is_vanilla:
+    # vanilla_* reference points:
+    #   - vanilla_llama: no memory at all (LoRA'd loss FLOOR)
+    #   - vanilla_full_context: passes raw context embeddings as memory (LoRA'd CEILING)
+    # With LoRA off they have 0 trainable params → eval-only. With LoRA-all on they
+    # train their shared ~1.7M adapter exactly like every other arm.
+    if not is_eval_only:
         opt = torch.optim.AdamW(
             model.trainable_parameters(),
             lr=cfg.learning_rate,
@@ -249,7 +257,7 @@ def train_one_variant(
     else:
         opt = None
 
-    train_dl = None if is_vanilla else make_mixed_qa_dataloader(
+    train_dl = None if is_eval_only else make_mixed_qa_dataloader(
         cfg, tokenizer,
         composite_passages_path=COMPOSITE_TRAIN_P,
         composite_questions_path=COMPOSITE_TRAIN_Q,
@@ -305,7 +313,7 @@ def train_one_variant(
     stopped_at_step = n_steps
     evals_since_best = 0
 
-    if is_vanilla:
+    if is_eval_only:
         # Eval-only path. Skip any prior jsonl and run a single final-val pass.
         if jsonl_path.exists():
             jsonl_path.unlink()
@@ -820,46 +828,57 @@ def main():
             "(e.g. --mix-weights 0.35 0.15 0.15 0.15 0.2)."
         )
 
-    # Tranche-2 sizing (chunk=8192, M=128, 64× compression):
-    #   graph_v5: K_node=128, K_edge=196, K_proposal=196, d_node=d_state=256
-    #     → substrate = 128·256 + 196·(2·256+256) = 32,768 + 150,528 = 183,296 floats ≈ 179K
-    #   baselines: n_flat_codes=128, d_inner=1398 → 128·1398 = 178,944 floats (matched)
-    #   Memory floats reaching Llama: M=128 × d_llama=2048 = 262K → 8192·2048 / 262K = 64×
+    # Tranche-3 sizing (chunk=8192, 61× compression) — matched to graph_v6:
+    #   graph_v6 substrate: K_node=128, K_edge=196, d_node=d_state=384
+    #     → 128·384 + 196·(2·384+384) = 49,152 + 225,792 = 274,944 floats; 48.0M params
+    #   baselines: n_flat_codes=192, per_slot=1432 → 192·1432 = 274,944 floats (matched)
+    #     per_slot (1432) < d_llama (2048) keeps the slot the true bottleneck — every
+    #     stored float can reach Llama through the prepend projection (no no-op floats).
+    #     Compression: 8192·2048 / 274,944 = 61× (matches graph_v6).
+    #   MT is EXEMPT from the float match: its per-token KV bank is uncompressed /
+    #     unbounded in footprint, so it is the best-case retrieval reference, not a
+    #     fixed-footprint compressor. Its params are still matched (~47.8M).
     cfg = ReprConfig(
         batch_size=args.batch_size,
         fixed_window_size=args.window_size,
         max_window_size=args.chunk_size,
         max_steps=args.steps,
         warmup_steps=500,
-        # Bottleneck: 128 memory tokens × d_llama matched across all variants.
+        # Bottleneck: 192 memory slots × 1432 = 274,944 state floats across all
+        # fixed-footprint variants (flat / continuous / Mamba / graph), matched to
+        # graph_v6's substrate. MT exempt (see header).
         d_node_state=128,
         n_edges=68,
-        n_flat_codes=128,
-        d_continuous=1398, d_concept_baseline=1398,
-        d_mt_value=1398, d_recurrent=1398,
-        # v5.5 graph sizing — target ~48M, with most of the bump going to the
-        # readout (gibberish-decode probe showed v5.4 readout was the bottleneck).
-        # See MessagePassingReadoutV5 v5.5 notes: per-round MLPs + post-MP FFN.
+        n_flat_codes=192,                  # was 128 (slot count = prepend tokens)
+        d_continuous=1432, d_concept_baseline=1432,
+        d_mt_value=1432, d_recurrent=1432,  # was 1398; 192·1432 = 274,944
+        # v5.5 graph_v5 sizing (graph_v5 arm only; graph_v6 uses ReprConfig defaults,
+        # which already give 274,944 floats / 48.0M params).
         graph_v5_K_node=128, graph_v5_K_edge=196, graph_v5_K_proposal=196,
-        graph_v5_d_node=384,               # was 256
-        graph_v5_d_state=384,              # was 256
-        graph_v5_d_updater=640,            # was 384
-        graph_v5_updater_layers=5,         # was 4
-        graph_v5_n_message_rounds=6,       # was 4
-        graph_v5_mp_d_hidden=1024,         # was 256; per-round MLP hidden
+        graph_v5_d_node=384,
+        graph_v5_d_state=384,
+        graph_v5_d_updater=640,
+        graph_v5_updater_layers=5,
+        graph_v5_n_message_rounds=6,
+        graph_v5_mp_d_hidden=1024,
         # Baseline encoder (SmallBiTransformer; used by flat/continuous/MT only —
-        # NOT graph_v5 or Mamba). 4 layers → ~49M trainable each, matched to
-        # graph_v5 (48.6M) + Mamba d1280 (49.5M). 6 layers was ~63M (oversized).
-        d_enc=768,                         # was 512
-        enc_n_layers=4,                    # was 6 (63M); 4 → ~49M matched
-        enc_n_heads=12,                    # was 4
-        enc_ffn_dim=3072,                  # was 1024
-        # Mamba — d_mamba=1280 × 4L ≈ 49.5M trainable, matched to graph_v5's
-        # 48.6M (probed 2026-05-29). The earlier 1792 was ~90.8M (≈2× graph) —
-        # an oversized, NOT-matched baseline; the prior "~50M" estimate was wrong
-        # (it predated the 2→4 layer bump). 1024 would be 33.7M (under-matched).
-        d_mamba=1280,                      # was 1792 (90.8M, oversized)
+        # NOT graph or Mamba). d816 × 4L → 47.8–48.6M each, matched to graph_v6
+        # (48.0M). d768 was 43–44M — under-matched once graph grew from 48.6M→48.0M
+        # with the float target rising 178,944→274,944 (params ≈ flat w.r.t. floats).
+        d_enc=816,                         # was 768 (43–44M); 816 → ~48M matched
+        enc_n_layers=4,
+        enc_n_heads=12,                    # 816 = 12·68
+        enc_ffn_dim=3264,                  # was 3072
+        # Mamba — d_mamba=1256 × 4L ≈ 47.95M, matched to graph_v6's 48.0M.
+        # 1280 was 49.5M (matched the older graph_v5 48.6M); 1256 re-centres on 48.0.
+        d_mamba=1256,                      # was 1280 (49.5M)
         edge_token_packing="fused",
+        # LoRA-all (fair joint training): EVERY arm — graph, the four baselines,
+        # and BOTH vanilla references — gets the SAME rank-16 q/v LoRA on the frozen
+        # Llama-1B (~1.70M params: q 65,536 + v 40,960 per layer × 16). The decoder
+        # budget is identical across arms; only the memory mechanism differs.
+        # vanilla_llama+LoRA = floor, vanilla_full_context+LoRA = ceiling.
+        use_llama_lora=True,
         b_diversity_scale=args.b_diversity_scale,
         mt_diversity_scale=args.mt_diversity_scale,
         **({"learning_rate": args.lr} if args.lr is not None else {}),
