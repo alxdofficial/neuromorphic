@@ -45,7 +45,7 @@ from src.repr_learning.config import ReprConfig                        # noqa: E
 from src.repr_learning.model import ReprLearningModel                  # noqa: E402
 from src.repr_learning.data_qa import (                                # noqa: E402
     HotpotQADataset, MuSiQueDataset, NarrativeQADataset, QADataset,
-    BABILongDataset, RULERNIAHDataset,
+    BABILongDataset, RULERNIAHDataset, LoCoMoQADataset,
     collate_qa,
 )
 
@@ -55,7 +55,7 @@ COMPOSITE_VAL_Q = ROOT / "data/wave1/composite_v1/val/questions.jsonl"
 # Tranche-3 sweep variants — matches /tmp/run_tranche3.sh exactly.
 # vanilla_llama / vanilla_full_context are not in this sweep (separate baselines).
 DEFAULT_VARIANTS = [
-    "graph_v5_baseline",
+    "graph_v6_baseline",
     "flat_baseline",
     "continuous_baseline",
     "recurrent_baseline",
@@ -72,9 +72,14 @@ FAMILY_TO_BUILDER = {
     "hotpot_qa":    "hotpot",
     "narrative_qa": "narrative",
     "musique":      "musique",
-    # OOD (eval-only, never trained on): synthetic, contamination-free.
     "babilong":     "babilong",
+    # OOD (eval-only, never trained on):
+    #   ruler_niah — synthetic needle-in-haystack, contamination-free, 8k.
+    #   locomo — real very-long-term dialogue (~9–26k tok); run at a LARGER
+    #            --chunk-size (e.g. 32768) so the streaming encoder windows the
+    #            whole conversation into the O(1) memory (length-gen probe).
     "ruler_niah":   "ruler_niah",
+    "locomo":       "locomo",
 }
 
 
@@ -186,7 +191,7 @@ def _build_dataset(builder: str, *, tokenizer, chunk_size: int, cfg: ReprConfig,
     if builder == "narrative":
         return NarrativeQADataset(
             split="validation", tokenizer=tokenizer, chunk_size=chunk_size,
-            pad_token_id=cfg.pad_token_id, seed=seed,
+            sep_token_id=cfg.sep_token_id, pad_token_id=cfg.pad_token_id, seed=seed,
         )
     if builder == "musique":
         return MuSiQueDataset(
@@ -203,6 +208,14 @@ def _build_dataset(builder: str, *, tokenizer, chunk_size: int, cfg: ReprConfig,
     if builder == "ruler_niah":
         # OOD: synthetic multi-key needle-in-haystack, never trained on.
         return RULERNIAHDataset(
+            split="validation", tokenizer=tokenizer, chunk_size=chunk_size,
+            sep_token_id=cfg.sep_token_id, pad_token_id=cfg.pad_token_id, seed=seed,
+        )
+    if builder == "locomo":
+        # OOD: real very-long-term dialogue. Native length ~9–26k > 8k — run
+        # this family at a larger --chunk-size so the streaming encoder windows
+        # the whole conversation into the fixed-footprint memory.
+        return LoCoMoQADataset(
             split="validation", tokenizer=tokenizer, chunk_size=chunk_size,
             sep_token_id=cfg.sep_token_id, pad_token_id=cfg.pad_token_id, seed=seed,
         )
@@ -409,6 +422,7 @@ MAX_NEW_TOKENS_PER_FAMILY = {
     "musique":      16,
     "babilong":     12,   # bAbI answers are 1-2 words
     "ruler_niah":   12,   # a 7-digit number
+    "locomo":       32,   # dates / names / short phrases; some 1-sentence
 }
 
 

@@ -775,30 +775,39 @@ def main():
                          "tranche-3 hard-only protocol). Contamination-controlled "
                          "2-4 hop QA — complements HotpotQA by eliminating "
                          "shortcut reasoning.")
-    ap.add_argument("--babilong", action="store_true",
-                    help="Enable BABILong source (default: DISABLED). "
-                         "Synthetic state-tracking, pre-formatted at the "
-                         "config length (4k/8k/16k).")
+    ap.add_argument("--babilong", action=argparse.BooleanOptionalAction,
+                    default=True,
+                    help="Enable BABILong source (default: ENABLED for the "
+                         "v2.1 joint sweep — train + held-out eval, fine-tuned "
+                         "small-model track only). Synthetic state-tracking, "
+                         "pre-formatted at the config length (4k/8k/16k). "
+                         "Use --no-babilong to disable.")
     ap.add_argument("--babilong-config", type=str, default="auto",
                     help="BABILong length config. 'auto' picks the closest "
                          "config below chunk_size (e.g. 4k for chunk=4096, "
                          "8k for chunk=8192). Manual: 0k, 1k, 2k, 4k, 8k, "
                          "16k, 32k, 64k, 128k.")
     ap.add_argument("--mix-weights", nargs="+", type=float,
-                    default=[0.30, 0.25, 0.25, 0.20, 0.0],
+                    default=[0.2, 0.2, 0.2, 0.2, 0.2],
                     metavar="W",
                     help="Sampling weights for (composite, hotpot, narrative, "
-                         "musique, babilong). 2026-05-28 tranche-3 hard-only "
-                         "default: 0.30/0.25/0.25/0.20/0.0 — balanced across "
-                         "the 4 hard families. Older 3-tuple callers still "
-                         "work; missing entries default to 0.")
-    ap.add_argument("--composite-task-weights", nargs="+", default=None,
+                         "musique, babilong). v2.1 joint-sweep default: equal "
+                         "0.2 each across the 5 sources (composite restricted "
+                         "to biographical via --composite-task-weights). Equal-"
+                         "by-source is the least-gameable fair-head-to-head mix. "
+                         "Older 3-tuple callers still work; missing entries "
+                         "default to 0.")
+    ap.add_argument("--composite-task-weights", nargs="+",
+                    default=["biographical:1.0"],
                     metavar="FAMILY:W",
-                    help="Per-family weights inside composite_v1 (e.g. "
-                         "'biographical:1.0' to train only on biographical, or "
-                         "'biographical:2.0 hotpot_qa:1.0' for 2:1 ratio). "
-                         "Unlisted families get weight 0 (filtered out). "
-                         "Default: None = all 9 families sampled uniformly.")
+                    help="Per-family weights inside composite_v1. v2.1 joint-"
+                         "sweep default: 'biographical:1.0' — composite is "
+                         "restricted to the biographical family only (the "
+                         "hardest/most-relational family; atomic+relational+"
+                         "temporal+aggregation question types over a controlled "
+                         "entity-relation world). Unlisted families get weight 0 "
+                         "(filtered out). Pass e.g. '' or list families to "
+                         "override; 'biographical:2.0 calendar:1.0' for ratios.")
     ap.add_argument("--patience", type=int, default=5,
                     help="Stop training when best.pt hasn't updated for this "
                          "many consecutive val evals past --min-step-for-stop. "
