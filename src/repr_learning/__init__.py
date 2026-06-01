@@ -12,29 +12,21 @@ from .model import ReprLearningModel
 from .encoder import (
     ContinuousBaselineEncoder,
     FlatBaselineEncoder,
-    GraphBaselineEncoder,
-    GraphV5BaselineEncoder,
+    FullContextEncoder,
     GraphV6BaselineEncoder,
     MemorizingBaselineEncoder,
     NullEncoder,
-    PlasticBaselineEncoder,
     RecurrentBaselineEncoder,
-    SplatBaselineEncoder,
-    V21Encoder,
 )
 
 __all__ = [
     "ReprConfig",
     "ReprLearningModel",
-    "V21Encoder",
     "FlatBaselineEncoder",
     "ContinuousBaselineEncoder",
     "MemorizingBaselineEncoder",
     "RecurrentBaselineEncoder",
-    "PlasticBaselineEncoder",
-    "SplatBaselineEncoder",
-    "GraphBaselineEncoder",
-    "GraphV5BaselineEncoder",
     "GraphV6BaselineEncoder",
     "NullEncoder",
+    "FullContextEncoder",
 ]

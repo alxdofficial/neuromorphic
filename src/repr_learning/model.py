@@ -19,15 +19,10 @@ from .encoder import (
     ContinuousBaselineEncoder,
     FlatBaselineEncoder,
     FullContextEncoder,
-    GraphBaselineEncoder,
-    GraphV5BaselineEncoder,
     GraphV6BaselineEncoder,
     MemorizingBaselineEncoder,
     NullEncoder,
-    PlasticBaselineEncoder,
     RecurrentBaselineEncoder,
-    SplatBaselineEncoder,
-    V21Encoder,
 )
 from .decoder import FrozenLlamaDecoder
 from .jepa import (
@@ -47,15 +42,10 @@ class ReprLearningModel(nn.Module):
     """
 
     VARIANTS = {
-        "v21": V21Encoder,
         "flat_baseline": FlatBaselineEncoder,
         "continuous_baseline": ContinuousBaselineEncoder,
         "memorizing_baseline": MemorizingBaselineEncoder,
         "recurrent_baseline": RecurrentBaselineEncoder,
-        "plastic_baseline": PlasticBaselineEncoder,
-        "splat_baseline": SplatBaselineEncoder,
-        "graph_baseline": GraphBaselineEncoder,
-        "graph_v5_baseline": GraphV5BaselineEncoder,
         "graph_v6_baseline": GraphV6BaselineEncoder,
         "vanilla_llama": NullEncoder,         # loss floor — Llama with no memory
         "vanilla_full_context": FullContextEncoder,  # loss ceiling — Llama sees full evidence
@@ -64,7 +54,7 @@ class ReprLearningModel(nn.Module):
     def __init__(
         self,
         cfg: ReprConfig,
-        variant: str = "v21",
+        variant: str = "graph_v6_baseline",
         llama_model: Optional[nn.Module] = None,
         chat_template: Optional[ChatTemplate] = None,
     ):
@@ -595,27 +585,7 @@ class ReprLearningModel(nn.Module):
         # ---- 1. Encode context (no_grad embed lookup) ----
         with torch.no_grad():
             ctx_embeds = embed(batch.context_ids)
-            # Plastic variant + surprise enabled: extra frozen-Llama forward
-            # over the full context to compute per-token NLL as the
-            # neuromodulator signal. Off by default — the surprise pass on
-            # 4096 tokens is the dominant cost (6× slowdown). Re-enable via
-            # cfg.plastic_use_surprise for ablation.
-            use_surprise = (
-                self.variant == "plastic_baseline"
-                and getattr(self.cfg, "plastic_use_surprise", False)
-            )
-            if use_surprise:
-                ctx_logits = self.decoder.llama(
-                    input_ids=batch.context_ids,
-                    attention_mask=batch.context_mask.to(torch.long),
-                ).logits                                                  # [B, T_ctx, V]
-                log_probs = F.log_softmax(ctx_logits[:, :-1, :].float(), dim=-1)
-                tgt = batch.context_ids[:, 1:]
-                nll = -log_probs.gather(-1, tgt.unsqueeze(-1)).squeeze(-1)  # [B, T_ctx-1]
-                ctx_surprise = F.pad(nll, (1, 0), value=0.0)              # [B, T_ctx]
-                ctx_surprise = ctx_surprise * batch.context_mask.to(ctx_surprise.dtype)
-            else:
-                ctx_surprise = None
+            ctx_surprise = None   # was the plastic_baseline neuromod signal (retired)
         n_windows = (T_ctx + window_size - 1) // window_size
         state = self.encoder.init_streaming_state(B, device, ctx_embeds.dtype)
         # Activation-checkpoint each window during training so we hold ~one
@@ -829,50 +799,14 @@ class ReprLearningModel(nn.Module):
                     pred_targets[i, pred_pos] = answer_ids_for_loss[i, k]
 
         # ---- 4. Llama forward (causal mask is native; padding via attn_mask) ----
-        # Plastic/Splat variants: install a forward_pre_hook on the chosen
-        # Llama decoder layer that calls encoder.inject(hidden_states, state).
-        # The hook is removed in finally so the shared Llama module is
-        # unmodified across variants.
+        # graph_v6: install a forward_pre_hook on the chosen Llama decoder layer
+        # that calls encoder.inject(hidden_states, facts) at every position. The
+        # hook is removed in finally so the shared Llama module is unmodified
+        # across variants.
         hook_handle = None
         if zero_memory:
-            # Skip hook installation entirely for plastic/splat — Llama
-            # forward runs unmodified (no fast-weight delta, no splat
-            # density injection). Matches "no memory" for prepend variants.
+            # No memory: Llama forward runs unmodified (no per-token read).
             pass
-        elif self.variant == "plastic_baseline":
-            state_for_hook = finalize_aux["plastic_fast_state"]
-            inject_layer_idx = self.encoder.inject_layer_idx
-            encoder_ref = self.encoder
-
-            def pre_hook(module, args, kwargs):
-                if not args:
-                    return None
-                hidden_states = args[0]
-                injected = encoder_ref.inject(hidden_states, state_for_hook)
-                new_args = (injected,) + args[1:]
-                return new_args, kwargs
-
-            hook_handle = (
-                self.decoder.llama.model.layers[inject_layer_idx]
-                .register_forward_pre_hook(pre_hook, with_kwargs=True)
-            )
-        elif self.variant == "splat_baseline":
-            blobs_for_hook = finalize_aux["splat_blobs"]
-            inject_layer_idx = self.encoder.inject_layer_idx
-            encoder_ref = self.encoder
-
-            def pre_hook(module, args, kwargs):
-                if not args:
-                    return None
-                hidden_states = args[0]
-                injected = encoder_ref.inject(hidden_states, blobs_for_hook)
-                new_args = (injected,) + args[1:]
-                return new_args, kwargs
-
-            hook_handle = (
-                self.decoder.llama.model.layers[inject_layer_idx]
-                .register_forward_pre_hook(pre_hook, with_kwargs=True)
-            )
         elif self.variant == "graph_v6_baseline":
             # Per-decode-token read (docs/graph_v6.md READ Stage B): facts built in
             # finalize_memory, soft-retrieved + fused at every position by the hook.
