@@ -31,7 +31,7 @@ import string
 import sys
 import time
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -52,14 +52,17 @@ from src.repr_learning.data_qa import (                                # noqa: E
 COMPOSITE_VAL_P = ROOT / "data/wave1/composite_v1/val/passages.jsonl"
 COMPOSITE_VAL_Q = ROOT / "data/wave1/composite_v1/val/questions.jsonl"
 
-# Tranche-3 sweep variants — matches /tmp/run_tranche3.sh exactly.
-# vanilla_llama / vanilla_full_context are not in this sweep (separate baselines).
+# v2.1 joint sweep — all 7 arms scored with identical decode params so the
+# floor/ceiling are produced in the SAME run as the comparison arms (EM/
+# Containment/Judge), not only on reconstruction NLL.
 DEFAULT_VARIANTS = [
-    "graph_v6_baseline",
+    "graph_v6_baseline",     # primary
     "flat_baseline",
     "continuous_baseline",
     "recurrent_baseline",
     "memorizing_baseline",
+    "vanilla_llama",         # floor (no context)
+    "vanilla_full_context",  # ceiling (full evidence)
 ]
 
 # Doubly-nested path comes from `--out outputs/repr_learning/tranche4_<v>`
@@ -283,11 +286,9 @@ def collect_samples(families: list[str], n_per_family: int, *,
 # ═══════════════════════════════════════════════════════════════════════════
 
 
-# Variant → (allowed-unexpected key prefixes for strict-ish load).
-# graph_v5_baseline carries soft_pointer.W_v as a dead module since v5.3+.
-VARIANT_ALLOW_UNEXPECTED = {
-    "graph_v5_baseline": {"encoder.soft_pointer.W_v.weight"},
-}
+# Variant → allowed-unexpected state-dict keys for strict-ish load. (graph_v5
+# is retired/deleted; no live arm needs an allowance.)
+VARIANT_ALLOW_UNEXPECTED: dict[str, set] = {}
 
 
 def _verify_ckpt_metadata(variant: str, sd: dict, cfg: ReprConfig, model):
@@ -330,19 +331,43 @@ def _verify_ckpt_metadata(variant: str, sd: dict, cfg: ReprConfig, model):
                 )
 
 
-def load_variant(variant: str, ckpt_path: Path, cfg: ReprConfig, llama):
-    """Load one variant from its ckpt, sharing the frozen Llama."""
+def _frozen_base_key(k: str) -> bool:
+    """A frozen-Llama BASE weight (not saved in ckpt): decoder.llama.* without
+    a LoRA adapter in the name. LoRA keys (decoder.llama.*lora*) ARE saved and
+    must match, so they are NOT treated as freely-missing."""
+    return k.startswith("decoder.llama.") and "lora" not in k.lower()
+
+
+def load_variant(variant: str, ckpt_path: Path, base_cfg: ReprConfig, llama):
+    """Load one variant, rebuilding its ReprConfig from the checkpoint's OWN
+    pinned cfg_dict so eval sizing + LoRA exactly match what that arm trained
+    with. The eval-side cfg must NOT be hardcoded — it drifts from the trainer
+    and silently crash-skips every fixed-footprint baseline (audit flat-01)."""
     if not ckpt_path.exists():
         raise FileNotFoundError(f"{variant}: ckpt missing at {ckpt_path}")
-    model = ReprLearningModel(cfg, variant=variant, llama_model=llama)
     sd = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    cfg_dict = (sd.get("metadata") or {}).get("cfg_dict")
+    if cfg_dict:
+        valid = {f.name for f in fields(ReprConfig)}
+        cfg = ReprConfig(**{k: v for k, v in cfg_dict.items() if k in valid})
+    else:
+        print(f"   [warn] {variant}: ckpt has no metadata.cfg_dict — falling back "
+              f"to eval default cfg; sizing may mismatch. Retrain to embed cfg_dict.")
+        cfg = base_cfg
+    # LoRA-all: each variant self-loads a FRESH frozen Llama (passing None) so the
+    # shared module isn't LoRA-wrapped in place across variants (double-wrap). Only
+    # share the base module when this variant has no LoRA.
+    llama_arg = None if getattr(cfg, "use_llama_lora", False) else llama
+    model = ReprLearningModel(cfg, variant=variant, llama_model=llama_arg)
     _verify_ckpt_metadata(variant, sd, cfg, model)
     state = sd["model_state_dict"]
     allow = VARIANT_ALLOW_UNEXPECTED.get(variant, set())
     missing, unexpected = model.load_state_dict(state, strict=False)
-    bad_missing = [k for k in missing if not k.startswith("decoder.llama.")]
+    # Frozen base weights are legitimately absent (not saved); LoRA + memory keys
+    # must match. Anything else missing/unexpected is real ckpt drift → abort.
+    bad_missing = [k for k in missing if not _frozen_base_key(k)]
     bad_unexpected = [k for k in unexpected
-                      if k not in allow and not k.startswith("decoder.llama.")]
+                      if k not in allow and not _frozen_base_key(k)]
     if bad_missing or bad_unexpected:
         raise RuntimeError(
             f"{variant} ckpt drift:\n"
@@ -464,10 +489,17 @@ def generate_answers(llama, tokenizer, memory: torch.Tensor,
                       memory_mask: Optional[torch.Tensor] = None,
                       adaptive_budget: bool = True,
                       chat_template=None,   # ChatTemplate or None
+                      inject=None,          # graph_v6 per-token read: {encoder,facts,layer_idx}
                       ) -> tuple[list[str], list[str]]:
     """Greedy AR-decode per sample. When chat_template is set, prefix is:
        [pre_mem; memory; post_mem; question; post_q]
     Otherwise the legacy [memory; question] concat is used.
+
+    `llama` MUST be the per-variant LoRA-wrapped decoder (model.decoder.llama),
+    not the shared base — otherwise the trained adapter is dropped. For graph_v6,
+    `inject` carries the per-token MemInject hook spec so the read mechanism is
+    actually exercised at decode (mirrors model.compute_qa_loss); without it the
+    primary arm decodes with ZERO memory (audit graph-1).
 
     Returns (raw_texts, cleaned_texts) — raw kept for audit, cleaned scored.
     """
@@ -526,12 +558,36 @@ def generate_answers(llama, tokenizer, memory: torch.Tensor,
         full = torch.cat(parts, dim=1)
         attn = torch.cat(masks, dim=1)
 
-        gen = llama.generate(
-            inputs_embeds=full, attention_mask=attn,
-            max_new_tokens=mnt, do_sample=False,
-            pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
-            eos_token_id=stop_token_id,
-        )
+        # graph_v6: install the SAME per-token MemInject pre-hook used in
+        # compute_qa_loss so the read injects this sample's facts at every
+        # decode position. Per-sample facts slice [i:i+1]; removed in finally.
+        hook_handle = None
+        if inject is not None:
+            enc_ref = inject["encoder"]
+            # facts is a dict of [B,...] tensors (e.g. {"value": ...}); slice to
+            # this sample. Non-tensor entries pass through unchanged.
+            facts_i = {k: (v[i:i+1] if torch.is_tensor(v) else v)
+                       for k, v in inject["facts"].items()}
+            lidx = inject["layer_idx"]
+
+            def _pre_hook(module, args, kwargs, _enc=enc_ref, _f=facts_i):
+                if not args:
+                    return None
+                hs = args[0]
+                return (_enc.inject(hs, _f),) + args[1:], kwargs
+
+            hook_handle = llama.model.layers[lidx].register_forward_pre_hook(
+                _pre_hook, with_kwargs=True)
+        try:
+            gen = llama.generate(
+                inputs_embeds=full, attention_mask=attn,
+                max_new_tokens=mnt, do_sample=False,
+                pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
+                eos_token_id=stop_token_id,
+            )
+        finally:
+            if hook_handle is not None:
+                hook_handle.remove()
         # `generate` with inputs_embeds returns only NEW tokens (no prefix).
         raw = tokenizer.decode(gen[0].tolist(), skip_special_tokens=True).strip()
         clean = _truncate_at_natural_end(raw)
@@ -623,8 +679,11 @@ def main():
     print(f"[collect] {len(samples)} total samples in {time.time()-t0:.1f}s")
 
     # ── Load frozen Llama once, share across variants ────────────────────
-    print(f"\n[llama] loading {cfg.llama_model} (shared across variants, frozen)")
-    llama = AutoModelForCausalLM.from_pretrained(cfg.llama_model, dtype=torch.float32)
+    # Shared frozen Llama is only a FALLBACK for non-LoRA variants; under LoRA-all
+    # every variant self-loads its own (bf16) decoder in load_variant. Load bf16 to
+    # match the training/val numerical regime (was fp32 → train/eval dtype mismatch).
+    print(f"\n[llama] loading {cfg.llama_model} (shared fallback, frozen, bf16)")
+    llama = AutoModelForCausalLM.from_pretrained(cfg.llama_model, dtype=torch.bfloat16)
     llama.train(False)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     llama = llama.to(device)
@@ -661,10 +720,20 @@ def main():
                     model, batch, device, args.window_size,
                 )
                 mem_mask = finalize_aux.get("memory_mask")
+                # graph_v6 reads via a per-token inject hook (not prepend) — pass
+                # the spec so decode exercises the actual read mechanism.
+                inject = None
+                facts = finalize_aux.get("graph_v6_facts")
+                if facts is not None:
+                    inject = {"encoder": model.encoder, "facts": facts,
+                              "layer_idx": model.encoder.inject_layer_idx}
+                # Decode with THIS variant's LoRA-wrapped Llama (not the shared
+                # base) so the trained rank-16 adapter is applied.
                 raw_preds, clean_preds = generate_answers(
-                    llama, tokenizer, memory.detach(), batch,
+                    model.decoder.llama, tokenizer, memory.detach(), batch,
                     args.max_new_tokens, device, memory_mask=mem_mask,
                     chat_template=getattr(model, "chat_template", None),
+                    inject=inject,
                 )
                 for i, s in enumerate(batch):
                     raw = raw_preds[i]

@@ -1088,7 +1088,13 @@ class LoCoMoQADataset(IterableDataset):
                 n_trunc += 1
             self._conv_ids.append(ids)
             for qa in sample.get("qa", []):
-                if qa.get("question") is None or qa.get("answer") is None:
+                # Category-5 (adversarial) rows carry their gold under
+                # `adversarial_answer`, not `answer` — without this fallback the
+                # entire "knowing what you DON'T know" subtask is dropped.
+                ans = qa.get("answer")
+                if ans is None:
+                    ans = qa.get("adversarial_answer")
+                if qa.get("question") is None or ans is None:
                     continue
                 self._qa.append((ci, qa))
         lens = [len(x) for x in self._conv_ids]
@@ -1147,7 +1153,8 @@ class LoCoMoQADataset(IterableDataset):
                 ctx_ids = ctx_ids + [self.pad_token_id] * (cs - valid_len)
 
             q_text = str(qa["question"])
-            a_text = str(qa["answer"]).strip()
+            # cat-5 adversarial gold lives in `adversarial_answer`.
+            a_text = str(qa.get("answer") or qa.get("adversarial_answer") or "").strip()
             cat = qa.get("category")
             q_ids = tok(q_text, add_special_tokens=False,
                         return_attention_mask=False)["input_ids"]
