@@ -170,6 +170,17 @@ class ReprConfig:
     # Names of Linear submodules to wrap. Default targets attention Q+V.
     llama_lora_target_names: tuple = ("q_proj", "v_proj")
 
+    # ── Activation efficiency ───────────────────────────────────────────────
+    # Activation-checkpoint each streaming-write window so we don't retain all
+    # n_windows of encoder activations for one backward. This is what makes the
+    # windowed encoders (flat/continuous/MT) fit at chunk=8192/BS=8 — without it
+    # 8 windows of per-window activations are held at once and OOM. Exact
+    # gradients; trades recompute for ~per-window activation peak.
+    grad_checkpoint_stream: bool = True
+    # Gradient-checkpoint the Llama decoder forward (needed for the full-context
+    # arm, which forwards the whole 8192-token context through Llama with grad).
+    grad_checkpoint_llama: bool = False
+
     # ── Q-Former adapter (V2.1 only, optional) ─────────────────────────────
     # BLIP-2-style cross-attention adapter inserted between the V21 encoder's
     # projected memory tokens and Llama's input. Learned "Llama-side" queries

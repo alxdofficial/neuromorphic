@@ -201,18 +201,28 @@ class SmallBiTransformer(nn.Module):
         if attention_mask is not None:
             # nn.TransformerEncoder expects True = mask (don't attend)
             src_key_padding_mask = ~attention_mask         # True where padded
-            # Defensive: when a sample's window is 100% padding (can happen
-            # for shorter inputs like HotpotQA contexts that don't fill the
-            # 4096-token budget across all four 1024-token windows), the
-            # all-True padding mask makes softmax over all-masked keys
-            # produce NaN. Unmask position 0 in any such row — that row's
-            # output is meaningless anyway (no valid tokens in this window),
-            # but it stays finite and the downstream slot state isn't
-            # contaminated for the OTHER rows in the batch.
-            all_padded_rows = src_key_padding_mask.all(dim=-1)  # [B]
-            if all_padded_rows.any():
-                src_key_padding_mask = src_key_padding_mask.clone()
-                src_key_padding_mask[all_padded_rows, 0] = False
+            if not src_key_padding_mask.any():
+                # No padding anywhere in this window → drop the mask entirely so
+                # SDPA can pick the FlashAttention kernel (O(T) memory; never
+                # materializes or saves the T×T scores for backward). Masking
+                # nothing is a mathematical no-op, so this is EXACT — not an
+                # approximation. ~7 of 8 packed 1024-windows hit this path, which
+                # is what lets the encoders fit at chunk=8192/BS=8 without (much)
+                # activation checkpointing. The partially-filled tail window keeps
+                # its mask (math backend, but one window's O(T²) is cheap).
+                src_key_padding_mask = None
+            else:
+                # Defensive: when a sample's window is 100% padding (can happen
+                # for shorter inputs like HotpotQA contexts that don't fill the
+                # token budget across all 1024-token windows), the all-True
+                # padding mask makes softmax over all-masked keys produce NaN.
+                # Unmask position 0 in any such row — that row's output is
+                # meaningless anyway (no valid tokens), but it stays finite and
+                # the downstream slot state isn't contaminated for OTHER rows.
+                all_padded_rows = src_key_padding_mask.all(dim=-1)  # [B]
+                if all_padded_rows.any():
+                    src_key_padding_mask = src_key_padding_mask.clone()
+                    src_key_padding_mask[all_padded_rows, 0] = False
         else:
             src_key_padding_mask = None
         out = self.transformer(h, src_key_padding_mask=src_key_padding_mask)

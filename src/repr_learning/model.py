@@ -10,6 +10,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint
 from torch import Tensor
 
 from .chat_template import ChatTemplate, build_chat_template
@@ -78,6 +79,15 @@ class ReprLearningModel(nn.Module):
 
         self.encoder = self.VARIANTS[variant](cfg)
         self.decoder = FrozenLlamaDecoder(cfg, llama_model=llama_model)
+        # Optional HF per-layer gradient checkpointing on the Llama base model
+        # (recompute in backward, use_reentrant=False; HF gates on self.training so
+        # eval is unaffected). Flag-controlled, off by default. vanilla_full_context
+        # is NOT trained — it re-forwards the full ~8192-token context per question
+        # (~40x the decoder tokens of the memory arms), so backward OOMs; it runs
+        # frozen/eval-only instead (a frozen full-context Llama is a valid ceiling).
+        if getattr(cfg, "grad_checkpoint_llama", False):
+            self.decoder.llama.model.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False})
 
         # Chat template: caller can pass a pre-built one to avoid reloading
         # the tokenizer per model instance. Otherwise build it here. When
@@ -370,13 +380,26 @@ class ReprLearningModel(nn.Module):
             chunk_embeds = embed(batch.input_ids)
         n_windows = (T + window_size - 1) // window_size
         state = self.encoder.init_streaming_state(B, device, chunk_embeds.dtype)
+        # Activation-checkpoint each window during training so we hold ~one
+        # window of encoder activations instead of all n_windows at once (the
+        # chunk=8192 OOM for the windowed encoders). Exact gradients; recompute
+        # in backward. Skipped under no_grad (eval) — nothing to save for backward.
+        ckpt_stream = (getattr(self.cfg, "grad_checkpoint_stream", True)
+                       and self.training and torch.is_grad_enabled())
         for w in range(n_windows):
             s = w * window_size
             e = min(s + window_size, T)
-            state, _ = self.encoder.streaming_write(
-                state, chunk_embeds[:, s:e, :], batch.attention_mask[:, s:e],
-                chunk_offset=s,
-            )
+            win_emb = chunk_embeds[:, s:e, :]
+            win_mask = batch.attention_mask[:, s:e]
+            if ckpt_stream:
+                def _write(st, em, mk, off=s):
+                    new_st, _ = self.encoder.streaming_write(st, em, mk, chunk_offset=off)
+                    return new_st
+                state = torch.utils.checkpoint.checkpoint(
+                    _write, state, win_emb, win_mask, use_reentrant=False)
+            else:
+                state, _ = self.encoder.streaming_write(
+                    state, win_emb, win_mask, chunk_offset=s)
         memory, finalize_aux = self.encoder.finalize_memory(state)
         # memory: [B, M, d_llama] — placeholder [B, 0, d_llama] for MT and Vanilla.
 
@@ -595,16 +618,30 @@ class ReprLearningModel(nn.Module):
                 ctx_surprise = None
         n_windows = (T_ctx + window_size - 1) // window_size
         state = self.encoder.init_streaming_state(B, device, ctx_embeds.dtype)
+        # Activation-checkpoint each window during training so we hold ~one
+        # window of encoder activations instead of all n_windows at once (the
+        # chunk=8192 OOM for the windowed encoders flat/continuous/MT). Exact
+        # gradients; recompute in backward. Skipped under no_grad (eval) and when
+        # per-window `extra` (plastic surprise) is present.
+        ckpt_stream = (getattr(self.cfg, "grad_checkpoint_stream", True)
+                       and self.training and torch.is_grad_enabled())
         for w in range(n_windows):
             s = w * window_size
             e = min(s + window_size, T_ctx)
             extra = {}
             if ctx_surprise is not None:
                 extra["surprise"] = ctx_surprise[:, s:e]
-            state, _ = self.encoder.streaming_write(
-                state, ctx_embeds[:, s:e, :], batch.context_mask[:, s:e],
-                chunk_offset=s, **extra,
-            )
+            win_emb = ctx_embeds[:, s:e, :]
+            win_mask = batch.context_mask[:, s:e]
+            if ckpt_stream and not extra:
+                def _write(st, em, mk, off=s):
+                    new_st, _ = self.encoder.streaming_write(st, em, mk, chunk_offset=off)
+                    return new_st
+                state = torch.utils.checkpoint.checkpoint(
+                    _write, state, win_emb, win_mask, use_reentrant=False)
+            else:
+                state, _ = self.encoder.streaming_write(
+                    state, win_emb, win_mask, chunk_offset=s, **extra)
         # v5.6: hand the question to the encoder (graph_v5 reads it for the
         # question-conditioned readout; dict-state variants ignore the keys).
         # NullEncoder (Tensor state) and Mamba (list state) are non-dict — guard.

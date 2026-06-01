@@ -253,7 +253,12 @@ def train_one_variant(
     # A variant is eval-only iff it has no trainable params. With LoRA-all on, the
     # two vanilla references DO train (their ~1.7M LoRA) — they become the LoRA'd
     # floor (no context) and ceiling (full context), not frozen reference points.
-    is_eval_only = (n_trainable == 0)
+    # vanilla_full_context is kept FROZEN/eval-only (the ceiling): it re-forwards
+    # the full ~8192-token context per question (~40x the decoder tokens of the
+    # memory arms), so LoRA-training it OOMs under backward — and a frozen
+    # full-context Llama is already a valid upper bound. Its zero-init LoRA, if
+    # built, is an identity no-op. vanilla_llama (the floor) still LoRA-trains.
+    is_eval_only = (n_trainable == 0) or variant == "vanilla_full_context"
     print(f"\n{'='*78}")
     print(f"Variant: {variant}  ({n_trainable:,} trainable, {n_steps} steps)")
     print(f"{'='*78}")
@@ -392,6 +397,8 @@ def train_one_variant(
 
     t_start = time.time()
     last_print_step, last_print_time = start_step, t_start
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()   # per-variant peak-VRAM tracking
 
     # Resume: use a local step counter rather than skipping batches from the
     # iterator. The dataloader is seeded but stochastic per worker; replaying
@@ -675,16 +682,20 @@ def train_one_variant(
     jsonl_fp.close()
 
     elapsed = time.time() - t_start
+    peak_vram_gb = (torch.cuda.max_memory_allocated() / 1e9
+                    if torch.cuda.is_available() else 0.0)
     src = f"best.pt @ {best_val_step}" if best_ckpt_path.exists() else f"last weights"
     print(f"  DONE: {step} steps in {elapsed/60:.1f} min  "
           f"final val_recon={final_val['val_loss_recon']:.4f} "
-          f"top1={final_val['val_top1_acc']*100:.1f}% ({src})", flush=True)
+          f"top1={final_val['val_top1_acc']*100:.1f}% ({src})  "
+          f"peak_vram={peak_vram_gb:.1f}GB", flush=True)
 
     summary = {
         "variant": variant,
         "trainable_params": n_trainable,
         "n_steps": step,
         "elapsed_s": elapsed,
+        "peak_vram_gb": peak_vram_gb,
         "final_val_loss_recon": final_val["val_loss_recon"],
         "final_val_top1_acc": final_val["val_top1_acc"],
         "final_val_per_family": final_val["val_per_family"],
@@ -709,7 +720,7 @@ def main():
     # plastic_baseline, splat_baseline) removed from defaults; they are still
     # selectable via explicit --variants if needed.
     ap.add_argument("--variants", nargs="+", default=[
-        "graph_v5_baseline",      # primary architecture
+        "graph_v6_baseline",      # primary architecture (soft-pointer + FiLM read)
         "flat_baseline",
         "continuous_baseline",
         "memorizing_baseline",
@@ -717,8 +728,8 @@ def main():
         "vanilla_llama",          # loss floor (no context)
         "vanilla_full_context",   # frozen-LM reference (sees raw context)
     ])
-    ap.add_argument("--steps", type=int, default=10_000)
-    ap.add_argument("--batch-size", type=int, default=2)
+    ap.add_argument("--steps", type=int, default=8_000)
+    ap.add_argument("--batch-size", type=int, default=8)
     ap.add_argument("--lr", type=float, default=None,
                     help="Override cfg.learning_rate (default 1e-4). Scale with "
                          "BS — e.g. sqrt rule: 1e-4×sqrt(BS/2) → BS=16 ≈ 2.5e-4.")
@@ -746,6 +757,11 @@ def main():
     ap.add_argument("--mt-diversity-scale", type=float, default=0.0)
     ap.add_argument("--out-tag", type=str, default="v1h")
     ap.add_argument("--resume", action="store_true")
+    # Per-window activation checkpointing on the encoder streaming write. With the
+    # FlashAttention encoder path (packed windows drop the mask) most variants fit
+    # without it, so default ON is a safety net you can disable for full speed.
+    ap.add_argument("--grad-ckpt-stream", action=argparse.BooleanOptionalAction,
+                    default=True)
     ap.add_argument("--no-hotpot", action="store_true",
                     help="Disable HotpotQA source (default: enabled)")
     # 2026-05-28: hard-only protocol enables narrative + musique by default;
@@ -919,6 +935,7 @@ def main():
         # budget is identical across arms; only the memory mechanism differs.
         # vanilla_llama+LoRA = floor, vanilla_full_context+LoRA = ceiling.
         use_llama_lora=True,
+        grad_checkpoint_stream=args.grad_ckpt_stream,
         b_diversity_scale=args.b_diversity_scale,
         mt_diversity_scale=args.mt_diversity_scale,
         **({"learning_rate": args.lr} if args.lr is not None else {}),
