@@ -29,6 +29,26 @@ from .config import ReprConfig
 from .selection import gumbel_argmax_ste, load_balance_loss, router_z_loss
 
 
+class _NormMatch(nn.Module):
+    """Put projected memory tokens in Llama's token-embedding magnitude region.
+
+    The prepend projections used to end in nn.LayerNorm(d_llama), whose output has L2 norm
+    ~sqrt(d_llama) ≈ 45 — ~49× the ~0.9 norm of real Llama token embeddings. Prepended
+    unmasked, those 49×-loud tokens act as attention distractors the frozen LM cannot route
+    around (the dominant reason the prepend baselines fell below the no-memory floor). Keep
+    the LayerNorm (centering/stability) but rescale to ~0.9 (learnable). This is a magnitude
+    CORRECTION, not added capacity — it does not change what the baseline is.
+    """
+
+    def __init__(self, d: int, target: float = 0.9):
+        super().__init__()
+        self.ln = nn.LayerNorm(d)
+        self.scale = nn.Parameter(torch.tensor(float(target)))
+
+    def forward(self, x: Tensor) -> Tensor:
+        return F.normalize(self.ln(x), dim=-1) * self.scale
+
+
 @functools.lru_cache(maxsize=128)
 def _sinusoidal_pe(seq_len: int, d_model: int, offset: int = 0,
                     *, device=None, dtype=torch.float32) -> Tensor:
@@ -346,7 +366,7 @@ class FlatBaselineEncoder(nn.Module):
         self.proj_code = nn.Sequential(
             nn.Linear(cfg.d_concept_baseline, cfg.d_llama // 2), nn.GELU(),
             nn.Linear(cfg.d_llama // 2, cfg.d_llama),
-            nn.LayerNorm(cfg.d_llama),
+            _NormMatch(cfg.d_llama),     # v2.2: norm-match to Llama token scale (was LayerNorm → 49× OOD)
         )
 
     def init_streaming_state(self, batch_size: int, device, dtype):
@@ -573,7 +593,7 @@ class ContinuousBaselineEncoder(nn.Module):
         self.proj_cont = nn.Sequential(
             nn.Linear(cfg.d_continuous, cfg.d_llama // 2), nn.GELU(),
             nn.Linear(cfg.d_llama // 2, cfg.d_llama),
-            nn.LayerNorm(cfg.d_llama),
+            _NormMatch(cfg.d_llama),     # v2.2: norm-match to Llama token scale (was LayerNorm → 49× OOD)
         )
 
     def _init_slots(self, B: int, device, dtype) -> Tensor:
@@ -696,7 +716,7 @@ class MemorizingBaselineEncoder(nn.Module):
         self.proj_value = nn.Sequential(
             nn.Linear(cfg.d_mt_value, cfg.d_llama // 2), nn.GELU(),
             nn.Linear(cfg.d_llama // 2, cfg.d_llama),
-            nn.LayerNorm(cfg.d_llama),
+            _NormMatch(cfg.d_llama),     # v2.2: norm-match to Llama token scale (was LayerNorm → 49× OOD)
         )
         self.n_retrieve = cfg.n_flat_codes  # 96 — match V2.1 memory token count
 
@@ -1274,7 +1294,7 @@ class RecurrentBaselineEncoder(nn.Module):
         self.proj_to_llama = nn.Sequential(
             nn.Linear(cfg.d_recurrent, cfg.d_llama // 2), nn.GELU(),
             nn.Linear(cfg.d_llama // 2, cfg.d_llama),
-            nn.LayerNorm(cfg.d_llama),
+            _NormMatch(cfg.d_llama),     # v2.2: norm-match to Llama token scale (was LayerNorm → 49× OOD)
         )
 
         self.target_len = cfg.n_flat_codes  # 96
