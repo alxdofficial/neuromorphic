@@ -102,6 +102,21 @@ signal**. Mechanically alive ≠ functionally useful.
 mechanism) and re-run the graph_v6 arm only vs the saved floor/ceiling. If that clears the floor but
 doesn't beat the baselines, escalate to F4/F5/F6 (substrate + interface).
 
+## v6.1 OUTCOME (2026-06-01, commit 27e2a40 — implemented F2+F1+F3, retrained graph_v6 only)
+**The below-floor regression is FIXED.** graph_v6 judge **10.9 → 13.5** (EM/containment 6.2→8.0):
+from *below* the no-memory floor (13.0) and tied-last, to *above* it and the **#1 compressor**
+(edging mamba 13.2). The corruption fix landed exactly as the diagnosis predicted — and at the *same*
+~5% read magnitude (`rezero` ~0.049, unchanged), confirming the problem was **corruption** (query-leak
++ mid-layer + ungated), not magnitude. `state_effect` 0.19→13.9, node-collapse stayed low (0.21).
+
+**But the read is now mostly GATED OFF, not actively helping.** The inject probe on the v6.1 ckpt
+shows REAL = OFF = SHUFFLE (identical) — the per-position gate learned to suppress the read to ~0
+because the *facts still aren't reliable enough to be worth using*. So v6.1 "stopped the bleeding"
+(removed corruption → cleared floor) but didn't add much signal; graph_v6 is now statistically tied
+with the floor/mamba at ~13, still far below the ceiling (38.2). **The binding constraint moved from
+*corruption* (fixed) to *fact quality*.** Next (v6.2) = F4 (node decorrelation/whitening +
+slot-competition) + F5 (soft-top-k + fact_key) so the facts become worth reading and the gate opens.
+
 ## Provenance
 - Probe: `scripts/repr_learning/probe_graph_v6_inject.py` (REAL/OFF/SHUFFLE on v2_1 ckpt).
 - Telemetry: `outputs/repr_learning/v2_1_graph_v6_baseline/jsonl/graph_v6_baseline.jsonl`.
