@@ -3453,6 +3453,37 @@ class GraphV6BaselineEncoder(nn.Module):
             "graph_v6_edge_gate_mean_avg": (state["edge_gate_mean_accum"] / n_w).to(torch.float32),
             "graph_v6_fact_norm": fact_value.detach().float().norm(dim=-1).mean().to(torch.float32),
         }
+        # ── Eval-only health telemetry (no grad, zero train-time cost) ────────
+        # Diagnose whether the v6 mechanism is alive: dead read (rezero eff≈0),
+        # ignored edge-state (state_effect≈0 violates no-op-free), collapsed node
+        # bank (collapse_cos→1), degenerate soft-pointer read (entropy→0 over-sharp
+        # or →log K diffuse; active_frac→0 = hub collapse).
+        if not self.training:
+            with torch.no_grad():
+                fr = self.fact_reader
+                eff = (fr.scale_max * torch.tanh(fr.scale_raw)).abs().mean()
+                aux["graph_v6_rezero_scale_eff"] = eff.float().to(torch.float32)
+                fact_zero = self._build_facts(state, zero_state=True)
+                aux["graph_v6_state_effect"] = (
+                    (fact_value - fact_zero).float().norm(dim=-1).mean().to(torch.float32))
+                Nf = N.float()
+                Nf = Nf / Nf.norm(dim=-1, keepdim=True).clamp_min(1e-9)
+                cos = Nf @ Nf.transpose(1, 2)                          # [B, Kn, Kn]
+                Kn = N.shape[1]
+                offmask = ~torch.eye(Kn, dtype=torch.bool, device=N.device)
+                aux["graph_v6_node_collapse_cos"] = cos[:, offmask].mean().to(torch.float32)
+                sp_k, sp_v = self.read_pointer.project_kv(N)
+                _, a_src = self.read_pointer.attend(state["q_src"], sp_k, sp_v)
+                _, a_dst = self.read_pointer.attend(state["q_dst"], sp_k, sp_v)
+                def _ent(a):                                           # mean read-pointer entropy
+                    p = a.float().clamp_min(1e-9)
+                    return (-(p * p.log()).sum(-1)).mean()
+                aux["graph_v6_read_src_entropy"] = _ent(a_src).to(torch.float32)
+                aux["graph_v6_read_dst_entropy"] = _ent(a_dst).to(torch.float32)
+                picks = torch.cat([a_src.argmax(-1), a_dst.argmax(-1)], dim=1)  # [B, 2*K_edge]
+                active = torch.zeros(N.shape[0], Kn, dtype=torch.bool, device=N.device)
+                active.scatter_(1, picks, True)
+                aux["graph_v6_node_active_frac"] = active.float().mean().to(torch.float32)
         return empty_mem, aux
 
     def inject(self, hidden_states, facts):

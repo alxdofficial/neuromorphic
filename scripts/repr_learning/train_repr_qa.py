@@ -87,6 +87,7 @@ def run_val(model, val_set, device, n_batches: int, window_size: int) -> dict:
     losses, accs, per_fam_stats = [], [], {}
     last_mp_cos: float | None = None  # eval-only telemetry (gated in MP readout)
     last_v5_eval: dict[str, float] = {}  # eval-only encoder telemetry
+    last_v6_eval: dict[str, float] = {}  # graph_v6 eval-only health telemetry
     # Deterministic-eval seed (audit fix 2026-05-27): graph_v5's chunk-fresh
     # init was sampling fresh noise per call → same model + same batch produced
     # ~0.2 loss variance. Seeding torch RNG per batch makes eval reproducible.
@@ -118,6 +119,14 @@ def run_val(model, val_set, device, n_batches: int, window_size: int) -> dict:
             v = out.get(k)
             if v is not None:
                 last_v5_eval[k] = float(v)
+        for k in ("graph_v6_node_gate_mean_avg", "graph_v6_edge_gate_mean_avg",
+                  "graph_v6_fact_norm", "graph_v6_rezero_scale_eff",
+                  "graph_v6_state_effect", "graph_v6_node_collapse_cos",
+                  "graph_v6_read_src_entropy", "graph_v6_read_dst_entropy",
+                  "graph_v6_node_active_frac"):
+            v = out.get(k)
+            if v is not None:
+                last_v6_eval[k] = float(v)
         # Per-family: use per-row loss instead of batch-wide mean (a 2-row
         # batch with rows from families X and Y was previously credited
         # the same mean to both, hiding genuine per-family differences).
@@ -146,6 +155,8 @@ def run_val(model, val_set, device, n_batches: int, window_size: int) -> dict:
     if last_mp_cos is not None:
         result["val_graph_v5_mp_buf_cross_node_cos_final"] = last_mp_cos
     for k, v in last_v5_eval.items():
+        result[f"val_{k}"] = v
+    for k, v in last_v6_eval.items():
         result[f"val_{k}"] = v
     return result
 
@@ -207,7 +218,13 @@ def save_checkpoint(model, opt, step, path: Path, **extras):
         "metadata": _ckpt_metadata(model),
     }
     payload.update(extras)
-    torch.save(payload, path)
+    # Atomic write: torch.save to a temp sibling, then atomically rename. A crash
+    # mid-write (OOM kill, timeout, Ctrl-C) otherwise leaves a truncated .pt that
+    # makes --resume fail hard. Over a multi-hour, 7-variant sweep there are many
+    # save windows; POSIX rename(2) is atomic so resume always sees a complete file.
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    torch.save(payload, tmp_path)
+    tmp_path.replace(path)
 
 
 def train_one_variant(
@@ -471,6 +488,22 @@ def train_one_variant(
         for key in _graph_v5_scalar_keys:
             if key in out and out[key] is not None:
                 row[key] = float(out[key])
+        # graph_v6 telemetry (only present when variant == graph_v6_baseline).
+        # Write-side gate means + fact norm are emitted every step; the read-side
+        # health probes (rezero/state_effect/collapse/entropy/active_frac) are
+        # eval-only (computed in finalize_memory when not self.training), so on
+        # train steps only the first three are present — `if key in out` handles it.
+        _graph_v6_scalar_keys = (
+            "graph_v6_node_gate_mean_avg", "graph_v6_edge_gate_mean_avg",
+            "graph_v6_fact_norm",
+            "graph_v6_rezero_scale_eff", "graph_v6_state_effect",
+            "graph_v6_node_collapse_cos",
+            "graph_v6_read_src_entropy", "graph_v6_read_dst_entropy",
+            "graph_v6_node_active_frac",
+        )
+        for key in _graph_v6_scalar_keys:
+            if key in out and out[key] is not None:
+                row[key] = float(out[key])
         # v5.4: per-round MP telemetry — log final-round value as a scalar so
         # it shows up in jsonl plotting. Full arrays kept in aux for probes.
         for arr_key, scalar_key in [
@@ -565,10 +598,17 @@ def train_one_variant(
             if improved:
                 best_val_recon = vm["val_loss_recon"]
                 best_val_step = step
-                save_checkpoint(model, opt, step, best_ckpt_path)
+                evals_since_best = 0
+                # best.pt carries its own best-tracking metadata so a --resume from
+                # best.pt restores it (resume normally uses last.pt, which already
+                # stashes these; this keeps best.pt self-describing too).
+                save_checkpoint(
+                    model, opt, step, best_ckpt_path,
+                    best_val_recon=best_val_recon, best_val_step=best_val_step,
+                    evals_since_best=evals_since_best,
+                )
                 print(f"    [best ckpt @ {step}]  val_recon={best_val_recon:.4f}",
                       flush=True)
-                evals_since_best = 0
             else:
                 # No improvement. Only count it against patience past
                 # min_step_for_stop (warmup eval points don't trigger stops).
