@@ -368,7 +368,9 @@ class ReprConfig:
     graph_v6_edge_gate_init_bias: float = 1.0
     graph_v6_init_log_sigma: float = 0.0
     graph_v6_film_hidden: int = 512
-    graph_v6_inject_layer: int = 8         # Llama layer for the per-token MemInject hook
+    graph_v6_inject_layer: int = 13        # v6.1: late-layer inject (was 8 = mid-stack "conform
+                                           # zone" where a wrong read flips the answer; 13/16 ≈
+                                           # top-third "ignore zone", Ben-Artzy — a bad read is harmless)
 
     # ── Gaussian Splat substrate (Exp 3) ──────────────────────────────────
     # See docs/exp3_gaussian_splat_baseline.md for full design.

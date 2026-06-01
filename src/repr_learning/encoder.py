@@ -1554,6 +1554,10 @@ class GraphV6BaselineEncoder(nn.Module):
                 fr = self.fact_reader
                 eff = (fr.scale_max * torch.tanh(fr.scale_raw)).abs().mean()
                 aux["graph_v6_rezero_scale_eff"] = eff.float().to(torch.float32)
+                # v6.1: per-position read gate mean (from the last decode pass) — should
+                # drop below 1 if the model learns to suppress the read where unhelpful.
+                if getattr(fr, "_last_gate_mean", None) is not None:
+                    aux["graph_v6_read_gate_mean"] = fr._last_gate_mean.to(torch.float32)
                 fact_zero = self._build_facts(state, zero_state=True)
                 aux["graph_v6_state_effect"] = (
                     (fact_value - fact_zero).float().norm(dim=-1).mean().to(torch.float32))

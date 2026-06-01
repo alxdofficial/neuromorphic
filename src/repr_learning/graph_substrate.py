@@ -309,12 +309,14 @@ class AttnBlock(nn.Module):
         self.attn = QKNormAttention(d, n_heads)
         self.post_norm = nn.LayerNorm(d)
 
-    def forward(self, q, kv, kv_pad_mask=None):
+    def forward(self, q, kv, kv_pad_mask=None, residual=True):
         q_n = self.q_in_norm(q)
         kv_n = self.kv_in_norm(kv)
         out = self.attn(q_n, kv_n, kv_pad_mask=kv_pad_mask)
         out = self.post_norm(out)
-        return q + out
+        # residual=False (graph_v6.1 reader): return the PURE attention output so the
+        # caller injects a fact-only signal with no q (hidden-state) leak-through.
+        return (q + out) if residual else out
 
 
 # ─────────────────────────────────────────────────────────────────────────

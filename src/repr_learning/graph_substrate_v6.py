@@ -235,8 +235,18 @@ class GraphV6FactReader(nn.Module):
         self.ffn = nn.Sequential(nn.Linear(d_read, ffn_mult * d_read), nn.GELU(),
                                  nn.Linear(ffn_mult * d_read, d_read))
         self.W_out = nn.Linear(d_read, d_llama)
-        nn.init.normal_(self.W_out.weight, std=0.02)
+        nn.init.normal_(self.W_out.weight, std=0.01)   # v6.1: gentler init (was 0.02)
         nn.init.zeros_(self.W_out.bias)
+        # v6.1 F1: per-position relevance GATE. A residual inject is otherwise always-on
+        # and the decoder can't down-weight it where memory is irrelevant (unlike a
+        # prepend token, which Llama's own attention can zero) — that ungated noise is
+        # what pushed graph_v6 BELOW the no-memory floor. gate=σ(g(hidden))∈[0,1] makes
+        # the read a true no-op per position. Init weight 0, bias +2 → gate≈0.88 (read
+        # available, W_out gets gradient) and learns to gate DOWN where the read hurts.
+        self.gate_proj = nn.Linear(d_llama, 1)
+        nn.init.zeros_(self.gate_proj.weight)
+        nn.init.constant_(self.gate_proj.bias, 2.0)
+        self._last_gate_mean = None
         self.scale_max = scale_max
         self.scale_raw = nn.Parameter(torch.full((d_llama,), 0.05))  # eff ≈ 0.05 at init (gentle)
 
@@ -246,8 +256,13 @@ class GraphV6FactReader(nn.Module):
         h_dtype = hidden_states.dtype
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             q = self.q_proj(hidden_states)                          # [B, T, d_read]
-            attended = self.attn(q, fact_value, kv_pad_mask=fact_pad_mask)  # multi-head soft read
+            # v6.1 F2: residual=False — the read is a PURE function of the retrieved
+            # facts (AttnBlock's q-residual re-injected a fact-INDEPENDENT map of the
+            # hidden state = the corruption term that flipped correct decodes).
+            attended = self.attn(q, fact_value, kv_pad_mask=fact_pad_mask, residual=False)
             r = attended + self.ffn(self.ffn_norm(attended))
             eff = self.scale_max * torch.tanh(self.scale_raw)
-            inj = eff * self.W_out(r)                               # [B, T, d_llama]
+            gate = torch.sigmoid(self.gate_proj(hidden_states))     # [B, T, 1] per-position off-switch
+            inj = gate * eff * self.W_out(r)                        # [B, T, d_llama]
+        self._last_gate_mean = gate.detach().float().mean()
         return hidden_states + (inj.to(h_dtype) if inj.dtype != h_dtype else inj)
