@@ -80,15 +80,16 @@ class SmallBiTransformer(nn.Module):
             norm_first=True,
         )
         self.transformer = nn.TransformerEncoder(layer, num_layers=cfg.enc_n_layers)
-        # Learned positional embedding. Sized to the largest expected window:
-        # max(legacy window_size_max, v1b max_window_size). New entries are
-        # randomly initialized; v0 ckpts loaded with strict=False keep their
-        # 384-row subset and the trailing rows are fresh-trained.
-        pos_max = max(cfg.window_size_max, cfg.max_window_size)
-        self.pos_embed = nn.Parameter(
-            torch.zeros(1, pos_max, cfg.d_enc),
-        )
-        nn.init.normal_(self.pos_embed, std=0.01)
+        # Positional encoding: non-parametric sinusoidal (_sinusoidal_pe), applied
+        # per-window with absolute offset in forward(). This used to be a LEARNED
+        # table sized [1, max(window_size_max, max_window_size), d_enc]; at the
+        # operative chunk_size=8192 (trainer sets max_window_size=chunk_size) that
+        # is [1, 8192, 816] = 6,684,672 trainable floats — load-bearing capacity
+        # that handed flat/continuous/MT a ~13% memory-param edge over graph_v6
+        # (sinusoidal, non-parametric) and mamba (no PE). Sinusoidal matches
+        # graph_v6's substrate exactly and preserves the absolute-position design
+        # intent (token@chunk_pos=p gets the p-th PE) at zero param cost, so the
+        # head-to-head compares matched ~48M memory mechanisms.
 
     def forward(self, token_embeds: Tensor, attention_mask: Optional[Tensor] = None,
                 position_offset: int = 0) -> Tensor:
@@ -99,7 +100,8 @@ class SmallBiTransformer(nn.Module):
         # over windows of a longer chunk. v1g passes `position_offset=w*window_size`
         # per streaming write so token@chunk_pos=1500 gets pos_embed[1500], NOT
         # pos_embed[476] like it would if every window started from index 0.
-        h = h + self.pos_embed[:, position_offset:position_offset + T, :]
+        h = h + _sinusoidal_pe(T, h.shape[-1], offset=position_offset,
+                               device=h.device, dtype=h.dtype)
         if attention_mask is not None:
             # nn.TransformerEncoder expects True = mask (don't attend)
             src_key_padding_mask = ~attention_mask         # True where padded

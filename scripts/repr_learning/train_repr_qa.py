@@ -369,6 +369,19 @@ def train_one_variant(
             "final_val_per_family": final_val["val_per_family"],
             "eval_only": True,
         }
+        # Save a loadable ckpt so the per-family eval harness can load this
+        # eval-only arm (e.g. vanilla_full_context) uniformly — load_variant
+        # requires a ckpt. No optimizer state (nothing trained); cfg_dict +
+        # mask_embed + zero-init LoRA are all eval needs.
+        best_ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+        _keep = lambda k: (not k.startswith("decoder.llama.")) or ("lora_" in k)
+        torch.save({
+            "step": 0,
+            "model_state_dict": {k: v for k, v in model.state_dict().items() if _keep(k)},
+            "metadata": _ckpt_metadata(model),
+            "eval_only": True,
+        }, best_ckpt_path)
+        print(f"  [eval-only] saved ckpt → {best_ckpt_path}", flush=True)
         del model
         torch.cuda.empty_cache()
         return summary
@@ -953,13 +966,18 @@ def main():
         graph_v5_n_message_rounds=6,
         graph_v5_mp_d_hidden=1024,
         # Baseline encoder (SmallBiTransformer; used by flat/continuous/MT only —
-        # NOT graph or Mamba). d816 × 4L → 47.8–48.6M each, matched to graph_v6
-        # (48.0M). d768 was 43–44M — under-matched once graph grew from 48.6M→48.0M
-        # with the float target rising 178,944→274,944 (params ≈ flat w.r.t. floats).
-        d_enc=816,                         # was 768 (43–44M); 816 → ~48M matched
+        # NOT graph or Mamba). NON-parametric sinusoidal PE (matched to graph_v6's
+        # substrate). The old learned [max_window,816] pos_embed grew to [8192,816]
+        # = 6.68M floats at chunk=8192 — a load-bearing +13% memory-param edge over
+        # graph_v6 (sinusoidal) and Mamba (no PE); removed (encoder.py SmallBiTransformer).
+        # d_enc=816 × 4L + ffn=3300 lands flat/continuous at 48.0M, matched to
+        # graph_v6 (48.02M) and Mamba (47.95M) within 0.1%. MT is ~47.2M — leaner by
+        # design (float-exempt retrieval ref, no learned codebook); NOT padded, since
+        # that would add dead params, and MT already has the largest memory footprint.
+        d_enc=816,
         enc_n_layers=4,
         enc_n_heads=12,                    # 816 = 12·68
-        enc_ffn_dim=3264,                  # was 3072
+        enc_ffn_dim=3300,                  # 3264→3300: re-center flat/cont on 48.0M post-sinusoidal-PE
         # Mamba — d_mamba=1256 × 4L ≈ 47.95M, matched to graph_v6's 48.0M.
         # 1280 was 49.5M (matched the older graph_v5 48.6M); 1256 re-centres on 48.0.
         d_mamba=1256,                      # was 1280 (49.5M)

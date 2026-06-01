@@ -69,31 +69,21 @@ def main():
     headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
 
     rows = [json.loads(l) for l in open(args.jsonl)]
-    fams = sorted(set(r["family"] for r in rows))
-    cfg = ReprConfig(n_flat_codes=128, max_window_size=8192, fixed_window_size=1024)
-    tok = AutoTokenizer.from_pretrained(cfg.llama_model)
-    qcache = ROOT / "outputs/repr_learning/eval_per_family/judge_qa_cache.json"
-    qa = {}
-    if qcache.exists():
-        c = json.loads(qcache.read_text())
-        if all(f in c for f in fams):
-            qa = {f: [(q, r) for q, r in c[f]] for f in fams}
-            print(f"[judge] question cache hit ({sum(len(v) for v in qa.values())} q) — skipping data load", flush=True)
-    if not qa:
-        print(f"[judge] pairing questions for {len(rows)} predictions across {fams} (one-time ~1-2 min) ...", flush=True)
-        for fam in fams:
-            ss = EPF.collect_samples([fam], 48, tokenizer=tok, cfg=cfg, chunk_size=8192, passages_per_chunk=600)
-            qa[fam] = [(tok.decode(s.question_ids.tolist()).strip(), s.answer_refs) for s in ss]
-        qcache.write_text(json.dumps({f: [[q, list(r)] for q, r in v] for f, v in qa.items()}))
-    by_vf = defaultdict(list)
-    for r in rows:
-        by_vf[(r["variant"], r["family"])].append(r)
+    # Each eval per-sample row carries its own question text (eval_per_family
+    # writes "question"), so pair directly — no re-collection / index-align /
+    # refs-assert, which broke for OOD families (e.g. locomo at non-8k chunking)
+    # and any n-per-family != the hardcoded 48.
     tasks = []
-    for (v, f), rr in by_vf.items():
-        for i, r in enumerate(rr):
-            q, refs = qa[f][i]
-            assert list(refs) == list(r["refs"]), f"pairing mismatch {v}/{f}/{i}: {refs} vs {r['refs']}"
-            tasks.append({"v": v, "f": f, "q": q, "refs": r["refs"], "pred": r["pred"], "contain": r["contain"]})
+    skipped = 0
+    for r in rows:
+        q = r.get("question")
+        if not q:
+            skipped += 1
+            continue
+        tasks.append({"v": r["variant"], "f": r["family"], "q": q,
+                      "refs": r["refs"], "pred": r["pred"], "contain": r.get("contain", 0)})
+    if skipped:
+        print(f"[judge] WARNING: {skipped} rows lacked 'question' (legacy per_sample) — skipped", flush=True)
     if args.n:
         tasks = random.Random(0).sample(tasks, min(args.n, len(tasks)))
     print(f"[judge] judging {len(tasks)} with {args.model}, {args.workers}-way, structured-output ...", flush=True)

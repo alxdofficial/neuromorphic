@@ -746,6 +746,10 @@ def main():
                         "raw": raw,
                         "pred": clean,
                         "refs": s.answer_refs,
+                        # Carry the question text so downstream judging pairs
+                        # directly (no fragile re-collection + index-align).
+                        "question": tokenizer.decode(
+                            s.question_ids.tolist(), skip_special_tokens=True).strip(),
                         "em": em,
                         "contain": contain,
                         "recall": recall,
