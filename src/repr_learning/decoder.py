@@ -112,6 +112,11 @@ class FrozenLlamaDecoder(nn.Module):
         if llama_model is None:
             llama_model, _ = load_frozen_llama(cfg.llama_model)
         self.llama = llama_model
+        # Always freeze the base LM — whether self-loaded or externally supplied
+        # (don't trust callers to have frozen it). LoRA below re-enables only the
+        # adapter params. Prevents an accidental-unfrozen-Llama footgun.
+        for p in self.llama.parameters():
+            p.requires_grad_(False)
 
         # Optional LoRA — wraps Llama's q_proj+v_proj (or configured targets)
         # with trainable low-rank updates. Lets the frozen LM adapt to the

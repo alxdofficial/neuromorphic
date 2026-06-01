@@ -1,0 +1,30 @@
+
+==============================================================================
+CHUNK 0  —  context (first ~600 tokens):
+Military career of Simón Bolívar The military and political career of Simón Bolívar, (July 24, 1783 – December 17, 1830), which included both formal service in the armies of various revolutionary regimes and actions organized by himself or in collaboration with other exiled patriot leaders during the years from 1811 to 1830, was an important element in the success of the independence wars in South America. Given the unstable political climate during these years, Bolívar and other patriot leaders, such as Santiago Mariño, Manuel Piar, José Francisco Bermúdez and Francisco de Paula Santander often had to go into exile in the Caribbean or nearby areas of Spanish America that at the moment were controlled by those favoring independence, and from there, carry on the struggle. These wars resulted in the creation of several South American states out of the former Spanish colonies, the currently existing Venezuela, Colombia, Ecuador, Peru and Bolivia, and the now defunct Gran Colombia. Thus Spoke Zarathustra Thus Spoke Zarathustra: A Book for All and None (German: "Also sprach Zarathustra: Ein Buch für Alle und Keinen", also translated as Thus Spake Zarathustra) is a philosophical novel by German philosopher Friedrich Nietzsche, composed in four parts between 1883 and 1885 and published between 1883 and 1891. Much of the work deals with ideas such as the "eternal recurrence of the same", the parable on the "death of God", and the "prophecy" of the "Übermensch", which were first intro
+
+Question (trained on): Who set Nietzche's philosophical novel to music?
+Gold answer:           Richard Strauss
+
+Generative decode — Llama.generate() with memory prepended:
+  starter='The document'
+    →  is a letter from the president of the United States to the president of the United States of Canada, dated 4 March 1867, in which he asks for the creation of a confederation of the British North American colonies, including Canada, the United States, and the British West Indies.2
+  starter='Based on the passage,'
+    →  and the 2010 filmThe Social NetworkFacebookFacebook is a social networking service that allows its users to send and read messages, share links and photos, and build their personal profile. It is one of the most popular social networking services in the world, with more than 1.2 billion active
+  starter='Question: What is this about?\nAnswer:'
+    → the andrews of the world, the andrews of the world, the andrews of the world, the andrews of the world, the andrews of the world, the andrews of the world, the andrews of the world, the andrew
+
+==============================================================================
+CHUNK 1  —  context (first ~600 tokens):
+Don't Lose Touch "Don't Lose Touch" is a song by the Gainesville, Florida-based punk rock band Against Me!, released as the first single from their 2005 album "Searching for a Former Clarity". Like the second single "From Her Lips to God's Ears (The Energizer)", it was released exclusively on twelve-inch vinyl with a remixed version of the song as the A-side and the album version as the B-side. The A-side version was remixed by German electronic music duo Mouse on Mars. The single was limited to 3,050 copies. Delaware River–Turnpike Toll Bridge The Delaware River–Turnpike Toll Bridge is a four-lane, steel, arch-shaped, continuous truss bridge that connects the Pennsylvania Turnpike's East-West Mainline with the main trunk of the New Jersey Turnpike, via the Pearl Harbor Memorial Turnpike Extension (formerly known as the Pennsylvania Extension). The bridge crosses the Delaware River, connecting Bristol Township, Pennsylvania and Burlington Township, New Jersey. The bridge was closed to traffic on January 20, 2017, after a crack was discovered in a steel truss; it reopened on March 9 of that year. Gainesville, Florida Gainesville is the county seat and largest city in Alachua County, Florida, United States, and the principal city of the Gainesville, Florida Metropolitan Statistical Area (MSA). The population of Gainesville in the 2013 US Census estimates was 127,488, a 2.4% growth from 2010. Gainesville is the largest city in the region of North Central Florida. It is also a co
+
+Question (trained on): Which North Central town in Florida is home to the punk rock band Against Me!?
+Gold answer:           Gainesville, Florida
+
+Generative decode — Llama.generate() with memory prepended:
+  starter='The document'
+    →  is a letter from the president of the United States to the president of the United Kingdom, dated 4 December 1941, in which he asks the British government to join the United States in the war against Japan. Winston Churchill, British prime minister, responded by sending a letter to Roosevelt, dated
+  starter='Based on the passage,'
+    →  and the 2010 filmThe Social NetworkFacebookFacebook is a social networking service that allows its users to send and read messages, share links and photos, and build their personal profile. It is one of the most popular social networking services in the world, with more than 1.2 billion active
+  starter='Question: What is this about?\nAnswer:'
+    → the first woman to win the Nobel Prize in Physics, Marie Curie was a Polish chemist and physicist who discovered radium and polonium. She was the first woman to win the Nobel Prize in Physics. She was the first woman to win the Nobel Prize in Physics. She was the first woman

@@ -158,24 +158,39 @@ def generate_from_memory(llama, tokenizer, memory: torch.Tensor,
 
 def generate_qa_answers(llama, tokenizer, memory: torch.Tensor,
                          question_ids_list: list[list[int]], max_new_tokens: int,
-                         device) -> list[str]:
-    """Feed [memory; question_embeds] to Llama and greedy-generate the
-    answer autoregressively. This mirrors the training input format
-    (compute_qa_loss prepends memory then puts the question, then computes
-    teacher-forced CE on the answer). At inference, we generate the answer
-    instead — the honest test of "can the model actually produce the
-    answer it's being scored on."
+                         device, chat_template=None) -> list[str]:
+    """Feed [pre_mem; memory; post_mem; question; post_q] to Llama and
+    greedy-generate. Mirrors training-time compute_qa_loss layout. When
+    chat_template is None (pre-tranche-4 ckpts), legacy [memory; question]
+    raw concat is used.
     """
     B, K, D = memory.shape
     assert len(question_ids_list) == B
     embed_layer = llama.get_input_embeddings()
+    # Pre-embed chat scaffold once if present.
+    if chat_template is not None:
+        pre_mem_emb = embed_layer(chat_template.pre_memory_ids.to(device))
+        post_mem_emb = embed_layer(chat_template.post_memory_ids.to(device))
+        post_q_emb = embed_layer(chat_template.post_question_ids.to(device))
+        stop_token_id = chat_template.eot_id
+    else:
+        pre_mem_emb = post_mem_emb = post_q_emb = None
+        stop_token_id = tokenizer.eos_token_id
     pieces = []
     for i in range(B):
         q_tensor = torch.tensor(question_ids_list[i], dtype=torch.long,
                                  device=device).unsqueeze(0)         # [1, T_q]
         q_emb = embed_layer(q_tensor)                                  # [1, T_q, D]
-        full = torch.cat([memory[i:i+1].to(q_emb.dtype), q_emb], dim=1)
-        pieces.append(full)
+        parts = []
+        if pre_mem_emb is not None:
+            parts.append(pre_mem_emb.unsqueeze(0).to(q_emb.dtype))
+        parts.append(memory[i:i+1].to(q_emb.dtype))
+        if post_mem_emb is not None:
+            parts.append(post_mem_emb.unsqueeze(0).to(q_emb.dtype))
+        parts.append(q_emb)
+        if post_q_emb is not None:
+            parts.append(post_q_emb.unsqueeze(0).to(q_emb.dtype))
+        pieces.append(torch.cat(parts, dim=1))
     max_len = max(p.shape[1] for p in pieces)
     inputs_embeds = torch.zeros(B, max_len, D, dtype=pieces[0].dtype, device=device)
     attn = torch.zeros(B, max_len, dtype=torch.long, device=device)
@@ -188,7 +203,7 @@ def generate_qa_answers(llama, tokenizer, memory: torch.Tensor,
             inputs_embeds=inputs_embeds, attention_mask=attn,
             max_new_tokens=max_new_tokens, do_sample=False,
             pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
-            eos_token_id=tokenizer.eos_token_id,
+            eos_token_id=stop_token_id,
         )
     return [tokenizer.decode(seq.tolist(), skip_special_tokens=True) for seq in gen]
 

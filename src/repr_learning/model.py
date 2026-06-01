@@ -12,6 +12,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
+from .chat_template import ChatTemplate, build_chat_template
 from .config import ReprConfig
 from .encoder import (
     ContinuousBaselineEncoder,
@@ -19,6 +20,7 @@ from .encoder import (
     FullContextEncoder,
     GraphBaselineEncoder,
     GraphV5BaselineEncoder,
+    GraphV6BaselineEncoder,
     MemorizingBaselineEncoder,
     NullEncoder,
     PlasticBaselineEncoder,
@@ -53,6 +55,7 @@ class ReprLearningModel(nn.Module):
         "splat_baseline": SplatBaselineEncoder,
         "graph_baseline": GraphBaselineEncoder,
         "graph_v5_baseline": GraphV5BaselineEncoder,
+        "graph_v6_baseline": GraphV6BaselineEncoder,
         "vanilla_llama": NullEncoder,         # loss floor — Llama with no memory
         "vanilla_full_context": FullContextEncoder,  # loss ceiling — Llama sees full evidence
     }
@@ -62,6 +65,7 @@ class ReprLearningModel(nn.Module):
         cfg: ReprConfig,
         variant: str = "v21",
         llama_model: Optional[nn.Module] = None,
+        chat_template: Optional[ChatTemplate] = None,
     ):
         super().__init__()
         self.cfg = cfg
@@ -74,6 +78,39 @@ class ReprLearningModel(nn.Module):
 
         self.encoder = self.VARIANTS[variant](cfg)
         self.decoder = FrozenLlamaDecoder(cfg, llama_model=llama_model)
+
+        # Chat template: caller can pass a pre-built one to avoid reloading
+        # the tokenizer per model instance. Otherwise build it here. When
+        # the backbone has no chat template (base Llama), self.chat_template
+        # stays None and compute_qa_loss falls back to legacy raw concat.
+        if chat_template is not None:
+            self.chat_template = chat_template
+            print(f"[chat-template] (shared) {self.chat_template.summary()}")
+        else:
+            self.chat_template = self._maybe_build_chat_template(cfg)
+
+    @staticmethod
+    def _maybe_build_chat_template(cfg: ReprConfig) -> Optional[ChatTemplate]:
+        """Build a chat template for cfg.llama_model if the tokenizer has one.
+
+        Narrow exception handling: ImportError on transformers is the only
+        thing we swallow. Tokenizer-without-chat-template returns None
+        explicitly. Any OTHER failure (build error, file missing) raises —
+        we don't silently fall back to raw concat when the user clearly
+        chose an Instruct backbone.
+        """
+        try:
+            from transformers import AutoTokenizer
+        except ImportError as e:
+            print(f"[chat-template] disabled — transformers missing: {e}")
+            return None
+        _tok = AutoTokenizer.from_pretrained(cfg.llama_model)
+        if getattr(_tok, "chat_template", None) is None:
+            print(f"[chat-template] disabled — {cfg.llama_model} has no chat template")
+            return None
+        ct = build_chat_template(_tok, cfg.system_intro_for_memory)
+        print(f"[chat-template] {ct.summary()}")
+        return ct
 
     def forward(
         self,
@@ -568,6 +605,12 @@ class ReprLearningModel(nn.Module):
                 state, ctx_embeds[:, s:e, :], batch.context_mask[:, s:e],
                 chunk_offset=s, **extra,
             )
+        # v5.6: hand the question to the encoder (graph_v5 reads it for the
+        # question-conditioned readout; dict-state variants ignore the keys).
+        # NullEncoder (Tensor state) and Mamba (list state) are non-dict — guard.
+        if isinstance(state, dict):
+            state["question_embeds"] = embed(batch.question_ids)
+            state["question_mask"] = batch.question_mask
         memory, finalize_aux = self.encoder.finalize_memory(state)
         # memory: [B, M, d_llama] or [B, 0, d_llama] for MT/Vanilla
         M = memory.shape[1]
@@ -602,13 +645,80 @@ class ReprLearningModel(nn.Module):
         # packing, the last real-question token is always immediately
         # followed by the first real-answer token, regardless of batch
         # variation.
+        #
+        # When self.chat_template is set (Instruct/chat-tuned backbones), we
+        # additionally splice in fixed scaffold tokens around memory/Q/A and
+        # append an <|eot_id|> to each answer. Layout per row:
+        #
+        #   [pre_mem][memory][post_mem][question][post_q][answer + eot]
+        #
+        # All scaffold spans are constant per template. Memory + question +
+        # answer keep their existing per-row packing semantics.
         with torch.no_grad():
             q_embeds = embed(batch.question_ids)
             a_embeds = embed(batch.answer_ids)
 
         q_lens = batch.question_mask.sum(dim=1)               # [B]
         a_lens = batch.answer_mask.sum(dim=1)                 # [B]
-        T_total = M + T_q + T_a                                # upper bound
+
+        # Chat-template path: splice scaffold tokens around memory/Q/A. If
+        # cfg.append_answer_eot is True (default), also append the backbone's
+        # end-of-turn token after each answer's last real token so TF training
+        # learns to emit it (and AR decode can then stop cleanly on it).
+        ct = self.chat_template
+        if ct is not None:
+            append_eot = bool(getattr(self.cfg, "append_answer_eot", True))
+            # Pre-embed scaffold token ids (no_grad — embedding lookup)
+            with torch.no_grad():
+                pre_mem_ids = ct.pre_memory_ids.to(device)
+                post_mem_ids = ct.post_memory_ids.to(device)
+                post_q_ids = ct.post_question_ids.to(device)
+                pre_mem_embeds = embed(pre_mem_ids)            # [L_pre, d]
+                post_mem_embeds = embed(post_mem_ids)          # [L_post_mem, d]
+                post_q_embeds = embed(post_q_ids)              # [L_post_q, d]
+            L_pre = pre_mem_embeds.shape[0]
+            L_post_mem = post_mem_embeds.shape[0]
+            L_post_q = post_q_embeds.shape[0]
+
+            if append_eot:
+                eot = ct.eot_id
+                # Append eot to answer tensors. Extend by 1 column, place eot
+                # at each row's current end (position a_lens[i]); mark mask +
+                # content mask True at that position so loss is computed on it.
+                B_, T_a_old = batch.answer_ids.shape
+                row_idx = torch.arange(B_, device=device)
+                a_lens_long = a_lens.long()
+                ans_pad = int(self.cfg.pad_token_id)
+                new_a_ids = torch.full((B_, T_a_old + 1), ans_pad,
+                                        dtype=torch.long, device=device)
+                new_a_ids[:, :T_a_old] = batch.answer_ids
+                new_a_ids[row_idx, a_lens_long] = eot
+                new_a_mask = torch.zeros((B_, T_a_old + 1), dtype=torch.bool, device=device)
+                new_a_mask[:, :T_a_old] = batch.answer_mask
+                new_a_mask[row_idx, a_lens_long] = True
+                new_content_mask = torch.zeros((B_, T_a_old + 1), dtype=torch.bool, device=device)
+                new_content_mask[:, :T_a_old] = batch.answer_content_mask
+                new_content_mask[row_idx, a_lens_long] = True
+                # Re-embed answer with appended eot, update per-row lengths.
+                with torch.no_grad():
+                    a_embeds = embed(new_a_ids)                     # [B, T_a+1, d]
+                a_lens = new_a_mask.sum(dim=1)
+                answer_ids_for_loss = new_a_ids
+                answer_content_for_loss = new_content_mask
+                T_a = T_a_old + 1
+            else:
+                # Chat scaffold spliced in, but no eot appended to answer —
+                # for ablating "does EOT supervision actually help?" or for
+                # apples-to-apples vs tranche-3 numbers.
+                answer_ids_for_loss = batch.answer_ids
+                answer_content_for_loss = batch.answer_content_mask
+        else:
+            L_pre = L_post_mem = L_post_q = 0
+            pre_mem_embeds = post_mem_embeds = post_q_embeds = None
+            answer_ids_for_loss = batch.answer_ids
+            answer_content_for_loss = batch.answer_content_mask
+
+        T_total = L_pre + M + L_post_mem + T_q + L_post_q + T_a   # upper bound
 
         # Determine dtype for full_embeds. memory might be empty (vanilla)
         # in which case use q_embeds dtype.
@@ -622,7 +732,7 @@ class ReprLearningModel(nn.Module):
         full_embeds = torch.zeros(B, T_total, q_embeds.shape[-1],
                                    device=device, dtype=q_embeds.dtype)
         attn_mask_full = torch.zeros(B, T_total, dtype=torch.bool, device=device)
-        # Per-row alignment: at prediction position M+t_q+k-1 predict answer[k]
+        # Per-row alignment: at prediction position (offset+k-1) predict answer[k]
         pred_mask = torch.zeros(B, T_total - 1, dtype=torch.bool, device=device)
         pred_targets = torch.zeros(B, T_total - 1, dtype=torch.long, device=device)
 
@@ -636,32 +746,50 @@ class ReprLearningModel(nn.Module):
         for i in range(B):
             t_q = int(q_lens[i].item())
             t_a = int(a_lens[i].item())
-            # Place memory (zero_memory: leave embeds as zeros AND keep
-            # attn_mask_full False so Llama can't attend to those positions)
+            col = 0
+            # Scaffold: pre-memory header (chat-template path only; no-op when ct=None)
+            if L_pre > 0:
+                full_embeds[i, col:col + L_pre] = pre_mem_embeds.to(q_embeds.dtype)
+                attn_mask_full[i, col:col + L_pre] = True
+                col += L_pre
+            # Memory (zero_memory: leave embeds as zeros AND keep attn False)
             if M > 0 and not zero_memory:
-                full_embeds[i, :M] = memory_dec[i]
+                full_embeds[i, col:col + M] = memory_dec[i]
                 if mem_mask_from_enc is not None:
-                    attn_mask_full[i, :M] = mem_mask_from_enc[i, :M].to(torch.bool)
+                    attn_mask_full[i, col:col + M] = mem_mask_from_enc[i, :M].to(torch.bool)
                 else:
-                    attn_mask_full[i, :M] = True
-            # Place real question
+                    attn_mask_full[i, col:col + M] = True
+            col += M
+            # Scaffold: post-memory transition (<|eot|><|user_header|>)
+            if L_post_mem > 0:
+                full_embeds[i, col:col + L_post_mem] = post_mem_embeds.to(q_embeds.dtype)
+                attn_mask_full[i, col:col + L_post_mem] = True
+                col += L_post_mem
+            # Real question
             if t_q > 0:
-                full_embeds[i, M:M + t_q] = q_embeds[i, :t_q]
-                attn_mask_full[i, M:M + t_q] = True
-            # Place real answer
+                full_embeds[i, col:col + t_q] = q_embeds[i, :t_q]
+                attn_mask_full[i, col:col + t_q] = True
+            col += t_q
+            # Scaffold: post-question transition (<|eot|><|asst_header|>)
+            if L_post_q > 0:
+                full_embeds[i, col:col + L_post_q] = post_q_embeds.to(q_embeds.dtype)
+                attn_mask_full[i, col:col + L_post_q] = True
+                col += L_post_q
+            # Real answer (with eot appended if chat-template path)
+            ans_start = col
             if t_a > 0:
-                full_embeds[i, M + t_q:M + t_q + t_a] = a_embeds[i, :t_a]
-                attn_mask_full[i, M + t_q:M + t_q + t_a] = True
-            # Per-row prediction alignment: logit at position p predicts token at p+1
-            # To predict answer[k] (real token at position M+t_q+k), we use
-            # the logit at position M+t_q+k-1. Loss only at content positions.
+                full_embeds[i, col:col + t_a] = a_embeds[i, :t_a]
+                attn_mask_full[i, col:col + t_a] = True
+            # Per-row prediction alignment: logit at position p predicts token at p+1.
+            # To predict answer[k] (real token at position ans_start+k), we use
+            # the logit at position ans_start+k-1. Loss only at content positions.
             for k in range(t_a):
-                if not batch.answer_content_mask[i, k]:
+                if not answer_content_for_loss[i, k]:
                     continue
-                pred_pos = M + t_q + k - 1
+                pred_pos = ans_start + k - 1
                 if 0 <= pred_pos < T_total - 1:
                     pred_mask[i, pred_pos] = True
-                    pred_targets[i, pred_pos] = batch.answer_ids[i, k]
+                    pred_targets[i, pred_pos] = answer_ids_for_loss[i, k]
 
         # ---- 4. Llama forward (causal mask is native; padding via attn_mask) ----
         # Plastic/Splat variants: install a forward_pre_hook on the chosen
@@ -701,6 +829,25 @@ class ReprLearningModel(nn.Module):
                     return None
                 hidden_states = args[0]
                 injected = encoder_ref.inject(hidden_states, blobs_for_hook)
+                new_args = (injected,) + args[1:]
+                return new_args, kwargs
+
+            hook_handle = (
+                self.decoder.llama.model.layers[inject_layer_idx]
+                .register_forward_pre_hook(pre_hook, with_kwargs=True)
+            )
+        elif self.variant == "graph_v6_baseline":
+            # Per-decode-token read (docs/graph_v6.md READ Stage B): facts built in
+            # finalize_memory, soft-retrieved + fused at every position by the hook.
+            facts_for_hook = finalize_aux["graph_v6_facts"]
+            inject_layer_idx = self.encoder.inject_layer_idx
+            encoder_ref = self.encoder
+
+            def pre_hook(module, args, kwargs):
+                if not args:
+                    return None
+                hidden_states = args[0]
+                injected = encoder_ref.inject(hidden_states, facts_for_hook)
                 new_args = (injected,) + args[1:]
                 return new_args, kwargs
 
@@ -835,6 +982,8 @@ class ReprLearningModel(nn.Module):
             # can log them via out.get(key) without unpacking aux dict.
             for k, v in finalize_aux.items():
                 if k.startswith("graph_v5_"):
+                    graph_telemetry[k] = v
+                elif k.startswith("graph_v6_") and k != "graph_v6_facts":
                     graph_telemetry[k] = v
         # Vanilla has no trainable params in the QA loss path (Llama is frozen
         # and mask_embed isn't used without a [MASK] token in the input). Add

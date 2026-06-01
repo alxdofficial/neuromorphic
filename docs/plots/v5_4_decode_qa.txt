@@ -1,0 +1,77 @@
+
+==============================================================================
+CHUNK 0  (theory_of_mind)  —  context (first ~600 tokens):
+The scene: Grace and Kira are in the same room. Olive and Bob are in the room. Noah and Henry are in the room. Emma steps out of the room. Olive leaves the room. Emma steps out of the room. Mia steps out of the room. Emma and Paul are in the room. Alice quietly moves the book out of the cardboard box and into the plastic bin. Emma comes back into the room. Henry quietly moves the letter out of the red box and into the wooden drawer. Paul comes back into the room. Mia puts the letter into the plastic bin. Leo steps out of the room. Grace quietly moves the notebook out of the fabric pouch and into the paper envelope. Paul places the letter in the wicker basket. Noah returns to the room. Grace walks out of the room. Henry and Frank are together in the room. The scene: Jack and Olive are in the same room. Frank steps out of the room. Bob sets the key down inside the fabric pouch. Henry quietly moves the notebook out of the blue box and into the metal cabinet. Jack puts the phone into the wicker basket. Henry walks back into the room. Frank comes back into the room. Paul quietly moves the watch out of the glass jar and into the red box. Jack walks back into the room. Noah quietly moves the ring out of the glass jar and into the blue box. Frank steps out of the room. The scene: Isla and Emma are in the same room. While Grace is alone, Grace moves the key from the blue box to the fabric pouch. Alice puts the watch into the paper envelope. Frank returns to the room. Noah walks out of
+
+Q:    If asked, where would Noah look for the envelope?
+Gold: Noah would look for the envelope in the paper envelope.
+Pred: Yes, Yes, Yes, Yes, Yes, Yes, Yes, Yes, Yes, Yes, Yes, Yes, Yes, Yes, Yes,
+      [MISS]
+
+==============================================================================
+CHUNK 1  (hotpot_qa)  —  context (first ~600 tokens):
+Gnome Omega The Gnome 7 Omega (commonly called the Gnome 50 hp) is a French seven-cylinder, air-cooled aero engine produced by Gnome et Rhône. It was shown at the Paris Aero Salon held in December 1908 and was first flown in 1909. It was the world's first aviation rotary engine produced in quantity. Its introduction revolutionized the aviation industry and it was used by many early aircraft. It produced 50 horsepower (37 kW) from its capacity of 8 litres (488 cubic inches). A Gnome Omega engine powers the 1912 Blackburn Monoplane, owned and operated by the Shuttleworth Collection, the oldest known airworthy British-designed aeroplane worldwide. A two-row version of the same engine was also produced, known as the Gnome 14 Omega-Omega or Gnome 100 hp. The prototype Omega engine still exists, and is on display at the United States' National Air and Space Museum. Chris Evans (actor) Christopher Robert Evans (born June 13, 1981) is an American actor and filmmaker. Evans is known for his superhero roles as the Marvel Comics characters Steve Rogers / Captain America in the Marvel Cinematic Universe and Johnny Storm / Human Torch in "Fantastic Four" and. The Newcomers (film) The Newcomers is a 2000 American family drama film directed by James Allen Bradley and starring Christopher McCoy, Kate Bosworth, Paul Dano and Chris Evans. Christopher McCoy plays Sam Docherty, a boy who moves to Vermont with his family, hoping to make a fresh start away from the city. It was filmed in Vermont, 
+
+Q:    what is one of the stars of  The Newcomers known for
+Gold: superhero roles as the Marvel Comics
+Pred: his role in the 2009 film The Hangover II, and for his role in the 2010 film The Hangover III, and for
+      [MISS]
+
+==============================================================================
+CHUNK 2  (hotpot_qa)  —  context (first ~600 tokens):
+Chris Duesterdiek Christopher "Chris" Robin Duesterdiek is a Canadian sound designer. He is best known for his work on "The Snow Walker" (2003), "Elysium" (2013), "The Interview" (2014) and "The Revenant" (2015). Carolyn Jones Carolyn Sue Jones (April 28, 1930 – August 3, 1983) was an American actress of television and film. Jones began her film career in the early 1950s, and by the end of the decade had achieved recognition with a nomination for an Academy Award for Best Supporting Actress for "The Bachelor Party" (1957) and a Golden Globe Award as one of the most promising actresses of 1959. Her film career continued for another 20 years. In 1964, she began playing the role of Morticia Addams (as well as her sister Ophelia and the feminine counterpart of Thing, Lady Fingers), in the original black and white television series "The Addams Family", receiving a Golden Globe Award nomination for her work. 1997 Tennessee Volunteers football team The 1997 Tennessee Volunteers football team represented the University of Tennessee during the 1997 NCAA Division I-A football season. Quarterback Peyton Manning had already completed his degree in three years, and had been projected to be the top overall pick in the 1997 NFL Draft, but returned to Tennessee for his senior year. The Volunteers opened the season with victories against Texas Tech and UCLA, but for the third time in his career, Manning fell to Florida, 33–20. The Vols won the rest of their regular season games, finishing 10–
+
+Q:    What movie did Chris Duesterdiek work on that was directed by Seth Rogen and Evan Goldberg?
+Gold: The Interview
+Pred: The Interview (2013)The Interview (2013)The Interview (2013)The Interview (2013)The Interview (2013)
+      [CONTAINS]
+
+==============================================================================
+CHUNK 3  (revisions)  —  context (first ~600 tokens):
+Revision: on the rollout, the deployment region has changed from north america only to eu-west. Note: the release date on the audit is Wednesday. Note: the deployment region on the hardening pass is us-east. Revision: on the integration, the deployment region has changed from eu-west to ap-south. Actually, the approval status for the cleanup is being changed to rejected (was under review). Correction for the cleanup: scratch that — the status is actually on track, not ready to ship. We've decided that for the migration, the project lead will be Tom. For the migration, the project lead is Maria. Note: the status on the audit is blocked. We've decided that for the launch, the deployment region will be eu-west. The status for the consolidation is currently set to delayed. The approval status for the rollout is currently set to rejected. Update on the consolidation: the project lead is no longer Kai — it's now Tom. Correction for the refactor: scratch that — the scope is actually the full migration, not the entire pipeline. For the cleanup, the review reviewer is Hilde. We've decided that for the hardening pass, the budget will be $100K. The budget for the redesign is currently set to $100K. Actually, the approval status for the consolidation is being changed to approved (was under review). Correction for the cleanup: scratch that — the release date is actually the end of the month, not the 22nd. Actually, the approval status for the integration is being changed to approved with 
+
+Q:    How many updates have been made to the status for the hardening pass?
+Gold: The status on the hardening pass hasn't been revised since the initial value.
+Pred: The status on the hardening pass hasn't been revised since the initial value. The status on the hardening pass hasn't been revised since the initial
+      [CONTAINS]
+
+==============================================================================
+CHUNK 4  (hotpot_qa)  —  context (first ~600 tokens):
+Sevens (album) Sevens is the seventh studio album by American country music artist Garth Brooks. It was released on November 25, 1997, and debuted at #1 on the "Billboard" 200, and on the Top Country Albums chart. The album also topped the Country album charts in Britain for several months and crossed over into the mainstream pop charts. His duet with Trisha Yearwood, "In Another's Eyes", won the Grammy Award for Best Country Collaboration with Vocals at the Grammy Awards of 1998. "Sevens" was nominated for the Best Country Album Grammy the following year. Mokhotlong District Mokhotlong district (in Sesotho language "the place of the bald ibis") is a district of Lesotho. It includes the highest terrain in the Maloti Range and the source of the Senqu River, Lesotho’s primary watershed. Mokhotlong is the capital or camptown, and only town in the district. Mokhotlong borders on the KwaZulu-Natal Province of South Africa, with its north point bordering the Free State Province. Domestically, it borders on Butha-Buthe District in northwest, Leribe District in west, and Thaba-Tseka District in the south. It's True! It's True! It's True! It's True! (1969) is the ninth comedy album by Bill Cosby. It was his last for Warner Bros. Records. It was recorded live at Harrah's, Lake Tahoe, Nevada. Due to a musician's strike, Cosby got extra stage time at Harrah's, much of which was captured on this album. It features Cosby performing stand-up comedy on topics including women, helicopters, an
+
+Q:    In what town is the office organization solutions company whose Canadian arm is Oxford headquartered?
+Gold: Melville
+Pred: Oxford, England, United KingdomOxford, England, United KingdomOxford, England, United KingdomOxford, England, United KingdomOxford
+      [MISS]
+
+==============================================================================
+CHUNK 5  (calendar)  —  context (first ~600 tokens):
+On Tuesday at 11am I have a tutoring session. It runs for 1 hour. On Sunday at 9am I have a book club. It runs for 2 hours. On Monday at 7pm I have a tutoring session. It runs for 1 hour. There is a yoga class on my calendar for Monday 6pm, lasting 1 hour. On Wednesday at 4pm I have a guitar lesson. It runs for 1 hour. I scheduled a team meeting for Monday at 8pm; it should take about 1 hour. I scheduled a piano lesson for Monday at 12pm; it should take about 1 hour. There is a book club on my calendar for Friday 9am, lasting 2 hours. I scheduled a client call for Saturday at 8pm; it should take about 1 hour. I scheduled a workshop for Monday at 11am; it should take about 3 hours. On Monday at 4pm I have a doctor's appointment. It runs for 1 hour. There is a hiking trip on my calendar for Saturday 5pm, lasting 4 hours. On Sunday at 4pm I have a team meeting. It runs for 1 hour. I scheduled a dentist visit for Wednesday at 7am; it should take about 1 hour. On Thursday at 8pm I have a tutoring session. It runs for 1 hour. I scheduled a personal training session for Sunday at 7pm; it should take about 1 hour. There is a therapy session on my calendar for Friday 8pm, lasting 1 hour. My calendar shows an interview on Monday starting at 6pm (1-hour block). I scheduled a piano lesson for Wednesday at 3pm; it should take about 1 hour. There is a coffee with a friend on my calendar for Friday 8pm, lasting 1 hour. I scheduled a workshop for Monday at 12pm; it should take about 3 hours.
+
+Q:    Am I free on Wednesday at 7am?
+Gold: No, I'm not free — I have a dentist visit on Wednesday at 7am.
+Pred: No, no. I have nothing on Wednesday. I have nothing on Wednesday. I have nothing on Wednesday. I have nothing on Wednesday. I have
+      [MISS]
+
+==============================================================================
+CHUNK 6  (hotpot_qa)  —  context (first ~600 tokens):
+Mountain Air Cargo Mountain Air Cargo (MAC) is an American cargo airline based in Denver, North Carolina. It is a major contract carrier for FedEx Express, operating in the eastern United States and the Caribbean region. Previous turboprop operations in South America have been discontinued by FedEx, which now operates jet aircraft in that area. MAC is one of the largest feeder airlines in the United States. Its main maintenance facility is at Kinston Regional Jetport. All of the ATR and C208 aircraft operated by Mountain Air are owned by Fedex Express, and are operated by MAC on a "dry lease" basis. Baltimore Ravens Cheerleaders The Baltimore Ravens Cheerleaders are a cheerleading and dance squad for the Baltimore Ravens of the National Football League. Unlike other NFL Cheerleading squads, the Ravens squad is a co-ed squad, with the female cheerleaders doing various dance moves, and the males working on stunts, as in traditional cheerleading. The group was founded in 1998, and currently consists of 48 members (20 stunt team performers and 28 dancers). The squad performs at the Ravens home stadium M&T Bank Stadium. The squad's director is Tina Galdieri, who cheered at the 1996 Summer Olympics in Atlanta, as well as the WLAF's (later NFL Europe) Barcelona Dragons, and also led the University of Maryland's cheerleading squad to a National Championship in 1999. The squad also has a "Lil Ravens" summer program, and unlike the other squads, boys also are permitted to join. The gro
+
+Q:    How many episodes were there of the TV series where Julianna Margulies had the role of Carol Hathaway?
+Gold: 331 episodes
+Pred: 22 episodes in the TV series and 10 episodes in the filmThe Good Wife" (2009) and 10 episodes in the TV seriesThe
+      [MISS]
+
+==============================================================================
+CHUNK 7  (boxes)  —  context (first ~600 tokens):
+A button is placed into Box 1. Box 3 starts out with a pen inside. At the start, Box 2 holds a thread. Box 5 contains a matchbox. Box 1 starts out with a seed inside. The card is moved from Box 3 to Box 2. The marble is transferred from Box 1 to Box 2. Inside Box 1 there is a spoon. I take the ring out of Box 2 and put it in Box 5. Inside Box 4 there is an apple. I remove the thimble from Box 2. The stone is removed from Box 1. Inside Box 2 there is a key. I take the fork out of Box 1 and put it in Box 2. The thread is taken out of Box 4. At the start, Box 2 holds a ribbon. Box 2 contains an apple. A marble is placed into Box 2. Box 2 starts out with a marble inside. The book is taken out of Box 4. I remove the stamp from Box 2. Inside Box 3 there is a fork. I remove the seed from Box 4. A pen is placed into Box 2. I remove the key from Box 1. The marble is moved from Box 2 to Box 1. A candle is added to the contents of Box 1. Inside Box 4 there is a coin. At the start, Box 4 holds a feather. Inside Box 1 there is a key. I take the candle out of Box 2 and put it in Box 1. I add a pen to Box 2. Box 3 contains a thread. Inside Box 3 there is a fork. The spoon is taken out of Box 2. The marble is transferred from Box 3 to Box 4. The ring is removed from Box 4. Inside Box 4 there is a card. Inside Box 1 there is a card. The matchbox is transferred from Box 2 to Box 5. The leaf is removed from Box 2. Box 3 contains a stamp. I take the shell out of Box 2 and put it in Box 3. Box 5 
+
+Q:    What does Box 2 currently contain?
+Gold: Box 2 is now empty.
+Pred: After all the operations, Box 2 has nothing inside. After all the operations, Box 2 has nothing inside. After all the operations, Box
+      [MISS]
+
+==============================================================================
+SUMMARY over 8 samples:
+  exact match (first sentence): 0/8
+  gold substring in prediction: 2/8

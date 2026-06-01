@@ -89,6 +89,11 @@ def encode_memory(model, batch, device, window_size: int = 1024):
                 attention_mask=batch.context_mask[:, s:e].to(device),
                 chunk_offset=s,
             )
+        # v5.6: hand the question to graph_v5's question-conditioned readout
+        # (dict-state variants only; others ignore the extra keys).
+        if isinstance(state, dict):
+            state["question_embeds"] = embed(batch.question_ids.to(device))
+            state["question_mask"] = batch.question_mask.to(device)
         memory, finalize_aux = enc.finalize_memory(state)
         # MT: retrieve per-query using the question embeddings.
         mt_bank = finalize_aux.get("mt_bank")
@@ -103,22 +108,34 @@ def encode_memory(model, batch, device, window_size: int = 1024):
 
 def generate_qa_answer(llama, tokenizer, memory: torch.Tensor,
                         question_ids: list[int], max_new_tokens: int,
-                        device) -> str:
-    """Single-sample generation: [memory; question] → greedy autoregressive."""
+                        device, chat_template=None) -> str:
+    """Single-sample generation. When chat_template is set the prefix is
+       [pre_mem; memory; post_mem; question; post_q]
+    matching tranche-4+ training. Otherwise legacy [memory; question].
+    """
     embed = llama.get_input_embeddings()
     q = torch.tensor(question_ids, dtype=torch.long, device=device).unsqueeze(0)
     q_emb = embed(q)
+    parts = []
+    if chat_template is not None:
+        parts.append(embed(chat_template.pre_memory_ids.to(device)).unsqueeze(0).to(q_emb.dtype))
     if memory.shape[1] > 0:
-        full = torch.cat([memory.to(q_emb.dtype), q_emb], dim=1)
-    else:
-        full = q_emb
+        parts.append(memory.to(q_emb.dtype))
+    if chat_template is not None:
+        parts.append(embed(chat_template.post_memory_ids.to(device)).unsqueeze(0).to(q_emb.dtype))
+    parts.append(q_emb)
+    if chat_template is not None:
+        parts.append(embed(chat_template.post_question_ids.to(device)).unsqueeze(0).to(q_emb.dtype))
+    full = torch.cat(parts, dim=1) if parts else q_emb
     attn = torch.ones(full.shape[:2], dtype=torch.long, device=device)
+    stop_token_id = (chat_template.eot_id if chat_template is not None
+                      else tokenizer.eos_token_id)
     with torch.no_grad():
         gen = llama.generate(
             inputs_embeds=full, attention_mask=attn,
             max_new_tokens=max_new_tokens, do_sample=False,
             pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
-            eos_token_id=tokenizer.eos_token_id,
+            eos_token_id=stop_token_id,
         )
     return tokenizer.decode(gen[0].tolist(), skip_special_tokens=True)
 
@@ -206,11 +223,13 @@ def main():
         memory = encode_memory(model, batch, device).detach()
         print(f"  ckpt step={step}  memory shape={tuple(memory.shape)}")
         per_variant_gens[variant] = []
+        ct = getattr(model, "chat_template", None)
         for b in range(args.chunks):
             q_ids = samples[b]["question_ids"].tolist()
             gen = generate_qa_answer(
                 llama, tokenizer, memory[b:b+1],
                 q_ids, args.max_new_tokens, device,
+                chat_template=ct,
             )
             per_variant_gens[variant].append(gen.strip())
         del model

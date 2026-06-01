@@ -6,15 +6,22 @@ borrows, and any modifications we made for our text-window
 reconstruction setup. Cite this in any publication that uses
 these baselines.
 
-We currently compare **8 variants** in the trainer:
-- **A** (`flat_baseline`) — flat codebook, prepend reads
-- **B** (`continuous_baseline`) — continuous slots with slot-attention, prepend reads
-- **MT** (`memorizing_baseline`) — per-token kNN retrieval bank, prepend reads
-- **Mamba** (`recurrent_baseline`) — recurrent SSM encoder, prepend reads
-- **plastic** (`plastic_baseline`) — Hebbian fast-weights, per-position MemInject reads
-- **splat** (`splat_baseline`) — signed Gaussian mixture, per-position MemInject reads (see `docs/exp3_gaussian_splat_baseline.md`)
-- **graph** (`graph_baseline`) — bounded edge memory with expert-choice routing (see `docs/exp1_graph_baseline.md`)
+We currently compare **graph_v5 (our model) + 4 baselines + vanilla** in the trainer:
+- **graph_v5** (`graph_v5_baseline`) — **OUR MODEL**: shared node bank + soft-pointer edges + message-passing readout (see `docs/exp1_graph_v5_design.md`)
+- **A** (`flat_baseline`) — flat discrete codebook (VQ-VAE family) + dead-code revival, prepend reads
+- **B** (`continuous_baseline`) — continuous slots via **canonical Slot Attention** (Locatello 2020: GRU + 3-iter refinement + stochastic shared-Gaussian init, no diversity loss), prepend reads
+- **MT** (`memorizing_baseline`) — per-token KV bank with **per-position retrieval** (faithful Memorizing Transformers), prepend reads
+- **Mamba** (`recurrent_baseline`) — **canonical Mamba** SSM encoder (4-layer, RMSNorm pre-norm, official `selective_scan_cuda` kernel), prepend reads
 - **vanilla** (`vanilla_llama`) — no-memory loss floor
+
+> **Retired** (no longer in the active sweep): `plastic_baseline` (Hebbian
+> fast-weights), `splat_baseline` (Gaussian mixture), `graph_baseline` (the
+> pre-v5 edge-memory design). **The model moved from the codebook-based V2.1
+> (described below for historical context) to the current `graph_v5` substrate**
+> — treat "V2.1" sections as lineage, not the current candidate.
+> The 2026-05-29 baseline-fidelity audit restored canonical Slot Attention (B),
+> per-position retrieval (MT), and dead-code revival (A), and replaced the
+> handicapped 2-layer-no-norm Mamba with the canonical 4-layer version.
 
 All variants are matched at a comparable pre-projection bottleneck
 width per window (~26,000 floats in current v1h sizing) — the precise
@@ -92,23 +99,22 @@ continuous latent vectors that cross-attend to inputs.
 | Orthogonal slot-query initialization | [Saxe et al. 2014 — *Exact solutions to nonlinear dynamics*](https://arxiv.org/abs/1312.6120) |
 | Diversity / pairwise-cosine regularizer | Common across the slot literature; cf. [Wu et al. 2024 — *AdaSlot*](https://arxiv.org/abs/2406.09196) on slot-redundancy reduction |
 
-**Modifications vs original Slot Attention**:
-- We use a **simplified** inverted-attention block (no GRU update, no
-  iterative refinement) for two iterations. Sufficient for our setting
-  and avoids the per-step overhead of the full Locatello recipe.
-- We add an **explicit diversity loss** on memory tokens (squared
-  pairwise cosine) scaled to compete with reconstruction CE. Without
-  this, B reliably collapses all 96 slots to one effective vector
-  because the reconstruction loss has no slot-level supervision (Llama
-  treats memory tokens as a permutation-invariant set). The Slot
-  Attention paper's stochastic-init + iterative-GRU mechanism could
-  also work, but adding a direct diversity regularizer is the standard
-  fallback in the slot-attention literature when collapse persists.
-- We did NOT add the GRU update or stochastic slot sampling — those
-  add training-time cost and our diversity loss already prevents
-  collapse in this setting.
+**Faithful Slot Attention (restored 2026-05-29 audit)**: B now implements
+the canonical Locatello et al. 2020 recipe — `slot_iters=3` iterative
+refinement with **shared weights**, a **GRU update** (input = attention
+update, hidden = previous slots), a residual MLP, and **stochastic
+shared-Gaussian slot init** (slots sampled from one learned N(μ, diag σ)
+shared across slots). It uses **no diversity loss** (`b_diversity_scale=0`):
+the stochastic init + GRU + iterative competition prevent collapse by
+mechanism, as in the paper. Eval uses a fixed persistent noise vector for
+determinism.
 
-**Tests:** whether V2.1's discrete codebook structure adds value over
+> Previously B used a single inverted-attention pass + deterministic
+> orthogonal init + a pairwise-cosine diversity penalty. An external audit
+> found the diversity loss is **not** standard in the slot literature and
+> that dropping the GRU + iteration was a material handicap — both corrected.
+
+**Tests:** whether graph_v5's discrete structure adds value over
 unstructured continuous slots at matched bottleneck width.
 
 ## Baseline 4 — Memorizing Transformers (`MemorizingBaselineEncoder`)
@@ -131,10 +137,18 @@ verbatim, retrieve at decode.
 | Single-query pooling from unmasked positions | Novel — adapted for span-masked reconstruction (the original MT paper retrieves per query position; we use a single pooled query for budget parity with V2.1's 96-token output) |
 | Top-K hard retrieval + STE for gradient | [Locatello et al. 2020 — STE form for discrete picks](https://arxiv.org/abs/2006.15055) |
 
-**Modifications**: hard top-K (rather than per-position kNN as in the
-original MT paper) so the encoder outputs a fixed 96 memory tokens to
-Llama. Added a soft STE gate so gradient flows back to the
-key-producing weights despite the hard selection.
+**Setup (per-position retrieval restored 2026-05-29 audit)**: every
+question token produces its own query; bank keys are scored against all of
+them and **max-pooled** (a key is kept if ANY decoding position wants it),
+then hard top-K=96 with a soft STE gate for gradient. This restores MT's
+core per-position mechanism while still emitting a fixed 96 memory tokens
+for budget parity. No diversity loss (`mt_diversity_scale=0`) — canonical
+MT has none, and per-position retrieval diversifies naturally.
+
+> Previously the QA path pooled the question to a **single** query. An audit
+> found this was the dominant handicap — MT scored *worst* on biographical
+> fact-lookup (F1 0.04), exactly where a retrieval method with ~900× more
+> memory should dominate. Corrected to per-position.
 
 **Tests:** establishes where a retrieval-augmented architecture (with a
 large verbatim bank) lands on this benchmark. Performance better than
@@ -205,7 +219,7 @@ majority simply 'dies off' and is never updated"
 | Switch-style load-balance loss | Fedus et al. 2022 | ✅ Applied |
 | Gumbel-STE for stable gradient | Jang et al. 2017 | ✅ Applied |
 | Use actual STE picks in load-balance | (this work) | ✅ Applied (post-audit fix) |
-| Dead-code revival | [CVQ-VAE Zheng 2023](https://arxiv.org/abs/2307.15139) | ❌ Skipped — A converged with 341/4096 codes used at 30K steps; not yet load-bearing |
+| Dead-code revival | [CVQ-VAE Zheng 2023](https://arxiv.org/abs/2307.15139) | ✅ Applied (2026-05-29 audit — EMA usage tracking + reseed dead codes from heavy users; A had collapsed to ~341/4096) |
 | EMA codebook update | [van den Oord 2017 §3.2](https://arxiv.org/abs/1711.00937) | ❌ Skipped — Gumbel-STE substitutes |
 | Auxiliary-loss-free balancing (DeepSeek-style dynamic bias) | [Wang et al. 2024](https://arxiv.org/abs/2408.15664) | ❌ Skipped — load-balance + STE was sufficient |
 | FSQ (Finite Scalar Quantization, no codebook) | [Mentzer et al. 2023](https://arxiv.org/abs/2309.15505) | ❌ Architectural alternative; not comparable to V2.1's discrete codebook |
@@ -220,10 +234,10 @@ outputs when the loss has no per-slot supervision
 | Literature fix | Source | Status |
 |---|---|---|
 | Inverted softmax-over-slots attention | Locatello 2020 | ✅ Applied (simplified, single-iteration) |
-| Slot-diversity regularizer | Slot-BERT, DIAS, general orthogonality regularizer literature | ✅ Applied (1000× scaled squared-cosine penalty) |
-| Orthogonal slot init | Saxe et al. 2014 | ✅ Applied |
-| Stochastic slot init (sample from learned distribution) | Locatello 2020 §3.2 | ❌ Skipped — diversity loss + orthogonal init covers the symptom; reduces non-determinism for eval |
-| GRU update + iterative refinement (T=3) | Locatello 2020 | ❌ Skipped — simplified to single inverted-attention pass; principled but expensive |
+| GRU update + iterative refinement (T=3) | Locatello 2020 | ✅ Applied (2026-05-29 audit — shared-weight iteration + GRU restored) |
+| Stochastic shared-Gaussian slot init | Locatello 2020 §3.2 | ✅ Applied (replaced deterministic orthogonal init) |
+| Slot-diversity regularizer | — | ❌ Removed — non-canonical; collapse now prevented by init + GRU + iteration |
+| Orthogonal slot init | Saxe et al. 2014 | ❌ Replaced by canonical stochastic shared-Gaussian init |
 | Slot-contrastive loss | [Slot-BERT, Liao et al. 2025](https://arxiv.org/abs/2501.06481) | ❌ Subsumed by our diversity loss |
 | Slot re-initialization / self-distillation | [DIAS Zhao 2025](https://arxiv.org/abs/2507.23755) | ❌ Skipped — collapse already prevented |
 
@@ -262,14 +276,17 @@ collapses (disp → 1.0). Same symptom as B's slot collapse, different cause.
 - Training instability at large Mamba stacks
   ([GroupMamba Shaker 2024](https://arxiv.org/abs/2407.13772))
 
-**Our setup**:
-- Uses the official `mamba_ssm` library — inherits HIPPO init + proper
-  dt initialization automatically
-- Only 2 Mamba layers — well below the instability regime
-- LayerNorm + residual connections present
+**Our setup (canonical, post-2026-05-29 audit)**:
+- Official `mamba_ssm` library — inherits HIPPO init + proper dt init;
+  fast `selective_scan_cuda` + `causal_conv1d` kernels confirmed engaged
+- **4 Mamba layers** at d_model=1024 with **per-block pre-norm RMSNorm**
+  (`h = h + mixer(RMSNorm(h))`) + a final RMSNorm — the canonical residual recipe
+- fp32 master weights under bf16 autocast (standard mixed precision; not
+  full-bf16, which would move the optimizer to bf16 and degrade quality)
 
-**No fixes applied**: we trust the library's defaults. Mamba should train
-healthily in our setting; we'll confirm at health-check time.
+> Previously 2 layers at d1792 with **no per-block norm** — a non-canonical,
+> shallow config that handicapped Mamba. Replaced after the audit. (The
+> single full-sequence sweep is Mamba's normal, efficient mode, not a cost.)
 
 ### V2.1 (our model)
 

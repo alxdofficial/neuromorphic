@@ -52,7 +52,10 @@ def main():
     # See audit issue: eval_best.py defaults previously mismatched trainer →
     # eval was on a different protocol than training → numbers were not
     # directly comparable.
-    ap.add_argument("--chunk-size", type=int, default=4096)
+    # Defaults updated post-tranche-3 to match the hard-only protocol:
+    # chunk_size=8192, Narrative+MuSiQue on, mix 0.30/0.25/0.25/0.20/0.
+    # For pre-tranche-3 ckpts (4096, no Narrative), pass legacy flags.
+    ap.add_argument("--chunk-size", type=int, default=8192)
     ap.add_argument("--window-size", type=int, default=1024,
                     help="MATCHES trainer default. 16 windows/chunk at 256 vs "
                          "4 windows at 1024 — significantly different streaming "
@@ -62,17 +65,19 @@ def main():
     ap.add_argument("--batch-size", type=int, default=None,
                     help="Override cfg.batch_size. Useful for memory-heavy variants "
                          "(plastic with chunk_size=4096 OOMs at BS=2; needs BS=1).")
-    # NOTE: narrative defaults to False to match trainer CLI default. For
-    # the tranche 1 v2 ckpts (which DID train with narrative), pass --narrative.
-    ap.add_argument("--narrative", action="store_true", default=False,
-                    help="Enable NarrativeQA source. MATCHES trainer default "
-                         "(off by default). Pass --narrative for ckpts trained "
-                         "with narrative_qa in the mix.")
+    ap.add_argument("--narrative", action=argparse.BooleanOptionalAction, default=True,
+                    help="Enable NarrativeQA source. Default ON (matches "
+                         "tranche-3+ trainer default). Pass --no-narrative for "
+                         "ckpts trained without narrative_qa in the mix.")
+    ap.add_argument("--musique", action=argparse.BooleanOptionalAction, default=True,
+                    help="Enable MuSiQue source. Default ON (matches "
+                         "tranche-3+ trainer default).")
     ap.add_argument("--mix-weights", type=float, nargs="+",
-                    default=[0.7, 0.3, 0.0, 0.0, 0.0],
+                    default=[0.30, 0.25, 0.25, 0.20, 0.0],
                     metavar="W",
                     help="Sampling weights: composite, hotpot, narrative, musique, babilong. "
-                         "Default MATCHES trainer (0.7/0.3/0/0/0). Override per trained ckpt.")
+                         "Default MATCHES tranche-3+ trainer (hard-only). "
+                         "Pre-tranche-3 ckpts: pass --mix-weights 0.7 0.3 0 0 0.")
     ap.add_argument("--passages-per-chunk", type=int, default=0,
                     help="0 = auto-scale by trainer's formula max(75, (chunk_size//1024)*75) "
                          "(= 300 at 4096, 600 at 8192, 1200 at 16384). MATCHES trainer.")

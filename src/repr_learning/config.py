@@ -11,10 +11,25 @@ class ReprConfig:
     Default values match docs/v2.1_repr_learning.md.
     """
 
-    # ── Llama backbone ─────────────────────────────────────────────────────
-    llama_model: str = "meta-llama/Llama-3.2-1B"
+    # ── Backbone (LM the encoder injects memory into) ──────────────────────
+    # Field is "llama_model" historically — any HF chat model works. Set this
+    # to an Instruct/chat-tuned model to enable chat-template scaffolding
+    # (see src/repr_learning/chat_template.py). The model loader detects
+    # whether the tokenizer has a chat template and routes accordingly.
+    llama_model: str = "meta-llama/Llama-3.2-1B-Instruct"
     d_llama: int = 2048  # Llama-3.2-1B hidden size
     llama_vocab_size: int = 128_256
+    # System prompt placed BEFORE the memory slot in the chat scaffold.
+    # Only used when the backbone tokenizer has a chat template.
+    system_intro_for_memory: str = (
+        "You are a helpful assistant. The following text contains memories "
+        "from a long document. Use only those memories to answer the user's question."
+    )
+    # When True, append the backbone's chat-end token (eot/im_end/etc.) to
+    # the answer tokens so teacher-forced training learns to emit a clean
+    # end-of-turn marker. Required for sensible AR decode behavior under
+    # chat-template prompting.
+    append_answer_eot: bool = True
 
     # ── Encoder ────────────────────────────────────────────────────────────
     d_enc: int = 512                # encoder transformer hidden size
@@ -70,6 +85,7 @@ class ReprConfig:
     # Baseline B: continuous slots, no codebook ("A without quantization").
     #   pre-projection: 96 × 725 = 69,600
     d_continuous: int = 725         # B's continuous slot dim
+    slot_iters: int = 3             # B: canonical Slot Attention refinement iterations (Locatello 2020, Alg. 1)
 
     # Baseline 4 (MT): per-token KV bank, query from unmasked positions,
     # top-96 retrieved as memory tokens. Tests "retrieve don't compress."
@@ -79,8 +95,16 @@ class ReprConfig:
     # Baseline 5 (Mamba): state-space-model encoder, per-token outputs
     # bottlenecked to d_recurrent then pooled 256 → 96.
     #   pre-projection (after pool): 96 × 725 = 69,600
-    d_mamba: int = 1024             # Mamba internal d_model
-    mamba_n_layers: int = 2
+    # Canonical Mamba (tranche-5): narrower + deeper + pre-norm RMSNorm
+    # residual blocks (matches the official mamba_ssm Block structure).
+    # NOTE: the QA trainer OVERRIDES d_mamba (train_repr_qa.py v5.5 block) — the
+    # operative value lives there: 1280 × 4L ≈ 49.5M trainable, matched to
+    # graph_v5's 48.6M (probed 2026-05-29). This dataclass default only applies
+    # to scripts that build a bare ReprConfig(). Prior tranche-4 used d1792 × 2L
+    # with NO per-block norm — a non-canonical, shallow config that handicapped
+    # Mamba; a later override briefly ran d1792 × 4L (90.8M, ~2× graph — too big).
+    d_mamba: int = 1280             # Mamba internal d_model (matches trainer override)
+    mamba_n_layers: int = 4         # canonical depth (RMSNorm pre-norm); fits BS=8 sans grad-ckpt
     mamba_d_state: int = 16
     mamba_expand: int = 2
     d_recurrent: int = 725          # Mamba per-token bottleneck width
@@ -113,18 +137,21 @@ class ReprConfig:
     qformer_diversity_scale: float = 1000.0  # multiplier (matches B's recipe)
 
     # ── B (continuous_baseline) diversity scale ───────────────────────────
-    # Multiplier on B's squared-off-diag-cos penalty inside finalize_memory
-    # and forward. Held at 1000 for v1e/v1f back-compat; v1g lowered it
-    # after observing aux stuck at ~2000 (62% of total loss) on 500-step
-    # smoke. Lower scale frees gradient budget for recon and lets the
-    # competing slot-attn vs diversity balance settle to a new equilibrium.
-    b_diversity_scale: float = 1000.0
+    # Multiplier on B's squared-off-diag-cos penalty. DEFAULT 0: canonical
+    # Slot Attention (Locatello 2020) prevents slot collapse via stochastic
+    # shared-Gaussian init + GRU update + iterative competition — it uses NO
+    # diversity/orthogonality loss. The earlier non-zero scale was a
+    # non-canonical crutch that distorted the baseline (forced orthogonality
+    # real slots never impose). Re-enable as a SMALL tie-breaker only if a
+    # retrain shows collapse (watch diversity_slots_raw telemetry).
+    b_diversity_scale: float = 0.0
 
     # ── MT (memorizing_baseline) diversity scale ─────────────────────────
-    # Same penalty applied to MT's retrieved memory tokens to fight slot
-    # collapse. Default 1000 for v1e back-compat; v1g lowers to 50 same
-    # as B for the same reason (otherwise aux dominates recon).
-    mt_diversity_scale: float = 1000.0
+    # Default 0: canonical Memorizing Transformers (Wu et al. 2022) uses NO
+    # diversity loss. Per-position retrieval naturally diversifies (different
+    # decoding positions retrieve different keys), so the earlier penalty was
+    # a non-canonical crutch. Re-enable small only if a retrain shows collapse.
+    mt_diversity_scale: float = 0.0
 
     # ── Role embeddings on V2.1 memory tokens ──────────────────────────────
     # Llama receives 96 memory tokens but has no built-in way to tell src
@@ -186,7 +213,12 @@ class ReprConfig:
     use_variable_length: bool = False
     min_window_size: int = 128
     max_window_size: int = 1024
-    # Llama-3.2: pad has no dedicated id; eos=128001 works (attention masked).
+    # Llama-3.2: no dedicated pad id. We reuse <|end_of_text|>=128001 for
+    # padding in dataset tensors; attention masks mask these positions out.
+    # NOTE: Llama-3.2-1B-Instruct uses <|eot_id|>=128009 for eos AND pad
+    # (different from base Llama). The 128001 value here is still a valid
+    # special token in the Instruct tokenizer — it just isn't its eos —
+    # but as long as the attention mask is consistent, both work.
     pad_token_id: int = 128_001
     sep_token_id: int = 198      # newline — natural sentence/paragraph separator
 
@@ -304,6 +336,29 @@ class ReprConfig:
     # Default 0.1 (light touch — empirical sweet spot in GCNII literature).
     graph_v5_mp_anchor_strength: float = 0.1
 
+    # ── Graph v6 (docs/graph_v6.md) ────────────────────────────────────────
+    # Soft-pointer graph memory with a no-op-free, per-token read. Persistent
+    # state N[K_node,d_node] + per-edge (q_src,q_dst [d_node], state [d_state]) —
+    # same float accounting as graph_v5. Defaults match the v5 operative config
+    # (274,944 substrate floats); re-match baselines once the arch is frozen.
+    graph_v6_K_node: int = 128
+    graph_v6_K_edge: int = 196
+    graph_v6_d_node: int = 384
+    graph_v6_d_state: int = 384
+    graph_v6_d_updater: int = 640          # write-transformer token dim
+    graph_v6_updater_layers: int = 5
+    graph_v6_updater_heads: int = 16
+    graph_v6_d_read: int = 512             # fact-token / read dim
+    graph_v6_read_heads: int = 8           # multi-head cross-attention read heads
+    graph_v6_read_ffn_mult: int = 4
+    graph_v6_builder_mlp_hidden: int = 768  # post-FiLM residual MLP hidden
+    graph_v6_read_temperature: float = 0.3
+    graph_v6_node_gate_init_bias: float = 0.5
+    graph_v6_edge_gate_init_bias: float = 1.0
+    graph_v6_init_log_sigma: float = 0.0
+    graph_v6_film_hidden: int = 512
+    graph_v6_inject_layer: int = 8         # Llama layer for the per-token MemInject hook
+
     # ── Gaussian Splat substrate (Exp 3) ──────────────────────────────────
     # See docs/exp3_gaussian_splat_baseline.md for full design.
     # v3 sweep: K=100, d=128 → bottleneck K·(2d+2) = 25,800 floats
@@ -354,6 +409,13 @@ class ReprConfig:
         # but is set to d_concept_baseline = d_continuous = d_mt_value = d_recurrent
         # by convention. Take d_continuous as representative.
         return self.n_flat_codes * self.d_continuous
+
+    @property
+    def bottleneck_floats_graph_v6(self) -> int:
+        """graph_v6 persistent substrate: node bank + per-edge (q_src, q_dst, state).
+        Same accounting as graph_v5 (the two soft-pointer queries are the 2·d_node term)."""
+        return (self.graph_v6_K_node * self.graph_v6_d_node
+                + self.graph_v6_K_edge * (2 * self.graph_v6_d_node + self.graph_v6_d_state))
 
     @property
     def n_memory_tokens(self) -> int:

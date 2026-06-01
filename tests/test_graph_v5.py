@@ -70,6 +70,10 @@ def test_backward_grad_flow():
     pins = torch.randn(B, T_w, cfg.d_llama)
     mask = torch.ones(B, T_w, dtype=torch.bool)
     state, _ = enc.streaming_write(state, pins, attention_mask=mask)
+    # v5.6: exercise the question-conditioned read path so q_proj + W_q are in
+    # the graph (W_q is zero-init so q_proj's grad is 0 at step 0, but present).
+    state["question_embeds"] = torch.randn(B, 5, cfg.d_llama)
+    state["question_mask"] = torch.ones(B, 5, dtype=torch.bool)
     memory, aux = enc.finalize_memory(state)
 
     loss = memory.pow(2).mean()
@@ -101,9 +105,18 @@ def test_backward_grad_flow():
         # those params start contributing once trained, so they're excluded
         # from the at-init grad-flow assertion.
         "readout.W_init.weight",
-        "readout.msg_mlps.0.0.weight", "readout.msg_mlps.0.2.weight",
+        # v5.6: gating (content_mlps × gate_lins) replaces the concat msg_mlps.
+        # gate_lins is zero-init in WEIGHT but its grad is nonzero (∂msg/∂W_g =
+        # content·edge_state), so it belongs here.
+        "readout.content_mlps.0.0.weight", "readout.content_mlps.0.2.weight",
+        "readout.gate_lins.0.weight", "readout.gate_lins.0.bias",
         "readout.pre_norm.weight", "readout.out_norm.weight",
         "readout.W_out.weight",
+        # v5.6: question-conditioned read (W_q zero-init but nonzero grad) +
+        # differentiable routing temperature. (q_proj's grad is 0 at step 0
+        # because W_q=0 blocks the backward to its input — so it's NOT asserted
+        # nonzero here, only that it's present / not-None via the `missing` check.)
+        "readout.W_q.weight", "route_log_temp",
     ]
     name_to_grad = {n: p.grad for n, p in enc.named_parameters()
                     if p.grad is not None}
@@ -187,7 +200,8 @@ def test_mp_readout_multi_round_actually_propagates():
     mp4.post_ffn_norm.load_state_dict(mp1.post_ffn_norm.state_dict())
     mp4.post_ffn.load_state_dict(mp1.post_ffn.state_dict())
     for r in range(4):
-        mp4.msg_mlps[r].load_state_dict(mp1.msg_mlps[0].state_dict())
+        mp4.content_mlps[r].load_state_dict(mp1.content_mlps[0].state_dict())
+        mp4.gate_lins[r].load_state_dict(mp1.gate_lins[0].state_dict())
 
     with torch.no_grad():
         mem1, _ = mp1(N, alpha_src, alpha_dst, edge_state)
@@ -221,7 +235,7 @@ def test_mp_readout_grad_flows_evenly_across_rounds():
         # v5.5: per-round MLPs. Use last-round mlp — its gradient flows directly
         # from the readout output, so it's the most sensitive test for "did
         # gradient reach the MP path at all."
-        return mp.msg_mlps[-1][-1].weight.grad.norm().item()
+        return mp.content_mlps[-1][-1].weight.grad.norm().item()
 
     g1 = _measure_msg_mlp_grad_norm(T=1)
     g4 = _measure_msg_mlp_grad_norm(T=4)

@@ -150,6 +150,41 @@ def run_val(model, val_set, device, n_batches: int, window_size: int) -> dict:
     return result
 
 
+def _ckpt_metadata(model) -> dict:
+    """Identity metadata pinned into every ckpt.
+
+    Captures backbone, chat-scaffold tokens (hash, date, lengths), tokenizer
+    eos/pad ids, and the cfg dataclass as a dict. Eval/resume code can verify
+    these match the current environment and abort on drift. Without this,
+    base-Llama-trained encoders can silently be evaluated against Instruct
+    Llama with chat scaffold (the audit issue #1).
+    """
+    import dataclasses, hashlib
+    cfg = model.cfg
+    meta = {
+        "backbone_model": cfg.llama_model,
+        "cfg_dict": dataclasses.asdict(cfg),
+        "system_intro_for_memory": cfg.system_intro_for_memory,
+    }
+    ct = getattr(model, "chat_template", None)
+    if ct is not None:
+        # Concatenate scaffold token ids and hash — any drift in tokens or
+        # date will produce a different digest.
+        scaffold_bytes = b"".join([
+            ct.pre_memory_ids.numpy().tobytes(),
+            ct.post_memory_ids.numpy().tobytes(),
+            ct.post_question_ids.numpy().tobytes(),
+            ct.eot_id.to_bytes(8, "little", signed=False) if isinstance(ct.eot_id, int) else b"",
+        ])
+        meta["chat_scaffold_hash"] = hashlib.sha256(scaffold_bytes).hexdigest()
+        meta["chat_scaffold_pre_len"] = int(len(ct.pre_memory_ids))
+        meta["chat_scaffold_post_mem_len"] = int(len(ct.post_memory_ids))
+        meta["chat_scaffold_post_q_len"] = int(len(ct.post_question_ids))
+        meta["chat_scaffold_eot_id"] = int(ct.eot_id)
+        meta["chat_scaffold_date_string"] = ct.date_string
+    return meta
+
+
 def save_checkpoint(model, opt, step, path: Path, **extras):
     """Persist model + opt state. `extras` lets callers stash auxiliary
     tracking fields (best_val_recon / best_val_step) so resume can pick
@@ -169,6 +204,7 @@ def save_checkpoint(model, opt, step, path: Path, **extras):
             k: v for k, v in model.state_dict().items() if keep(k)
         },
         "optimizer_state_dict": opt.state_dict(),
+        "metadata": _ckpt_metadata(model),
     }
     payload.update(extras)
     torch.save(payload, path)
@@ -186,6 +222,7 @@ def train_one_variant(
     composite_task_weights: Optional[dict[str, float]] = None,
     patience: int = 5,                       # eval-points without improvement → stop
     min_step_for_stop: int = 2000,           # don't stop during warmup-noise era
+    min_delta: float = 0.01,                 # min val_recon drop to count as a real improvement
 ) -> dict:
     device = "cuda"
     model = ReprLearningModel(cfg, variant=variant, llama_model=llama).to(device)
@@ -299,7 +336,13 @@ def train_one_variant(
     start_step = 0
     if resume and ckpt_path.exists():
         sd = torch.load(ckpt_path, map_location=device, weights_only=False)
-        model.load_state_dict(sd["model_state_dict"], strict=False)
+        _res = model.load_state_dict(sd["model_state_dict"], strict=False)
+        _bad = [k for k in (_res.missing_keys + _res.unexpected_keys)
+                if "llama" not in k.lower()]
+        if _bad:
+            raise RuntimeError(
+                "[resume] checkpoint/arch mismatch — non-Llama missing/unexpected "
+                f"keys would silently leave params random: {_bad[:12]}")
         opt.load_state_dict(sd["optimizer_state_dict"])
         start_step = int(sd.get("step", 0)) + 1
         # Restore best-tracking so we don't overwrite the prior best.pt with
@@ -510,7 +553,7 @@ def train_one_variant(
             # This is also the patience-reset signal — if best.pt updates,
             # the model is still improving; clear the staleness counter.
             improved = (step >= BEST_MIN_STEP
-                        and vm["val_loss_recon"] < best_val_recon - 1e-4)
+                        and vm["val_loss_recon"] < best_val_recon - min_delta)
             if improved:
                 best_val_recon = vm["val_loss_recon"]
                 best_val_step = step
@@ -569,7 +612,11 @@ def train_one_variant(
     # the trustworthy "what's the best this variant achieved" number.
     if best_ckpt_path.exists():
         sd = torch.load(best_ckpt_path, map_location=device, weights_only=False)
-        model.load_state_dict(sd["model_state_dict"], strict=False)
+        _res = model.load_state_dict(sd["model_state_dict"], strict=False)
+        _bad = [k for k in (_res.missing_keys + _res.unexpected_keys)
+                if "llama" not in k.lower()]
+        if _bad:
+            raise RuntimeError(f"[final-best] checkpoint/arch mismatch — non-Llama keys: {_bad[:12]}")
         print(f"  [loaded best.pt @ step {best_val_step} for final eval]", flush=True)
     final_val = run_val(model, val_set, device, val_batches, window_size)
     jsonl_fp.write(json.dumps({
@@ -605,7 +652,10 @@ def train_one_variant(
 
 
 def main():
-    ap = argparse.ArgumentParser()
+    # allow_abbrev=False: stop `--out <path>` from prefix-matching `--out-tag`,
+    # which silently baked a full relative path into the tag and re-nested every
+    # run under outputs/repr_learning/outputs/repr_learning/.
+    ap = argparse.ArgumentParser(allow_abbrev=False)
     # Active suite (2026-05-28 tranche-3): graph_v5 + 4 baselines, plus the
     # two frozen-Llama reference points. Retired variants (graph_baseline,
     # plastic_baseline, splat_baseline) removed from defaults; they are still
@@ -641,8 +691,11 @@ def main():
                     help="composite_v1 passages sampled per chunk. 0 = auto: "
                          "scales with chunk_size (~75 per 1024 tokens). "
                          "Manual override accepted as positive int.")
-    ap.add_argument("--b-diversity-scale", type=float, default=50.0)
-    ap.add_argument("--mt-diversity-scale", type=float, default=50.0)
+    # Default 0: B (canonical Slot Attention) and MT (per-position retrieval)
+    # prevent collapse by mechanism, not by a non-canonical diversity loss.
+    # Pass a small positive value only if a retrain shows collapse.
+    ap.add_argument("--b-diversity-scale", type=float, default=0.0)
+    ap.add_argument("--mt-diversity-scale", type=float, default=0.0)
     ap.add_argument("--out-tag", type=str, default="v1h")
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--no-hotpot", action="store_true",
@@ -690,6 +743,12 @@ def main():
                          "and could fire on the same step a new best landed). "
                          "0 disables. Default 5 (≈ 2500-step plateau at "
                          "val_every=500).")
+    ap.add_argument("--early-stop-min-delta", type=float, default=0.01,
+                    help="Min val_recon drop to count as a real improvement "
+                         "(resets the patience counter). Was hardcoded 1e-4 — "
+                         "~200x below val noise (~0.02), so sub-noise drift kept "
+                         "resetting patience and runs ground to the step cap. "
+                         "0.01 is a meaningful-improvement threshold above noise.")
     ap.add_argument("--min-step-for-stop", type=int, default=3000,
                     help="Don't trigger early-stop before this step. Skips "
                          "warmup-noise era where val is bouncy. Bumped 2000→"
@@ -697,6 +756,13 @@ def main():
                          "improving past step 5000 when patience fired at 5k. "
                          "Slow learners need more runway before plateau check.")
     args = ap.parse_args()
+
+    if "/" in args.out_tag:
+        ap.error(
+            f"--out-tag must be a bare tag, not a path (got {args.out_tag!r}). "
+            f"Outputs go to outputs/repr_learning/<out_tag>_<variant>/ automatically; "
+            f"pass e.g. --out-tag tranche5_mamba_canonical"
+        )
 
     if "v21" in args.variants:
         raise SystemExit("v21 is not supported in v1h yet.")
@@ -781,13 +847,18 @@ def main():
         graph_v5_updater_layers=5,         # was 4
         graph_v5_n_message_rounds=6,       # was 4
         graph_v5_mp_d_hidden=1024,         # was 256; per-round MLP hidden
-        # Baseline encoder — uniform bump to ~63M each on flat/cont/MT.
+        # Baseline encoder (SmallBiTransformer; used by flat/continuous/MT only —
+        # NOT graph_v5 or Mamba). 4 layers → ~49M trainable each, matched to
+        # graph_v5 (48.6M) + Mamba d1280 (49.5M). 6 layers was ~63M (oversized).
         d_enc=768,                         # was 512
-        enc_n_layers=6,                    # was 2
+        enc_n_layers=4,                    # was 6 (63M); 4 → ~49M matched
         enc_n_heads=12,                    # was 4
         enc_ffn_dim=3072,                  # was 1024
-        # Mamba — bump to ~50M trainable (target was 40-50M for "adequately similar").
-        d_mamba=1792,                      # was 768
+        # Mamba — d_mamba=1280 × 4L ≈ 49.5M trainable, matched to graph_v5's
+        # 48.6M (probed 2026-05-29). The earlier 1792 was ~90.8M (≈2× graph) —
+        # an oversized, NOT-matched baseline; the prior "~50M" estimate was wrong
+        # (it predated the 2→4 layer bump). 1024 would be 33.7M (under-matched).
+        d_mamba=1280,                      # was 1792 (90.8M, oversized)
         edge_token_packing="fused",
         b_diversity_scale=args.b_diversity_scale,
         mt_diversity_scale=args.mt_diversity_scale,
@@ -855,6 +926,7 @@ def main():
             composite_task_weights=composite_task_weights,
             patience=args.patience,
             min_step_for_stop=args.min_step_for_stop,
+            min_delta=args.early_stop_min_delta,
         )
         summaries.append(s)
 

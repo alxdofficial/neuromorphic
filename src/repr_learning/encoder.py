@@ -723,6 +723,13 @@ class FlatBaselineEncoder(nn.Module):
         # if it improves routing signal-to-noise.
         self.score_log_scale = nn.Parameter(torch.tensor(0.0))
 
+        # Dead-code revival (CVQ-VAE, Zheng et al. 2023): VQ codebooks collapse
+        # to a small active subset (~341/4096 observed pre-fix). Track EMA pick
+        # usage and periodically reseed never-picked codes from heavy users +
+        # noise so the full codebook stays a fair discrete-bottleneck control.
+        self.register_buffer("code_usage_ema", torch.zeros(cfg.n_nodes))
+        self.register_buffer("_revival_step", torch.zeros((), dtype=torch.long))
+
         self.proj_code = nn.Sequential(
             nn.Linear(cfg.d_concept_baseline, cfg.d_llama // 2), nn.GELU(),
             nn.Linear(cfg.d_llama // 2, cfg.d_llama),
@@ -751,9 +758,54 @@ class FlatBaselineEncoder(nn.Module):
         new_state = self.slot_attn(state, text_h, key_padding_mask=kv_mask)
         return new_state, {}
 
+    @torch.no_grad()
+    def _record_usage(self, code_id: Tensor) -> None:
+        """EMA of per-code pick frequency (fraction of picks). Window-decayed."""
+        n = self.cfg.n_nodes
+        hist = torch.bincount(code_id.reshape(-1), minlength=n).to(
+            self.code_usage_ema.dtype
+        )
+        hist = hist / hist.sum().clamp(min=1.0)
+        decay = 1.0 - 1.0 / max(self.cfg.dead_code_revival_window, 1)
+        self.code_usage_ema.mul_(decay).add_(hist, alpha=1.0 - decay)
+        self._revival_step += 1
+
+    @torch.no_grad()
+    def _maybe_revive(self) -> None:
+        """Every interval (post-warmup), reseed never-picked codes from heavy
+        users + noise. Runs BEFORE the codebook is used this step so the
+        in-place edit can't corrupt autograd's saved tensors."""
+        cfg = self.cfg
+        step = int(self._revival_step)
+        if (step < cfg.dead_code_revival_warmup
+                or step % cfg.dead_code_revival_interval != 0):
+            return
+        n = cfg.n_nodes
+        w = self.code_usage_ema.clamp(min=0)
+        if float(w.sum()) <= 0:
+            return
+        dead_idx = torch.nonzero(
+            self.code_usage_ema < (0.01 / n), as_tuple=False,
+        ).squeeze(-1)                                  # <1% of uniform usage
+        if dead_idx.numel() == 0:
+            return
+        max_revive = max(1, n // 10)                   # cap per interval for stability
+        if dead_idx.numel() > max_revive:
+            perm = torch.randperm(dead_idx.numel(), device=dead_idx.device)
+            dead_idx = dead_idx[perm[:max_revive]]
+        donors = torch.multinomial(w, dead_idx.numel(), replacement=True)
+        noise = torch.randn_like(self.concept_id.data[dead_idx])
+        self.concept_id.data[dead_idx] = (
+            self.concept_id.data[donors]
+            + noise * cfg.dead_code_revival_noise_std
+        )
+        self.code_usage_ema[dead_idx] = self.code_usage_ema[donors]
+
     def finalize_memory(self, state: Tensor) -> tuple[Tensor, dict]:
         """Project the final slot-query state to memory tokens + aux losses."""
         cfg = self.cfg
+        if self.training:
+            self._maybe_revive()  # reseed dead codes BEFORE using the codebook
         code_q = self.code_head(state)
         scores = (code_q @ self.concept_id.T) * self.score_log_scale.exp()
         code_id, onehot = gumbel_argmax_ste(
@@ -761,13 +813,17 @@ class FlatBaselineEncoder(nn.Module):
         )
         code_emb = onehot @ self.concept_id
         memory = self.proj_code(code_emb)
+        if self.training:
+            self._record_usage(code_id)
         with torch.no_grad():
             ent = -(F.softmax(scores, dim=-1)
                     * F.log_softmax(scores, dim=-1)).sum(-1).mean()
+            n_active = int((self.code_usage_ema > 0.01 / cfg.n_nodes).sum())
         aux = {
             "load_balance_loss": load_balance_loss(scores, picks=code_id),
             "picked_ids": code_id,
             "routing_entropy": ent,
+            "codes_active": torch.tensor(float(n_active)),
         }
         return memory, aux
 
@@ -784,6 +840,70 @@ class FlatBaselineEncoder(nn.Module):
         state = self.init_streaming_state(B, token_embeds.device, token_embeds.dtype)
         state, _ = self.streaming_write(state, token_embeds, attention_mask)
         return self.finalize_memory(state)
+
+
+class _CanonicalSlotAttention(nn.Module):
+    """Faithful Slot Attention (Locatello et al. 2020, Algorithm 1).
+
+    Iterative refinement with SHARED weights across iterations:
+      - softmax-OVER-SLOTS competition + weighted-mean normalization,
+      - a GRU update (input = attention update, hidden = previous slots),
+      - a residual MLP after the GRU.
+    The GRU + iteration loop (paired with stochastic shared-Gaussian slot
+    init in the caller) is the canonical anti-collapse mechanism. No
+    diversity/orthogonality loss is used — that is non-canonical.
+    """
+
+    def __init__(self, d_enc: int, n_iters: int = 3, d_ffn: Optional[int] = None):
+        super().__init__()
+        self.n_iters = n_iters
+        self.scale = d_enc ** -0.5
+        self.norm_inputs = nn.LayerNorm(d_enc)
+        self.norm_slots = nn.LayerNorm(d_enc)
+        self.norm_mlp = nn.LayerNorm(d_enc)
+        self.to_q = nn.Linear(d_enc, d_enc, bias=False)
+        self.to_k = nn.Linear(d_enc, d_enc, bias=False)
+        self.to_v = nn.Linear(d_enc, d_enc, bias=False)
+        self.gru = nn.GRUCell(d_enc, d_enc)
+        d_ffn = d_ffn or 2 * d_enc
+        self.mlp = nn.Sequential(
+            nn.Linear(d_enc, d_ffn), nn.GELU(), nn.Linear(d_ffn, d_enc),
+        )
+
+    def forward(
+        self, slots: Tensor, inputs: Tensor,
+        key_padding_mask: Optional[Tensor] = None,
+        n_iters: Optional[int] = None,
+    ) -> Tensor:
+        # slots: [B, N, d]  inputs: [B, T, d]  key_padding_mask: [B, T] True=pad
+        B, N, d = slots.shape
+        n = n_iters if n_iters is not None else self.n_iters
+        inputs_n = self.norm_inputs(inputs)
+        k = self.to_k(inputs_n)                       # [B, T, d]
+        v = self.to_v(inputs_n)                       # [B, T, d]
+        all_padded = (
+            key_padding_mask.all(dim=-1) if key_padding_mask is not None else None
+        )
+        for _ in range(n):
+            slots_prev = slots
+            q = self.to_q(self.norm_slots(slots)) * self.scale    # [B, N, d]
+            attn = q @ k.transpose(-2, -1)            # [B, N, T]
+            attn = attn.softmax(dim=1)                # compete OVER SLOTS
+            if key_padding_mask is not None:
+                attn = attn.masked_fill(key_padding_mask.unsqueeze(1), 0.0)
+            attn = attn + 1e-8
+            attn = attn / attn.sum(dim=-1, keepdim=True)          # weighted mean over keys
+            updates = attn @ v                        # [B, N, d]
+            if all_padded is not None and all_padded.any():
+                updates = updates * (~all_padded).to(updates.dtype).view(-1, 1, 1)
+            slots = self.gru(
+                updates.reshape(B * N, d), slots_prev.reshape(B * N, d),
+            ).reshape(B, N, d)
+            slots = slots + self.mlp(self.norm_mlp(slots))
+            if all_padded is not None and all_padded.any():
+                keep = (~all_padded).to(slots.dtype).view(-1, 1, 1)
+                slots = slots * keep + slots_prev * (1.0 - keep)
+        return slots
 
 
 class ContinuousBaselineEncoder(nn.Module):
@@ -808,22 +928,23 @@ class ContinuousBaselineEncoder(nn.Module):
         self.cfg = cfg
 
         self.bi_transformer = SmallBiTransformer(cfg)
-        # Orthogonal init: 96 slots start in 96 mutually orthogonal
-        # directions, giving the inverted-attention competition below
-        # a non-degenerate starting point.
-        self.cont_queries = nn.Parameter(torch.zeros(cfg.n_flat_codes, cfg.d_enc))
-        nn.init.orthogonal_(self.cont_queries)
-        # Slot Attention-style inverted attention (Locatello et al. 2020).
-        # Softmax-over-slots creates zero-sum competition: each input
-        # token votes for which slot gets it, so slots specialize. This
-        # is the canonical anti-collapse mechanism for slot architectures.
-        # Standard cross-attention (softmax-over-keys) has no such
-        # competition and reliably collapses all 96 slots into one effective
-        # vector for this kind of task.
-        self.slot_attn = _InvertedSlotAttn(cfg.d_enc)
-        # A second inverted-attention layer for refinement (analogous to
-        # iterating Slot Attention; cheaper than a full GRU loop).
-        self.slot_attn_2 = _InvertedSlotAttn(cfg.d_enc)
+        N, d = cfg.n_flat_codes, cfg.d_enc
+        # Canonical Slot Attention init (Locatello et al. 2020): slots are
+        # SAMPLED from a single learned Gaussian N(mu, diag(exp(log_sigma)))
+        # SHARED across all slots. Symmetry is broken by the sampled noise +
+        # the iterative competition, NOT by per-slot learned embeddings — so
+        # slots specialize through the algorithm rather than via hard-coded
+        # diversity (the old orthogonal-init + diversity-loss did the latter,
+        # which distorted the baseline).
+        self.slot_mu = nn.Parameter(torch.zeros(1, 1, d))
+        self.slot_log_sigma = nn.Parameter(torch.zeros(1, 1, d))
+        nn.init.xavier_uniform_(self.slot_mu)
+        nn.init.xavier_uniform_(self.slot_log_sigma)
+        # Deterministic eval: with shared mu/sigma all slots are identical
+        # without noise; a fixed persistent eval-eps breaks symmetry
+        # reproducibly while training samples fresh noise each step.
+        self.register_buffer("slot_eval_eps", torch.randn(1, N, d))
+        self.slot_attn = _CanonicalSlotAttention(d, n_iters=cfg.slot_iters)
 
         # Per-slot continuous head: d_enc → D_cont
         self.cont_head = nn.Sequential(
@@ -838,34 +959,24 @@ class ContinuousBaselineEncoder(nn.Module):
             nn.LayerNorm(cfg.d_llama),
         )
 
-    def init_streaming_state(self, batch_size: int, device, dtype):
-        """v1g streaming init: per-batch slot state. State lives in the
-        encoder's native dtype (fp32); the Llama-side `dtype` arg is unused
-        here — the encoder casts inputs to its weights' dtype internally."""
-        del dtype
-        return self.cont_queries.unsqueeze(0).expand(
-            batch_size, -1, -1,
-        ).contiguous()
+    def _init_slots(self, B: int, device, dtype) -> Tensor:
+        """Sample slots from the learned shared Gaussian. Train: fresh noise.
+        Eval: fixed persistent eps (deterministic, still symmetry-broken)."""
+        del dtype  # encoder casts to its own param dtype internally
+        sigma = torch.exp(self.slot_log_sigma)
+        if self.training:
+            eps = torch.randn(
+                B, self.cfg.n_flat_codes, self.cfg.d_enc,
+                device=self.slot_mu.device, dtype=self.slot_mu.dtype,
+            )
+        else:
+            eps = self.slot_eval_eps.to(self.slot_mu.dtype).expand(B, -1, -1)
+        return self.slot_mu + sigma * eps
 
-    def streaming_write(
-        self, state: Tensor, token_embeds: Tensor,
-        attention_mask: Optional[Tensor] = None, chunk_offset: int = 0,
-    ) -> tuple[Tensor, dict]:
-        """One v1g write: two rounds of inverted slot attention over a new
-        1024-token window, with `state` as the input slot queries. This is
-        the canonical streaming Slot Attention recipe — each write is an
-        iteration of refinement using the next window's tokens."""
-        text_h = self.bi_transformer(token_embeds, attention_mask,
-                                      position_offset=chunk_offset)
-        kv_mask = ~attention_mask if attention_mask is not None else None
-        state = self.slot_attn(state, text_h, key_padding_mask=kv_mask)
-        state = self.slot_attn_2(state, text_h, key_padding_mask=kv_mask)
-        return state, {}
-
-    def finalize_memory(self, state: Tensor) -> tuple[Tensor, dict]:
-        """Project final slot state to d_llama + compute diversity loss."""
-        cont_vec = self.cont_head(state)
-        memory = self.proj_cont(cont_vec)
+    def _aux(self, slots: Tensor, memory: Tensor, cont_vec: Tensor) -> dict:
+        """Diversity is TELEMETRY ONLY for collapse monitoring; it is added to
+        the loss only when cfg.b_diversity_scale > 0 (default 0 = faithful Slot
+        Attention, which prevents collapse via stochastic init + GRU + iters)."""
         with torch.amp.autocast("cuda", enabled=False):
             def _diversity(x):
                 x_norm = F.normalize(x.float(), dim=-1)
@@ -874,16 +985,39 @@ class ContinuousBaselineEncoder(nn.Module):
                 eye = torch.eye(M, dtype=torch.bool, device=cos.device)
                 off_diag = cos[:, ~eye].view(cos.shape[0], -1)
                 return off_diag.pow(2).mean()
-            diversity_slots = _diversity(state)
+            diversity_slots = _diversity(slots)
             diversity_mem = _diversity(memory)
-            diversity_loss = diversity_slots + diversity_mem
-        aux = {
-            "load_balance_loss": self.cfg.b_diversity_scale * diversity_loss,
+        return {
+            "load_balance_loss": self.cfg.b_diversity_scale
+            * (diversity_slots + diversity_mem),
             "diversity_slots_raw": diversity_slots,
             "diversity_mem_raw": diversity_mem,
             "cont_vec_norm": cont_vec.norm(dim=-1).mean(),
         }
-        return memory, aux
+
+    def init_streaming_state(self, batch_size: int, device, dtype):
+        """v1g streaming init: sample per-batch slots from the learned shared
+        Gaussian (canonical Slot Attention init)."""
+        return self._init_slots(batch_size, device, dtype)
+
+    def streaming_write(
+        self, state: Tensor, token_embeds: Tensor,
+        attention_mask: Optional[Tensor] = None, chunk_offset: int = 0,
+    ) -> tuple[Tensor, dict]:
+        """One streaming write: canonical Slot Attention refinement over a new
+        1024-token window, with `state` as the current slots. Slots carry
+        across windows, so each window adds slot_iters refinement steps."""
+        text_h = self.bi_transformer(token_embeds, attention_mask,
+                                      position_offset=chunk_offset)
+        kv_mask = ~attention_mask if attention_mask is not None else None
+        state = self.slot_attn(state, text_h, key_padding_mask=kv_mask)
+        return state, {}
+
+    def finalize_memory(self, state: Tensor) -> tuple[Tensor, dict]:
+        """Project final slot state to d_llama; diversity is telemetry only."""
+        cont_vec = self.cont_head(state)
+        memory = self.proj_cont(cont_vec)
+        return memory, self._aux(state, memory, cont_vec)
 
     def forward(
         self,
@@ -893,46 +1027,13 @@ class ContinuousBaselineEncoder(nn.Module):
     ) -> tuple[Tensor, dict]:
         del mask_positions
         B = token_embeds.shape[0]
-
         text_h = self.bi_transformer(token_embeds, attention_mask)
-        cont_queries = self.cont_queries.unsqueeze(0).expand(B, -1, -1)
         kv_mask = ~attention_mask if attention_mask is not None else None
-        # Two inverted-attention rounds (Slot Attention-style competition)
-        cont_slots = self.slot_attn(cont_queries, text_h, key_padding_mask=kv_mask)
-        cont_slots = self.slot_attn_2(cont_slots, text_h, key_padding_mask=kv_mask)
-
-        cont_vec = self.cont_head(cont_slots)                      # [B, M, D_cont]
+        slots = self._init_slots(B, token_embeds.device, token_embeds.dtype)
+        slots = self.slot_attn(slots, text_h, key_padding_mask=kv_mask)
+        cont_vec = self.cont_head(slots)                           # [B, M, D_cont]
         memory = self.proj_cont(cont_vec)                          # [B, M, d_llama]
-
-        # Diversity loss on memory tokens. Penalizes squared pairwise cosine.
-        # Reconstruction CE has no slot-level supervision (Llama can use any
-        # subset of memory tokens), so without an explicit diversity signal
-        # the optimal solution is to collapse all 96 slots to one vector.
-        # We compute the loss on the cont_slots (pre-projection) AND the
-        # memory tokens (post-projection) so both spaces are diversified.
-        with torch.amp.autocast("cuda", enabled=False):
-            def _diversity(x):
-                x_norm = F.normalize(x.float(), dim=-1)
-                cos = x_norm @ x_norm.transpose(1, 2)
-                M = cos.shape[1]
-                eye = torch.eye(M, dtype=torch.bool, device=cos.device)
-                off_diag = cos[:, ~eye].view(cos.shape[0], -1)
-                return off_diag.pow(2).mean()
-
-            diversity_slots = _diversity(cont_slots)
-            diversity_mem = _diversity(memory)
-            diversity_loss = diversity_slots + diversity_mem
-
-        # Scale large enough to compete with reconstruction CE. Effective
-        # contribution after load_balance_coef=0.01 multiplier is up to
-        # ~20 nat at full collapse, dominating recon's ~7 nat.
-        aux = {
-            "load_balance_loss": self.cfg.b_diversity_scale * diversity_loss,
-            "diversity_slots_raw": diversity_slots,
-            "diversity_mem_raw": diversity_mem,
-            "cont_vec_norm": cont_vec.norm(dim=-1).mean(),
-        }
-        return memory, aux
+        return memory, self._aux(slots, memory, cont_vec)
 
 
 class MemorizingBaselineEncoder(nn.Module):
@@ -1036,11 +1137,12 @@ class MemorizingBaselineEncoder(nn.Module):
         question_mask: Tensor,           # [B, T_q] bool — True at valid question positions
         K: int,                          # retrieval budget
     ) -> tuple[Tensor, dict]:
-        """v1h QA retrieval — one query per chunk, pooled from question tokens.
+        """v1h QA retrieval — per-question-token retrieval (faithful MT).
 
-        The query is the mean of `bi_transformer.in_proj(question_embeds)` over
-        valid question positions. No bi_transformer attention is applied —
-        same recipe as `retrieve_per_sentence` (avoids any contextual leak).
+        Each question token produces its own query; bank keys are scored
+        against all of them and max-pooled, so a key is kept if ANY position
+        wants it (MT's per-position mechanism), then top-K are returned. Uses
+        in_proj only (no attention) to avoid leaking still-masked tokens.
         Returns [B, K, d_llama] retrieved memory tokens, one set per example."""
         keys = bank["keys"]
         values = bank["values"]
@@ -1048,17 +1150,28 @@ class MemorizingBaselineEncoder(nn.Module):
         B, T, d_value = keys.shape
         device = keys.device
 
-        # Project question embeds to d_enc via in_proj only (no attention)
+        # Per-position retrieval (faithful Memorizing Transformers, Wu et al.
+        # 2022): score the bank against EVERY question token, not one pooled
+        # query. A bank key's score is the MAX over question tokens — a key is
+        # retrieved if ANY decoding position wants it. This restores MT's core
+        # mechanism (different facts for different positions) while still
+        # emitting a fixed K memory tokens for budget parity. (in_proj only,
+        # no attention — avoids leaking still-masked tokens, same as before.)
         q_proj = self.bi_transformer.in_proj(
             question_embeds.to(self.bi_transformer.in_proj.weight.dtype)
-        )                                                       # [B, T_q, d_enc]
-        contrib = question_mask.to(q_proj.dtype).unsqueeze(-1)  # [B, T_q, 1]
-        denom = contrib.sum(dim=1).clamp(min=1.0)                # [B, 1]
-        q_pool = (q_proj * contrib).sum(dim=1) / denom            # [B, d_enc]
-        query = self.query_head(q_pool)                          # [B, d_value]
-
-        # Score keys against the single per-example query
-        scores = torch.einsum("btd,bd->bt", keys, query)         # [B, T]
+        )                                                        # [B, T_q, d_enc]
+        per_tok_query = self.query_head(q_proj)                  # [B, T_q, d_value]
+        per_tok_scores = torch.einsum("btd,bqd->bqt", keys, per_tok_query)  # [B, T_q, T]
+        per_tok_scores = per_tok_scores.masked_fill(
+            ~question_mask.bool().unsqueeze(-1), float("-inf"),
+        )
+        scores = per_tok_scores.max(dim=1).values                # [B, T]
+        # Entirely-padded question rows → max over all -inf; finite-ize so the
+        # downstream top-K/softmax guards behave (such rows have no valid query
+        # and retrieve uniformly, matching the old pooled-query degenerate case).
+        scores = torch.where(
+            torch.isfinite(scores), scores, torch.zeros_like(scores),
+        )
         if attn_mask is not None:
             scores = scores.masked_fill(~attn_mask, float("-inf"))
 
@@ -1109,6 +1222,15 @@ class MemorizingBaselineEncoder(nn.Module):
         retrieved = retrieved * gate
 
         memory = self.proj_value(retrieved)                       # [B, K, d_llama]
+        # Re-zero invalid slots AFTER projection: proj_value's bias + LayerNorm
+        # map zeroed retrieved vectors to NONZERO memory, injecting garbage
+        # tokens into Llama. Mask again here so (a) padded top-K slots, (b)
+        # all-pad-BANK rows, and (c) all-pad-QUESTION rows (no valid query
+        # token → arbitrary retrieval) all stay exactly zero. (Audit 2026-05-29.)
+        query_valid = question_mask.bool().any(dim=-1)            # [B]
+        memory = memory * valid_topk.unsqueeze(-1).to(memory.dtype)
+        memory = memory * any_valid.view(B, 1, 1).to(memory.dtype)
+        memory = memory * query_valid.view(B, 1, 1).to(memory.dtype)
 
         # Diversity loss on retrieved memory (same recipe)
         with torch.amp.autocast("cuda", enabled=False):
@@ -1483,12 +1605,12 @@ class FullContextEncoder(nn.Module):
 class RecurrentBaselineEncoder(nn.Module):
     """Baseline 5: Mamba state-space-model bottleneck.
 
-    Mamba processes the 256-token input as a recurrent state-space
-    model, producing 256 per-token hidden states. Those are narrowed
-    to d_recurrent (725) per token, then adaptively pooled to 96
-    memory tokens and projected to d_llama.
+    Mamba processes the full context as a recurrent state-space model,
+    producing one hidden state per token. Those are narrowed to
+    d_recurrent per token, then adaptively average-pooled to
+    n_flat_codes (128) memory tokens and projected to d_llama.
 
-    Pre-projection budget: 96 × d_recurrent = 69,600 floats / chunk.
+    Pre-projection budget: n_flat_codes × d_recurrent floats / chunk.
 
     Tests: does recurrent compression match parallel slot-attention
     compression at matched bottleneck width?
@@ -1511,7 +1633,13 @@ class RecurrentBaselineEncoder(nn.Module):
         # Project Llama embed → Mamba d_model
         self.in_proj = nn.Linear(cfg.d_llama, cfg.d_mamba, bias=False)
 
-        # Mamba stack
+        # Canonical Mamba stack: pre-norm RMSNorm residual blocks, matching
+        # the official mamba_ssm Block (h = h + mixer(RMSNorm(h))). Prior
+        # config used the bare mixer with no per-block norm — non-canonical
+        # and destabilizing. One RMSNorm per layer + a final RMSNorm.
+        self.mamba_norms = nn.ModuleList([
+            nn.RMSNorm(cfg.d_mamba) for _ in range(cfg.mamba_n_layers)
+        ])
         self.mamba_blocks = nn.ModuleList([
             Mamba(
                 d_model=cfg.d_mamba,
@@ -1520,7 +1648,7 @@ class RecurrentBaselineEncoder(nn.Module):
             )
             for _ in range(cfg.mamba_n_layers)
         ])
-        self.norm = nn.LayerNorm(cfg.d_mamba)
+        self.norm = nn.RMSNorm(cfg.d_mamba)
 
         # Per-token bottleneck: d_mamba → d_recurrent
         self.bottleneck = nn.Linear(cfg.d_mamba, cfg.d_recurrent)
@@ -1568,9 +1696,11 @@ class RecurrentBaselineEncoder(nn.Module):
         # 1. Project to Mamba d_model
         h = self.in_proj(token_embeds.to(self.in_proj.weight.dtype))   # [B, T, d_mamba]
 
-        # 2. Mamba stack with residual
-        for block in self.mamba_blocks:
-            h = h + block(h)
+        # 2. Canonical pre-norm residual Mamba stack: h = h + mixer(RMSNorm(h)).
+        # 4 layers at d=1024 fit the full 8192-token sweep in VRAM at BS=8
+        # without activation checkpointing, so no recompute in backward.
+        for norm, block in zip(self.mamba_norms, self.mamba_blocks):
+            h = h + block(norm(h))
         h = self.norm(h)                                               # [B, T, d_mamba]
 
         # 3. Per-token bottleneck
@@ -2771,6 +2901,21 @@ class GraphV5BaselineEncoder(nn.Module):
         # Kept for back-compat with diagnostic scripts that read this field.
         self.read_temperature = float(cfg.graph_v5_read_temperature)
 
+        # v5.6: learnable routing temperature for the differentiable soft
+        # assignment in slot_routing_on_endpoints (softmax over proposals). Init
+        # τ=0.1 (soft but selective over K_proposal candidates); learnable so the
+        # model can sharpen/soften. Stored as log for positivity.
+        self.route_log_temp = nn.Parameter(torch.log(torch.tensor(0.1)))
+
+        # v5.6: question projection for the question-conditioned readout. Pools
+        # question token embeds (d_llama) → d_node summary q_vec that biases the
+        # readout. The readout's W_q is zero-init, so this starts inert and the
+        # read begins question-agnostic.
+        self.q_proj = nn.Sequential(
+            nn.Linear(cfg.d_llama, self.d_node),
+            nn.LayerNorm(self.d_node),
+        )
+
     # ── Streaming interface ───────────────────────────────────────────────
     def init_streaming_state(self, batch_size: int, device, dtype, seed=None):
         """If seed is given, init noise is deterministic (for eval).
@@ -2825,7 +2970,7 @@ class GraphV5BaselineEncoder(nn.Module):
           7. RMSNorm queries + state.
         """
         from .graph_substrate_v5 import (
-            slot_routing_on_endpoints, gather_picked_per_slot, _rmsnorm,
+            slot_routing_on_endpoints, _rmsnorm,
         )
 
         w_dtype = next(self.pin_encoder.parameters()).dtype
@@ -2888,14 +3033,26 @@ class GraphV5BaselineEncoder(nn.Module):
         endpoint_src_prop, _  = self.soft_pointer.attend(proposals["q_src"], sp_k, sp_v)
         endpoint_dst_prop, _  = self.soft_pointer.attend(proposals["q_dst"], sp_k, sp_v)
 
-        # 5. Slot routing on materialized endpoints.
-        picked_idx, pick_affinity, pick_count = slot_routing_on_endpoints(
+        # 5. Slot routing on materialized endpoints — v5.6 DIFFERENTIABLE soft
+        # assignment (softmax over proposals at learnable temperature), replacing
+        # the hard argmax gather so the task gradient shapes topology.
+        route_temp = self.route_log_temp.exp().clamp_min(1e-3)
+        route_w, picked_idx, pick_affinity, pick_count = slot_routing_on_endpoints(
             endpoint_src_old, endpoint_dst_old,
             endpoint_src_prop, endpoint_dst_prop,
+            temperature=route_temp,
         )
-        picked_q_src = gather_picked_per_slot(proposals["q_src"], picked_idx)
-        picked_q_dst = gather_picked_per_slot(proposals["q_dst"], picked_idx)
-        picked_state = gather_picked_per_slot(proposals["state"], picked_idx)
+        # Soft combination of proposals (differentiable) — replaces the gather.
+        picked_q_src = torch.matmul(route_w, proposals["q_src"])   # [B, K_edge, d_node]
+        picked_q_dst = torch.matmul(route_w, proposals["q_dst"])
+        picked_state = torch.matmul(route_w, proposals["state"])
+        with torch.no_grad():
+            # v5.6: entropy of the ACTUAL soft route_w (the argmax-based
+            # pick_entropy below is misleadingly sharp). High → edges averaging
+            # proposals (collapse risk); low → sharp selection. Watch this:
+            # if it stays pinned near log(K_proposal), sharpen route_log_temp.
+            _rw = route_w.float().clamp_min(1e-9)
+            route_soft_entropy = (-(_rw * _rw.log()).sum(-1)).mean().to(torch.float32)
 
         # 6. Per-edge gate blends old → picked. Anchor-biased init.
         g = self.edge_gate(
@@ -2968,6 +3125,7 @@ class GraphV5BaselineEncoder(nn.Module):
             "graph_v5_edge_pick_affinity": pick_aff_mean,
             "graph_v5_edge_frac_selfpick": frac_selfpick,
             "graph_v5_edge_pick_entropy": pick_entropy,
+            "graph_v5_route_soft_entropy": route_soft_entropy,
         }
 
     def finalize_memory(self, state) -> tuple[Tensor, dict]:
@@ -2980,6 +3138,22 @@ class GraphV5BaselineEncoder(nn.Module):
         device = N.device
         n_w = max(state["n_windows"], 1)
 
+        # v5.6 question-conditioned read: pool the question token embeds (carried
+        # in the state dict by the QA-loss / eval-encode paths) → q_vec. Absent
+        # (e.g. recon/HSM path) → None → readout stays question-agnostic.
+        q_vec = None
+        q_embeds = state.get("question_embeds")
+        if q_embeds is not None:
+            q_dtype = next(self.q_proj.parameters()).dtype
+            q_embeds = q_embeds.to(q_dtype)
+            q_mask = state.get("question_mask")
+            if q_mask is not None:
+                m = q_mask.to(q_dtype).unsqueeze(-1)               # [B, T_q, 1]
+                pooled = (q_embeds * m).sum(1) / m.sum(1).clamp_min(1e-6)
+            else:
+                pooled = q_embeds.mean(1)
+            q_vec = self.q_proj(pooled)                           # [B, d_node]
+
         # Soft-pointer α via SoftPointer (W_k + learnable τ); telemetry
         # endpoints computed as α @ N directly, bypassing the dead W_v
         # which drifts under weight decay and would corrupt endpoint metrics.
@@ -2990,9 +3164,10 @@ class GraphV5BaselineEncoder(nn.Module):
 
         # v5.4: message-passing readout. K = N (stable address), V = msg_buf
         # (evolving content). T rounds of MP. Outputs K_node memory tokens.
-        # K_node×K_node cosine matmul gated to eval-only to keep training fast.
+        # v5.6: q_vec conditions the read (query-driven hops).
         memory, mp_telem = self.readout(
             N, attn_src, attn_dst, edge_state,
+            q_vec=q_vec,
             compute_telemetry=not self.training,
         )
 
@@ -3098,4 +3273,203 @@ class GraphV5BaselineEncoder(nn.Module):
         state = self.init_streaming_state(B, device, dtype)
         state, _ = self.streaming_write(state, token_embeds, attention_mask)
         return self.finalize_memory(state)
+
+
+class GraphV6BaselineEncoder(nn.Module):
+    """Graph v6: soft-pointer graph memory with a no-op-free, per-token read.
+
+    See docs/graph_v6.md + src/repr_learning/graph_substrate_v6.py.
+
+    WRITE (graph_v5 lineage): chunk-fresh (mu,sigma) node bank + soft-pointer edges,
+      updated per window by a unified typed-token transformer (GraphV6Updater) with a
+      per-token FFN readout + anchor gate. No proposal pool, no competitive write head.
+    READ (plastic lineage): finalize_memory builds per-edge FACT-TOKENS (directional
+      FiLM-by-state of materialized endpoints) and returns them in aux with an empty
+      [B,0,d_llama] memory placeholder (M=0); compute_qa_loss installs a per-position
+      pre-hook calling self.inject, which does soft retrieval over the fact-tokens at
+      every decode position and fuses the result into that position's hidden state.
+    """
+
+    def __init__(self, cfg: ReprConfig):
+        super().__init__()
+        self.cfg = cfg
+        self.K_node = cfg.graph_v6_K_node
+        self.K_edge = cfg.graph_v6_K_edge
+        self.d_node = cfg.graph_v6_d_node
+        self.d_state = cfg.graph_v6_d_state
+        d_read = cfg.graph_v6_d_read
+        self.inject_layer_idx = getattr(cfg, "graph_v6_inject_layer", 8)
+
+        from .graph_substrate_v5 import SoftPointer
+        from .graph_substrate_v6 import (
+            GraphV6Updater, GraphV6Gate, GraphV6FactBuilder, GraphV6FactReader,
+        )
+
+        d_up = cfg.graph_v6_d_updater
+        self.pin_encoder = nn.Sequential(
+            nn.Linear(cfg.d_llama, d_up * 2, bias=False),
+            nn.GELU(),
+            nn.Linear(d_up * 2, d_up),
+            nn.LayerNorm(d_up),
+        )
+        # chunk-fresh init params (no per-slot trained params)
+        s = float(cfg.graph_v6_init_log_sigma)
+        self.mu_node = nn.Parameter(torch.zeros(self.d_node))
+        self.log_sigma_node = nn.Parameter(torch.full((self.d_node,), s))
+        self.mu_state = nn.Parameter(torch.zeros(self.d_state))
+        self.log_sigma_state = nn.Parameter(torch.full((self.d_state,), s))
+        self.mu_q = nn.Parameter(torch.zeros(self.d_node))
+        self.log_sigma_q = nn.Parameter(torch.full((self.d_node,), s))
+
+        self.updater = GraphV6Updater(
+            d_node=self.d_node, d_state=self.d_state, d=d_up,
+            K_node=self.K_node, K_edge=self.K_edge, d_pin=d_up,
+            n_layers=cfg.graph_v6_updater_layers, n_heads=cfg.graph_v6_updater_heads,
+        )
+        self.node_gate = GraphV6Gate(self.d_node, hidden=64,
+                                     init_bias=cfg.graph_v6_node_gate_init_bias)
+        self.edge_gate = GraphV6Gate(2 * self.d_node + self.d_state, hidden=64,
+                                     init_bias=cfg.graph_v6_edge_gate_init_bias)
+        self.read_pointer = SoftPointer(
+            d_node=self.d_node, init_temperature=float(cfg.graph_v6_read_temperature),
+            kv_split=True,
+        )
+        self.fact_builder = GraphV6FactBuilder(
+            d_node=self.d_node, d_state=self.d_state, d_read=d_read,
+            film_hidden=cfg.graph_v6_film_hidden, mlp_hidden=cfg.graph_v6_builder_mlp_hidden,
+        )
+        self.fact_reader = GraphV6FactReader(
+            d_llama=cfg.d_llama, d_read=d_read,
+            n_heads=cfg.graph_v6_read_heads, ffn_mult=cfg.graph_v6_read_ffn_mult,
+        )
+
+    # ── Streaming interface ──────────────────────────────────────────────
+    def init_streaming_state(self, batch_size, device, dtype, seed=None):
+        from .graph_substrate_v6 import init_graph_v6_state
+        w_dtype = next(self.pin_encoder.parameters()).dtype
+        gen = None
+        if seed is not None:
+            gen = torch.Generator(device=device)
+            gen.manual_seed(int(seed))
+        state = init_graph_v6_state(
+            B=batch_size, K_node=self.K_node, K_edge=self.K_edge,
+            d_node=self.d_node, d_state=self.d_state,
+            mu_node=self.mu_node, log_sigma_node=self.log_sigma_node,
+            mu_state=self.mu_state, log_sigma_state=self.log_sigma_state,
+            mu_q=self.mu_q, log_sigma_q=self.log_sigma_q,
+            device=device, dtype=w_dtype, generator=gen,
+        )
+        zero = torch.zeros((), device=device, dtype=torch.float32)
+        return {**state, "n_windows": 0,
+                "node_gate_mean_accum": zero.clone(),
+                "edge_gate_mean_accum": zero.clone()}
+
+    def streaming_write(self, state, token_embeds, attention_mask=None, chunk_offset=0):
+        from .graph_substrate_v5 import _rmsnorm
+        from .graph_substrate_v6 import _sinusoidal_pe
+        w_dtype = next(self.pin_encoder.parameters()).dtype
+        token_embeds = token_embeds.to(w_dtype)
+        if attention_mask is not None and not attention_mask.any():
+            return state, {}
+
+        pins = self.pin_encoder(token_embeds)
+        T_w = pins.shape[1]
+        pe = _sinusoidal_pe(T_w, pins.shape[-1], offset=chunk_offset,
+                            device=pins.device, dtype=pins.dtype)
+        pins = pins + pe.unsqueeze(0)
+
+        if attention_mask is not None:
+            pins_pad_mask = ~attention_mask
+            all_pad_rows = pins_pad_mask.all(dim=-1)
+            if all_pad_rows.any():
+                pins_pad_mask = pins_pad_mask.clone()
+                pins_pad_mask[all_pad_rows, 0] = False
+            if not pins_pad_mask.any():
+                pins_pad_mask = None
+            has_real = attention_mask.any(dim=-1)
+        else:
+            pins_pad_mask = None
+            has_real = None
+
+        N_old, q_src_old, q_dst_old, st_old = (
+            state["N"], state["q_src"], state["q_dst"], state["state"])
+        tgt = self.updater(pins, pins_pad_mask, N_old, q_src_old, q_dst_old, st_old)
+
+        # gate node bank (target = FFN readout)
+        g_node = self.node_gate(N_old, tgt["N"])
+        N_new = _rmsnorm(N_old + g_node.unsqueeze(-1) * (tgt["N"] - N_old))
+
+        # gate edges (one anchor gate over the concatenated edge fields)
+        edge_old = torch.cat([q_src_old, q_dst_old, st_old], dim=-1)
+        edge_tgt = torch.cat([tgt["q_src"], tgt["q_dst"], tgt["state"]], dim=-1)
+        g_edge = self.edge_gate(edge_old, edge_tgt)                # [B, K_edge]
+        ge = g_edge.unsqueeze(-1)
+        q_src_new = _rmsnorm(q_src_old + ge * (tgt["q_src"] - q_src_old))
+        q_dst_new = _rmsnorm(q_dst_old + ge * (tgt["q_dst"] - q_dst_old))
+        st_new = _rmsnorm(st_old + ge * (tgt["state"] - st_old))
+
+        if has_real is not None:
+            km = has_real.to(w_dtype).view(-1, 1, 1)
+            N_new = N_new * km + N_old * (1 - km)
+            q_src_new = q_src_new * km + q_src_old * (1 - km)
+            q_dst_new = q_dst_new * km + q_dst_old * (1 - km)
+            st_new = st_new * km + st_old * (1 - km)
+
+        with torch.no_grad():
+            ngm = g_node.float().mean().to(torch.float32)
+            egm = g_edge.float().mean().to(torch.float32)
+        new_state = dict(state)
+        new_state.update(
+            N=N_new, q_src=q_src_new, q_dst=q_dst_new, state=st_new,
+            n_windows=state["n_windows"] + 1,
+            node_gate_mean_accum=state["node_gate_mean_accum"] + ngm,
+            edge_gate_mean_accum=state["edge_gate_mean_accum"] + egm,
+        )
+        return new_state, {"graph_v6_node_gate_mean": ngm, "graph_v6_edge_gate_mean": egm}
+
+    def _build_facts(self, state, zero_state=False):
+        """READ Stage A: materialize endpoints + directional FiLM-by-state fact tokens."""
+        N, q_src, q_dst, st = state["N"], state["q_src"], state["q_dst"], state["state"]
+        sp_k, sp_v = self.read_pointer.project_kv(N)
+        src_ep, _ = self.read_pointer.attend(q_src, sp_k, sp_v)
+        dst_ep, _ = self.read_pointer.attend(q_dst, sp_k, sp_v)
+        return self.fact_builder(src_ep, dst_ep, st, zero_state=zero_state)
+
+    def finalize_memory(self, state):
+        N = state["N"]
+        B, device = N.shape[0], N.device
+        dtype = next(self.fact_reader.parameters()).dtype
+        zero_state = bool(state.get("zero_state", False))   # finer ablation than zero_memory
+        fact_value = self._build_facts(state, zero_state=zero_state)
+        empty_mem = torch.zeros(B, 0, self.cfg.d_llama, device=device, dtype=dtype)
+        n_w = max(state["n_windows"], 1)
+        aux = {
+            "load_balance_loss": torch.zeros((), device=device, dtype=dtype),
+            # graph_aux=0 (no aux loss) — also flips compute_qa_loss's `graph_aux is not
+            # None` guard True so the graph_v6_* telemetry pass-through actually fires.
+            "graph_aux": torch.zeros((), device=device, dtype=dtype),
+            "graph_v6_facts": {"value": fact_value},
+            "graph_v6_node_gate_mean_avg": (state["node_gate_mean_accum"] / n_w).to(torch.float32),
+            "graph_v6_edge_gate_mean_avg": (state["edge_gate_mean_accum"] / n_w).to(torch.float32),
+            "graph_v6_fact_norm": fact_value.detach().float().norm(dim=-1).mean().to(torch.float32),
+        }
+        return empty_mem, aux
+
+    def inject(self, hidden_states, facts):
+        """READ Stage B: per-position soft retrieval over fact-tokens (installed as a
+        forward pre-hook on Llama layer `inject_layer_idx` by compute_qa_loss)."""
+        return self.fact_reader(hidden_states, facts["value"])
+
+    def forward(self, token_embeds, attention_mask=None, mask_positions=None):
+        """Non-streaming fallback (recon/HSM paths). The QA path uses streaming_write +
+        finalize_memory + the per-position inject hook. Here we return a prepend
+        projection of the fact-tokens so non-QA callers get usable memory."""
+        del mask_positions
+        B, device, dtype = token_embeds.shape[0], token_embeds.device, token_embeds.dtype
+        state = self.init_streaming_state(B, device, dtype)
+        state, _ = self.streaming_write(state, token_embeds, attention_mask)
+        fact_value = self._build_facts(state)
+        memory = self.fact_reader.W_out(fact_value).to(dtype)     # [B, K_edge, d_llama] (query-agnostic fallback)
+        aux = {"load_balance_loss": torch.zeros((), device=device, dtype=memory.dtype)}
+        return memory, aux
 

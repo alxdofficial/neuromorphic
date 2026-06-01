@@ -1,0 +1,82 @@
+
+==============================================================================
+CHUNK 0  —  context (first ~600 tokens):
+Military career of Simón Bolívar The military and political career of Simón Bolívar, (July 24, 1783 – December 17, 1830), which included both formal service in the armies of various revolutionary regimes and actions organized by himself or in collaboration with other exiled patriot leaders during the years from 1811 to 1830, was an important element in the success of the independence wars in South America. Given the unstable political climate during these years, Bolívar and other patriot leaders, such as Santiago Mariño, Manuel Piar, José Francisco Bermúdez and Francisco de Paula Santander often had to go into exile in the Caribbean or nearby areas of Spanish America that at the moment were controlled by those favoring independence, and from there, carry on the struggle. These wars resulted in the creation of several South American states out of the former Spanish colonies, the currently existing Venezuela, Colombia, Ecuador, Peru and Bolivia, and the now defunct Gran Colombia. Thus Spoke Zarathustra Thus Spoke Zarathustra: A Book for All and None (German: "Also sprach Zarathustra: Ein Buch für Alle und Keinen", also translated as Thus Spake Zarathustra) is a philosophical novel by German philosopher Friedrich Nietzsche, composed in four parts between 1883 and 1885 and published between 1883 and 1891. Much of the work deals with ideas such as the "eternal recurrence of the same", the parable on the "death of God", and the "prophecy" of the "Übermensch", which were first intro
+
+Question: Who set Nietzche's philosophical novel to music?
+Answer:   Richard Strauss
+
+Memory slot decode (top-8 vocab tokens per slot, from memory @ lm_head.T after RMS-norm):
+  slot  0: 'Fr' | 'Fr' | 'ely' | 'att' | 'em' | 'unit' | 'Dunn' | 'blood'
+  slot  1: 'Fr' | 'Fr' | 'att' | 'em' | 'ely' | 'Schneider' | 'ag' | 'Shepherd'
+  slot  2: 'Fr' | 'Fr' | 'att' | 'em' | 'ely' | 'Dunn' | 'schedule' | 'ast'
+  slot  3: 'andle' | 'assim' | 'cho' | 'otta' | 'hold' | 'ote' | 'iver' | 'hold'
+  slot  4: 'Fr' | 'Fr' | 'em' | 'ely' | 'att' | 'nder' | 'schedule' | 'ulton'
+  slot  5: 'Fr' | 'Fr' | 'att' | 'ely' | 'em' | 'ulton' | 'ag' | 'Moff'
+  slot  6: 'Fr' | 'Fr' | 'att' | 'em' | 'nder' | 'ely' | 'ag' | 'schedule'
+  slot  7: 'Fr' | 'Fr' | 'att' | 'em' | 'ely' | 'ast' | 'ulton' | 'ag'
+  slot  8: 'Fr' | 'Fr' | 'att' | 'em' | 'schedule' | 'ag' | 'ely' | 'Moff'
+  slot  9: 'Fr' | 'Fr' | 'att' | 'ely' | 'em' | 'unj' | 'ag' | 'Moff'
+  slot 10: 'Fr' | 'Fr' | 'att' | 'ely' | 'em' | 'unj' | 'ast' | 'Dunn'
+  slot 11: 'Fr' | 'Fr' | 'att' | 'em' | 'ely' | 'schedule' | 'ulton' | 'ag'
+  slot 12: 'Fr' | 'Fr' | 'ely' | 'att' | 'em' | 'unj' | 'schedule' | 'Schneider'
+  slot 13: 'cho' | 'hold' | 'otta' | 'andle' | 'hold' | 'assim' | 'ote' | 'af'
+  slot 14: 'cho' | 'hold' | 'otta' | 'andle' | 'hold' | 'ilos' | 'ingers' | 'реч'
+  slot 15: 'Fr' | 'Fr' | 'att' | 'em' | 'ulton' | 'ely' | 'nder' | 'schedule'
+  slot 16: 'cho' | 'hold' | 'otta' | 'andle' | 'ilos' | 'hold' | 'ingers' | 'реч'
+  slot 17: 'cho' | 'hold' | 'otta' | 'andle' | 'hold' | 'assim' | 'ilos' | 'ote'
+  slot 18: 'Fr' | 'Fr' | 'att' | 'ely' | 'em' | 'schedule' | 'ag' | 'ulton'
+  slot 19: 'em' | 'Fr' | 'schedule' | 'ag' | 'Fr' | 'ogn' | 'att' | 'ots'
+  slot 20: 'Fr' | 'Fr' | 'att' | 'schedule' | 'em' | 'ag' | 'nder' | 'ely'
+  slot 21: 'cho' | 'hold' | 'otta' | 'andle' | 'ilos' | 'hold' | 'assim' | 'реч'
+  slot 22: 'Fr' | 'Fr' | 'att' | 'ely' | 'em' | 'nder' | 'schedule' | 'ag'
+  slot 23: 'cho' | 'hold' | 'otta' | 'andle' | 'ilos' | 'hold' | 'ingers' | 'assim'
+  slot 24: 'Fr' | 'Fr' | 'ely' | 'att' | 'em' | 'nder' | 'schedule' | 'ulton'
+  slot 25: 'Fr' | 'schedule' | 'Fr' | 'ag' | 'em' | 'ogn' | 'este' | 'icus'
+  slot 26: 'Fr' | 'Fr' | 'att' | 'schedule' | 'em' | 'ely' | 'Dunn' | 'nder'
+  slot 27: 'Fr' | 'Fr' | 'em' | 'att' | 'ely' | 'schedule' | 'ast' | 'Dunn'
+  slot 28: 'Fr' | 'Fr' | 'em' | 'att' | 'ely' | 'schedule' | 'unj' | 'ast'
+  slot 29: 'Fr' | 'Fr' | 'att' | 'ely' | 'nder' | 'schedule' | 'em' | 'unj'
+  slot 30: 'Fr' | 'Fr' | 'att' | 'em' | 'ely' | 'ag' | 'Dunn' | 'schedule'
+  slot 31: 'iver' | 'ogn' | 'erm' | 'efe' | 'andle' | 'assim' | 'este' | 'Host'
+
+==============================================================================
+CHUNK 1  —  context (first ~600 tokens):
+Don't Lose Touch "Don't Lose Touch" is a song by the Gainesville, Florida-based punk rock band Against Me!, released as the first single from their 2005 album "Searching for a Former Clarity". Like the second single "From Her Lips to God's Ears (The Energizer)", it was released exclusively on twelve-inch vinyl with a remixed version of the song as the A-side and the album version as the B-side. The A-side version was remixed by German electronic music duo Mouse on Mars. The single was limited to 3,050 copies. Delaware River–Turnpike Toll Bridge The Delaware River–Turnpike Toll Bridge is a four-lane, steel, arch-shaped, continuous truss bridge that connects the Pennsylvania Turnpike's East-West Mainline with the main trunk of the New Jersey Turnpike, via the Pearl Harbor Memorial Turnpike Extension (formerly known as the Pennsylvania Extension). The bridge crosses the Delaware River, connecting Bristol Township, Pennsylvania and Burlington Township, New Jersey. The bridge was closed to traffic on January 20, 2017, after a crack was discovered in a steel truss; it reopened on March 9 of that year. Gainesville, Florida Gainesville is the county seat and largest city in Alachua County, Florida, United States, and the principal city of the Gainesville, Florida Metropolitan Statistical Area (MSA). The population of Gainesville in the 2013 US Census estimates was 127,488, a 2.4% growth from 2010. Gainesville is the largest city in the region of North Central Florida. It is also a co
+
+Question: Which North Central town in Florida is home to the punk rock band Against Me!?
+Answer:   Gainesville, Florida
+
+Memory slot decode (top-8 vocab tokens per slot, from memory @ lm_head.T after RMS-norm):
+  slot  0: 'Fr' | 'Fr' | 'ely' | 'em' | 'att' | 'Dunn' | 'ast' | 'schedule'
+  slot  1: 'Fr' | 'Fr' | 'ely' | 'att' | 'em' | 'ast' | 'schedule' | 'Dunn'
+  slot  2: 'Fr' | 'Fr' | 'ely' | 'em' | 'att' | 'Dunn' | 'ast' | 'blood'
+  slot  3: 'andle' | 'cho' | 'assim' | 'otta' | 'hold' | 'ote' | 'hold' | 'iver'
+  slot  4: 'Fr' | 'Fr' | 'ely' | 'att' | 'em' | 'ast' | 'Dunn' | 'Schneider'
+  slot  5: 'Fr' | 'Fr' | 'ely' | 'em' | 'ag' | 'att' | 'ast' | 'blood'
+  slot  6: 'Fr' | 'Fr' | 'em' | 'att' | 'ely' | 'ag' | 'Dunn' | 'schedule'
+  slot  7: 'Fr' | 'Fr' | 'ely' | 'att' | 'em' | 'Schneider' | 'schedule' | 'ag'
+  slot  8: 'Fr' | 'Fr' | 'att' | 'em' | 'ely' | 'schedule' | 'ag' | 'Schneider'
+  slot  9: 'Fr' | 'Fr' | 'att' | 'ely' | 'em' | 'ag' | 'ast' | 'schedule'
+  slot 10: 'Fr' | 'Fr' | 'em' | 'ely' | 'att' | 'ast' | 'Dunn' | 'schedule'
+  slot 11: 'Fr' | 'Fr' | 'att' | 'em' | 'ely' | 'Dunn' | 'ast' | 'schedule'
+  slot 12: 'Fr' | 'Fr' | 'em' | 'ely' | 'att' | 'schedule' | 'ast' | 'Schneider'
+  slot 13: 'cho' | 'hold' | 'andle' | 'otta' | 'hold' | 'assim' | 'ingers' | 'inski'
+  slot 14: 'cho' | 'hold' | 'andle' | 'hold' | 'otta' | 'ingers' | 'inski' | 'assim'
+  slot 15: 'Fr' | 'Fr' | 'em' | 'ely' | 'att' | 'ast' | 'Dunn' | 'unj'
+  slot 16: 'cho' | 'hold' | 'andle' | 'hold' | 'otta' | 'ingers' | 'inski' | 'ilos'
+  slot 17: 'cho' | 'hold' | 'andle' | 'otta' | 'hold' | 'ingers' | '-name' | 'inski'
+  slot 18: 'Fr' | 'Fr' | 'att' | 'ely' | 'em' | 'schedule' | 'Dunn' | 'ag'
+  slot 19: 'Fr' | 'Fr' | 'schedule' | 'em' | 'ag' | 'att' | 'Dunn' | 'otal'
+  slot 20: 'Fr' | 'Fr' | 'att' | 'em' | 'ely' | 'ag' | 'schedule' | 'ember'
+  slot 21: 'cho' | 'hold' | 'andle' | 'hold' | 'otta' | 'ingers' | 'inski' | 'ilos'
+  slot 22: 'Fr' | 'Fr' | 'ely' | 'em' | 'att' | 'ag' | 'Dunn' | 'schedule'
+  slot 23: 'cho' | 'hold' | 'andle' | 'otta' | 'hold' | 'ingers' | 'inski' | '-name'
+  slot 24: 'Fr' | 'Fr' | 'att' | 'em' | 'ely' | 'Dunn' | 'ast' | 'schedule'
+  slot 25: 'schedule' | 'Fr' | 'ots' | 'att' | 'Fr' | 'ag' | 'ogn' | '_att'
+  slot 26: 'Fr' | 'Fr' | 'att' | 'ely' | 'em' | 'Dunn' | 'ast' | 'schedule'
+  slot 27: 'Fr' | 'Fr' | 'att' | 'em' | 'ely' | 'ast' | 'Dunn' | 'schedule'
+  slot 28: 'Fr' | 'Fr' | 'em' | 'ely' | 'att' | 'ast' | 'schedule' | 'nder'
+  slot 29: 'Fr' | 'Fr' | 'ely' | 'em' | 'att' | 'ast' | 'Dunn' | 'ag'
+  slot 30: 'Fr' | 'Fr' | 'em' | 'ely' | 'att' | 'Dunn' | 'ast' | 'schedule'
+  slot 31: 'ogn' | 'reput' | 'este' | 'modern' | 'iver' | 'Fr' | 'rel' | 'ml'

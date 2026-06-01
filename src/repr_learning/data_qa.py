@@ -174,6 +174,15 @@ class QADataset(IterableDataset):
                 if 0 <= pos < len(a_ids):
                     content_mask[pos] = True
 
+            # For composite_v1, refs = [target_value] (load-bearing content
+            # only) so EM/F1 isn't fooled by templated prefixes. Fall back
+            # to the full answer string when target_value is absent.
+            answer_full = target_q.get("answer") or ""
+            target_val = target_q.get("target_value") or ""
+            # Span-only when target_value exists (drop the echoing sentence —
+            # else F1 pays out for parroting the question prefix). Fall back to
+            # the full answer only when target_value is absent.
+            refs = [target_val] if target_val else ([answer_full] if answer_full else [])
             yield {
                 "context_ids": torch.tensor(ctx_tokens, dtype=torch.long),
                 "context_mask": torch.tensor(
@@ -185,6 +194,7 @@ class QADataset(IterableDataset):
                 "answer_content_mask_list": content_mask,
                 "task_family": chunk["task_family"],
                 "question_type": target_q["question_type"],
+                "answer_refs": refs,
             }
 
 
@@ -415,6 +425,7 @@ class HotpotQADataset(IterableDataset):
                 "answer_content_mask_list": content_mask,
                 "task_family": "hotpot_qa",
                 "question_type": ex.get("type", "comparison_or_bridge"),
+                "answer_refs": [a_text],
             }
 
 
@@ -475,10 +486,13 @@ class NarrativeQADataset(IterableDataset):
             ex = self.data[idx]
             doc_text = ex["document"]["text"]
             q_text = ex["question"]["text"]
-            # NarrativeQA has multiple reference answers; sample one
+            # NarrativeQA has multiple reference answers; sample one for the
+            # training tensor, surface ALL of them for downstream multi-ref
+            # eval (NarrativeQA scoring is max over references).
             ans_list = ex["answers"]
             if not ans_list:
                 continue
+            answer_refs = [a["text"] for a in ans_list if a.get("text")]
             a_text = rng.choice(ans_list)["text"]
 
             # Tokenize document fully (this can be slow for very long docs)
@@ -516,6 +530,7 @@ class NarrativeQADataset(IterableDataset):
                 "answer_content_mask_list": content_mask,
                 "task_family": "narrative_qa",
                 "question_type": "narrative",
+                "answer_refs": answer_refs,  # multi-ref for eval; ignored by collate
             }
 
 
@@ -650,6 +665,8 @@ class MuSiQueDataset(IterableDataset):
             a_ids = tok(a_text, add_special_tokens=False,
                          return_attention_mask=False)["input_ids"]
             content_mask = [True] * len(a_ids)
+            aliases = ex.get("answer_aliases") or []
+            answer_refs = [a_text] + [a for a in aliases if a and a != a_text]
 
             yield {
                 "context_ids": torch.tensor(ctx_tokens, dtype=torch.long),
@@ -662,6 +679,7 @@ class MuSiQueDataset(IterableDataset):
                 "answer_content_mask_list": content_mask,
                 "task_family": "musique",
                 "question_type": "multi_hop_ans",
+                "answer_refs": answer_refs,
             }
 
 
@@ -784,8 +802,159 @@ class BABILongDataset(IterableDataset):
                 "question_ids": torch.tensor(q_ids, dtype=torch.long),
                 "answer_ids": torch.tensor(a_ids, dtype=torch.long),
                 "answer_content_mask_list": content_mask,
+                "answer_refs": [a_text],   # for eval scoring (EM/F1)
                 "task_family": f"babilong_{task}",
                 "question_type": task,
+            }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# RULER — synthetic multi-key needle-in-a-haystack (EVAL-ONLY, OOD)
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class RULERNIAHDataset(IterableDataset):
+    """RULER-style multi-key needle-in-a-haystack (Hsieh et al., 2024, NVIDIA).
+
+    EVAL-ONLY out-of-distribution probe — never trained on. K distinct "magic
+    number" needles are hidden in benign filler; given one key, the model must
+    retrieve its value. Fully synthetic → contamination-free (Llama cannot know
+    the random values); tests pure associative recall at long context. The
+    answer is the exact value, so EM/F1 are clean (no echo/abstraction).
+    """
+
+    _FILLER = [
+        "The afternoon light moved slowly across the wooden floor.",
+        "A train passed somewhere far away, and then the quiet returned.",
+        "He counted the steps out of habit, not because it mattered.",
+        "Rain had been promised all week, but the clouds never broke.",
+        "The market was busy with the ordinary errands of a Tuesday.",
+        "She folded the letter twice and left it on the table.",
+        "Outside, the wind turned the pages of a forgotten newspaper.",
+        "They spoke of small things, the weather and the price of bread.",
+        "A door closed somewhere upstairs and the house settled again.",
+        "The river was low that summer and the stones showed through.",
+        "He sharpened the pencil to a fine point and set it down.",
+        "The cat watched the birds without any real intention.",
+        "Lamps came on one by one along the length of the street.",
+        "Someone was practicing scales on a piano two floors below.",
+        "The kettle clicked off and the steam thinned into nothing.",
+        "Leaves gathered in the corner of the yard near the fence.",
+        "The bus was late, as it usually was on rainy mornings.",
+        "She traced the rim of the cup with one absent finger.",
+        "The clock in the hall had been five minutes slow for years.",
+        "A gull wheeled once over the harbor and was gone.",
+        "The bookshelf sagged a little under its uneven weight.",
+        "He left the radio on low, more for company than for news.",
+        "The path curved away under the bare and patient trees.",
+        "Footsteps crossed the ceiling and then went quiet.",
+    ]
+    _ADJ = ["silver", "quiet", "ancient", "golden", "hollow", "crimson",
+            "northern", "restless", "frozen", "gentle", "distant", "amber",
+            "velvet", "iron", "scarlet", "winding"]
+    _NOUN = ["harbor", "lantern", "meadow", "compass", "willow", "cipher",
+             "falcon", "garden", "ferry", "beacon", "orchard", "summit",
+             "quartz", "river", "thicket", "anchor"]
+
+    def __init__(
+        self,
+        split: str,                 # accepted for interface parity; ignored (synthetic)
+        tokenizer,
+        chunk_size: int = 8192,
+        n_needles: int = 1,         # single needle: 4-needle/64:1 is unwinnable for compressive memory
+        sep_token_id: int = 198,
+        pad_token_id: int = 128_001,
+        seed: int = 0,
+    ):
+        super().__init__()
+        del split
+        self.tokenizer = tokenizer
+        self.chunk_size = chunk_size
+        self.n_needles = n_needles
+        self.sep_token_id = sep_token_id
+        self.pad_token_id = pad_token_id
+        self.seed = seed
+
+    def _key(self, rng) -> str:
+        return f"{rng.choice(self._ADJ)}-{rng.choice(self._NOUN)}"
+
+    def __iter__(self) -> Iterator[dict]:
+        worker = torch.utils.data.get_worker_info()
+        wid = worker.id if worker is not None else 0
+        rng = random.Random(self.seed + 911 + wid * 100_003)
+        tok = self.tokenizer
+
+        def _tok(s: str) -> list:
+            return tok(s, add_special_tokens=False,
+                       return_attention_mask=False)["input_ids"]
+
+        while True:
+            # Ordered list (not a set) so key order is deterministic regardless
+            # of PYTHONHASHSEED.
+            keys, _seen = [], set()
+            while len(keys) < self.n_needles:
+                k = self._key(rng)
+                if k not in _seen:
+                    _seen.add(k)
+                    keys.append(k)
+            vals = [rng.randint(1_000_000, 9_999_999) for _ in keys]
+            needles = [_tok(f"The special magic number for {k} is {v}.")
+                       for k, v in zip(keys, vals)]
+            needle_total = sum(len(n) for n in needles) + len(needles)
+
+            # Fill benign filler up to ~chunk_size minus the needle budget, so
+            # the needles fit without truncation.
+            budget = self.chunk_size - needle_total - 8
+            filler_units, acc = [], 0
+            while acc < budget:
+                u = _tok(rng.choice(self._FILLER))
+                filler_units.append(u)
+                acc += len(u) + 1
+
+            # Insert the needles at distinct random positions among the filler.
+            n_slots = len(filler_units) + 1
+            positions = sorted(rng.sample(range(n_slots),
+                                          min(self.n_needles, n_slots)))
+            units, ni = [], 0
+            for i in range(n_slots):
+                while ni < len(positions) and positions[ni] == i:
+                    units.append(needles[ni])
+                    ni += 1
+                if i < len(filler_units):
+                    units.append(filler_units[i])
+
+            ctx_ids: list = []
+            for u in units:
+                ctx_ids.extend(u)
+                ctx_ids.append(self.sep_token_id)
+            ctx_ids = ctx_ids[:self.chunk_size]
+            valid_len = len(ctx_ids)
+            if valid_len < self.chunk_size:
+                ctx_ids = ctx_ids + [self.pad_token_id] * (self.chunk_size - valid_len)
+
+            # Target only from needles actually inserted (small chunks may fit
+            # fewer than n_needles), so the answer is always present in context.
+            target = rng.randrange(len(positions))
+            # Explicit instruction: without it the Instruct model refuses the
+            # unusual "magic number" framing ("I'm not aware of any...") and the
+            # whole task scores 0 regardless of memory (verified 2026-05-30).
+            q_ids = _tok(f"What is the special magic number for {keys[target]}? "
+                         f"Answer with only the number.")
+            a_text = str(vals[target])
+            a_ids = _tok(a_text)
+
+            yield {
+                "context_ids": torch.tensor(ctx_ids, dtype=torch.long),
+                "context_mask": torch.tensor(
+                    [True] * valid_len + [False] * (self.chunk_size - valid_len),
+                    dtype=torch.bool,
+                ),
+                "question_ids": torch.tensor(q_ids, dtype=torch.long),
+                "answer_ids": torch.tensor(a_ids, dtype=torch.long),
+                "answer_content_mask_list": [True] * len(a_ids),
+                "answer_refs": [a_text],
+                "task_family": "ruler_niah",
+                "question_type": "niah_multikey",
             }
 
 

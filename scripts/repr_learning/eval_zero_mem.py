@@ -161,17 +161,28 @@ def main():
         if not path.exists():
             raise FileNotFoundError(f"{var}: ckpt {path} not found")
 
-    print("Loading tokenizer + Llama (frozen, shared)...", flush=True)
-    tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B")
+    # IMPORTANT: ReprConfig's default llama_model is now Llama-3.2-1B-Instruct
+    # (post-tranche-4). Old v1h checkpoints were trained against base Llama
+    # with raw-concat prompts; loading them under Instruct's chat-template
+    # scaffold silently invalidates results. Pin the backbone explicitly to
+    # the legacy base model when evaluating pre-tranche-4 ckpts.
+    BACKBONE_FOR_LEGACY_CKPTS = "meta-llama/Llama-3.2-1B"
+    print(f"Loading tokenizer + Llama (frozen, shared) — pinned backbone: "
+          f"{BACKBONE_FOR_LEGACY_CKPTS}", flush=True)
+    tokenizer = AutoTokenizer.from_pretrained(BACKBONE_FOR_LEGACY_CKPTS)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    llama, _ = load_frozen_llama("meta-llama/Llama-3.2-1B", dtype=torch.bfloat16)
+    llama, _ = load_frozen_llama(BACKBONE_FOR_LEGACY_CKPTS, dtype=torch.bfloat16)
     llama = llama.to(device)
 
     # Build cfg with the SAME overrides train_repr_qa.py main() uses for v1h.
     # Default ReprConfig has older shapes (n_flat_codes=96, max_window=1024)
     # which cause load_state_dict size-mismatch failures on v1h checkpoints.
     cfg = ReprConfig(
+        llama_model=BACKBONE_FOR_LEGACY_CKPTS,   # also pin in cfg so chat
+                                                  # template build sees no
+                                                  # chat_template and skips
+                                                  # scaffold (matches training).
         batch_size=args.batch_size,
         fixed_window_size=args.window_size,
         max_window_size=args.chunk_size,

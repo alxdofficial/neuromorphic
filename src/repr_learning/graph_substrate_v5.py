@@ -385,18 +385,25 @@ def slot_routing_on_endpoints(
     endpoint_dst_old: Tensor,
     endpoint_src_prop: Tensor,        # [B, K_proposal, d_node] — materialized proposal endpoints
     endpoint_dst_prop: Tensor,
-) -> tuple[Tensor, Tensor, Tensor]:
-    """Each existing edge picks ONE proposal by combined cosine affinity on
-    the MATERIALIZED endpoints (under the new bank). Multiple edges CAN
-    pick the same proposal → convergence pressure (k-means dynamic).
+    temperature: float = 0.1,
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    """Each existing edge SOFT-assigns over proposals by combined cosine
+    affinity on the MATERIALIZED endpoints (under the new bank).
 
-    K_proposal can differ from K_edge (the proposal pool can be larger than
-    the existing-edge count, giving routing more candidates to choose from).
+    v5.6: differentiable softmax soft-assignment replaces the v5.1 hard argmax.
+    The hard pick severed the task gradient from topology formation (node
+    placement ↔ edge wiring couldn't co-adapt under the loss; verified
+    2026-05-29). Softmax (temperature τ) restores it. Multiple edges can still
+    place high weight on the same proposal → convergence preserved. The
+    argmax-derived picked_idx/affinity/count are kept for TELEMETRY only.
+
+    K_proposal can differ from K_edge (proposal pool can be larger).
 
     Returns:
-      picked_idx       : [B, K_edge] int in [0, K_proposal)
-      pick_affinity    : [B, K_edge] in [-1, 1]
-      pick_count       : [B, K_proposal] int — how many edges picked each proposal
+      route_w          : [B, K_edge, K_proposal] softmax weights (differentiable)
+      picked_idx       : [B, K_edge] argmax index (telemetry, no grad)
+      pick_affinity    : [B, K_edge] max affinity (telemetry, no grad)
+      pick_count       : [B, K_proposal] argmax histogram (telemetry, no grad)
     """
     es_old = F.normalize(endpoint_src_old, dim=-1, eps=1e-6)
     ed_old = F.normalize(endpoint_dst_old, dim=-1, eps=1e-6)
@@ -407,12 +414,14 @@ def slot_routing_on_endpoints(
     aff_dst = ed_old @ ed_prop.transpose(-1, -2)
     affinity = 0.5 * (aff_src + aff_dst)
 
-    pick_affinity, picked_idx = affinity.max(dim=-1)    # [B, K_edge]
+    route_w = (affinity / temperature).softmax(dim=-1)  # [B, K_edge, K_proposal]
 
-    K_proposal = endpoint_src_prop.shape[1]
-    one_hot = F.one_hot(picked_idx, num_classes=K_proposal).to(affinity.dtype)
-    pick_count = one_hot.sum(dim=1)                     # [B, K_proposal]
-    return picked_idx, pick_affinity, pick_count
+    with torch.no_grad():
+        pick_affinity, picked_idx = affinity.max(dim=-1)    # [B, K_edge]
+        K_proposal = endpoint_src_prop.shape[1]
+        one_hot = F.one_hot(picked_idx, num_classes=K_proposal).to(affinity.dtype)
+        pick_count = one_hot.sum(dim=1)                     # [B, K_proposal]
+    return route_w, picked_idx, pick_affinity, pick_count
 
 
 def gather_picked_per_slot(field: Tensor, picked_idx: Tensor) -> Tensor:
@@ -673,20 +682,39 @@ class MessagePassingReadoutV5(nn.Module):
         # message-construction stage (e.g. round 0-1 aggregate, round 2-3
         # compose, round 4-5 format), at the cost of T× the msg_mlp params.
         d_h = d_mlp_hidden if d_mlp_hidden is not None else 2 * d_node
-        self.msg_mlps = nn.ModuleList([
+        # v5.6: STRONG CONDITIONING (gating) replaces the v5.5 concat MLP.
+        # Old: msg = MLP(concat[src_ctx, edge_state]) — "weak" conditioning;
+        # the MLP can zero the edge_state input columns, which is exactly what
+        # it learned (edge_state measured read-side DEAD, 2026-05-29). New:
+        # content_mlp processes node content, edge_state enters as a per-channel
+        # multiplicative GATE — strictly more expressive than concat and the
+        # gate can't be trivially ignored. (Weak/strong/pure hierarchy; gating
+        # beats concat on perf and ECC on cost — Tang 2023; multiplicative
+        # interactions enrich the function class — Jayakumar 2020.)
+        self.content_mlps = nn.ModuleList([
             nn.Sequential(
-                nn.Linear(d_node + d_state, d_h),
+                nn.Linear(d_node, d_h),
                 nn.GELU(),
                 nn.Linear(d_h, d_node),
             )
             for _ in range(T)
         ])
-        # Small init on output linear so round-1 doesn't smash the seed in
-        # the residual (msg_buf = msg_buf + agg). The model can scale it up
-        # from there. Applied identically per round.
-        for mlp in self.msg_mlps:
-            nn.init.normal_(mlp[-1].weight, std=0.02)
-            nn.init.zeros_(mlp[-1].bias)
+        # Per-round gate from edge_state → d_msg. Used as gate = 1 + tanh(·) in
+        # forward, so it's BOUNDED to (0, 2) — prevents the unbounded-linear-gate
+        # magnitude blow-up over T rounds × D TBPTT windows. Zero-init weight AND
+        # bias → tanh(0)=0 → gate≈1 (msg≈content) at start, with full init
+        # gradient (tanh'(0)=1; ∂msg/∂W_g = content·edge_state·sech² ≠ 0).
+        self.gate_lins = nn.ModuleList([
+            nn.Linear(d_state, d_node) for _ in range(T)
+        ])
+        # Small init on content output so round-1 doesn't smash the seed in the
+        # residual (msg_buf = msg_buf + agg). Gate init: ×1 (zero pre-tanh).
+        for cm in self.content_mlps:
+            nn.init.normal_(cm[-1].weight, std=0.02)
+            nn.init.zeros_(cm[-1].bias)
+        for gl in self.gate_lins:
+            nn.init.zeros_(gl.weight)
+            nn.init.zeros_(gl.bias)
 
         # v5.5: post-MP FFN block — a "thinking" pass on msg_buf after the T
         # MP rounds finish, before W_out projects to d_llama. GPT-style:
@@ -708,12 +736,21 @@ class MessagePassingReadoutV5(nn.Module):
         self.out_norm = nn.LayerNorm(d_node)
         self.W_out = nn.Linear(d_node, d_llama)
 
+        # v5.6 question-conditioned read: projects the question summary (q_vec,
+        # in d_node) to a bias added to the per-round read + final projection.
+        # Zero-init → starts as the question-agnostic readout (stability), then
+        # learns query-driven hops.
+        self.W_q = nn.Linear(d_node, d_node)
+        nn.init.zeros_(self.W_q.weight)
+        nn.init.zeros_(self.W_q.bias)
+
     def forward(
         self,
         N: Tensor,              # [B, K_node, d_node]
         alpha_src: Tensor,      # [B, K_edge, K_node] — soft pointer (from soft_pointer)
         alpha_dst: Tensor,      # [B, K_edge, K_node]
         edge_state: Tensor,     # [B, K_edge, d_state]
+        q_vec: Optional[Tensor] = None,   # [B, d_node] — question summary (v5.6)
         compute_telemetry: bool = False,
     ) -> tuple[Tensor, dict]:
         """Returns (memory, telemetry).
@@ -727,18 +764,28 @@ class MessagePassingReadoutV5(nn.Module):
         seed = self.W_init(N)                                          # [B, K_node, d_msg]
         msg_buf = seed
 
+        # v5.6 question-conditioned read: q_vec biases the per-round read AND
+        # the final projection, so the T rounds propagate question-relevant
+        # content (query-driven hops). W_q zero-init → starts question-agnostic.
+        # q_vec None (e.g. recon path) → bias 0 (broadcasts harmlessly).
+        q_bias = self.W_q(q_vec).unsqueeze(1) if q_vec is not None else 0.0
+
         per_round_buf_norm: list[Tensor] = []
         per_round_agg_norm: list[Tensor] = []
         per_round_buf_cos: list[Tensor] = []
 
         for t in range(self.T):
-            # Pre-norm read
-            norm_buf = self.pre_norm(msg_buf)                          # [B, K_node, d_msg]
+            # Pre-norm read (question-biased)
+            norm_buf = self.pre_norm(msg_buf + q_bias)                 # [B, K_node, d_msg]
             # Materialize src context from msg_buf (NOT from N — that's the key insight)
             src_ctx = torch.matmul(alpha_src, norm_buf)                # [B, K_edge, d_msg]
-            # Build messages: src_ctx ⊕ edge_state → d_msg
-            msg_in = torch.cat([src_ctx, edge_state], dim=-1)
-            msg = self.msg_mlps[t](msg_in)                             # [B, K_edge, d_msg]
+            # v5.6 gating (strong conditioning): edge_state multiplicatively
+            # modulates the node-content message — can't be zeroed out the way
+            # the old concat MLP did. gate = 1 + tanh(·) ∈ (0,2): bounded (no
+            # blow-up), starts at 1 (msg ≈ content), full init gradient.
+            content = self.content_mlps[t](src_ctx)                   # [B, K_edge, d_msg]
+            gate = 1.0 + torch.tanh(self.gate_lins[t](edge_state))    # [B, K_edge, d_msg] ∈ (0,2)
+            msg = content * gate                                      # [B, K_edge, d_msg]
             # Aggregate at dst — α_dst[k] is "how much each edge points at k"
             agg = torch.matmul(alpha_dst.transpose(-1, -2), msg)       # [B, K_node, d_msg]
 
@@ -777,8 +824,10 @@ class MessagePassingReadoutV5(nn.Module):
         # on the final msg_buf state. Zero-init residual means this starts as
         # identity and only contributes once trained, so it can't destabilize
         # the seed-recovery dynamics from the T MP rounds.
-        msg_buf = msg_buf + self.post_ffn(self.post_ffn_norm(msg_buf))
-        memory = self.W_out(self.out_norm(msg_buf))                    # [B, K_node, d_llama]
+        # v5.6: post-FFN "thinking" pass is also question-conditioned (q_bias in
+        # its input), so the format/compose stage can select on the question.
+        msg_buf = msg_buf + self.post_ffn(self.post_ffn_norm(msg_buf + q_bias))
+        memory = self.W_out(self.out_norm(msg_buf + q_bias))           # [B, K_node, d_llama]
 
         if compute_telemetry:
             telemetry = {
