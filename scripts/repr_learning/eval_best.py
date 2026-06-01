@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Re-evaluate a saved best.pt on a freshly-materialized fixed val set.
+"""[LEGACY — pre-tranche-3; hardcodes n_flat_codes=36/d_mamba=768/use_musique=
+False. For the current v2.1/graph_v6 sweep use eval_per_family.py.]
+Re-evaluate a saved best.pt on a freshly-materialized fixed val set.
 
 This is the "trustworthy number" script — fixes the two eval pathologies in
 the trainer's in-line eval:

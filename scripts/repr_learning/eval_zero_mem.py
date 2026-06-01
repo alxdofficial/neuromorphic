@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Zero-memory ablation: for each trained checkpoint, run val twice (with
+"""[LEGACY config — --mix-weights defaults to a 3-tuple (0.7/0.3/0.0); the
+current v2.1 protocol is the 5-source equal mix. Pass explicit --mix-weights
+to match training, or use eval_per_family.py's no-context floor (vanilla_llama
+arm) for the current sweep.]
+Zero-memory ablation: for each trained checkpoint, run val twice (with
 real memory, with memory zeroed) and report the gap.
 
 A large gap (real ≪ zeroed) means memory is doing real work. A small gap

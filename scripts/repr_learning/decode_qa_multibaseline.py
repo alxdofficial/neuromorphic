@@ -1,4 +1,7 @@
-"""Autoregressive QA decode across multiple trained variants.
+"""[LEGACY — its VARIANTS list + ckpt paths target graph_v5/tranche-era runs
+(now deleted). For the current v2.1/graph_v6 sweep, AR-decode eval is done by
+eval_per_family.py. Kept for reference only.]
+Autoregressive QA decode across multiple trained variants.
 
 For each variant we hold the **same** input chunks fixed and ask:
   - Encode chunk → per-variant memory tokens

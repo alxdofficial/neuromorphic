@@ -956,11 +956,17 @@ class RULERNIAHDataset(IterableDataset):
             needle_total = sum(len(n) for n in needles) + len(needles)
 
             # Fill benign filler up to ~chunk_size minus the needle budget, so
-            # the needles fit without truncation.
+            # the needles fit without truncation. Guard against OVERSHOOT: a
+            # final filler unit (~10-15 tok) could push the total past chunk_size
+            # and clip the tail — which, if a needle landed last, would drop the
+            # answer from the context. Stop before exceeding budget so the
+            # post-insertion total stays ≤ chunk_size and no needle is truncated.
             budget = self.chunk_size - needle_total - 8
             filler_units, acc = [], 0
             while acc < budget:
                 u = _tok(rng.choice(self._FILLER))
+                if acc + len(u) + 1 > budget:
+                    break
                 filler_units.append(u)
                 acc += len(u) + 1
 

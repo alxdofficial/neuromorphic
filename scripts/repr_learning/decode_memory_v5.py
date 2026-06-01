@@ -1,4 +1,7 @@
-"""Decode v5.4 memory tokens to text.
+"""[LEGACY — graph_v5/v5.4 forensic decode probe. graph_v5 is RETIRED (not a
+v2.1 arm) and its checkpoints were deleted; this script bypasses the current
+finalize_memory/q-conditioning path. Kept for reference only.]
+Decode v5.4 memory tokens to text.
 
 Two modes, both useful but answering different questions:
 

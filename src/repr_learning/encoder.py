@@ -3358,6 +3358,14 @@ class GraphV6BaselineEncoder(nn.Module):
         from .graph_substrate_v6 import init_graph_v6_state
         w_dtype = next(self.pin_encoder.parameters()).dtype
         gen = None
+        # Deterministic-eval guard: the node/edge/q init noise is symmetry-
+        # breaking randomness that SHOULD vary per step during training, but at
+        # eval it must be FIXED so metrics are reproducible run-to-run (matches
+        # the continuous/MT deterministic-eval-noise convention, v5.4 fix #2).
+        # Without this, graph_v6 eval drew from the global RNG (gen=None) and
+        # graph init changed between eval runs.
+        if seed is None and not self.training:
+            seed = 1234
         if seed is not None:
             gen = torch.Generator(device=device)
             gen.manual_seed(int(seed))

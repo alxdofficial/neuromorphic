@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""v1h pre-launch audit. Runs one training step per variant on the mixed
+"""[LEGACY — pre-tranche-3 preflight; stale variant/mix/capacity assumptions.
+Not used by the current v2.1/graph_v6 sweep. Kept for historical reference.]
+v1h pre-launch audit. Runs one training step per variant on the mixed
 source pipeline (composite_v1 + HotpotQA + NarrativeQA) and checks:
 
   (A) Forward + backward produce finite loss with non-zero gradient.
