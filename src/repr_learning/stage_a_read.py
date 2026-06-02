@@ -128,12 +128,16 @@ class ARReadHead(nn.Module):
 
 class StageAModel(nn.Module):
     def __init__(self, cfg: ReprConfig, arm: str, d_read: int = 256, max_slots: int = 32,
-                 read_mode: str = "ar", bos_id: int = 128_000):
+                 read_mode: str = "ar", bos_id: int = 128_000,
+                 deterministic_write: bool = False, vicreg_scale: float = 0.0):
         super().__init__()
         self.cfg, self.arm = cfg, arm
         self.read_mode = read_mode                                             # "ar" (default) | "nonar"
         self.bos_id = bos_id                                                   # Llama-3 BOS (decode start token)
+        self.vicreg_scale = vicreg_scale                                       # anti-collapse repulsion weight
         self.encoder = ARM_CLASSES[arm](cfg)                                   # the WRITE (trainable)
+        if deterministic_write:                                               # kill per-step slot/init noise
+            self.encoder.deterministic_write = True
         # frozen Llama embed/un-embed (lookup only — never the decoder)
         from transformers import AutoModelForCausalLM
         llama = AutoModelForCausalLM.from_pretrained(cfg.llama_model, torch_dtype=torch.float32)
@@ -156,7 +160,7 @@ class StageAModel(nn.Module):
             memory = aux["graph_v6_facts"]["value"]   # graph injects fact tokens (dim d_read), not prepend
         return memory.to(torch.float32)               # [B, M, d_mem]
 
-    def _memory(self, batch, zero_memory, shuffle_memory, oracle_memory):
+    def _memory(self, batch, zero_memory, shuffle_memory, oracle_memory, passage_memory=False):
         """Return (mem_exp [B*P,M,d], mem_mask [B*P,M], key_vec [B*P,d_key], B, P)."""
         keys, k_mask = batch["keys"], batch["keys_mask"]                       # [B,P,Tk]
         B, P, Tk = keys.shape
@@ -164,10 +168,19 @@ class StageAModel(nn.Module):
         kw = k_mask.unsqueeze(-1).float()
         key_vec = (ke * kw).sum(2) / kw.sum(2).clamp_min(1.0)                 # [B,P,d] mean-pool
         if oracle_memory:
-            # POSITIVE CONTROL: ground-truth value embeddings ARE the memory (per query).
+            # POSITIVE CONTROL (value-oracle): ground-truth value embeddings ARE the memory.
+            # Tests "can the read COPY a thing sitting alone in memory".
             vals, v_mask = batch["values"], batch["values_mask"]             # [B,P,Tv]
             mem_exp = self.embed(vals.reshape(B * P, -1)).to(torch.float32)  # [B*P,Tv,d]
             mm_exp = v_mask.reshape(B * P, -1)
+        elif passage_memory:
+            # POSITIVE CONTROL (passage-oracle): the RAW passage embeddings are the memory
+            # (no learned write). Tests "can the read FIND the value among distractors by key".
+            # If high -> read can locate-in-context, so real-write 0% indicts the WRITE.
+            # If ~0   -> read can't locate-in-context, so real-write 0% is a READ limit, not write.
+            pas, pm = batch["passage"], batch["passage_mask"]                # [B,Tp]
+            mem_exp = self.embed(pas).to(torch.float32).repeat_interleave(P, 0)  # [B*P,Tp,d]
+            mm_exp = pm.repeat_interleave(P, 0)
         else:
             memory = self.write(batch["passage"], batch["passage_mask"])     # [B,M,d]
             if zero_memory:
@@ -181,9 +194,11 @@ class StageAModel(nn.Module):
             mm_exp = mem_mask.repeat_interleave(P, 0)
         return mem_exp, mm_exp, key_vec.reshape(B * P, -1), B, P
 
-    def forward(self, batch, n_slots, zero_memory=False, shuffle_memory=False, oracle_memory=False):
+    def forward(self, batch, n_slots, zero_memory=False, shuffle_memory=False, oracle_memory=False,
+                passage_memory=False):
         # NON-AR path: per-slot (key,pos) query -> logits [B,P,n_slots,V]
-        mem_exp, mm_exp, key_flat, B, P = self._memory(batch, zero_memory, shuffle_memory, oracle_memory)
+        mem_exp, mm_exp, key_flat, B, P = self._memory(batch, zero_memory, shuffle_memory,
+                                                       oracle_memory, passage_memory)
         r = self.read(mem_exp, mm_exp, key_flat, n_slots)                    # [B*P,L,d_llama]
         return (r @ self.unembed_w.t()).view(B, P, n_slots, -1)
 
@@ -208,16 +223,28 @@ class StageAModel(nn.Module):
             ids = torch.cat([ids, nxt[:, None]], dim=1)
         return ids[:, 1:]                                                   # [N,L]
 
-    def loss_and_recall(self, batch, zero_memory=False, shuffle_memory=False, oracle_memory=False):
+    def loss_and_recall(self, batch, zero_memory=False, shuffle_memory=False, oracle_memory=False,
+                        passage_memory=False):
         vals, v_mask = batch["values"], batch["values_mask"]                 # [B,P,Tv]
         L = vals.size(-1)
         if self.read_mode == "ar":
-            mem_exp, mm_exp, key_flat, B, P = self._memory(batch, zero_memory, shuffle_memory, oracle_memory)
+            mem_exp, mm_exp, key_flat, B, P = self._memory(batch, zero_memory, shuffle_memory,
+                                                           oracle_memory, passage_memory)
             vflat, vmflat = vals.reshape(B * P, -1), v_mask.reshape(B * P, -1)
             logits = self._ar_logits_tf(mem_exp, mm_exp, key_flat, vflat)    # TF [B*P,L,V]
             ce = F.cross_entropy(logits.reshape(-1, logits.size(-1)), vflat.reshape(-1),
                                  reduction="none").view_as(vflat)
             loss = (ce * vmflat).sum() / vmflat.sum().clamp_min(1.0)
+            if self.vicreg_scale > 0 and not (oracle_memory or passage_memory):
+                # anti-collapse: push the per-item memory vectors to be DECORRELATED
+                # across the batch (directly attacks the measured cross-item cosine ~1.0).
+                z = mem_exp.reshape(mem_exp.size(0), -1).float()
+                z = z - z.mean(0, keepdim=True)
+                zn = F.normalize(z, dim=-1)
+                sim = zn @ zn.t()
+                n = sim.size(0)
+                offdiag = sim[~torch.eye(n, dtype=torch.bool, device=sim.device)]
+                loss = loss + self.vicreg_scale * offdiag.pow(2).mean()
             with torch.no_grad():
                 gen = self._ar_generate(mem_exp, mm_exp, key_flat, L)        # honest greedy AR decode
                 last = vmflat.sum(-1, keepdim=True) - 1                      # EOS index per row
@@ -227,7 +254,7 @@ class StageAModel(nn.Module):
             return loss, recall
         # NON-AR path
         logits = self(batch, L, zero_memory=zero_memory, shuffle_memory=shuffle_memory,
-                      oracle_memory=oracle_memory)                           # [B,P,L,V]
+                      oracle_memory=oracle_memory, passage_memory=passage_memory)  # [B,P,L,V]
         ce = F.cross_entropy(logits.reshape(-1, logits.size(-1)), vals.reshape(-1),
                              reduction="none").view_as(vals)
         loss = (ce * v_mask).sum() / v_mask.sum().clamp_min(1.0)

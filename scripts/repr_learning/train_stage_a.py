@@ -35,12 +35,12 @@ def build_val(tok, n_pairs, n_items, bs, dev, seed=999):
 
 
 @torch.no_grad()
-def run_val(model, val_batches, oracle=False):
+def run_val(model, val_batches, oracle=False, passage=False):
     model.train(False)                       # inference mode (no dropout); avoids the literal eval token
     real = off = shuf = 0.0
     for b in val_batches:
-        real += model.loss_and_recall(b, oracle_memory=oracle)[1].item()
-        if not oracle:                       # write-based controls share the arm's mem dim, not the oracle's
+        real += model.loss_and_recall(b, oracle_memory=oracle, passage_memory=passage)[1].item()
+        if not (oracle or passage):          # write-based controls share the arm's mem dim, not the oracle's
             off += model.loss_and_recall(b, zero_memory=True)[1].item()
             shuf += model.loss_and_recall(b, shuffle_memory=True)[1].item()
     model.train(True)
@@ -49,45 +49,49 @@ def run_val(model, val_batches, oracle=False):
 
 
 def train_one(arm, n_pairs, steps=600, batch_size=16, lr=1e-3, eval_every=100,
-              val_items=128, tok=None, verbose=True, oracle=False, warmstart_oracle=0):
+              val_items=128, tok=None, verbose=True, oracle=False, warmstart_oracle=0,
+              passage=False, deterministic_write=False, vicreg_scale=0.0):
     """Train one (arm, n_pairs) config; return final (REAL, OFF, SHUFFLE) recall.
-    oracle=True bypasses the write: the answer embeddings ARE the memory (read-head
-    + metric positive control).
+    oracle=True bypasses the write: value embeddings ARE the memory (read can COPY).
+    passage=True bypasses the write: raw passage embeddings are the memory (read must
+    FIND the value among distractors — the locate-in-context positive control).
     warmstart_oracle=N: train the FIRST N steps on oracle memory (so the read becomes
     competent), then switch to the real write — the chicken-and-egg test. Use only
     with prepend arms whose memory dim == d_llama (matches the oracle's mem_proj)."""
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     cfg = ReprConfig()
     tok = tok or AutoTokenizer.from_pretrained(cfg.llama_model)
-    model = StageAModel(cfg, arm).to(dev)
+    model = StageAModel(cfg, arm, deterministic_write=deterministic_write,
+                        vicreg_scale=vicreg_scale).to(dev)
     train = iter(DataLoader(StageAKVDataset(tok, n_pairs=n_pairs, seed=0),
                             batch_size=batch_size, collate_fn=collate_stage_a))
     val = build_val(tok, n_pairs, val_items, batch_size, dev)
 
     # materialize the lazy mem-projection with one forward, THEN build the optimizer.
-    # warm-start materializes on the oracle dim (d_llama); the real arm must match it.
+    # oracle/passage/warm-start all materialize on the d_llama dim; a real arm must match it.
     boot_oracle = oracle or warmstart_oracle > 0
-    model.loss_and_recall(_to(next(train), dev), oracle_memory=boot_oracle)
+    model.loss_and_recall(_to(next(train), dev), oracle_memory=boot_oracle, passage_memory=passage)
     params = [p for p in model.parameters() if p.requires_grad]
     opt = torch.optim.AdamW(params, lr=lr)
     if verbose:
-        print(f"[stage-a] arm={arm} n_pairs={n_pairs} bs={batch_size} oracle={oracle} "
-              f"warmstart={warmstart_oracle} trainable={sum(p.numel() for p in params) / 1e6:.2f}M  dev={dev}")
+        print(f"[stage-a] arm={arm} n_pairs={n_pairs} bs={batch_size} oracle={oracle} passage={passage} "
+              f"warmstart={warmstart_oracle} det_write={deterministic_write} vicreg={vicreg_scale} "
+              f"trainable={sum(p.numel() for p in params) / 1e6:.2f}M  dev={dev}")
 
     t0 = time.time()
     for step in range(1, steps + 1):
         oracle_now = oracle or step <= warmstart_oracle
         b = _to(next(train), dev)
-        loss, rec = model.loss_and_recall(b, oracle_memory=oracle_now)
+        loss, rec = model.loss_and_recall(b, oracle_memory=oracle_now, passage_memory=passage)
         opt.zero_grad(); loss.backward()
         torch.nn.utils.clip_grad_norm_(params, 1.0); opt.step()
         if verbose and (step == 1 or step % eval_every == 0 or step == warmstart_oracle):
-            real, off, shuf = run_val(model, val, oracle=oracle_now)
-            tag = "ORACLE" if oracle_now else "REAL  "
+            real, off, shuf = run_val(model, val, oracle=oracle_now, passage=passage)
+            tag = "PASSG" if passage else ("ORACLE" if oracle_now else "REAL  ")
             print(f"  step {step:4d} [{tag}]  loss={loss.item():.3f} train_rec={rec.item():.2f} | "
                   f"val {tag.strip()}={real:.3f} OFF={off:.3f} SHUFFLE={shuf:.3f}  ({time.time() - t0:.0f}s)")
 
-    real, off, shuf = run_val(model, val, oracle=oracle)
+    real, off, shuf = run_val(model, val, oracle=oracle, passage=passage)
     if verbose:
         gap = real - max(off, shuf)
         print(f"\nFINAL  REAL={real:.3f}  OFF={off:.3f}  SHUFFLE={shuf:.3f}  (load-bearing gap={gap:+.3f})")
@@ -111,10 +115,17 @@ def main():
                     help="positive control: answer embeddings ARE the memory (tests read+metric, not write)")
     ap.add_argument("--warmstart-oracle", type=int, default=0,
                     help="train first N steps on oracle memory, then switch to the real write (chicken-and-egg test)")
+    ap.add_argument("--passage-oracle", action="store_true",
+                    help="positive control: RAW passage embeddings are the memory (tests locate-in-context read)")
+    ap.add_argument("--deterministic-write", action="store_true",
+                    help="freeze the encoder's per-step slot/init noise (fix #1 for the 11.5x SNR inversion)")
+    ap.add_argument("--vicreg", type=float, default=0.0,
+                    help="anti-collapse cross-item decorrelation weight (fix #2 for memory collapse)")
     args = ap.parse_args()
     train_one(args.arm, args.n_pairs, steps=args.steps, batch_size=args.batch_size,
               lr=args.lr, eval_every=args.eval_every, val_items=args.val_items,
-              oracle=args.oracle, warmstart_oracle=args.warmstart_oracle)
+              oracle=args.oracle, warmstart_oracle=args.warmstart_oracle, passage=args.passage_oracle,
+              deterministic_write=args.deterministic_write, vicreg_scale=args.vicreg)
 
 
 if __name__ == "__main__":

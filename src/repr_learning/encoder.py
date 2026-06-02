@@ -601,7 +601,10 @@ class ContinuousBaselineEncoder(nn.Module):
         Eval: fixed persistent eps (deterministic, still symmetry-broken)."""
         del dtype  # encoder casts to its own param dtype internally
         sigma = torch.exp(self.slot_log_sigma)
-        if self.training:
+        # deterministic_write (Stage-A diagnostic): force the fixed eval-eps even in
+        # train mode, so the slot init stops resampling per step (kills the ~11.5x
+        # slot-noise-over-content SNR inversion). Default off — main pipeline unchanged.
+        if self.training and not getattr(self, "deterministic_write", False):
             eps = torch.randn(
                 B, self.cfg.n_flat_codes, self.cfg.d_enc,
                 device=self.slot_mu.device, dtype=self.slot_mu.dtype,
@@ -1457,8 +1460,8 @@ class GraphV6BaselineEncoder(nn.Module):
         # the continuous/MT deterministic-eval-noise convention, v5.4 fix #2).
         # Without this, graph_v6 eval drew from the global RNG (gen=None) and
         # graph init changed between eval runs.
-        if seed is None and not self.training:
-            seed = 1234
+        if seed is None and (not self.training or getattr(self, "deterministic_write", False)):
+            seed = 1234   # deterministic_write (Stage-A): freeze graph init noise in train too
         if seed is not None:
             gen = torch.Generator(device=device)
             gen.manual_seed(int(seed))
