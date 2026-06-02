@@ -47,7 +47,9 @@ RELATIONS = [
     ("second-grade teacher", _person), ("hometown", _place), ("best friend", _person),
     ("mentor", _person), ("birthplace", _place), ("employer", _plain), ("pet", _person),
     ("favorite dish", _plain), ("neighbor", _person), ("alma mater", _plain),
-    ("manager", _person), ("birth city", _place),
+    ("manager", _person), ("birth city", _place), ("dentist", _person),
+    ("landlord", _person), ("favorite author", _person), ("primary school", _plain),
+    ("childhood street", _place), ("first employer", _plain),
 ]
 
 PASSAGE_TEMPLATES = [
@@ -78,6 +80,11 @@ class StageAKVDataset(IterableDataset):
         self.max_passage_tok = max_passage_tok
         self.rels_per_owner = rels_per_owner
         self.eos = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 2
+        # capacity check: n_owners * |relations| distinct (owner,relation) keys must cover n_pairs
+        n_owners = max(1, -(-n_pairs // rels_per_owner))
+        cap = n_owners * len(RELATIONS)
+        assert n_pairs <= cap, (f"n_pairs={n_pairs} exceeds capacity {cap} "
+                                f"(raise rels_per_owner or add RELATIONS)")
 
     def _ids(self, s: str) -> List[int]:
         return self.tok(s, add_special_tokens=False).input_ids
@@ -95,6 +102,7 @@ class StageAKVDataset(IterableDataset):
                 continue
             used.add((owner, rel))
             facts.append((owner, rel, vfn(rng)))
+        assert len(facts) == self.n_pairs, f"guard tripped: {len(facts)}/{self.n_pairs} facts"
 
         order = list(range(len(facts)))
         rng.shuffle(order)
@@ -111,13 +119,16 @@ class StageAKVDataset(IterableDataset):
                           {"owners": owners, "facts": facts, "passage": passage})
 
     def __iter__(self):
-        rng = random.Random(self.seed)
+        wi = torch.utils.data.get_worker_info()           # distinct stream per worker
+        rng = random.Random(self.seed + (wi.id if wi is not None else 0))
         for _ in range(self.n_items):
             yield self._gen(rng)
 
 
-def collate_stage_a(batch: List[StageAItem], pad_id: int = 0) -> dict:
+def collate_stage_a(batch: List[StageAItem], pad_id: int = 128_001) -> dict:
+    # pad_id default = Llama-3 pad token (NOT 0, which is a real BPE piece).
     B, P = len(batch), len(batch[0].key_ids)
+    assert all(len(x.key_ids) == P for x in batch), "items in a batch have differing #pairs"
     Tp = max(x.passage_ids.numel() for x in batch)
     Tk = max(k.numel() for x in batch for k in x.key_ids)
     Tv = max(v.numel() for x in batch for v in x.val_ids)
