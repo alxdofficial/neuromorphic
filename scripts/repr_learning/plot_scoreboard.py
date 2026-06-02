@@ -61,6 +61,12 @@ def _collect_outputs_root(out_root: Path, out_tag: str) -> dict:
         if row is None:
             print(f"[warn] {label}: no val rows in {path}")
             continue
+        if int(row.get("step", 0)) == 0:
+            # A single step-0 row = an untrained snapshot (e.g. the full-context
+            # ceiling logged its val once at init); not a real best.pt. Skip so
+            # it doesn't masquerade as a converged point.
+            print(f"[warn] {label}: only an untrained step-0 row — skipping")
+            continue
         out[label] = {
             "color": color,
             "group": group,
@@ -73,62 +79,59 @@ def _collect_outputs_root(out_root: Path, out_tag: str) -> dict:
 
 
 def plot_3d(data: dict, out_path: Path) -> None:
+    # A clean 2D bubble chart conveys all three quantities far more legibly than
+    # a matplotlib 3D scatter: x = steps-to-best (← faster), y = answer-NLL
+    # (↓ lower = better), bubble AREA ∝ top-1. (Kept the function name/filename
+    # for callers; the old 3D render was unreadable.)
     import matplotlib.pyplot as plt
-    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  (registers projection)
 
-    # Single 3D scatter: x=best_step, y=val_recon, z=top1.
-    # x and y both reversed so the "good corner" — fast convergence, low
-    # loss, high top-1 — ends up at the front-right-top of the box.
-    fig = plt.figure(figsize=(11, 8))
-    ax = fig.add_subplot(111, projection="3d")
-
+    fig, ax = plt.subplots(figsize=(10.5, 6.8))
     for label, d in data.items():
+        top1 = d["top1"] * 100.0
         marker = "D" if d["group"] == "graph_v6" else "o"
-        ax.scatter(
-            [d["step"]], [d["val_recon"]], [d["top1"] * 100.0],
-            c=[d["color"]], s=180, marker=marker,
-            edgecolors="#222", linewidths=0.6,
-            label=label, depthshade=False,
-        )
-        short = label.split(" (")[0]
-        ax.text(d["step"], d["val_recon"], d["top1"] * 100.0 + 1.3,
-                short, fontsize=10, ha="center")
-
-    ax.set_xlabel("steps to best.pt", labelpad=8)
-    ax.set_ylabel("val_recon (lower = better)", labelpad=8)
-    ax.set_zlabel("top-1 accuracy (%)", labelpad=8)
-    ax.invert_xaxis()
+        ax.scatter(d["step"], d["val_recon"], s=140 + 26 * top1,
+                   c=[d["color"]], marker=marker, edgecolors="#222",
+                   linewidths=0.9, alpha=0.88, zorder=3)
+        ax.annotate(f"{label.split(' (')[0]}  ·  top-1 {top1:.0f}%",
+                    (d["step"], d["val_recon"]), textcoords="offset points",
+                    xytext=(9, 9), fontsize=9, zorder=4)
+    ax.set_xlabel("steps to best.pt  (← faster convergence)")
+    ax.set_ylabel("answer-NLL at best.pt  (↓ lower = better)")
     ax.invert_yaxis()
-    # Tilt + spin so the "good" corner (low step, low val_recon, high top1)
-    # is front-and-up. azim=-60 + elev=20 puts that corner toward the
-    # viewer; with x and y both inverted it lands on the top-right.
-    ax.view_init(elev=22, azim=-60)
-    ax.set_title("Scoreboard: best_step × val_recon × top-1\n"
-                 "(good corner = front-right-top)")
-    ax.legend(loc="upper left", fontsize=9, bbox_to_anchor=(0.02, 0.98))
+    ax.grid(alpha=0.22, zorder=0)
+    ax.set_title("Scoreboard — convergence × answer-NLL × top-1 (bubble area)\n"
+                 "v2.1 fair sweep, hard families")
     fig.tight_layout()
-    fig.savefig(out_path, dpi=130)
+    fig.savefig(out_path, dpi=140)
     print(f"[output] wrote {out_path}")
+
+
+def _collapse_families(per_family: dict) -> dict:
+    """Aggregate the 10 babilong_qaN sub-tasks into one n-weighted ``babilong``
+    bar (the v2.1 mix logs them split); keep every other family as-is."""
+    out, bab_loss, bab_n = {}, 0.0, 0
+    for fam, v in per_family.items():
+        ml = v.get("mean_loss")
+        if ml is None:
+            continue
+        if fam.startswith("babilong"):
+            n = v.get("n", 1)
+            bab_loss += ml * n
+            bab_n += n
+        else:
+            out[fam] = ml
+    if bab_n:
+        out["babilong"] = bab_loss / bab_n
+    return out
 
 
 def plot_per_family(data: dict, out_path: Path) -> None:
     import matplotlib.pyplot as plt
 
-    # narrative_qa is dropped at the current chunk_size=4096 tranche:
-    # the NarrativeQA story doesn't fit, so the per-family loss reflects
-    # truncation rather than comprehension. Will become informative at
-    # the 8K / 16K tranches.
-    EXCLUDE = {"narrative_qa"}
-
-    # Union of families across variants. Preserve roughly stable order with
-    # composite_v1's 9 first, then external corpora (hotpot_qa).
-    canonical_order = [
-        "biographical", "hotpot_qa", "boxes", "calendar", "preferences",
-        "theory_of_mind", "knights", "triage", "revisions", "passphrase",
-    ]
-    all_families = set()
-    for d in data.values():
-        all_families.update(k for k in d["per_family"].keys() if k not in EXCLUDE)
+    # The actual v2.1 hard-family mix (NOT the old composite-subtask list).
+    canonical_order = ["biographical", "hotpot_qa", "musique", "narrative_qa", "babilong"]
+    collapsed = {lbl: _collapse_families(d["per_family"]) for lbl, d in data.items()}
+    all_families = set().union(*collapsed.values()) if collapsed else set()
     families = [f for f in canonical_order if f in all_families]
     for f in sorted(all_families - set(canonical_order)):
         families.append(f)
@@ -139,10 +142,10 @@ def plot_per_family(data: dict, out_path: Path) -> None:
     x = np.arange(n_fam)
     bar_w = 0.8 / max(n_var, 1)
 
-    fig, ax = plt.subplots(figsize=(max(12, 1.0 * n_fam), 5.5))
+    fig, ax = plt.subplots(figsize=(max(11, 1.6 * n_fam), 5.5))
     for vi, vlabel in enumerate(variants):
         d = data[vlabel]
-        ys = [d["per_family"].get(f, {}).get("mean_loss", np.nan) for f in families]
+        ys = [collapsed[vlabel].get(f, np.nan) for f in families]
         offset = (vi - (n_var - 1) / 2) * bar_w
         bars = ax.bar(x + offset, ys, bar_w,
                       label=vlabel, color=d["color"],
