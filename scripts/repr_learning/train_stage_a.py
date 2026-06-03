@@ -50,7 +50,7 @@ def run_val(model, val_batches, oracle=False, passage=False):
 
 def train_one(arm, n_pairs, steps=600, batch_size=16, lr=1e-3, eval_every=100,
               val_items=128, tok=None, verbose=True, oracle=False, warmstart_oracle=0,
-              passage=False, deterministic_write=False, vicreg_scale=0.0):
+              passage=False, deterministic_write=False, vicreg_scale=0.0, recon_weight=0.0):
     """Train one (arm, n_pairs) config; return final (REAL, OFF, SHUFFLE) recall.
     oracle=True bypasses the write: value embeddings ARE the memory (read can COPY).
     passage=True bypasses the write: raw passage embeddings are the memory (read must
@@ -62,7 +62,7 @@ def train_one(arm, n_pairs, steps=600, batch_size=16, lr=1e-3, eval_every=100,
     cfg = ReprConfig()
     tok = tok or AutoTokenizer.from_pretrained(cfg.llama_model)
     model = StageAModel(cfg, arm, deterministic_write=deterministic_write,
-                        vicreg_scale=vicreg_scale).to(dev)
+                        vicreg_scale=vicreg_scale, recon_weight=recon_weight).to(dev)
     train = iter(DataLoader(StageAKVDataset(tok, n_pairs=n_pairs, seed=0),
                             batch_size=batch_size, collate_fn=collate_stage_a))
     val = build_val(tok, n_pairs, val_items, batch_size, dev)
@@ -76,7 +76,7 @@ def train_one(arm, n_pairs, steps=600, batch_size=16, lr=1e-3, eval_every=100,
     if verbose:
         print(f"[stage-a] arm={arm} n_pairs={n_pairs} bs={batch_size} oracle={oracle} passage={passage} "
               f"warmstart={warmstart_oracle} det_write={deterministic_write} vicreg={vicreg_scale} "
-              f"trainable={sum(p.numel() for p in params) / 1e6:.2f}M  dev={dev}")
+              f"recon={recon_weight} trainable={sum(p.numel() for p in params) / 1e6:.2f}M  dev={dev}")
 
     t0 = time.time()
     for step in range(1, steps + 1):
@@ -121,11 +121,14 @@ def main():
                     help="freeze the encoder's per-step slot/init noise (fix #1 for the 11.5x SNR inversion)")
     ap.add_argument("--vicreg", type=float, default=0.0,
                     help="anti-collapse cross-item decorrelation weight (fix #2 for memory collapse)")
+    ap.add_argument("--recon-weight", type=float, default=0.0,
+                    help="passage-reconstruction objective weight (force the write to encode its input)")
     args = ap.parse_args()
     train_one(args.arm, args.n_pairs, steps=args.steps, batch_size=args.batch_size,
               lr=args.lr, eval_every=args.eval_every, val_items=args.val_items,
               oracle=args.oracle, warmstart_oracle=args.warmstart_oracle, passage=args.passage_oracle,
-              deterministic_write=args.deterministic_write, vicreg_scale=args.vicreg)
+              deterministic_write=args.deterministic_write, vicreg_scale=args.vicreg,
+              recon_weight=args.recon_weight)
 
 
 if __name__ == "__main__":
