@@ -50,7 +50,7 @@ def run_val(model, val_batches, oracle=False, passage=False):
 
 def train_one(arm, n_pairs, steps=600, batch_size=16, lr=1e-3, eval_every=100,
               val_items=128, tok=None, verbose=True, oracle=False, warmstart_oracle=0,
-              passage=False, deterministic_write=False, vicreg_scale=0.0, recon_weight=0.0):
+              passage=False, deterministic_write=False, recon_weight=0.0):
     """Train one (arm, n_pairs) config; return final (REAL, OFF, SHUFFLE) recall.
     oracle=True bypasses the write: value embeddings ARE the memory (read can COPY).
     passage=True bypasses the write: raw passage embeddings are the memory (read must
@@ -58,11 +58,16 @@ def train_one(arm, n_pairs, steps=600, batch_size=16, lr=1e-3, eval_every=100,
     warmstart_oracle=N: train the FIRST N steps on oracle memory (so the read becomes
     competent), then switch to the real write — the chicken-and-egg test. Use only
     with prepend arms whose memory dim == d_llama (matches the oracle's mem_proj)."""
+    # warm-start materializes the read's LazyLinear mem_proj on oracle memory (d_llama=2048);
+    # graph fact-tokens are d_read=512, so a graph warm-start would crash at the switch.
+    assert not (warmstart_oracle > 0 and arm == "graph_v6_baseline"), (
+        "warmstart-oracle is incompatible with graph_v6 (mem_proj fixes at d_llama=2048, "
+        "real graph memory is d_read=512); use a prepend arm or drop --warmstart-oracle")
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     cfg = ReprConfig()
     tok = tok or AutoTokenizer.from_pretrained(cfg.llama_model)
     model = StageAModel(cfg, arm, deterministic_write=deterministic_write,
-                        vicreg_scale=vicreg_scale, recon_weight=recon_weight).to(dev)
+                        recon_weight=recon_weight).to(dev)
     train = iter(DataLoader(StageAKVDataset(tok, n_pairs=n_pairs, seed=0),
                             batch_size=batch_size, collate_fn=collate_stage_a))
     val = build_val(tok, n_pairs, val_items, batch_size, dev)
@@ -75,7 +80,7 @@ def train_one(arm, n_pairs, steps=600, batch_size=16, lr=1e-3, eval_every=100,
     opt = torch.optim.AdamW(params, lr=lr)
     if verbose:
         print(f"[stage-a] arm={arm} n_pairs={n_pairs} bs={batch_size} oracle={oracle} passage={passage} "
-              f"warmstart={warmstart_oracle} det_write={deterministic_write} vicreg={vicreg_scale} "
+              f"warmstart={warmstart_oracle} det_write={deterministic_write} "
               f"recon={recon_weight} trainable={sum(p.numel() for p in params) / 1e6:.2f}M  dev={dev}")
 
     t0 = time.time()
@@ -119,16 +124,13 @@ def main():
                     help="positive control: RAW passage embeddings are the memory (tests locate-in-context read)")
     ap.add_argument("--deterministic-write", action="store_true",
                     help="freeze the encoder's per-step slot/init noise (fix #1 for the 11.5x SNR inversion)")
-    ap.add_argument("--vicreg", type=float, default=0.0,
-                    help="anti-collapse cross-item decorrelation weight (fix #2 for memory collapse)")
     ap.add_argument("--recon-weight", type=float, default=0.0,
                     help="passage-reconstruction objective weight (force the write to encode its input)")
     args = ap.parse_args()
     train_one(args.arm, args.n_pairs, steps=args.steps, batch_size=args.batch_size,
               lr=args.lr, eval_every=args.eval_every, val_items=args.val_items,
               oracle=args.oracle, warmstart_oracle=args.warmstart_oracle, passage=args.passage_oracle,
-              deterministic_write=args.deterministic_write, vicreg_scale=args.vicreg,
-              recon_weight=args.recon_weight)
+              deterministic_write=args.deterministic_write, recon_weight=args.recon_weight)
 
 
 if __name__ == "__main__":

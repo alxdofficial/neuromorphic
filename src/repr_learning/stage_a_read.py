@@ -102,13 +102,12 @@ class PrefixLMReadHead(nn.Module):
 
 
 class StageAModel(nn.Module):
-    def __init__(self, cfg: ReprConfig, arm: str, d_read: int = 256, max_answer: int = 320,
+    def __init__(self, cfg: ReprConfig, arm: str, d_read: int = 256, max_answer: int = 512,
                  bos_id: int = 128_000, deterministic_write: bool = False,
-                 vicreg_scale: float = 0.0, recon_weight: float = 0.0):
+                 recon_weight: float = 0.0):
         super().__init__()
         self.cfg, self.arm = cfg, arm
         self.bos_id = bos_id
-        self.vicreg_scale = vicreg_scale                                   # legacy anti-collapse (off by default)
         self.recon_weight = recon_weight                                   # passage-reconstruction objective
         self.encoder = ARM_CLASSES[arm](cfg)                               # the WRITE (trainable)
         if deterministic_write:

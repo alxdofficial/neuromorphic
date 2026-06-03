@@ -136,7 +136,7 @@ class StageAKVDataset(IterableDataset):
     """Infinite stream of (passage, [(question, value)…]) items at a fixed ``n_pairs``."""
 
     def __init__(self, tokenizer, n_pairs: int = 4, seed: int = 0,
-                 n_items: int = 1_000_000, max_passage_tok: int = 256,
+                 n_items: int = 1_000_000, max_passage_tok: int = 512,
                  rels_per_owner: int = 8):
         self.tok = tokenizer
         self.n_pairs = n_pairs
@@ -155,7 +155,11 @@ class StageAKVDataset(IterableDataset):
 
     def _gen(self, rng: random.Random) -> StageAItem:
         n_owners = max(1, -(-self.n_pairs // self.rels_per_owner))  # ceil
-        owners = [coined_word(rng, rng.choice([1, 2])) for _ in range(n_owners)]
+        owners, seen = [], set()                                   # UNIQUE owners: duplicates would
+        while len(owners) < n_owners:                              # shrink (owner,relation) capacity
+            w = coined_word(rng, rng.choice([1, 2]))               # and trip the n_pairs assert
+            if w not in seen:
+                seen.add(w); owners.append(w)
         facts, used = [], set()
         guard = 0
         while len(facts) < self.n_pairs and guard < 2000:
@@ -174,7 +178,12 @@ class StageAKVDataset(IterableDataset):
         passage = " ".join(
             rng.choice(RELATIONS[facts[i][1]]["passage"]).format(o=facts[i][0], v=facts[i][2])
             for i in order)
-        pid = self._ids(passage)[:self.max_passage_tok]
+        pid = self._ids(passage)
+        # NO silent truncation: every queried fact must remain in the passage, else its
+        # coined value is unanswerable (would be misread as a capacity limit in the sweep).
+        assert len(pid) <= self.max_passage_tok, (
+            f"passage {len(pid)} tok > max_passage_tok {self.max_passage_tok} at n_pairs={self.n_pairs}; "
+            f"raise max_passage_tok (and the read's max_answer for reconstruction)")
 
         key_ids, val_ids, meta_facts = [], [], []
         for owner, ri, val in facts:
