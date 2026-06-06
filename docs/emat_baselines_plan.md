@@ -84,3 +84,24 @@ Every arm is **an encoder that consumes a passage and emits memory tokens `[B, M
 **Wiring:** new `ICAEBaselineEncoder` in `encoder.py`; add to `ReprLearningModel.VARIANTS`; export in `__init__`. Option (A) means the encoder self-loads its base in `__init__` (no post-construction wiring needed).
 
 **Smoke gate (the safety net — required before declaring done):** forward a tiny batch → `memory.shape == [B, M, d_llama]`; backward → encoder-LoRA + slot-embed grads are finite and non-zero, base grads are None/zero; then a 200-step EMAT run must show `REAL < SHUF` separating (memory used) before scaling.
+
+---
+
+## CCM port blueprint (variant #2) — from research a15438 (CCM, Kim et al. ICLR 2024, arXiv:2312.03414, MIT)
+
+**What CCM is:** recurrent **KV-cache** compression. At step t, append `n_comp` `<COMP>` tokens to chunk c(t); they attend over c(t) + the prior memory; harvest their per-layer K,V as the step's compressed memory; fold via **concat** (grows) or **merge** `Mem(t)=(1−1/t)·Mem(t−1)+(1/t)·h(t)` (fixed). **Trainable:** a **conditional LoRA** (rank 8, alpha 16, dropout 0.05, targets **q/k/v/o**) **gated to fire ONLY on `<COMP>` positions** (`out = W·x + 1[x=COMP]·ΔW·x`) + the `<COMP>` token embeddings. Base frozen. The COMP-gate is CCM's signature (keeps text processing frozen so the model can't bypass memory).
+
+**Interface mismatch & resolution (same as ICAE):** native memory = per-layer KV (can't feed our prepend-`[M,2048]` decoder). Port = take the **COMP tokens' last-layer hidden states** as the M memory vectors. Caveat **C1**: drops per-layer KV injection → per-unit capacity `16384→2048` floats (8×) on Llama-3.2-1B; compensate with `n_comp>1`; report by floats.
+
+**Interface map (recommend MERGE fold first — fixed budget, cleanest matched comparison):**
+- `init_streaming_state` → `{mem: [B, 0 or n_comp, d], t: 0}`.
+- `streaming_write(window)` → run own-copy LoRA-Llama over `[mem_hiddens ++ window ++ COMP]`; take COMP last-layer hiddens `h_comp[B,n_comp,d]`; **merge:** `mem ← (1−1/t)·mem + (1/t)·h_comp` (fixed `M=n_comp`); **concat:** stack (`M=n_comp×n_windows`). Per-window recurrence (BPTT through the fold; checkpoint each window like the others).
+- `finalize_memory` → return `mem` (`_NormMatch`).
+
+**The hard part — COMP-gated LoRA:** a custom `CompGatedLoRALinear` wrapping the frozen base q/k/v/o Linears with `lora_A/lora_B` + a per-forward `_comp_mask [B,T,1]` (1 at COMP positions, set on all wrappers before each forward). This is more invasive than ICAE's `apply_lora_to_llama` — implement + unit-test the gate (LoRA contribution is exactly 0 at non-COMP positions).
+
+**Weight-share:** own frozen base copy (option A), as ICAE — the COMP-gate already restricts the adapter, but a separate base removes all collision ambiguity.
+
+**Config (new block):** `ccm_lora_rank=8, ccm_lora_alpha=16, ccm_lora_targets=("q_proj","k_proj","v_proj","o_proj"), ccm_n_comp` (=n_flat_codes for matched M), `ccm_fold="merge"` (vs "concat"). Recipe-faithful rank 8 (not ICAE's 32) — note rank-faithful vs LoRA-budget-matched.
+
+**Smoke gate (required):** `memory==[B,M,d]`; grads reach LoRA+COMP-embeds, base frozen; **COMP-gate unit test** (zero LoRA delta at non-COMP positions); 3-step EMAT run no-NaN; then REAL<SHUF before scaling. Reimplement in our interface (don't lift CCM's HF-attention fork); may lift `peft_custom/lora.py` comp-mask logic as reference (MIT, attribute).
