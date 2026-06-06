@@ -62,3 +62,25 @@ Every arm is **an encoder that consumes a passage and emits memory tokens `[B, M
 4. **Port CCM + Beacon**.
 5. **Run the matched-budget comparison**; report the table.
 6. **Then** the graph bind/delta redesign + re-run (where our engineering goes).
+
+---
+
+## ICAE port blueprint (variant #1)
+
+**Interface mapping (streaming encoder contract):**
+- `init_streaming_state(B, device, dtype)` → buffer that accumulates window embeds (list or growing `[B, T, d]`).
+- `streaming_write(state, win_emb, win_mask, chunk_offset)` → append `(win_emb, win_mask)` to the buffer; return `(state, {})`. (ICAE isn't natively streaming — we accumulate, then run once at finalize.)
+- `finalize_memory(state)` → concat buffer → `[B, T, d]`; append **M learnable slot embeddings** → `[B, T+M, d]`; run the **LoRA-adapted Llama** over it; take the **last-M hidden states** as `memory [B, M, d]`; `_NormMatch(d_llama)` to match token scale (same as other variants). M = `cfg.n_flat_codes` (the shared budget).
+
+**Weight-sharing decision (the crux).** ICAE's encoder = frozen base + *encoder*-LoRA; decoder = the *same* frozen base. Our `apply_lora_to_llama` is non-toggleable, so two LoRAs on one base instance would collide. Two options:
+- **(A) Separate frozen base copy for the encoder** — unambiguously faithful (encoder = full Llama + its own LoRA), zero adapter-collision risk; cost = one extra ~2.5GB bf16 base. Simplest/safest.
+- **(B) Share the single base by reference + toggleable encoder-LoRA** — memory-efficient (keeps the one-shared-Llama design) but needs `apply_lora_to_llama` to support enable/disable around the encode pass.
+- **Decision: start with (A)** for a correct first number; add (B)'s toggle as an optimization once the arm is validated. Document the extra base in the budget table.
+
+**Reuse:** `apply_lora_to_llama(rank, alpha, target_names)` (same helper the decoder uses) for the encoder-LoRA; `_NormMatch` for the output scale; `load_frozen_llama(cfg.llama_model)` for option (A)'s base.
+
+**New config fields:** `icae_lora_rank` (default 32, ICAE uses ~512 on 7B → scale down for 1B), `icae_lora_alpha`, `icae_n_slots` (default = `n_flat_codes` for matched budget).
+
+**Wiring:** new `ICAEBaselineEncoder` in `encoder.py`; add to `ReprLearningModel.VARIANTS`; export in `__init__`. Option (A) means the encoder self-loads its base in `__init__` (no post-construction wiring needed).
+
+**Smoke gate (the safety net — required before declaring done):** forward a tiny batch → `memory.shape == [B, M, d_llama]`; backward → encoder-LoRA + slot-embed grads are finite and non-zero, base grads are None/zero; then a 200-step EMAT run must show `REAL < SHUF` separating (memory used) before scaling.
