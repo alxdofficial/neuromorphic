@@ -76,15 +76,23 @@ def materialize_val_set(val_dl, n_batches: int) -> list:
     return fixed
 
 
-def run_val(model, val_set, device, n_batches: int, window_size: int) -> dict:
+def run_val(model, val_set, device, n_batches: int, window_size: int,
+            gate_batches: int = 8) -> dict:
     """Eval on a fixed val_set (list of batches from materialize_val_set).
 
     n_batches caps the iteration in case val_set has more batches than we want
     to spend time on (e.g., subsampling for a fast in-training eval). To use the
     full set, pass n_batches >= len(val_set).
+
+    gate_batches: on the FIRST `gate_batches` val batches, additionally compute
+    the SHUF (rolled-batch memory) and OFF (zero memory) controls so each eval
+    reports the binding gate REAL ≪ SHUF ≪ OFF. Capped because each control is a
+    full extra encode+decode (3× cost). SHUF is skipped for a B==1 batch.
     """
     model.train(False)
     losses, accs, per_fam_stats = [], [], {}
+    # REAL/SHUF/OFF binding gate, accumulated over the first gate_batches.
+    shuf_abs, shuf_gap, off_abs, off_gap = [], [], [], []
     last_mp_cos: float | None = None  # eval-only telemetry (gated in MP readout)
     last_v5_eval: dict[str, float] = {}  # eval-only encoder telemetry
     last_v6_eval: dict[str, float] = {}  # graph_v6 eval-only health telemetry
@@ -105,6 +113,20 @@ def run_val(model, val_set, device, n_batches: int, window_size: int) -> dict:
             out = model.compute_qa_loss(batch, window_size=window_size)
         losses.append(float(out["loss_recon"]))
         accs.append(float(out["top1_acc"]))
+        # REAL/SHUF/OFF binding gate on the first gate_batches (3× cost → capped).
+        # Positive gap = memory helps (control loss higher than REAL).
+        if i < gate_batches:
+            real_l = float(out["loss_recon"])
+            with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                off = model.compute_qa_loss(batch, window_size=window_size,
+                                            zero_memory=True)
+                off_abs.append(float(off["loss_recon"]))
+                off_gap.append(float(off["loss_recon"]) - real_l)
+                if batch.context_ids.shape[0] > 1:
+                    shuf = model.compute_qa_loss(batch, window_size=window_size,
+                                                 shuffle_memory=True)
+                    shuf_abs.append(float(shuf["loss_recon"]))
+                    shuf_gap.append(float(shuf["loss_recon"]) - real_l)
         # Capture v5.4 oversmoothing canary from the last batch's last MP round.
         # Only populated in eval (MP readout gates the K×K matmul off in train).
         arr = out.get("graph_v5_mp_buf_cross_node_cos_per_round")
@@ -152,6 +174,13 @@ def run_val(model, val_set, device, n_batches: int, window_size: int) -> dict:
         "val_n_batches": len(losses),
         "val_per_family": fam_summary,
     }
+    # REAL/SHUF/OFF binding gate (subset means + per-batch gap vs REAL).
+    if off_abs:
+        result["val_loss_recon_off"] = sum(off_abs) / len(off_abs)
+        result["val_off_minus_real"] = sum(off_gap) / len(off_gap)
+    if shuf_abs:
+        result["val_loss_recon_shuf"] = sum(shuf_abs) / len(shuf_abs)
+        result["val_shuf_minus_real"] = sum(shuf_gap) / len(shuf_gap)
     if last_mp_cos is not None:
         result["val_graph_v5_mp_buf_cross_node_cos_final"] = last_mp_cos
     for k, v in last_v5_eval.items():
