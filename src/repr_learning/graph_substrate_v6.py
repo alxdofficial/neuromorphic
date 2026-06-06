@@ -182,25 +182,29 @@ class GraphV6Gate(nn.Module):
 # READ Stage A: directional FiLM-by-state fact-token builder
 # ─────────────────────────────────────────────────────────────────────────
 class GraphV6FactBuilder(nn.Module):
-    """fact = post-MLP( (1 + gamma(state)) ⊙ h + beta(state) ),  h = gelu(W_src·src + W_dst·dst).
+    """fact = post-MLP( LN( (W_src·src) ⊙ (W_dst·dst) ⊙ (1 + W_rel·state) ) ).
 
-    `state` modulates (multiplier) so it cannot be routed around; W_src != W_dst encodes
-    direction. (1+gamma) with film-output zero-init => fact ≈ h at init (transparent
-    relation), then learns to modulate. Returns fact_value [B, K_edge, d_read]; the reader
-    does its own (multi-head) key/value projection, so no separate fact_key is needed."""
+    BIND (multiplicative), replacing the old ADDITIVE FiLM pool
+    `h = gelu(W_src·src + W_dst·dst)` then FiLM-by-state. The elementwise
+    (Hadamard) product of role-specific projections is an order-aware
+    multiplicative bind — W_src ≠ W_dst encode direction, and ⊙ binds
+    which-src-with-which-dst-with-which-relation — so each fact token distinctly
+    encodes its (subject, relation, object) instead of smearing them into a SUM
+    (the membership→binding fix: a multiply preserves which-with-which where the
+    add averages it away). `(1 + W_rel·state)`: zero-init W_rel ⇒ relation
+    transparent at init (fact ≈ src⊙dst) and W_rel still gets gradient from
+    step 0; it then MODULATES multiplicatively — un-ignorable, can't null a fact
+    (same role the old (1+gamma) FiLM played). Returns [B, K_edge, d_read].
+    film_hidden kept only for call-site compatibility (unused)."""
 
     def __init__(self, d_node: int, d_state: int, d_read: int,
                  film_hidden: int = 512, mlp_hidden: int = 768):
         super().__init__()
         self.W_src = nn.Linear(d_node, d_read)
         self.W_dst = nn.Linear(d_node, d_read)
-        self.film = nn.Sequential(
-            nn.Linear(d_state, film_hidden), nn.GELU(),
-            nn.Linear(film_hidden, film_hidden), nn.GELU(),
-            nn.Linear(film_hidden, 2 * d_read),
-        )
-        nn.init.zeros_(self.film[-1].weight)   # gamma=beta=0 at init -> fact = h (transparent)
-        nn.init.zeros_(self.film[-1].bias)
+        self.W_rel = nn.Linear(d_state, d_read)
+        nn.init.zeros_(self.W_rel.weight)   # relation transparent at init: (1+0)=1
+        nn.init.zeros_(self.W_rel.bias)
         self.fact_norm = nn.LayerNorm(d_read)
         self.mlp_norm = nn.LayerNorm(d_read)
         self.mlp = nn.Sequential(nn.Linear(d_read, mlp_hidden), nn.GELU(),
@@ -209,12 +213,14 @@ class GraphV6FactBuilder(nn.Module):
 
     def forward(self, src_ep: Tensor, dst_ep: Tensor, state: Tensor,
                 zero_state: bool = False) -> Tensor:
-        # src_ep/dst_ep: [B, K_edge, d_node] (materialized endpoints); state: [B,K_edge,d_state]
-        h = F.gelu(self.W_src(src_ep) + self.W_dst(dst_ep))      # [B, K_edge, d_read], directional
+        # src_ep/dst_ep: [B, K_edge, d_node]; state: [B, K_edge, d_state]
         st = torch.zeros_like(state) if zero_state else state    # state-ablation probe hook
-        gamma, beta = self.film(st).chunk(2, dim=-1)
-        fact = self.fact_norm((1.0 + gamma) * h + beta)
-        fact = fact + self.mlp(self.mlp_norm(fact))              # post-FiLM residual MLP
+        k_src = self.W_src(src_ep)                               # [B, K_edge, d_read]
+        k_dst = self.W_dst(dst_ep)
+        k_rel = self.W_rel(st)
+        bind = k_src * k_dst * (1.0 + k_rel)                     # multiplicative BIND
+        fact = self.fact_norm(bind)                             # LN tames the product magnitude
+        fact = fact + self.mlp(self.mlp_norm(fact))            # per-token residual refine
         return fact
 
 
