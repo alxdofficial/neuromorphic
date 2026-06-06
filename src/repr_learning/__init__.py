@@ -14,6 +14,7 @@ from .encoder import (
     FlatBaselineEncoder,
     FullContextEncoder,
     GraphV6BaselineEncoder,
+    ICAEBaselineEncoder,
     MemorizingBaselineEncoder,
     NullEncoder,
     RecurrentBaselineEncoder,
@@ -27,6 +28,7 @@ __all__ = [
     "MemorizingBaselineEncoder",
     "RecurrentBaselineEncoder",
     "GraphV6BaselineEncoder",
+    "ICAEBaselineEncoder",
     "NullEncoder",
     "FullContextEncoder",
 ]

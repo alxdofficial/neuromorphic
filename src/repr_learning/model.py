@@ -20,6 +20,7 @@ from .encoder import (
     FlatBaselineEncoder,
     FullContextEncoder,
     GraphV6BaselineEncoder,
+    ICAEBaselineEncoder,
     MemorizingBaselineEncoder,
     NullEncoder,
     RecurrentBaselineEncoder,
@@ -47,6 +48,7 @@ class ReprLearningModel(nn.Module):
         "memorizing_baseline": MemorizingBaselineEncoder,
         "recurrent_baseline": RecurrentBaselineEncoder,
         "graph_v6_baseline": GraphV6BaselineEncoder,
+        "icae_baseline": ICAEBaselineEncoder,  # ICAE (ICLR'24) compressor, EMAT-retrained
         "vanilla_llama": NullEncoder,         # loss floor — Llama with no memory
         "vanilla_full_context": FullContextEncoder,  # loss ceiling — Llama sees full evidence
     }
@@ -648,8 +650,15 @@ class ReprLearningModel(nn.Module):
         # row is decoded with another row's memory. Applied AFTER the MT
         # retrieve so the retrieved bank is mismatched too. REAL ≫ SHUF ⇒ the
         # memory is actually used; REAL ≈ SHUF ⇒ ignored. zero_memory wins.
+        # Guard B>1: roll-by-1 at B==1 is identity → SHUF==REAL silently (the
+        # control gives zero signal). Require batched eval for a valid SHUF.
         if shuffle_memory and not zero_memory and M > 0:
-            memory = torch.roll(memory, shifts=1, dims=0)
+            if B > 1:
+                memory = torch.roll(memory, shifts=1, dims=0)
+            else:
+                raise ValueError(
+                    "shuffle_memory (SHUF control) needs batch size > 1; "
+                    "roll-by-1 at B==1 is a no-op (SHUF would equal REAL).")
 
         # zero_memory ablation: for prepend variants we DROP the memory
         # slots entirely (M=0) so the question starts at RoPE position 0,

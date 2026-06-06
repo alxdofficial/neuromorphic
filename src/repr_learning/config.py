@@ -170,6 +170,14 @@ class ReprConfig:
     # Names of Linear submodules to wrap. Default targets attention Q+V.
     llama_lora_target_names: tuple = ("q_proj", "v_proj")
 
+    # ── ICAE baseline (In-Context Autoencoder, Ge et al. ICLR 2024) ─────────
+    # Encoder = a SEPARATE frozen base copy + its OWN encoder-LoRA + M slots
+    # (option A, docs/emat_baselines_plan.md). Distinct from the decoder LoRA
+    # above so the two adapters can't collide on a shared base.
+    icae_lora_rank: int = 32
+    icae_lora_alpha: int = 64       # scale = alpha / rank = 2.0
+    icae_n_slots: int = 0           # 0 ⇒ fall back to n_flat_codes (matched budget)
+
     # ── Activation efficiency ───────────────────────────────────────────────
     # Activation-checkpoint each streaming-write window so we don't retain all
     # n_windows of encoder activations for one backward. This is what makes the
