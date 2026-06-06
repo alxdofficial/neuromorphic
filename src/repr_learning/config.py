@@ -188,6 +188,17 @@ class ReprConfig:
     ccm_n_comp: int = 0             # <COMP> tokens per step; 0 ⇒ n_flat_codes
     ccm_fold: str = "merge"         # "merge" (1/t mean, fixed M) | "concat" (grows)
 
+    # ── Beacon baseline (Activation Beacon, Zhang et al. BAAI, arXiv:2401.03462)
+    # SEPARATE full beacon q/k/v projections per layer (cloned-init from base,
+    # NOT LoRA — this is Beacon's distinguishing axis vs CCM) routed to beacon
+    # token positions; interleaved beacons (one per α-unit); streaming concat.
+    # Port reads beacon last-layer hiddens as the M memory vectors. Trainable is
+    # heavy (~100M on 1B with q,k,v) — that's faithful; report it. Drop to
+    # ("k","v") or fewer to shrink.
+    beacon_param: tuple = ("q", "k", "v")   # which projections get a separate beacon copy
+    beacon_ratio: int = 0                   # condensing ratio α (beacons/window=W/α); 0 ⇒ auto from n_flat_codes
+    beacon_window: int = 0                  # 0 ⇒ use trainer window_size
+
     # ── Activation efficiency ───────────────────────────────────────────────
     # Activation-checkpoint each streaming-write window so we don't retain all
     # n_windows of encoder activations for one backward. This is what makes the
