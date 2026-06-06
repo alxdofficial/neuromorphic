@@ -243,10 +243,21 @@ def save_checkpoint(model, opt, step, path: Path, **extras):
     """
     path.parent.mkdir(parents=True, exist_ok=True)
 
+    # Save TRAINABLE params + small buffers only; DROP frozen backbone weights —
+    # the decoder's Llama AND each encoder's own frozen base copy (ICAE/CCM/Beacon
+    # option-A). Keying on requires_grad (not a name prefix) is required because
+    # the CCM/Beacon adapters live INSIDE encoder.base.* (they wrap the base
+    # linears). Without dropping the frozen encoder base, every ckpt persists a
+    # 2nd frozen 1B (~GBs) → kills overnight sweeps on disk/I-O. Frozen weights are
+    # reconstructed from the pretrained backbone on load (load is strict=False).
+    trainable = {n for n, p in model.named_parameters() if p.requires_grad}
+
     def keep(k: str) -> bool:
-        if not k.startswith("decoder.llama."):
+        if k in trainable:
             return True
-        return "lora_" in k
+        if k.startswith("decoder.llama.") or k.startswith("encoder.base."):
+            return False
+        return True
 
     payload = {
         "step": step,

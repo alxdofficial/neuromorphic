@@ -1181,15 +1181,17 @@ class ICAEBaselineEncoder(nn.Module):
         attn = torch.cat([mask, slot_mask], dim=1).long()    # HF: 1=attend
         # Inner LlamaModel → last_hidden_state (skip the lm_head). Causal mask
         # means the appended slots (at the END) attend over all passage tokens.
-        # grad_checkpoint_llama: HF's per-layer checkpointing is gated on
-        # base.training (forced False here), so we explicitly checkpoint the
-        # whole base forward instead — otherwise the flag is a silent no-op and
-        # a long-context 1B encoder pass OOMs (adversarial review I2).
+        # ALWAYS activation-checkpoint the heavy 1B base forward under training
+        # (auto-skips under eval no_grad). HF's per-layer ckpt is gated on
+        # base.training=False here, and the trainer only checkpoints
+        # streaming_write (which for ICAE is just a cat), so without this the
+        # whole-passage finalize forward is un-checkpointed and OOMs at chunk
+        # 8192 (dual-review HIGH). No longer gated on the dead grad_checkpoint
+        # _llama flag — the previous gating made it a silent no-op.
         def _run_base(inp_, attn_):
             return self.base.model(inputs_embeds=inp_,
                                    attention_mask=attn_).last_hidden_state
-        if (self.training and torch.is_grad_enabled()
-                and getattr(self.cfg, "grad_checkpoint_llama", False)):
+        if self.training and torch.is_grad_enabled():
             import torch.utils.checkpoint as _ckpt
             h = _ckpt.checkpoint(_run_base, inp, attn, use_reentrant=False)
         else:
@@ -1224,10 +1226,10 @@ class _CompGatedLoRALinear(nn.Module):
         m = self._mask[0]
         if m is None:
             return out
-        A = self.lora_A.to(x.dtype)
-        B = self.lora_B.to(x.dtype)
-        delta = (x @ A.t()) @ B.t()                   # [B, T, out_f]
-        return out + m.to(out.dtype) * self.scale * delta
+        # Compute the low-rank update in fp32 (matching the decoder's LoRALinear)
+        # so CCM and ICAE differ only in mechanism, not adapter precision.
+        delta = (x.to(self.lora_A.dtype) @ self.lora_A.t()) @ self.lora_B.t()
+        return out + m.to(out.dtype) * self.scale * delta.to(out.dtype)
 
 
 class CCMBaselineEncoder(nn.Module):
