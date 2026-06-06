@@ -1,15 +1,15 @@
 """Encoder modules: V2.1 + four baselines.
 
 All five share a common bidirectional transformer over the input text
-(except RecurrentBaselineEncoder which uses Mamba). They differ in how
+(except MambaBaselineEncoder which uses Mamba). They differ in how
 the encoder output is turned into memory tokens for frozen Llama.
 
 V2.1Encoder              : 32 edges = (src_id, dst_id, edge_vec) triples
-FlatBaselineEncoder      : 96 independent code picks, no edge structure
-ContinuousBaselineEncoder: 96 continuous vectors, no quantization
-MemorizingBaselineEncoder: per-token KV bank, query from unmasked positions,
+VQVAEBaselineEncoder      : 96 independent code picks, no edge structure
+SlotAttentionBaselineEncoder: 96 continuous vectors, no quantization
+MemorizingTransformerBaselineEncoder: per-token KV bank, query from unmasked positions,
                            top-96 retrieved (Memorising-Transformers-style)
-RecurrentBaselineEncoder : Mamba SSM over 256 tokens, pool to 96
+MambaBaselineEncoder : Mamba SSM over 256 tokens, pool to 96
 
 All five return:
     memory_tokens : [B, n_memory_tokens, d_llama]
@@ -320,7 +320,7 @@ class _SlotSelfAttn(nn.Module):
         return slots
 
 
-class FlatBaselineEncoder(nn.Module):
+class VQVAEBaselineEncoder(nn.Module):
     """Baseline A: flat classification, 96 independent codes per window.
 
     No edge structure, no triples. 96 slot queries each pick one of 4096
@@ -368,6 +368,16 @@ class FlatBaselineEncoder(nn.Module):
             nn.Linear(cfg.d_llama // 2, cfg.d_llama),
             _NormMatch(cfg.d_llama),     # v2.2: norm-match to Llama token scale (was LayerNorm → 49× OOD)
         )
+        # ── DKVB K/V split: persistent KEY codebook (decoupled address) + key projection ──
+        if getattr(cfg, "vqvae_kv_split", False):
+            # data-independent address table that ROUTES selection; concept_id becomes the pure VALUE.
+            self.key_codebook = nn.Parameter(
+                torch.randn(cfg.n_nodes, cfg.d_concept_baseline) * cfg.d_concept_baseline ** -0.5)
+            self.proj_key = nn.Sequential(   # mirror proj_code so keys land at Llama token scale
+                nn.Linear(cfg.d_concept_baseline, cfg.d_llama // 2), nn.GELU(),
+                nn.Linear(cfg.d_llama // 2, cfg.d_llama),
+                _NormMatch(cfg.d_llama),
+            )
 
     def init_streaming_state(self, batch_size: int, device, dtype):
         """v1g streaming init: per-batch slot queries. State lives in the
@@ -440,11 +450,15 @@ class FlatBaselineEncoder(nn.Module):
         if self.training:
             self._maybe_revive()  # reseed dead codes BEFORE using the codebook
         code_q = self.code_head(state)
-        scores = (code_q @ self.concept_id.T) * self.score_log_scale.exp()
+        # DKVB: when split, route selection by the PERSISTENT key codebook (address decoupled from
+        # the value content); else route by concept_id (unchanged fused behavior).
+        kv_split = getattr(cfg, "vqvae_kv_split", False)
+        route_book = self.key_codebook if kv_split else self.concept_id
+        scores = (code_q @ route_book.T) * self.score_log_scale.exp()
         code_id, onehot = gumbel_argmax_ste(
             scores, cfg.selection_temperature, self.training,
         )
-        code_emb = onehot @ self.concept_id
+        code_emb = onehot @ self.concept_id          # VALUE = selected code's content
         memory = self.proj_code(code_emb)
         if self.training:
             self._record_usage(code_id)
@@ -462,6 +476,9 @@ class FlatBaselineEncoder(nn.Module):
             "routing_entropy": ent,
             "codes_active": torch.tensor(float(n_active)),
         }
+        if kv_split:
+            mem_key = self.proj_key(onehot @ self.key_codebook)   # KEY = persistent address of selected code
+            aux["vqvae_kv"] = {"keys": mem_key, "values": memory}
         return memory, aux
 
     def forward(
@@ -543,7 +560,7 @@ class _CanonicalSlotAttention(nn.Module):
         return slots
 
 
-class ContinuousBaselineEncoder(nn.Module):
+class SlotAttentionBaselineEncoder(nn.Module):
     """Baseline B: continuous bottleneck, no quantization.
 
     96 slot queries each produce a continuous vector of D_cont dim.
@@ -676,7 +693,7 @@ class ContinuousBaselineEncoder(nn.Module):
         return memory, self._aux(slots, memory, cont_vec)
 
 
-class MemorizingBaselineEncoder(nn.Module):
+class MemorizingTransformerBaselineEncoder(nn.Module):
     """Baseline 4: Memorising-Transformers-style retrieval.
 
     The encoder produces a per-token KV bank of size [T, d_mt_value].
@@ -1242,7 +1259,7 @@ class FullContextEncoder(nn.Module):
         return token_embeds, aux
 
 
-class RecurrentBaselineEncoder(nn.Module):
+class MambaBaselineEncoder(nn.Module):
     """Baseline 5: Mamba state-space-model bottleneck.
 
     Mamba processes the full context as a recurrent state-space model,
@@ -1266,7 +1283,7 @@ class RecurrentBaselineEncoder(nn.Module):
             from mamba_ssm import Mamba
         except ImportError as e:
             raise ImportError(
-                "RecurrentBaselineEncoder requires mamba_ssm. "
+                "MambaBaselineEncoder requires mamba_ssm. "
                 "Install with: pip install mamba-ssm"
             ) from e
 
@@ -1290,17 +1307,39 @@ class RecurrentBaselineEncoder(nn.Module):
         ])
         self.norm = nn.RMSNorm(cfg.d_mamba)
 
-        # Per-token bottleneck: d_mamba → d_recurrent
-        self.bottleneck = nn.Linear(cfg.d_mamba, cfg.d_recurrent)
-
-        # Project d_recurrent → d_llama
-        self.proj_to_llama = nn.Sequential(
-            nn.Linear(cfg.d_recurrent, cfg.d_llama // 2), nn.GELU(),
-            nn.Linear(cfg.d_llama // 2, cfg.d_llama),
-            _NormMatch(cfg.d_llama),     # v2.2: norm-match to Llama token scale (was LayerNorm → 49× OOD)
-        )
-
-        self.target_len = cfg.n_flat_codes  # 96
+        self._use_delta = getattr(cfg, "mamba_delta_rule", False)
+        if not self._use_delta:
+            # Per-token bottleneck: d_mamba → d_recurrent
+            self.bottleneck = nn.Linear(cfg.d_mamba, cfg.d_recurrent)
+            # Project d_recurrent → d_llama
+            self.proj_to_llama = nn.Sequential(
+                nn.Linear(cfg.d_recurrent, cfg.d_llama // 2), nn.GELU(),
+                nn.Linear(cfg.d_llama // 2, cfg.d_llama),
+                _NormMatch(cfg.d_llama),   # norm-match to Llama token scale
+            )
+            self.target_len = cfg.n_flat_codes  # 96
+        else:
+            # ── DeltaNet delta-rule associative read (MQAR) ───────────────────
+            # h → (key feats, value, write-gate β); S accumulates in fp32 via the
+            # delta rule (deallocate old binding before writing). Per-write (key,
+            # value) tokens exposed via aux["mamba_kv"] for the shared ReadHead.
+            self._delta_dk = getattr(cfg, "mamba_delta_dk", 128)
+            self._delta_dv = getattr(cfg, "mamba_delta_dv", 128)
+            s = cfg.d_mamba ** -0.5                       # fan-in init
+            self.delta_k = nn.Linear(cfg.d_mamba, self._delta_dk, bias=False)
+            self.delta_v = nn.Linear(cfg.d_mamba, self._delta_dv, bias=False)
+            self.delta_beta = nn.Linear(cfg.d_mamba, 1)
+            nn.init.normal_(self.delta_k.weight, std=s)
+            nn.init.normal_(self.delta_v.weight, std=s)
+            nn.init.zeros_(self.delta_beta.bias)          # sigmoid(0)=0.5 default write-gate
+            self.delta_proj_k = nn.Sequential(            # key tokens → d_llama (mirror DKVB proj_key)
+                nn.Linear(self._delta_dk, cfg.d_llama // 2), nn.GELU(),
+                nn.Linear(cfg.d_llama // 2, cfg.d_llama), _NormMatch(cfg.d_llama),
+            )
+            self.delta_proj_v = nn.Sequential(            # value tokens → d_llama
+                nn.Linear(self._delta_dv, cfg.d_llama // 2), nn.GELU(),
+                nn.Linear(cfg.d_llama // 2, cfg.d_llama), _NormMatch(cfg.d_llama),
+            )
 
     def init_streaming_state(self, batch_size: int, device, dtype):
         """Mamba's SSM hidden state IS naturally streaming, but plumbing the
@@ -1343,40 +1382,59 @@ class RecurrentBaselineEncoder(nn.Module):
             h = h + block(norm(h))
         h = self.norm(h)                                               # [B, T, d_mamba]
 
-        # 3. Per-token bottleneck
-        h = self.bottleneck(h)                                         # [B, T, d_recurrent]
+        if not self._use_delta:
+            # ── VANILLA PATH (unchanged) ───────────────────────────────────
+            # 3. Per-token bottleneck
+            h = self.bottleneck(h)                                     # [B, T, d_recurrent]
+            # 4. Adaptive pool T → target_len (valid prefix only per sample).
+            B, T, _ = h.shape
+            if attention_mask is not None:
+                h_t = h.transpose(1, 2).contiguous()                   # [B, d, T]
+                pooled = []
+                for i in range(B):
+                    valid = int(attention_mask[i].sum().item())
+                    if valid < 1:
+                        valid = 1
+                    p = F.adaptive_avg_pool1d(h_t[i:i + 1, :, :valid], self.target_len)
+                    pooled.append(p)
+                h_pooled = torch.cat(pooled, dim=0).transpose(1, 2)    # [B, 96, d_recurrent]
+            else:
+                h_t = h.transpose(1, 2)
+                h_pooled = F.adaptive_avg_pool1d(h_t, self.target_len).transpose(1, 2)
+            # 5. Project to Llama d_model
+            memory = self.proj_to_llama(h_pooled)                      # [B, 96, d_llama]
+            aux = {
+                "load_balance_loss": torch.zeros((), device=memory.device, dtype=memory.dtype),
+                "h_pooled_norm": h_pooled.norm(dim=-1).mean(),
+            }
+            return memory, aux
 
-        # 4. Adaptive pool T → target_len. With variable-length inputs we
-        # pool only the valid (non-padded) prefix per sample so padding
-        # never enters the pooled memory tokens.
+        # ── DELTA-RULE PATH (DeltaNet associative scan, fp32 state) ─────────────
         B, T, _ = h.shape
+        dk, dv = self._delta_dk, self._delta_dv
+        # key features: ELU+1 then unit-norm (||phi||=1 → exact-magnitude rank-1
+        # delta update). fp32 for the long-lived scan accumulator (mixed-precision rule).
+        phi_k = F.normalize(F.elu(self.delta_k(h)) + 1.0, dim=-1).float()   # [B,T,dk]
+        v_f = self.delta_v(h).float()                                       # [B,T,dv]
+        beta = torch.sigmoid(self.delta_beta(h)).squeeze(-1).float()        # [B,T]
+        S = torch.zeros(B, dv, dk, device=h.device, dtype=torch.float32)    # [B,dv,dk] associative matrix
+        step_values = torch.empty(B, T, dv, device=h.device, dtype=torch.float32)
+        for n in range(T):                                                  # sequential delta-rule scan
+            pk = phi_k[:, n]                                                # [B,dk]
+            pred = torch.einsum("bvk,bk->bv", S, pk)                        # current read at this key
+            S = S + beta[:, n, None, None] * torch.einsum("bv,bk->bvk", v_f[:, n] - pred, pk)
+            step_values[:, n] = torch.einsum("bvk,bk->bv", S, pk)          # value S encodes here post-write
         if attention_mask is not None:
-            # Per-sample pool over the valid prefix. Loop over B (small)
-            # — cheap relative to Mamba's O(T) recurrence.
-            h_t = h.transpose(1, 2).contiguous()                       # [B, d, T]
-            pooled = []
-            for i in range(B):
-                valid = int(attention_mask[i].sum().item())
-                if valid < 1:
-                    valid = 1
-                p = F.adaptive_avg_pool1d(
-                    h_t[i:i + 1, :, :valid], self.target_len,
-                )                                                       # [1, d, 96]
-                pooled.append(p)
-            h_pooled = torch.cat(pooled, dim=0).transpose(1, 2)        # [B, 96, d_recurrent]
-        else:
-            h_t = h.transpose(1, 2)                                    # [B, d_recurrent, T]
-            h_pooled = F.adaptive_avg_pool1d(h_t, self.target_len)     # [B, d_recurrent, 96]
-            h_pooled = h_pooled.transpose(1, 2)                        # [B, 96, d_recurrent]
-
-        # 5. Project to Llama d_model
-        memory = self.proj_to_llama(h_pooled)                          # [B, 96, d_llama]
-
+            vmask = attention_mask.float().unsqueeze(-1)                    # zero out padding-step tokens
+            phi_k = phi_k * vmask
+            step_values = step_values * vmask
+        cast = h.dtype                                                      # bf16 under autocast, else fp32
+        mem_keys = self.delta_proj_k(phi_k.to(cast))                      # [B,T,d_llama] = addresses
+        mem_values = self.delta_proj_v(step_values.to(cast))             # [B,T,d_llama] = content
+        memory = torch.zeros(B, 0, mem_keys.shape[-1], device=h.device, dtype=cast)
         aux = {
-            "load_balance_loss": torch.zeros(
-                (), device=memory.device, dtype=memory.dtype,
-            ),
-            "h_pooled_norm": h_pooled.norm(dim=-1).mean(),
+            "load_balance_loss": torch.zeros((), device=h.device, dtype=torch.float32),
+            "mamba_kv": {"keys": mem_keys, "values": mem_values},
         }
         return memory, aux
 
@@ -1409,6 +1467,7 @@ class GraphV6BaselineEncoder(nn.Module):
         from .graph_substrate_v5 import SoftPointer
         from .graph_substrate_v6 import (
             GraphV6Updater, GraphV6Gate, GraphV6FactBuilder, GraphV6FactReader,
+            GraphV6FactKeyBuilder,
         )
 
         d_up = cfg.graph_v6_d_updater
@@ -1448,6 +1507,25 @@ class GraphV6BaselineEncoder(nn.Module):
             d_llama=cfg.d_llama, d_read=d_read,
             n_heads=cfg.graph_v6_read_heads, ffn_mult=cfg.graph_v6_read_ffn_mult,
         )
+        # PREPEND-read scale match: W_out(fact_value) comes out ~20x louder than Llama's token
+        # embeddings (~0.9), making the prepended fact-tokens attention distractors the frozen
+        # decoder can't route around. Every other prepend baseline ends in _NormMatch; graph must too.
+        self.prepend_norm = _NormMatch(cfg.d_llama)
+        # ── K/V split (persistent-key MQAR fix): only built when the flag is on (else zero new params) ──
+        if getattr(cfg, "graph_v6_kv_split", False):
+            # project persistent node_id [K_node, d_up] -> endpoint space d_node so the soft-pointer
+            # weights can blend it into a persistent KEY address (fan-in init, no magic number).
+            self.node_id_key_proj = nn.Linear(d_up, self.d_node, bias=False)
+            nn.init.normal_(self.node_id_key_proj.weight, std=d_up ** -0.5)
+            self.key_builder = GraphV6FactKeyBuilder(
+                d_node=self.d_node, d_state=self.d_state, d_read=d_read,
+                film_hidden=cfg.graph_v6_film_hidden,            # cfg-driven (mirror the value builder),
+                mlp_hidden=cfg.graph_v6_builder_mlp_hidden,      # not hardcoded — per no-magic-numbers
+            )
+            self.W_out_key = nn.Linear(d_read, cfg.d_llama)
+            nn.init.normal_(self.W_out_key.weight, std=0.01)
+            nn.init.zeros_(self.W_out_key.bias)
+            self.prepend_norm_key = _NormMatch(cfg.d_llama)
 
     # ── Streaming interface ──────────────────────────────────────────────
     def init_streaming_state(self, batch_size, device, dtype, seed=None):
@@ -1542,20 +1620,46 @@ class GraphV6BaselineEncoder(nn.Module):
         return new_state, {"graph_v6_node_gate_mean": ngm, "graph_v6_edge_gate_mean": egm}
 
     def _build_facts(self, state, zero_state=False):
-        """READ Stage A: materialize endpoints + directional FiLM-by-state fact tokens."""
+        """READ Stage A: materialize endpoints + directional FiLM-by-state fact tokens.
+
+        Returns (fact_value, fact_key). fact_key is None unless graph_v6_kv_split=True, in which case
+        the KEY address is BOTH endpoints' soft-pointer weights blended over the PERSISTENT node_id (so
+        the address carries the full edge identity and does not drift with stored content); the VALUE
+        path is unchanged (both endpoints over the dynamic states + edge-state FiLM).
+        """
         N, q_src, q_dst, st = state["N"], state["q_src"], state["q_dst"], state["state"]
         sp_k, sp_v = self.read_pointer.project_kv(N)
-        src_ep, _ = self.read_pointer.attend(q_src, sp_k, sp_v)
-        dst_ep, _ = self.read_pointer.attend(q_dst, sp_k, sp_v)
-        return self.fact_builder(src_ep, dst_ep, st, zero_state=zero_state)
+        src_ep, a_src = self.read_pointer.attend(q_src, sp_k, sp_v)    # capture weights (was discarded)
+        dst_ep, a_dst = self.read_pointer.attend(q_dst, sp_k, sp_v)
+        fact_value = self.fact_builder(src_ep, dst_ep, st, zero_state=zero_state)
+        if getattr(self.cfg, "graph_v6_kv_split", False):
+            if getattr(self.cfg, "graph_v6_persist_keys", True):
+                # persistent key: SAME pointer weights, blended over node_id (data-independent content),
+                # for BOTH endpoints -> address carries the full edge identity (bidirectionally queryable)
+                node_id_d = self.node_id_key_proj(self.updater.node_id)   # [K_node, d_node]
+                src_ep_key = torch.matmul(a_src, node_id_d.unsqueeze(0))  # [B, K_edge, d_node]
+                dst_ep_key = torch.matmul(a_dst, node_id_d.unsqueeze(0))
+            else:
+                src_ep_key, dst_ep_key = src_ep, dst_ep                   # dynamic ablation leg (split-only)
+            st_key = torch.zeros_like(st) if zero_state else st
+            fact_key = self.key_builder(src_ep_key, dst_ep_key, st_key)
+        else:
+            fact_key = None
+        return fact_value, fact_key
 
     def finalize_memory(self, state):
         N = state["N"]
         B, device = N.shape[0], N.device
         dtype = next(self.fact_reader.parameters()).dtype
         zero_state = bool(state.get("zero_state", False))   # finer ablation than zero_memory
-        fact_value = self._build_facts(state, zero_state=zero_state)
-        empty_mem = torch.zeros(B, 0, self.cfg.d_llama, device=device, dtype=dtype)
+        fact_value, fact_key = self._build_facts(state, zero_state=zero_state)
+        if self.cfg.graph_v6_prepend_read:
+            # NEW-BRANCH design: prepend the FiLM fact-tokens (projected to d_llama) as memory
+            # tokens — Llama reads them with native attention like the baselines, NOT the
+            # per-decode-token inject hook. Bottleneck unchanged (K_edge × d_llama).
+            memory = self.prepend_norm(self.fact_reader.W_out(fact_value)).to(dtype)   # [B, K_edge, d_llama], Llama-scale
+        else:
+            memory = torch.zeros(B, 0, self.cfg.d_llama, device=device, dtype=dtype)
         n_w = max(state["n_windows"], 1)
         aux = {
             "load_balance_loss": torch.zeros((), device=device, dtype=dtype),
@@ -1567,6 +1671,11 @@ class GraphV6BaselineEncoder(nn.Module):
             "graph_v6_edge_gate_mean_avg": (state["edge_gate_mean_accum"] / n_w).to(torch.float32),
             "graph_v6_fact_norm": fact_value.detach().float().norm(dim=-1).mean().to(torch.float32),
         }
+        # K/V split: decoupled key memory (from persistent node_id) + value memory (the fused facts above).
+        if getattr(self.cfg, "graph_v6_kv_split", False) and fact_key is not None:
+            assert self.cfg.graph_v6_prepend_read, "graph_v6_kv_split requires graph_v6_prepend_read=True"
+            mem_key = self.prepend_norm_key(self.W_out_key(fact_key)).to(dtype)   # [B, K_edge, d_llama]
+            aux["graph_v6_kv"] = {"keys": mem_key, "values": memory}
         # ── Eval-only health telemetry (no grad, zero train-time cost) ────────
         # Diagnose whether the v6 mechanism is alive: dead read (rezero eff≈0),
         # ignored edge-state (state_effect≈0 violates no-op-free), collapsed node
@@ -1581,7 +1690,7 @@ class GraphV6BaselineEncoder(nn.Module):
                 # drop below 1 if the model learns to suppress the read where unhelpful.
                 if getattr(fr, "_last_gate_mean", None) is not None:
                     aux["graph_v6_read_gate_mean"] = fr._last_gate_mean.to(torch.float32)
-                fact_zero = self._build_facts(state, zero_state=True)
+                fact_zero, _ = self._build_facts(state, zero_state=True)
                 aux["graph_v6_state_effect"] = (
                     (fact_value - fact_zero).float().norm(dim=-1).mean().to(torch.float32))
                 Nf = N.float()
@@ -1602,7 +1711,7 @@ class GraphV6BaselineEncoder(nn.Module):
                 active = torch.zeros(N.shape[0], Kn, dtype=torch.bool, device=N.device)
                 active.scatter_(1, picks, True)
                 aux["graph_v6_node_active_frac"] = active.float().mean().to(torch.float32)
-        return empty_mem, aux
+        return memory, aux
 
     def inject(self, hidden_states, facts):
         """READ Stage B: per-position soft retrieval over fact-tokens (installed as a
@@ -1617,8 +1726,8 @@ class GraphV6BaselineEncoder(nn.Module):
         B, device, dtype = token_embeds.shape[0], token_embeds.device, token_embeds.dtype
         state = self.init_streaming_state(B, device, dtype)
         state, _ = self.streaming_write(state, token_embeds, attention_mask)
-        fact_value = self._build_facts(state)
-        memory = self.fact_reader.W_out(fact_value).to(dtype)     # [B, K_edge, d_llama] (query-agnostic fallback)
+        fact_value, _ = self._build_facts(state)
+        memory = self.prepend_norm(self.fact_reader.W_out(fact_value)).to(dtype)   # [B, K_edge, d_llama], Llama-scale
         aux = {"load_balance_loss": torch.zeros((), device=device, dtype=memory.dtype)}
         return memory, aux
 

@@ -368,6 +368,23 @@ class ReprConfig:
     graph_v6_edge_gate_init_bias: float = 1.0
     graph_v6_init_log_sigma: float = 0.0
     graph_v6_film_hidden: int = 512
+    graph_v6_prepend_read: bool = False    # NEW-BRANCH design: prepend the FiLM fact-tokens as
+                                           # memory tokens (Llama native attention, same read path
+                                           # as the baselines) instead of the per-decode-token
+                                           # inject hook. Identical bottleneck (K_edge × d_llama).
+    # K/V SPLIT (MQAR fix): separate decoupled key + value memory tokens. Default False = current
+    # fused behavior, fully backward-compatible (no new params when off).
+    graph_v6_kv_split: bool = False        # True → finalize_memory emits aux["graph_v6_kv"] = {keys, values}
+    graph_v6_persist_keys: bool = True     # (kv_split only) key address from persistent node_id (True)
+                                           # vs the drifting dynamic-state blend (False, ablation leg)
+    vqvae_kv_split: bool = False           # DKVB K/V split: persistent key codebook (decoupled address,
+                                           # routes selection) + trainable value codebook (concept_id).
+                                           # Default off = unchanged fused behavior.
+    mamba_delta_rule: bool = False         # DeltaNet delta-rule scan (replaces adaptive-pool read):
+                                           # h→(k,v,β), fp32 S += β(v − S·φ(k))⊗φ(k), per-write k/v tokens
+                                           # via aux["mamba_kv"]. Default off = vanilla selective-SSM pool.
+    mamba_delta_dk: int = 128              # delta-rule key feature dim
+    mamba_delta_dv: int = 128              # delta-rule value dim
     graph_v6_inject_layer: int = 13        # v6.1: late-layer inject (was 8 = mid-stack "conform
                                            # zone" where a wrong read flips the answer; 13/16 ≈
                                            # top-third "ignore zone", Ben-Artzy — a bad read is harmless)

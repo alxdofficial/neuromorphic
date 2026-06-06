@@ -22,7 +22,7 @@ from scripts.repr_learning.train_stage_a import train_one
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--arms", nargs="+", default=["graph_v6_baseline", "continuous_baseline"])
+    ap.add_argument("--arms", nargs="+", default=["graph_v6_baseline", "slot_attention_baseline"])
     ap.add_argument("--n-pairs", nargs="+", type=int, default=[1, 2, 4, 8, 16, 32])
     ap.add_argument("--steps", type=int, default=600)
     ap.add_argument("--batch-size", type=int, default=16)

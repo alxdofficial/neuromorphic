@@ -8,10 +8,10 @@ these baselines.
 
 We currently compare **graph_v5 (our model) + 4 baselines + vanilla** in the trainer:
 - **graph_v5** (`graph_v5_baseline`) — **OUR MODEL**: shared node bank + soft-pointer edges + message-passing readout (see `docs/exp1_graph_v5_design.md`)
-- **A** (`flat_baseline`) — flat discrete codebook (VQ-VAE family) + dead-code revival, prepend reads
-- **B** (`continuous_baseline`) — continuous slots via **canonical Slot Attention** (Locatello 2020: GRU + 3-iter refinement + stochastic shared-Gaussian init, no diversity loss), prepend reads
-- **MT** (`memorizing_baseline`) — per-token KV bank with **per-position retrieval** (faithful Memorizing Transformers), prepend reads
-- **Mamba** (`recurrent_baseline`) — **canonical Mamba** SSM encoder (4-layer, RMSNorm pre-norm, official `selective_scan_cuda` kernel), prepend reads
+- **A** (`vqvae_baseline`) — flat discrete codebook (VQ-VAE family) + dead-code revival, prepend reads
+- **B** (`slot_attention_baseline`) — continuous slots via **canonical Slot Attention** (Locatello 2020: GRU + 3-iter refinement + stochastic shared-Gaussian init, no diversity loss), prepend reads
+- **MT** (`memorizing_transformer_baseline`) — per-token KV bank with **per-position retrieval** (faithful Memorizing Transformers), prepend reads
+- **Mamba** (`mamba_baseline`) — **canonical Mamba** SSM encoder (4-layer, RMSNorm pre-norm, official `selective_scan_cuda` kernel), prepend reads
 - **vanilla** (`vanilla_llama`) — no-memory loss floor
 
 > **Retired** (no longer in the active sweep): `plastic_baseline` (Hebbian
@@ -65,7 +65,7 @@ typed by scene-graph categories; ours is fully learned.
 **Tests:** whether typed (src→edge→dst) discrete vocabulary beats
 flat alternatives at compressing a text window into 96 memory tokens.
 
-## Baseline A — Flat codebook (`FlatBaselineEncoder`)
+## Baseline A — Flat codebook (`VQVAEBaselineEncoder`)
 
 **Archetype**: VQ-VAE / Memory Layers at Scale family — discrete codebook
 indexed via softmax-gated picks.
@@ -87,7 +87,7 @@ because load-balance pressure is sufficient.
 **Tests:** whether V2.1's (src→edge→dst) typed structure adds value
 over a flat bag of 96 discrete picks from the same codebook.
 
-## Baseline B — Continuous slots (`ContinuousBaselineEncoder`)
+## Baseline B — Continuous slots (`SlotAttentionBaselineEncoder`)
 
 **Archetype**: Slot Attention / Perceiver IO family — fixed-size set of
 continuous latent vectors that cross-attend to inputs.
@@ -117,7 +117,7 @@ determinism.
 **Tests:** whether graph_v5's discrete structure adds value over
 unstructured continuous slots at matched bottleneck width.
 
-## Baseline 4 — Memorizing Transformers (`MemorizingBaselineEncoder`)
+## Baseline 4 — Memorizing Transformers (`MemorizingTransformerBaselineEncoder`)
 
 > **MT is a different memory class from A / B / plastic / splat / graph.** Its raw
 > memory bank is ~23,200 KB vs the bottleneck-matched variants' ~26 KB — about
@@ -156,7 +156,7 @@ the bottleneck-matched variants is expected and not the win condition
 for our own designs — what matters is whether structured compression at
 26 KB approaches the retrieval-augmented reference at 23,200 KB.
 
-## Baseline 5 — Mamba SSM (`RecurrentBaselineEncoder`)
+## Baseline 5 — Mamba SSM (`MambaBaselineEncoder`)
 
 **Archetype**: State-space-model / recurrent sequence model family.
 

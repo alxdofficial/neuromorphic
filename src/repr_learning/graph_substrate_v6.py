@@ -194,6 +194,10 @@ class GraphV6FactBuilder(nn.Module):
         super().__init__()
         self.W_src = nn.Linear(d_node, d_read)
         self.W_dst = nn.Linear(d_node, d_read)
+        # state in the fact's MAIN path (not just FiLM): the per-edge state is the one signal
+        # that stays high-rank when the node bank collapses, so the fact inherits its rank.
+        # (NOT zero-init — must contribute from step 0, before any collapse.)
+        self.W_state = nn.Linear(d_state, d_read)
         self.film = nn.Sequential(
             nn.Linear(d_state, film_hidden), nn.GELU(),
             nn.Linear(film_hidden, film_hidden), nn.GELU(),
@@ -210,12 +214,61 @@ class GraphV6FactBuilder(nn.Module):
     def forward(self, src_ep: Tensor, dst_ep: Tensor, state: Tensor,
                 zero_state: bool = False) -> Tensor:
         # src_ep/dst_ep: [B, K_edge, d_node] (materialized endpoints); state: [B,K_edge,d_state]
-        h = F.gelu(self.W_src(src_ep) + self.W_dst(dst_ep))      # [B, K_edge, d_read], directional
         st = torch.zeros_like(state) if zero_state else state    # state-ablation probe hook
+        h = F.gelu(self.W_src(src_ep) + self.W_dst(dst_ep)
+                   + self.W_state(st))                           # state in the main path → fact rank
         gamma, beta = self.film(st).chunk(2, dim=-1)
         fact = self.fact_norm((1.0 + gamma) * h + beta)
         fact = fact + self.mlp(self.mlp_norm(fact))              # post-FiLM residual MLP
         return fact
+
+
+class GraphV6FactKeyBuilder(nn.Module):
+    """KEY fact-token from BOTH endpoints' PERSISTENT address + edge state (MQAR K/V-split fix).
+
+    Mirrors GraphV6FactBuilder's VALUE structure (src + dst + FiLM-by-state) but with a SEPARATE
+    head, and is fed endpoints blended over the persistent `node_id` rather than the drifting node
+    states — so the address carries the full edge identity (queryable from either endpoint) yet does
+    not move with the stored content (no global-fixed-point collapse). A distinct head from the value
+    keeps key != value (no split collapse) even though both see both endpoints.
+    Init: fan-in (1/sqrt) on the linears; zero-init FiLM (key≈h at init); small (0.01) MLP residual.
+    """
+
+    def __init__(self, d_node: int, d_state: int, d_read: int,
+                 film_hidden: int = 256, mlp_hidden: int = 256):
+        super().__init__()
+        self.W_src_key = nn.Linear(d_node, d_read)
+        nn.init.normal_(self.W_src_key.weight, std=d_node ** -0.5)
+        nn.init.zeros_(self.W_src_key.bias)
+        self.W_dst_key = nn.Linear(d_node, d_read)
+        nn.init.normal_(self.W_dst_key.weight, std=d_node ** -0.5)
+        nn.init.zeros_(self.W_dst_key.bias)
+        self.W_state = nn.Linear(d_state, d_read)
+        nn.init.normal_(self.W_state.weight, std=d_state ** -0.5)
+        nn.init.zeros_(self.W_state.bias)
+        self.film = nn.Sequential(
+            nn.Linear(d_state, film_hidden), nn.GELU(),
+            nn.Linear(film_hidden, 2 * d_read),
+        )
+        nn.init.zeros_(self.film[-1].weight)    # gamma=beta=0 at init -> key ~= h (transparent relation)
+        nn.init.zeros_(self.film[-1].bias)
+        self.key_norm = nn.LayerNorm(d_read)
+        self.mlp = nn.Sequential(
+            nn.Linear(d_read, mlp_hidden), nn.GELU(),
+            nn.Linear(mlp_hidden, d_read),
+        )
+        nn.init.normal_(self.mlp[-1].weight, std=0.01)
+        nn.init.zeros_(self.mlp[-1].bias)
+        self.mlp_norm = nn.LayerNorm(d_read)
+        self.d_read = d_read
+
+    def forward(self, src_ep_key: Tensor, dst_ep_key: Tensor, state: Tensor) -> Tensor:
+        # both endpoints (persistent node_id blend) + edge state -> symmetric, bidirectionally-queryable key
+        h = F.gelu(self.W_src_key(src_ep_key) + self.W_dst_key(dst_ep_key) + self.W_state(state))
+        gamma, beta = self.film(state).chunk(2, dim=-1)
+        key = self.key_norm((1.0 + gamma) * h + beta)
+        key = key + self.mlp(self.mlp_norm(key))
+        return key
 
 
 # ─────────────────────────────────────────────────────────────────────────

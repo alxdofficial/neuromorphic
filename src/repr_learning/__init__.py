@@ -10,22 +10,22 @@ Design doc: docs/v2.1_repr_learning.md
 from .config import ReprConfig
 from .model import ReprLearningModel
 from .encoder import (
-    ContinuousBaselineEncoder,
-    FlatBaselineEncoder,
+    SlotAttentionBaselineEncoder,
+    VQVAEBaselineEncoder,
     FullContextEncoder,
     GraphV6BaselineEncoder,
-    MemorizingBaselineEncoder,
+    MemorizingTransformerBaselineEncoder,
     NullEncoder,
-    RecurrentBaselineEncoder,
+    MambaBaselineEncoder,
 )
 
 __all__ = [
     "ReprConfig",
     "ReprLearningModel",
-    "FlatBaselineEncoder",
-    "ContinuousBaselineEncoder",
-    "MemorizingBaselineEncoder",
-    "RecurrentBaselineEncoder",
+    "VQVAEBaselineEncoder",
+    "SlotAttentionBaselineEncoder",
+    "MemorizingTransformerBaselineEncoder",
+    "MambaBaselineEncoder",
     "GraphV6BaselineEncoder",
     "NullEncoder",
     "FullContextEncoder",

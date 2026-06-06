@@ -1,7 +1,7 @@
 """Top-level ReprLearningModel — wires encoder + decoder together.
 
-The model takes an encoder (V21Encoder, FlatBaselineEncoder, or
-ContinuousBaselineEncoder) and the frozen Llama decoder, and produces
+The model takes an encoder (V21Encoder, VQVAEBaselineEncoder, or
+SlotAttentionBaselineEncoder) and the frozen Llama decoder, and produces
 the reconstruction loss for training.
 """
 from __future__ import annotations
@@ -16,13 +16,13 @@ from torch import Tensor
 from .chat_template import ChatTemplate, build_chat_template
 from .config import ReprConfig
 from .encoder import (
-    ContinuousBaselineEncoder,
-    FlatBaselineEncoder,
+    SlotAttentionBaselineEncoder,
+    VQVAEBaselineEncoder,
     FullContextEncoder,
     GraphV6BaselineEncoder,
-    MemorizingBaselineEncoder,
+    MemorizingTransformerBaselineEncoder,
     NullEncoder,
-    RecurrentBaselineEncoder,
+    MambaBaselineEncoder,
 )
 from .decoder import FrozenLlamaDecoder
 from .jepa import (
@@ -42,13 +42,19 @@ class ReprLearningModel(nn.Module):
     """
 
     VARIANTS = {
-        "flat_baseline": FlatBaselineEncoder,
-        "continuous_baseline": ContinuousBaselineEncoder,
-        "memorizing_baseline": MemorizingBaselineEncoder,
-        "recurrent_baseline": RecurrentBaselineEncoder,
-        "graph_v6_baseline": GraphV6BaselineEncoder,
+        # canonical names = the published model each baseline is based on
+        "vqvae_baseline": VQVAEBaselineEncoder,                  # van den Oord 2017
+        "slot_attention_baseline": SlotAttentionBaselineEncoder,  # Locatello 2020
+        "memorizing_transformer_baseline": MemorizingTransformerBaselineEncoder,  # Wu 2022
+        "mamba_baseline": MambaBaselineEncoder,                  # Gu & Dao 2023
+        "graph_v6_baseline": GraphV6BaselineEncoder,             # ours
         "vanilla_llama": NullEncoder,         # loss floor — Llama with no memory
         "vanilla_full_context": FullContextEncoder,  # loss ceiling — Llama sees full evidence
+        # back-compat aliases (old variant strings in checkpoints / legacy scripts → same class)
+        "flat_baseline": VQVAEBaselineEncoder,
+        "continuous_baseline": SlotAttentionBaselineEncoder,
+        "memorizing_baseline": MemorizingTransformerBaselineEncoder,
+        "recurrent_baseline": MambaBaselineEncoder,
     }
 
     def __init__(
@@ -555,6 +561,8 @@ class ReprLearningModel(nn.Module):
         batch,                          # QABatch from data_qa.py
         window_size: int = 1024,
         zero_memory: bool = False,
+        shuffle_memory: bool = False,
+        oracle_memory: bool = False,
     ) -> dict:
         """v1h composite-QA loss.
 
@@ -633,7 +641,36 @@ class ReprLearningModel(nn.Module):
             )
             finalize_aux = {k: v for k, v in finalize_aux.items() if k != "mt_bank"}
             finalize_aux.update(mt_aux)
-            M = K_retrieve
+            M = memory.shape[1]    # retrieve_for_query returns min(K, bank_len); a passage
+                                   # shorter than n_flat_codes yields <K tokens (Stage-A short passages)
+
+        # ORACLE ceiling (Stage-A): bypass the encoder entirely — the RAW passage
+        # embeddings ARE the memory (lossless, M = T_ctx prepended tokens, padded
+        # positions attended-out). Isolates the FROZEN decoder's capability to
+        # locate-and-read the answer from a faithful memory from any encoder
+        # write/read loss. If oracle ALSO ≈ shuffle, the frozen decoder can't route
+        # content even from a perfect memory → the decoder (not the memory) is the wall.
+        if oracle_memory:
+            with torch.no_grad():
+                memory = embed(batch.context_ids)
+            finalize_aux = {"memory_mask": batch.context_mask}
+            M = memory.shape[1]
+
+        # SHUFFLE control (Stage-A load-bearing test): give each row a DIFFERENT
+        # passage's memory. graph_v6 reads facts from finalize_aux (NOT `memory`),
+        # so roll the right object per arm — rolling `memory` would be a silent
+        # no-op for graph_v6 and falsely look like REAL.
+        if shuffle_memory:
+            assert memory.shape[0] >= 2, "shuffle_memory control needs batch >= 2"
+            if (self.variant == "graph_v6_baseline" and not self.cfg.graph_v6_prepend_read
+                    and finalize_aux.get("graph_v6_facts") is not None):
+                fv = finalize_aux["graph_v6_facts"]
+                fv["value"] = fv["value"].roll(1, 0)
+            else:
+                memory = memory.roll(1, 0)
+                if finalize_aux.get("memory_mask") is not None:   # roll the per-slot mask WITH the memory
+                    finalize_aux = {**finalize_aux,               # (oracle: variable passage lengths)
+                                    "memory_mask": finalize_aux["memory_mask"].roll(1, 0)}
 
         # zero_memory ablation: for prepend variants we DROP the memory
         # slots entirely (M=0) so the question starts at RoPE position 0,
@@ -807,7 +844,8 @@ class ReprLearningModel(nn.Module):
         if zero_memory:
             # No memory: Llama forward runs unmodified (no per-token read).
             pass
-        elif self.variant == "graph_v6_baseline":
+        elif (self.variant == "graph_v6_baseline" and not oracle_memory
+                and not self.cfg.graph_v6_prepend_read):
             # Per-decode-token read (docs/graph_v6.md READ Stage B): facts built in
             # finalize_memory, soft-retrieved + fused at every position by the hook.
             facts_for_hook = finalize_aux["graph_v6_facts"]

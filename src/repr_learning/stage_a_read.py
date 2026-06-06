@@ -23,15 +23,19 @@ import torch.nn.functional as F
 
 from src.repr_learning.config import ReprConfig
 from src.repr_learning.encoder import (
-    FlatBaselineEncoder, ContinuousBaselineEncoder,
-    RecurrentBaselineEncoder, GraphV6BaselineEncoder,
+    VQVAEBaselineEncoder, SlotAttentionBaselineEncoder,
+    MambaBaselineEncoder, GraphV6BaselineEncoder,
 )
 
 ARM_CLASSES = {
-    "flat_baseline": FlatBaselineEncoder,
-    "continuous_baseline": ContinuousBaselineEncoder,
-    "recurrent_baseline": RecurrentBaselineEncoder,
+    "vqvae_baseline": VQVAEBaselineEncoder,
+    "slot_attention_baseline": SlotAttentionBaselineEncoder,
+    "mamba_baseline": MambaBaselineEncoder,
     "graph_v6_baseline": GraphV6BaselineEncoder,
+    # back-compat aliases
+    "flat_baseline": VQVAEBaselineEncoder,
+    "continuous_baseline": SlotAttentionBaselineEncoder,
+    "recurrent_baseline": MambaBaselineEncoder,
 }
 
 T_MEM, T_COND, T_ANS = 0, 1, 2          # stream type ids for the read transformer
@@ -128,6 +132,13 @@ class StageAModel(nn.Module):
         te = self.embed(passage).to(torch.float32)
         st = self.encoder.init_streaming_state(passage.size(0), passage.device, te.dtype)
         st, _ = self.encoder.streaming_write(st, te, attention_mask=p_mask, chunk_offset=0)
+        # continuous baseline: the carried slot state [B, n_flat_codes, d_enc] IS the
+        # per-item bottleneck. Hand it to the unified read directly (its mem_proj would
+        # only undo the vestigial d_llama projection) so interface == carried == matched B,
+        # exactly as graph hands its fact tokens. (flat keeps its codebook path; recurrent's
+        # state is non-tokenwise — both still emit d_llama until they're matched too.)
+        if self.arm == "continuous_baseline" and torch.is_tensor(st) and st.dim() == 3:
+            return st.to(torch.float32)                                    # [B, n_flat_codes, d_enc]
         memory, aux = self.encoder.finalize_memory(st)
         if memory.size(1) == 0 and isinstance(aux, dict) and aux.get("graph_v6_facts") is not None:
             memory = aux["graph_v6_facts"]["value"]                        # graph fact-tokens (dim d_read)
