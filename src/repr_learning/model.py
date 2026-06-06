@@ -555,6 +555,7 @@ class ReprLearningModel(nn.Module):
         batch,                          # QABatch from data_qa.py
         window_size: int = 1024,
         zero_memory: bool = False,
+        shuffle_memory: bool = False,
     ) -> dict:
         """v1h composite-QA loss.
 
@@ -573,7 +574,15 @@ class ReprLearningModel(nn.Module):
             MemInject variants (plastic, splat) skip the forward_pre_hook
             so Llama runs unmodified. Useful for measuring how much each
             architecture's memory actually contributes vs the parametric
-            Llama floor (vanilla_llama).
+            Llama floor (vanilla_llama). This is the OFF control.
+
+        shuffle_memory: the SHUF control. Roll the finalized memory along the
+            batch dim by 1 so each example is decoded with a DIFFERENT
+            example's memory (right question, wrong memory). If the decoder is
+            genuinely USING memory, REAL ≪ SHUF; if REAL ≈ SHUF the memory is
+            being ignored — the MQAR/binding-failure signature. The EMAT gate
+            is REAL ≫ SHUF ≫ OFF. Mutually exclusive with zero_memory (zero
+            wins). No-op when M == 0 (vanilla/MT-before-retrieve).
         """
         device = batch.context_ids.device
         B, T_ctx = batch.context_ids.shape
@@ -634,6 +643,13 @@ class ReprLearningModel(nn.Module):
             finalize_aux = {k: v for k, v in finalize_aux.items() if k != "mt_bank"}
             finalize_aux.update(mt_aux)
             M = K_retrieve
+
+        # shuffle_memory (SHUF control): roll memory along the batch so each
+        # row is decoded with another row's memory. Applied AFTER the MT
+        # retrieve so the retrieved bank is mismatched too. REAL ≫ SHUF ⇒ the
+        # memory is actually used; REAL ≈ SHUF ⇒ ignored. zero_memory wins.
+        if shuffle_memory and not zero_memory and M > 0:
+            memory = torch.roll(memory, shifts=1, dims=0)
 
         # zero_memory ablation: for prepend variants we DROP the memory
         # slots entirely (M=0) so the question starts at RoPE position 0,
