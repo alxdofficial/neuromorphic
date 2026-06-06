@@ -825,6 +825,10 @@ def main():
     # need the larger window to fit evidence + distractors).
     ap.add_argument("--chunk-size", type=int, default=8192)
     ap.add_argument("--window-size", type=int, default=1024)
+    ap.add_argument("--mem-tokens", type=int, default=128,
+                    help="EMAT matched MEMORY budget: M memory tokens × d_llama, "
+                         "matched across the prepend arms (ICAE/CCM/Beacon/graph). "
+                         "Derives icae_n_slots, ccm_n_comp, and Beacon's α.")
     ap.add_argument("--passages-per-chunk", type=int, default=0,
                     help="composite_v1 passages sampled per chunk. 0 = auto: "
                          "scales with chunk_size (~75 per 1024 tokens). "
@@ -1033,6 +1037,29 @@ def main():
         mt_diversity_scale=args.mt_diversity_scale,
         **({"learning_rate": args.lr} if args.lr is not None else {}),
     )
+
+    # ── EMAT matched MEMORY budget (decoder-read M × d_llama) ────────────────
+    # mem_tokens is the single knob; the prepend EMAT arms all emit ~M tokens at
+    # d_llama, so the decoder reads the SAME float budget from each — only the
+    # memory MECHANISM differs. Beacon (concat) derives α = chunk//M so its total
+    # ≈ M. Trainable params are NOT matched (LoRA ports vs the graph substrate
+    # differ by design, ~2.5M–48M–100M) — they are reported, not equated.
+    M = args.mem_tokens
+    cfg.icae_n_slots = M
+    cfg.ccm_n_comp = M
+    cfg.beacon_ratio = max(1, args.chunk_size // M)
+    _ceil = lambda a, b: -(-a // b)
+    _beacon_M = (_ceil(args.chunk_size, args.window_size)
+                 * _ceil(args.window_size, cfg.beacon_ratio))
+    print(f"[EMAT budget] mem_tokens={M} × d_llama={cfg.d_llama} = "
+          f"{M * cfg.d_llama:,} decoder-read floats/arm (only the mechanism differs)")
+    for _a, _m in (("icae", M), ("ccm", M), ("beacon", _beacon_M)):
+        print(f"   {_a:<8} M={_m:<4} → {_m * cfg.d_llama:,} floats")
+    if abs(_beacon_M - M) > max(1, M // 10):
+        raise SystemExit(
+            f"[EMAT budget] beacon M={_beacon_M} is >10% off mem_tokens={M} "
+            f"(α={cfg.beacon_ratio}); adjust --mem-tokens / chunk / window so the "
+            f"matched memory budget holds before launching.")
 
     # Auto-pick BABILong config to match chunk_size (audit fix #10).
     if args.babilong_config == "auto":
