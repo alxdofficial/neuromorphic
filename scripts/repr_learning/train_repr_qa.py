@@ -1047,13 +1047,14 @@ def main():
     M = args.mem_tokens
     cfg.icae_n_slots = M
     cfg.ccm_n_comp = M
+    cfg.graph_v6_K_edge = M          # graph prepends M fact-tokens (matched read)
     cfg.beacon_ratio = max(1, args.chunk_size // M)
     _ceil = lambda a, b: -(-a // b)
     _beacon_M = (_ceil(args.chunk_size, args.window_size)
                  * _ceil(args.window_size, cfg.beacon_ratio))
     print(f"[EMAT budget] mem_tokens={M} × d_llama={cfg.d_llama} = "
           f"{M * cfg.d_llama:,} decoder-read floats/arm (only the mechanism differs)")
-    for _a, _m in (("icae", M), ("ccm", M), ("beacon", _beacon_M)):
+    for _a, _m in (("graph", M), ("icae", M), ("ccm", M), ("beacon", _beacon_M)):
         print(f"   {_a:<8} M={_m:<4} → {_m * cfg.d_llama:,} floats")
     if abs(_beacon_M - M) > max(1, M // 10):
         raise SystemExit(

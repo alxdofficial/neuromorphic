@@ -1875,6 +1875,10 @@ class GraphV6BaselineEncoder(nn.Module):
             d_llama=cfg.d_llama, d_read=d_read,
             n_heads=cfg.graph_v6_read_heads, ffn_mult=cfg.graph_v6_read_ffn_mult,
         )
+        # EMAT prepend read: norm-match the projected fact-tokens to Llama's token
+        # scale (same as the baselines) so the graph reads through the IDENTICAL
+        # prepend interface — no privileged per-position inject hook.
+        self.prepend_norm = _NormMatch(cfg.d_llama)
 
     # ── Streaming interface ──────────────────────────────────────────────
     def init_streaming_state(self, batch_size, device, dtype, seed=None):
@@ -1982,7 +1986,12 @@ class GraphV6BaselineEncoder(nn.Module):
         dtype = next(self.fact_reader.parameters()).dtype
         zero_state = bool(state.get("zero_state", False))   # finer ablation than zero_memory
         fact_value = self._build_facts(state, zero_state=zero_state)
-        empty_mem = torch.zeros(B, 0, self.cfg.d_llama, device=device, dtype=dtype)
+        # PREPEND read (EMAT-matched, identical to the baselines): the K_edge
+        # fact-tokens projected to d_llama + norm-matched, returned as
+        # [B, K_edge, d_llama] prepend memory. The old per-position inject hook
+        # is retired (model.py) so the graph reads like every other arm and
+        # REAL/SHUF/OFF apply to it too. graph_v6_facts stays in aux for telemetry.
+        memory = self.prepend_norm(self.fact_reader.W_out(fact_value).float())
         n_w = max(state["n_windows"], 1)
         aux = {
             "load_balance_loss": torch.zeros((), device=device, dtype=dtype),
@@ -2029,7 +2038,7 @@ class GraphV6BaselineEncoder(nn.Module):
                 active = torch.zeros(N.shape[0], Kn, dtype=torch.bool, device=N.device)
                 active.scatter_(1, picks, True)
                 aux["graph_v6_node_active_frac"] = active.float().mean().to(torch.float32)
-        return empty_mem, aux
+        return memory, aux
 
     def inject(self, hidden_states, facts):
         """READ Stage B: per-position soft retrieval over fact-tokens (installed as a

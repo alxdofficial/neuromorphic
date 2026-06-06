@@ -832,29 +832,13 @@ class ReprLearningModel(nn.Module):
         # that calls encoder.inject(hidden_states, facts) at every position. The
         # hook is removed in finally so the shared Llama module is unmodified
         # across variants.
+        # graph_v6 now reads via the SAME prepend path as the baselines — its
+        # finalize_memory returns [B, K_edge, d_llama] memory that is prepended
+        # like every other arm. The old per-position inject hook (a privileged,
+        # separately-trained read the baselines never got) is RETIRED so the
+        # comparison isolates the write mechanism and the REAL/SHUF/OFF binding
+        # gate applies to the graph too (EMAT fairness fix).
         hook_handle = None
-        if zero_memory:
-            # No memory: Llama forward runs unmodified (no per-token read).
-            pass
-        elif self.variant == "graph_v6_baseline":
-            # Per-decode-token read (docs/graph_v6.md READ Stage B): facts built in
-            # finalize_memory, soft-retrieved + fused at every position by the hook.
-            facts_for_hook = finalize_aux["graph_v6_facts"]
-            inject_layer_idx = self.encoder.inject_layer_idx
-            encoder_ref = self.encoder
-
-            def pre_hook(module, args, kwargs):
-                if not args:
-                    return None
-                hidden_states = args[0]
-                injected = encoder_ref.inject(hidden_states, facts_for_hook)
-                new_args = (injected,) + args[1:]
-                return new_args, kwargs
-
-            hook_handle = (
-                self.decoder.llama.model.layers[inject_layer_idx]
-                .register_forward_pre_hook(pre_hook, with_kwargs=True)
-            )
 
         try:
             # Selective lm_head: run base model for hidden states, then only
