@@ -178,6 +178,16 @@ class ReprConfig:
     icae_lora_alpha: int = 64       # scale = alpha / rank = 2.0
     icae_n_slots: int = 0           # 0 ⇒ fall back to n_flat_codes (matched budget)
 
+    # ── CCM baseline (Compressed Context Memory, Kim et al. ICLR 2024) ──────
+    # Recurrent compression via a conditional LoRA gated to fire ONLY on <COMP>
+    # token positions (CCM's signature), recipe-faithful rank 8 / q,k,v,o.
+    # Port reads the COMP tokens' last-layer hiddens as the M memory vectors.
+    ccm_lora_rank: int = 8
+    ccm_lora_alpha: int = 16        # scale = alpha / rank = 2.0
+    ccm_lora_targets: tuple = ("q_proj", "k_proj", "v_proj", "o_proj")
+    ccm_n_comp: int = 0             # <COMP> tokens per step; 0 ⇒ n_flat_codes
+    ccm_fold: str = "merge"         # "merge" (1/t mean, fixed M) | "concat" (grows)
+
     # ── Activation efficiency ───────────────────────────────────────────────
     # Activation-checkpoint each streaming-write window so we don't retain all
     # n_windows of encoder activations for one backward. This is what makes the

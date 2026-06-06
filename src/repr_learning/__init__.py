@@ -10,6 +10,7 @@ Design doc: docs/v2.1_repr_learning.md
 from .config import ReprConfig
 from .model import ReprLearningModel
 from .encoder import (
+    CCMBaselineEncoder,
     ContinuousBaselineEncoder,
     FlatBaselineEncoder,
     FullContextEncoder,
