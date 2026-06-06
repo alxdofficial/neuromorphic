@@ -40,7 +40,7 @@ MAMBA_DELTA = False    # set by CLI (--kv-split) to enable the mamba DeltaNet de
 
 def cfg_for(v):
     cfg = replace(stage_a_cfg("nc8"), graph_v6_d_updater=384, graph_v6_updater_layers=3,
-                  graph_v6_read_ffn_mult=1, d_enc=D_ENC.get(v, 1408), d_mamba=1408, graph_v6_prepend_read=True)
+                  graph_v6_read_ffn_mult=1, d_enc=D_ENC.get(v, 1408), d_mamba=1408)
     if v == "graph_v6" and GRAPH_OVERRIDES:
         cfg = replace(cfg, **GRAPH_OVERRIDES)
     if v == "vqvae" and VQVAE_SPLIT:

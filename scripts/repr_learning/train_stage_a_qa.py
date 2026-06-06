@@ -106,9 +106,7 @@ def erank(model, ctx_ids, ctx_mask, variant):
     st = model.encoder.init_streaming_state(ctx_ids.size(0), ctx_ids.device, te.dtype)
     st, _ = model.encoder.streaming_write(st, te, ctx_mask, chunk_offset=0)
     mem, aux = model.encoder.finalize_memory(st)
-    if variant == "graph_v6_baseline":
-        mem = aux["graph_v6_facts"]["value"]
-    elif variant in ("memorizing_baseline", "memorizing_transformer_baseline"):  # MT stores a bank; finalize returns empty
+    if variant in ("memorizing_baseline", "memorizing_transformer_baseline"):  # MT stores a bank; finalize returns empty
         mem = aux["mt_bank"]["values"]              # [B, N, d] — the values that get retrieved
     mem = mem.float()
     N, M = mem.shape[0], mem.shape[1]
@@ -179,9 +177,6 @@ def main():
     ap.add_argument("--recon", action="store_true",
                     help="RECONSTRUCTION objective: value:=passage. Teacher-force the whole passage "
                          "through the frozen decoder. Reports REAL/OFF/SHUF recon loss + grad-norm-to-encoder.")
-    ap.add_argument("--graph-inject", action="store_true",
-                    help="revert graph_v6 to the per-decode-token INJECT read (main-branch design). "
-                         "Default (this branch): PREPEND the FiLM fact-tokens like the baselines.")
     ap.add_argument("--lora", action="store_true",
                     help="LoRA-all: rank-16 q/v LoRA on the (otherwise frozen) Llama for EVERY arm "
                          "(main's recipe) — lets the decoder LEARN to query the memory. Also restores "
@@ -201,10 +196,9 @@ def main():
     # per-variant d_enc equalizes trainable params (others default to 1408)
     D_ENC = {"vqvae_baseline": 1600, "memorizing_transformer_baseline": 1536,
              "flat_baseline": 1600, "memorizing_baseline": 1536}   # +old aliases
-    cfg = replace(stage_a_cfg("nc8"),                                     # ratio-1; inject_layer 13
+    cfg = replace(stage_a_cfg("nc8"),
                   graph_v6_d_updater=384, graph_v6_updater_layers=3, graph_v6_read_ffn_mult=1,
                   d_enc=D_ENC.get(args.variant, 1408), d_mamba=1408,
-                  graph_v6_prepend_read=not args.graph_inject,        # PREPEND fact-tokens (new-branch design)
                   use_llama_lora=args.lora,                           # --lora: decoder learns to query the memory
                   b_diversity_scale=50.0 if args.lora else 0.0,       # …and restore main's anti-collapse
                   mt_diversity_scale=50.0 if args.lora else 0.0)      # losses so baselines don't collapse

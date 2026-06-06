@@ -558,36 +558,15 @@ def generate_answers(llama, tokenizer, memory: torch.Tensor,
         full = torch.cat(parts, dim=1)
         attn = torch.cat(masks, dim=1)
 
-        # graph_v6: install the SAME per-token MemInject pre-hook used in
-        # compute_qa_loss so the read injects this sample's facts at every
-        # decode position. Per-sample facts slice [i:i+1]; removed in finally.
-        hook_handle = None
-        if inject is not None:
-            enc_ref = inject["encoder"]
-            # facts is a dict of [B,...] tensors (e.g. {"value": ...}); slice to
-            # this sample. Non-tensor entries pass through unchanged.
-            facts_i = {k: (v[i:i+1] if torch.is_tensor(v) else v)
-                       for k, v in inject["facts"].items()}
-            lidx = inject["layer_idx"]
-
-            def _pre_hook(module, args, kwargs, _enc=enc_ref, _f=facts_i):
-                if not args:
-                    return None
-                hs = args[0]
-                return (_enc.inject(hs, _f),) + args[1:], kwargs
-
-            hook_handle = llama.model.layers[lidx].register_forward_pre_hook(
-                _pre_hook, with_kwargs=True)
-        try:
-            gen = llama.generate(
-                inputs_embeds=full, attention_mask=attn,
-                max_new_tokens=mnt, do_sample=False,
-                pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
-                eos_token_id=stop_token_id,
-            )
-        finally:
-            if hook_handle is not None:
-                hook_handle.remove()
+        # Unified-read cleanup: the graph_v6 per-token inject hook is gone. graph_v6 now
+        # prepends its memory tokens into `full` (like every other variant), so generation
+        # is a single unmodified call — no per-sample hook.
+        gen = llama.generate(
+            inputs_embeds=full, attention_mask=attn,
+            max_new_tokens=mnt, do_sample=False,
+            pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
+            eos_token_id=stop_token_id,
+        )
         # `generate` with inputs_embeds returns only NEW tokens (no prefix).
         raw = tokenizer.decode(gen[0].tolist(), skip_special_tokens=True).strip()
         clean = _truncate_at_natural_end(raw)
@@ -720,13 +699,9 @@ def main():
                     model, batch, device, args.window_size,
                 )
                 mem_mask = finalize_aux.get("memory_mask")
-                # graph_v6 reads via a per-token inject hook (not prepend) — pass
-                # the spec so decode exercises the actual read mechanism.
+                # Unified-read cleanup: graph_v6 prepends memory tokens like every variant
+                # (the per-token inject hook was removed). No inject spec.
                 inject = None
-                facts = finalize_aux.get("graph_v6_facts")
-                if facts is not None:
-                    inject = {"encoder": model.encoder, "facts": facts,
-                              "layer_idx": model.encoder.inject_layer_idx}
                 # Decode with THIS variant's LoRA-wrapped Llama (not the shared
                 # base) so the trained rank-16 adapter is applied.
                 raw_preds, clean_preds = generate_answers(

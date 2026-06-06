@@ -132,7 +132,7 @@ def run(variant, phaseA=800, phaseB=600, bs=8, n_pairs=8, oracle=False):
     cfg = replace(stage_a_cfg("nc8"),
                   graph_v6_d_updater=384, graph_v6_updater_layers=3, graph_v6_read_ffn_mult=1,
                   d_enc=D_ENC.get(variant, 1408), d_mamba=1408,
-                  graph_v6_prepend_read=True, use_llama_lora=False,
+                  use_llama_lora=False,
                   b_diversity_scale=50.0, mt_diversity_scale=50.0)   # anti-collapse so the probe is fair
     tok = AutoTokenizer.from_pretrained(cfg.llama_model)
     model = ReprLearningModel(cfg, variant=variant, llama_model=None).to(DEV)

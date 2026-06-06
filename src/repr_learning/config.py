@@ -368,10 +368,6 @@ class ReprConfig:
     graph_v6_edge_gate_init_bias: float = 1.0
     graph_v6_init_log_sigma: float = 0.0
     graph_v6_film_hidden: int = 512
-    graph_v6_prepend_read: bool = False    # NEW-BRANCH design: prepend the FiLM fact-tokens as
-                                           # memory tokens (Llama native attention, same read path
-                                           # as the baselines) instead of the per-decode-token
-                                           # inject hook. Identical bottleneck (K_edge × d_llama).
     # K/V SPLIT (MQAR fix): separate decoupled key + value memory tokens. Default False = current
     # fused behavior, fully backward-compatible (no new params when off).
     graph_v6_kv_split: bool = False        # True → finalize_memory emits aux["graph_v6_kv"] = {keys, values}
@@ -385,9 +381,6 @@ class ReprConfig:
                                            # via aux["mamba_kv"]. Default off = vanilla selective-SSM pool.
     mamba_delta_dk: int = 128              # delta-rule key feature dim
     mamba_delta_dv: int = 128              # delta-rule value dim
-    graph_v6_inject_layer: int = 13        # v6.1: late-layer inject (was 8 = mid-stack "conform
-                                           # zone" where a wrong read flips the answer; 13/16 ≈
-                                           # top-third "ignore zone", Ben-Artzy — a bad read is harmless)
 
     # ── Gaussian Splat substrate (Exp 3) ──────────────────────────────────
     # See docs/exp3_gaussian_splat_baseline.md for full design.

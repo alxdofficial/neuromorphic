@@ -657,20 +657,14 @@ class ReprLearningModel(nn.Module):
             M = memory.shape[1]
 
         # SHUFFLE control (Stage-A load-bearing test): give each row a DIFFERENT
-        # passage's memory. graph_v6 reads facts from finalize_aux (NOT `memory`),
-        # so roll the right object per arm — rolling `memory` would be a silent
-        # no-op for graph_v6 and falsely look like REAL.
+        # passage's memory. All variants (graph_v6 included) now emit memory TOKENS,
+        # so rolling `memory` by 1 along the batch is the shuffle control for every arm.
         if shuffle_memory:
             assert memory.shape[0] >= 2, "shuffle_memory control needs batch >= 2"
-            if (self.variant == "graph_v6_baseline" and not self.cfg.graph_v6_prepend_read
-                    and finalize_aux.get("graph_v6_facts") is not None):
-                fv = finalize_aux["graph_v6_facts"]
-                fv["value"] = fv["value"].roll(1, 0)
-            else:
-                memory = memory.roll(1, 0)
-                if finalize_aux.get("memory_mask") is not None:   # roll the per-slot mask WITH the memory
-                    finalize_aux = {**finalize_aux,               # (oracle: variable passage lengths)
-                                    "memory_mask": finalize_aux["memory_mask"].roll(1, 0)}
+            memory = memory.roll(1, 0)
+            if finalize_aux.get("memory_mask") is not None:   # roll the per-slot mask WITH the memory
+                finalize_aux = {**finalize_aux,               # (oracle: variable passage lengths)
+                                "memory_mask": finalize_aux["memory_mask"].roll(1, 0)}
 
         # zero_memory ablation: for prepend variants we DROP the memory
         # slots entirely (M=0) so the question starts at RoPE position 0,
@@ -836,53 +830,20 @@ class ReprLearningModel(nn.Module):
                     pred_targets[i, pred_pos] = answer_ids_for_loss[i, k]
 
         # ---- 4. Llama forward (causal mask is native; padding via attn_mask) ----
-        # graph_v6: install a forward_pre_hook on the chosen Llama decoder layer
-        # that calls encoder.inject(hidden_states, facts) at every position. The
-        # hook is removed in finally so the shared Llama module is unmodified
-        # across variants.
-        hook_handle = None
-        if zero_memory:
-            # No memory: Llama forward runs unmodified (no per-token read).
-            pass
-        elif (self.variant == "graph_v6_baseline" and not oracle_memory
-                and not self.cfg.graph_v6_prepend_read):
-            # Per-decode-token read (docs/graph_v6.md READ Stage B): facts built in
-            # finalize_memory, soft-retrieved + fused at every position by the hook.
-            facts_for_hook = finalize_aux["graph_v6_facts"]
-            inject_layer_idx = self.encoder.inject_layer_idx
-            encoder_ref = self.encoder
-
-            def pre_hook(module, args, kwargs):
-                if not args:
-                    return None
-                hidden_states = args[0]
-                injected = encoder_ref.inject(hidden_states, facts_for_hook)
-                new_args = (injected,) + args[1:]
-                return new_args, kwargs
-
-            hook_handle = (
-                self.decoder.llama.model.layers[inject_layer_idx]
-                .register_forward_pre_hook(pre_hook, with_kwargs=True)
-            )
-
-        try:
-            # Selective lm_head: run base model for hidden states, then only
-            # apply lm_head to prediction positions. Profiled saving at B=12,
-            # T=224: 120→102 ms (15%), 7603→6209 MiB (1.4 GiB). Avoids the
-            # [B, T, vocab=128K] logits tensor entirely.
-            # v5.5 perf: use_cache=False — QA is teacher-forced + single-pass,
-            # there is no autoregressive decode that reuses KV. Building the
-            # cache adds a noticeable per-step cost (esp. for vanilla_full_ctx
-            # where T_ctx ~= 8K).
-            base_out = self.decoder.llama.model(
-                inputs_embeds=full_embeds,
-                attention_mask=attn_mask_full.to(torch.long),
-                use_cache=False,
-            )
-            hidden = base_out.last_hidden_state            # [B, T_total, d_llama]
-        finally:
-            if hook_handle is not None:
-                hook_handle.remove()
+        # Unified-read cleanup: the graph_v6 per-token inject hook (encoder.inject + fact_reader)
+        # is removed. Every variant — graph_v6 included — now prepends its memory TOKENS into
+        # full_embeds (built above), and Llama reads them with native attention.
+        # NOTE: prepend is the INTERIM stage-2 read. The unified shared cross-attention read
+        # (Llama hidden -> encoder k/v tokens, same mechanism the MQAR gate proves out) is the
+        # deferred stage-2 wiring — see docs/llama_stage2_speed_research.md.
+        # Selective lm_head (below) keeps the 128K-vocab projection to prediction positions only.
+        # v5.5 perf: use_cache=False — QA is teacher-forced single-pass; no AR decode reuses KV.
+        base_out = self.decoder.llama.model(
+            inputs_embeds=full_embeds,
+            attention_mask=attn_mask_full.to(torch.long),
+            use_cache=False,
+        )
+        hidden = base_out.last_hidden_state            # [B, T_total, d_llama]
 
         pred_hidden_all = hidden[:, :-1, :]                # [B, T_total-1, d_llama]
 
@@ -992,7 +953,7 @@ class ReprLearningModel(nn.Module):
             for k, v in finalize_aux.items():
                 if k.startswith("graph_v5_"):
                     graph_telemetry[k] = v
-                elif k.startswith("graph_v6_") and k != "graph_v6_facts":
+                elif k.startswith("graph_v6_"):
                     graph_telemetry[k] = v
         # Vanilla has no trainable params in the QA loss path (Llama is frozen
         # and mask_embed isn't used without a [MASK] token in the input). Add

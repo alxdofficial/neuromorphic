@@ -140,8 +140,7 @@ class StageAModel(nn.Module):
         if self.arm == "continuous_baseline" and torch.is_tensor(st) and st.dim() == 3:
             return st.to(torch.float32)                                    # [B, n_flat_codes, d_enc]
         memory, aux = self.encoder.finalize_memory(st)
-        if memory.size(1) == 0 and isinstance(aux, dict) and aux.get("graph_v6_facts") is not None:
-            memory = aux["graph_v6_facts"]["value"]                        # graph fact-tokens (dim d_read)
+        # graph_v6 now always emits non-empty value memory tokens (fact_reader removed) — no fallback.
         return memory.to(torch.float32)                                    # [B, M, d]
 
     def _memory_query(self, batch, zero_memory, shuffle_memory, oracle_memory, passage_memory):

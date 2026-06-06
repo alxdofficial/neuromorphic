@@ -28,7 +28,7 @@ results = {}
 def cfg_for(v):
     return replace(stage_a_cfg("nc8"),
                    graph_v6_d_updater=384, graph_v6_updater_layers=3, graph_v6_read_ffn_mult=1,
-                   d_enc=D_ENC.get(v, 1408), d_mamba=1408, graph_v6_prepend_read=True)
+                   d_enc=D_ENC.get(v, 1408), d_mamba=1408)
 
 
 def rec(v, name, ok, detail=""):

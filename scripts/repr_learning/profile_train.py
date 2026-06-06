@@ -28,11 +28,9 @@ BSS = [8, 16, 32, 64, 96]
 
 
 def cfg_for(v):
-    # graph_v6_prepend_read=False = PRODUCTION inject-at-13 (short backward, ~42ms). prepend was a
-    # stopgap that wrongly inflated graph_v6 stage-2 cost ~2.4x. NOTE: the OTHER 4 baselines are
-    # prepend-style by design (memory at the INPUT) -> they keep the full 16-layer backward (~100ms).
+    # All variants prepend memory tokens (graph_v6's inject hook was removed in the unified-read cleanup).
     return replace(stage_a_cfg("nc8"), graph_v6_d_updater=384, graph_v6_updater_layers=3,
-                   graph_v6_read_ffn_mult=1, d_enc=D_ENC.get(v, 1408), d_mamba=1408, graph_v6_prepend_read=False)
+                   graph_v6_read_ffn_mult=1, d_enc=D_ENC.get(v, 1408), d_mamba=1408)
 
 
 def _to(d):

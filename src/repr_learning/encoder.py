@@ -1462,11 +1462,10 @@ class GraphV6BaselineEncoder(nn.Module):
         self.d_node = cfg.graph_v6_d_node
         self.d_state = cfg.graph_v6_d_state
         d_read = cfg.graph_v6_d_read
-        self.inject_layer_idx = getattr(cfg, "graph_v6_inject_layer", 8)
 
         from .graph_substrate_v5 import SoftPointer
         from .graph_substrate_v6 import (
-            GraphV6Updater, GraphV6Gate, GraphV6FactBuilder, GraphV6FactReader,
+            GraphV6Updater, GraphV6Gate, GraphV6FactBuilder,
             GraphV6FactKeyBuilder,
         )
 
@@ -1503,14 +1502,12 @@ class GraphV6BaselineEncoder(nn.Module):
             d_node=self.d_node, d_state=self.d_state, d_read=d_read,
             film_hidden=cfg.graph_v6_film_hidden, mlp_hidden=cfg.graph_v6_builder_mlp_hidden,
         )
-        self.fact_reader = GraphV6FactReader(
-            d_llama=cfg.d_llama, d_read=d_read,
-            n_heads=cfg.graph_v6_read_heads, ffn_mult=cfg.graph_v6_read_ffn_mult,
-        )
-        # PREPEND-read scale match: W_out(fact_value) comes out ~20x louder than Llama's token
-        # embeddings (~0.9), making the prepended fact-tokens attention distractors the frozen
-        # decoder can't route around. Every other prepend baseline ends in _NormMatch; graph must too.
-        self.prepend_norm = _NormMatch(cfg.d_llama)
+        # Value projection: fact_value [B, K_edge, d_read] -> d_llama (was fact_reader.W_out, now
+        # standalone). This IS the value memory token the shared cross-attention read head consumes.
+        self.value_out = nn.Linear(d_read, cfg.d_llama)
+        nn.init.normal_(self.value_out.weight, std=0.01)
+        nn.init.zeros_(self.value_out.bias)
+        self.prepend_norm_val = _NormMatch(cfg.d_llama)   # norm-match to Llama token scale
         # ── K/V split (persistent-key MQAR fix): only built when the flag is on (else zero new params) ──
         if getattr(cfg, "graph_v6_kv_split", False):
             # project persistent node_id [K_node, d_up] -> endpoint space d_node so the soft-pointer
@@ -1650,46 +1647,27 @@ class GraphV6BaselineEncoder(nn.Module):
     def finalize_memory(self, state):
         N = state["N"]
         B, device = N.shape[0], N.device
-        dtype = next(self.fact_reader.parameters()).dtype
+        dtype = next(self.parameters()).dtype
         zero_state = bool(state.get("zero_state", False))   # finer ablation than zero_memory
         fact_value, fact_key = self._build_facts(state, zero_state=zero_state)
-        if self.cfg.graph_v6_prepend_read:
-            # NEW-BRANCH design: prepend the FiLM fact-tokens (projected to d_llama) as memory
-            # tokens — Llama reads them with native attention like the baselines, NOT the
-            # per-decode-token inject hook. Bottleneck unchanged (K_edge × d_llama).
-            memory = self.prepend_norm(self.fact_reader.W_out(fact_value)).to(dtype)   # [B, K_edge, d_llama], Llama-scale
-        else:
-            memory = torch.zeros(B, 0, self.cfg.d_llama, device=device, dtype=dtype)
+        # Unified read: project fact_value -> d_llama as the VALUE memory token the shared
+        # cross-attention read head consumes (no inject reader; no prepend/inject branch).
+        memory = self.prepend_norm_val(self.value_out(fact_value)).to(dtype)   # [B, K_edge, d_llama]
         n_w = max(state["n_windows"], 1)
         aux = {
             "load_balance_loss": torch.zeros((), device=device, dtype=dtype),
-            # graph_aux=0 (no aux loss) — also flips compute_qa_loss's `graph_aux is not
-            # None` guard True so the graph_v6_* telemetry pass-through actually fires.
             "graph_aux": torch.zeros((), device=device, dtype=dtype),
-            "graph_v6_facts": {"value": fact_value},
             "graph_v6_node_gate_mean_avg": (state["node_gate_mean_accum"] / n_w).to(torch.float32),
             "graph_v6_edge_gate_mean_avg": (state["edge_gate_mean_accum"] / n_w).to(torch.float32),
             "graph_v6_fact_norm": fact_value.detach().float().norm(dim=-1).mean().to(torch.float32),
         }
-        # K/V split: decoupled key memory (from persistent node_id) + value memory (the fused facts above).
+        # K/V split: decoupled key memory (from persistent node_id) + value memory (the facts above).
         if getattr(self.cfg, "graph_v6_kv_split", False) and fact_key is not None:
-            assert self.cfg.graph_v6_prepend_read, "graph_v6_kv_split requires graph_v6_prepend_read=True"
             mem_key = self.prepend_norm_key(self.W_out_key(fact_key)).to(dtype)   # [B, K_edge, d_llama]
             aux["graph_v6_kv"] = {"keys": mem_key, "values": memory}
-        # ── Eval-only health telemetry (no grad, zero train-time cost) ────────
-        # Diagnose whether the v6 mechanism is alive: dead read (rezero eff≈0),
-        # ignored edge-state (state_effect≈0 violates no-op-free), collapsed node
-        # bank (collapse_cos→1), degenerate soft-pointer read (entropy→0 over-sharp
-        # or →log K diffuse; active_frac→0 = hub collapse).
+        # ── Eval-only health telemetry (no grad): state-effect, node collapse, soft-pointer read ──
         if not self.training:
             with torch.no_grad():
-                fr = self.fact_reader
-                eff = (fr.scale_max * torch.tanh(fr.scale_raw)).abs().mean()
-                aux["graph_v6_rezero_scale_eff"] = eff.float().to(torch.float32)
-                # v6.1: per-position read gate mean (from the last decode pass) — should
-                # drop below 1 if the model learns to suppress the read where unhelpful.
-                if getattr(fr, "_last_gate_mean", None) is not None:
-                    aux["graph_v6_read_gate_mean"] = fr._last_gate_mean.to(torch.float32)
                 fact_zero, _ = self._build_facts(state, zero_state=True)
                 aux["graph_v6_state_effect"] = (
                     (fact_value - fact_zero).float().norm(dim=-1).mean().to(torch.float32))
@@ -1713,21 +1691,15 @@ class GraphV6BaselineEncoder(nn.Module):
                 aux["graph_v6_node_active_frac"] = active.float().mean().to(torch.float32)
         return memory, aux
 
-    def inject(self, hidden_states, facts):
-        """READ Stage B: per-position soft retrieval over fact-tokens (installed as a
-        forward pre-hook on Llama layer `inject_layer_idx` by compute_qa_loss)."""
-        return self.fact_reader(hidden_states, facts["value"])
-
     def forward(self, token_embeds, attention_mask=None, mask_positions=None):
-        """Non-streaming fallback (recon/HSM paths). The QA path uses streaming_write +
-        finalize_memory + the per-position inject hook. Here we return a prepend
-        projection of the fact-tokens so non-QA callers get usable memory."""
+        """Non-streaming fallback (recon/HSM paths): one streaming write + finalize, returns the
+        value memory token (the shared cross-attention read head consumes it)."""
         del mask_positions
         B, device, dtype = token_embeds.shape[0], token_embeds.device, token_embeds.dtype
         state = self.init_streaming_state(B, device, dtype)
         state, _ = self.streaming_write(state, token_embeds, attention_mask)
         fact_value, _ = self._build_facts(state)
-        memory = self.prepend_norm(self.fact_reader.W_out(fact_value)).to(dtype)   # [B, K_edge, d_llama], Llama-scale
+        memory = self.prepend_norm_val(self.value_out(fact_value)).to(dtype)   # [B, K_edge, d_llama]
         aux = {"load_balance_loss": torch.zeros((), device=device, dtype=memory.dtype)}
         return memory, aux
 
