@@ -16,6 +16,7 @@ from .encoder import (
     FlatBaselineEncoder,
     FullContextEncoder,
     GraphV6BaselineEncoder,
+    GraphV7BaselineEncoder,
     ICAEBaselineEncoder,
     MemorizingBaselineEncoder,
     NullEncoder,

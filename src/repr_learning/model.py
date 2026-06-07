@@ -22,6 +22,7 @@ from .encoder import (
     FlatBaselineEncoder,
     FullContextEncoder,
     GraphV6BaselineEncoder,
+    GraphV7BaselineEncoder,
     ICAEBaselineEncoder,
     MemorizingBaselineEncoder,
     NullEncoder,
@@ -50,6 +51,7 @@ class ReprLearningModel(nn.Module):
         "memorizing_baseline": MemorizingBaselineEncoder,
         "recurrent_baseline": RecurrentBaselineEncoder,
         "graph_v6_baseline": GraphV6BaselineEncoder,
+        "graph_v7_baseline": GraphV7BaselineEncoder,  # stable atoms + co-activation edges + ⊙ bind
         "icae_baseline": ICAEBaselineEncoder,  # ICAE (ICLR'24) compressor, EMAT-retrained
         "ccm_baseline": CCMBaselineEncoder,    # CCM (ICLR'24) recurrent compressor, EMAT-retrained
         "beacon_baseline": BeaconBaselineEncoder,  # Activation Beacon (BAAI) per-layer beacon attn

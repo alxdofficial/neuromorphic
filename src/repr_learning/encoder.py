@@ -2058,3 +2058,43 @@ class GraphV6BaselineEncoder(nn.Module):
         aux = {"load_balance_loss": torch.zeros((), device=device, dtype=memory.dtype)}
         return memory, aux
 
+
+class GraphV7BaselineEncoder(nn.Module):
+    """graph_v7: STABLE vocabulary-atom bank + co-activation-masked mobile edges + ⊙ bind.
+
+    Thin streaming wrapper around GraphV7Substrate (docs/graph_v7_doctrine.md). Reads via
+    PREPEND (finalize returns [B, K_edge, d_llama]); no inject hook, no node_gate."""
+
+    def __init__(self, cfg):
+        super().__init__()
+        from .graph_substrate_v7 import GraphV7Substrate
+        self.cfg = cfg
+        self.sub = GraphV7Substrate(cfg)
+
+    def init_streaming_state(self, batch_size, device, dtype, seed=None):
+        gen = None
+        if seed is None and not self.training:
+            seed = 1234                       # deterministic eval (v6 convention)
+        if seed is not None:
+            gen = torch.Generator(device=device)
+            gen.manual_seed(int(seed))
+        return self.sub.init_state(batch_size, device, dtype, gen)
+
+    def streaming_write(self, state, token_embeds, attention_mask, chunk_offset=0, **kwargs):
+        del chunk_offset, kwargs              # v7 routing is content-based; no positional offset
+        state = self.sub.streaming_write(state, token_embeds, attention_mask)
+        return state, {}
+
+    def finalize_memory(self, state):
+        return self.sub.finalize(state)
+
+    def forward(self, token_embeds, attention_mask=None, mask_positions=None):
+        """Non-streaming fallback (recon/HSM paths)."""
+        del mask_positions
+        B, device, dtype = token_embeds.shape[0], token_embeds.device, token_embeds.dtype
+        state = self.init_streaming_state(B, device, dtype)
+        state, _ = self.streaming_write(state, token_embeds, attention_mask)
+        memory, _ = self.finalize_memory(state)
+        aux = {"load_balance_loss": torch.zeros((), device=device, dtype=memory.dtype)}
+        return memory, aux
+
