@@ -126,6 +126,9 @@ class GraphV7Substrate(nn.Module):
             film_hidden=cfg.graph_v6_film_hidden, mlp_hidden=cfg.graph_v6_builder_mlp_hidden)
         self.W_out = nn.Linear(d_read, d_llama)
         self.prepend_norm = _NormMatch(d_llama)
+        # competition (edges claim distinct pairs) + atom decorrelation (keep vocab spread)
+        self.comp_coef = float(getattr(cfg, "graph_v7_competition_coef", 0.01))
+        self.decorr_coef = float(getattr(cfg, "graph_v7_decorr_coef", 0.01))
 
     # ── state ────────────────────────────────────────────────────────────────
     def init_state(self, B, device, dtype, generator=None):
@@ -226,7 +229,17 @@ class GraphV7Substrate(nn.Module):
         src_ep, dst_ep, p_src, p_dst = self.materialize(state)
         fact = self.fact_builder(src_ep, dst_ep, state["state"])     # [B,Ke,d_read]
         memory = self.prepend_norm(self.W_out(fact).float())         # [B,Ke,d_llama]
-        aux = {}
+        # ── competition + atom decorrelation (single load_balance_loss the trainer weights;
+        # aux-loss-as-fallback for collapse, consistent with the routing load-balance/z-loss) ──
+        eye_e = torch.eye(self.K_edge, device=memory.device, dtype=torch.bool)
+        joint = (torch.einsum('bek,bfk->bef', p_src, p_src)
+                 * torch.einsum('bek,bfk->bef', p_dst, p_dst)).float()   # both-endpoints-shared
+        comp_loss = joint.masked_fill(eye_e, 0.0).mean()             # penalize duplicate (src,dst)
+        af = F.normalize(self.atoms, dim=-1)
+        G = (af @ af.t()).float()
+        eye_n = torch.eye(self.K_node, device=G.device, dtype=torch.bool)
+        decorr_loss = (G.masked_fill(eye_n, 0.0) ** 2).mean()        # keep the vocabulary spread
+        aux = {"load_balance_loss": self.comp_coef * comp_loss + self.decorr_coef * decorr_loss}
         with torch.no_grad():
             def _ent(p):
                 p = p.float().clamp_min(1e-9)
@@ -234,8 +247,7 @@ class GraphV7Substrate(nn.Module):
             aux["graph_v7_src_entropy"] = _ent(p_src)
             aux["graph_v7_dst_entropy"] = _ent(p_dst)
             aux["graph_v7_active_frac"] = (state["a_accum"] > 1e-6).float().mean().to(torch.float32)
-            af = F.normalize(self.atoms.float(), dim=-1)
-            cos = af @ af.t()
-            off = ~torch.eye(self.K_node, dtype=torch.bool, device=af.device)
-            aux["graph_v7_atom_collapse_cos"] = cos[off].mean().to(torch.float32)
+            aux["graph_v7_competition_loss"] = comp_loss.to(torch.float32)
+            aux["graph_v7_decorr_loss"] = decorr_loss.to(torch.float32)
+            aux["graph_v7_atom_collapse_cos"] = G.masked_fill(eye_n, 0.0).abs().mean().to(torch.float32)
         return memory, aux
