@@ -594,6 +594,7 @@ def train_one_variant(
         _graph_v7_scalar_keys = (
             "graph_v7_src_entropy", "graph_v7_dst_entropy", "graph_v7_active_frac",
             "graph_v7_competition_loss", "graph_v7_decorr_loss", "graph_v7_atom_collapse_cos",
+            "graph_v7_state_effect", "graph_v7_atom_usage_entropy", "graph_v7_edge_state_norm",
         )
         for key in _graph_v7_scalar_keys:
             if key in out and out[key] is not None:

@@ -275,4 +275,14 @@ class GraphV7Substrate(nn.Module):
             aux["graph_v7_competition_loss"] = comp_loss.to(torch.float32)
             aux["graph_v7_decorr_loss"] = decorr_loss.to(torch.float32)
             aux["graph_v7_atom_collapse_cos"] = G.masked_fill(eye_n, 0.0).abs().mean().to(torch.float32)
+            # health: does the relation matter? (||fact − fact(zero edge_state)|| / ||fact||)
+            fact0 = self.fact_builder(src_ep, dst_ep, torch.zeros_like(state["state"]))
+            num = (fact - fact0).float().norm(dim=-1).mean()
+            aux["graph_v7_state_effect"] = (num / fact.float().norm(dim=-1).mean().clamp_min(1e-6)
+                                            ).to(torch.float32)
+            # health: codebook usage spread (low -> atoms collapsing/under-used) + edge-state norm
+            _u = _a / _a.sum(-1, keepdim=True).clamp_min(1e-9)
+            aux["graph_v7_atom_usage_entropy"] = (-(_u.clamp_min(1e-9) * _u.clamp_min(1e-9).log()
+                                                    ).sum(-1)).mean().to(torch.float32)
+            aux["graph_v7_edge_state_norm"] = state["state"].float().norm(dim=-1).mean().to(torch.float32)
         return memory, aux
