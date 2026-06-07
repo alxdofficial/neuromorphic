@@ -16,6 +16,7 @@ from torch import Tensor
 from .chat_template import ChatTemplate, build_chat_template
 from .config import ReprConfig
 from .encoder import (
+    AutoCompressorBaselineEncoder,
     BeaconBaselineEncoder,
     CCMBaselineEncoder,
     ContinuousBaselineEncoder,
@@ -55,6 +56,7 @@ class ReprLearningModel(nn.Module):
         "icae_baseline": ICAEBaselineEncoder,  # ICAE (ICLR'24) compressor, EMAT-retrained
         "ccm_baseline": CCMBaselineEncoder,    # CCM (ICLR'24) recurrent compressor, EMAT-retrained
         "beacon_baseline": BeaconBaselineEncoder,  # Activation Beacon (BAAI) per-layer beacon attn
+        "autocompressor_baseline": AutoCompressorBaselineEncoder,  # AutoCompressors/RMT recurrent summary
         "vanilla_llama": NullEncoder,         # loss floor — Llama with no memory
         "vanilla_full_context": FullContextEncoder,  # loss ceiling — Llama sees full evidence
     }
