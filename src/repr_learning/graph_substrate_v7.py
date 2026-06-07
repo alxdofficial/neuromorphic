@@ -56,10 +56,11 @@ def init_graph_v7_state(B, K_node, K_edge, d_node, d_state, d_val,
         eps = torch.randn(B, K, d, device=device, dtype=dtype, generator=generator)
         return mu.view(1, 1, -1) + log_sigma.exp().view(1, 1, -1) * eps
     z = lambda *s: torch.zeros(*s, device=device, dtype=dtype)
+    zf = lambda *s: torch.zeros(*s, device=device, dtype=torch.float32)
     return {
-        "C": z(B, K_node, K_node),          # co-activation (within-scope, decayed)
-        "content": z(B, K_node, d_val),     # per-atom pooled token content
-        "a_accum": z(B, K_node),            # per-atom total activation (the active mask)
+        "C": zf(B, K_node, K_node),         # co-activation (fp32 — drives the sharp dst mask)
+        "content": z(B, K_node, d_val),     # per-atom pooled token content (the value bundle)
+        "a_accum": zf(B, K_node),           # per-atom total activation (fp32 — the active threshold)
         "q_src": _sample(mu_q, log_sigma_q, K_edge, d_node),
         "q_dst": _sample(mu_q, log_sigma_q, K_edge, d_node),
         "state": _sample(mu_state, log_sigma_state, K_edge, d_state),
@@ -129,6 +130,7 @@ class GraphV7Substrate(nn.Module):
         # competition (edges claim distinct pairs) + atom decorrelation (keep vocab spread)
         self.comp_coef = float(getattr(cfg, "graph_v7_competition_coef", 0.01))
         self.decorr_coef = float(getattr(cfg, "graph_v7_decorr_coef", 0.01))
+        self.active_frac = float(getattr(cfg, "graph_v7_active_frac", 0.15))   # tight active set
 
     # ── state ────────────────────────────────────────────────────────────────
     def init_state(self, B, device, dtype, generator=None):
@@ -144,8 +146,8 @@ class GraphV7Substrate(nn.Module):
     def route(self, token_embeds, mask):
         tq = F.normalize(self.route_enc(token_embeds), dim=-1)         # [B,T,d_node]
         ak = F.normalize(self.atoms, dim=-1)                          # [Kn,d_node]
-        logits = torch.einsum('btd,kd->btk', tq, ak) / self._tau()
-        a = torch.softmax(logits, dim=-1)                             # [B,T,Kn]
+        logits = (torch.einsum('btd,kd->btk', tq, ak) / self._tau()).float()
+        a = torch.softmax(logits, dim=-1).to(token_embeds.dtype)      # [B,T,Kn] (sharp op in fp32)
         if mask is not None:
             a = a * mask.unsqueeze(-1).to(a.dtype)
         return a
@@ -161,11 +163,14 @@ class GraphV7Substrate(nn.Module):
         content_tok = self.content_enc(token_embeds)                 # [B,T,d_val]
         content_delta = torch.einsum('btk,btd->bkd', a, content_tok)
         a_delta = a.sum(dim=1)                                        # [B,Kn]
+        # decay applied once per WINDOW (not per scope) — a longer-memory accumulator that
+        # suits encode-once EMAT; the within-scope outer-product STRUCTURE above (no spurious
+        # cross-scope edges) is the load-bearing part and holds regardless of the decay cadence.
         d = self.decay
         state = dict(state)
-        state["C"] = d * state["C"] + C_delta
+        state["C"] = d * state["C"] + C_delta.float()                # fp32 accumulator
         state["content"] = d * state["content"] + content_delta
-        state["a_accum"] = d * state["a_accum"] + a_delta
+        state["a_accum"] = d * state["a_accum"] + a_delta.float()
         return state
 
     # ── per-window edge update ─────────────────────────────────────────────────
@@ -196,39 +201,55 @@ class GraphV7Substrate(nn.Module):
         return state
 
     def streaming_write(self, state, token_embeds, mask):
-        state = self.accumulate(state, token_embeds, mask)
-        state = self.update_edges(state)
-        state = dict(state)
-        state["n_windows"] = state["n_windows"] + 1
-        return state
+        B = token_embeds.shape[0]
+        has_real = (mask.any(dim=1) if mask is not None
+                    else torch.ones(B, dtype=torch.bool, device=token_embeds.device))   # [B]
+        new = self.accumulate(state, token_embeds, mask)
+        new = self.update_edges(new)
+        # all-pad rows: preserve ALL per-row state (no real tokens this window -> no mutation)
+        hr3 = has_real.view(-1, 1, 1)
+        out = dict(new)
+        for k in ("q_src", "q_dst", "state", "content", "C"):
+            out[k] = torch.where(hr3, new[k], state[k])
+        out["a_accum"] = torch.where(has_real.view(-1, 1), new["a_accum"], state["a_accum"])
+        out["n_windows"] = state["n_windows"] + 1
+        return out
 
     # ── endpoint materialization + readout ─────────────────────────────────────
     def materialize(self, state):
         atoms = self.atoms
-        ak = F.normalize(atoms, dim=-1)
+        ak = F.normalize(atoms, dim=-1)                              # KEYS (addressing) — static bank
+        content = state["content"]                                  # VALUES (per-example) [B,Kn,d_val]
         qs = F.normalize(state["q_src"], dim=-1)
         qd = F.normalize(state["q_dst"], dim=-1)
-        active = (state["a_accum"] > 1e-6).unsqueeze(1)              # [B,1,Kn]
+        # TIGHT active set: atoms whose accumulated activation is a real fraction of the peak.
+        # (a_accum > 1e-6 was a NO-OP — softmax routing lights every atom a little, so the old
+        #  mask never masked and endpoints pooled over the whole bank = the PMA failure.)
+        a = state["a_accum"].float()                                # [B,Kn] (fp32)
+        amax = a.amax(dim=-1, keepdim=True)
+        active = (a > self.active_frac * amax).unsqueeze(1)         # [B,1,Kn]
+        has_active = (amax > 1e-6).view(-1, 1, 1)                   # all-pad rows -> zero memory
         neg = torch.finfo(torch.float32).min
-        s_logits = (torch.einsum('bed,kd->bek', qs, ak) / self._tau()).float()
-        s_logits = s_logits.masked_fill(~active, neg)
-        p_src = torch.softmax(s_logits, dim=-1).to(atoms.dtype)      # [B,Ke,Kn]
-        # dst restricted to src's co-activation partners (p_src @ C), diagonal excluded
-        C = state["C"].detach()                                      # C is a MASK for v1
+        s_logits = (torch.einsum('bed,kd->bek', qs, ak) / self._tau()).float().masked_fill(~active, neg)
+        p_src = torch.softmax(s_logits, dim=-1).to(content.dtype)  # [B,Ke,Kn]
+        # dst restricted to src's co-activation partners (p_src @ C), diagonal (self) excluded
+        C = state["C"].detach().float()                            # C is a MASK (no grad through accum)
         Cz = C - torch.diag_embed(torch.diagonal(C, dim1=1, dim2=2))
-        co = torch.einsum('bek,bkj->bej', p_src, Cz)                 # [B,Ke,Kn]
+        co = torch.einsum('bek,bkj->bej', p_src.float(), Cz)       # [B,Ke,Kn] genuine-pair mask
         d_logits = (torch.einsum('bed,kd->bek', qd, ak) / self._tau()).float()
-        d_logits = d_logits + torch.log(co.float().clamp_min(1e-6))
-        d_logits = d_logits.masked_fill(~active, neg)
-        p_dst = torch.softmax(d_logits, dim=-1).to(atoms.dtype)
-        src_ep = torch.einsum('bek,kd->bed', p_src, atoms)
-        dst_ep = torch.einsum('bek,kd->bed', p_dst, atoms)
-        return src_ep, dst_ep, p_src, p_dst
+        d_logits = (d_logits + torch.log(co.clamp_min(1e-6))).masked_fill(~active, neg)
+        p_dst = torch.softmax(d_logits, dim=-1).to(content.dtype)
+        # endpoints BUNDLE the per-example CONTENT (frozen-LLM value), addressed by the static
+        # KEYS — the DKVB split the doctrine specifies (§4/§9): atoms=keys, content=values.
+        src_ep = torch.einsum('bek,bkd->bed', p_src, content)      # [B,Ke,d_val]
+        dst_ep = torch.einsum('bek,bkd->bed', p_dst, content)
+        return src_ep, dst_ep, p_src, p_dst, has_active
 
     def finalize(self, state):
-        src_ep, dst_ep, p_src, p_dst = self.materialize(state)
+        src_ep, dst_ep, p_src, p_dst, has_active = self.materialize(state)
         fact = self.fact_builder(src_ep, dst_ep, state["state"])     # [B,Ke,d_read]
         memory = self.prepend_norm(self.W_out(fact).float())         # [B,Ke,d_llama]
+        memory = memory * has_active.to(memory.dtype)                # all-pad rows -> zero memory
         # ── competition + atom decorrelation (single load_balance_loss the trainer weights;
         # aux-loss-as-fallback for collapse, consistent with the routing load-balance/z-loss) ──
         eye_e = torch.eye(self.K_edge, device=memory.device, dtype=torch.bool)
@@ -246,7 +267,9 @@ class GraphV7Substrate(nn.Module):
                 return (-(p * p.log()).sum(-1)).mean().to(torch.float32)
             aux["graph_v7_src_entropy"] = _ent(p_src)
             aux["graph_v7_dst_entropy"] = _ent(p_dst)
-            aux["graph_v7_active_frac"] = (state["a_accum"] > 1e-6).float().mean().to(torch.float32)
+            _a = state["a_accum"].float()                            # report the ACTUAL active mask
+            aux["graph_v7_active_frac"] = (_a > self.active_frac * _a.amax(dim=-1, keepdim=True)
+                                           ).float().mean().to(torch.float32)
             aux["graph_v7_competition_loss"] = comp_loss.to(torch.float32)
             aux["graph_v7_decorr_loss"] = decorr_loss.to(torch.float32)
             aux["graph_v7_atom_collapse_cos"] = G.masked_fill(eye_n, 0.0).abs().mean().to(torch.float32)

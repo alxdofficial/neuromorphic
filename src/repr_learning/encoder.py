@@ -2094,7 +2094,6 @@ class GraphV7BaselineEncoder(nn.Module):
         B, device, dtype = token_embeds.shape[0], token_embeds.device, token_embeds.dtype
         state = self.init_streaming_state(B, device, dtype)
         state, _ = self.streaming_write(state, token_embeds, attention_mask)
-        memory, _ = self.finalize_memory(state)
-        aux = {"load_balance_loss": torch.zeros((), device=device, dtype=memory.dtype)}
+        memory, aux = self.finalize_memory(state)   # keep the real aux (load_balance + telemetry)
         return memory, aux
 
