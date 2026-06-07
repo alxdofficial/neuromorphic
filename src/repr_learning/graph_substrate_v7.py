@@ -128,8 +128,8 @@ class GraphV7Substrate(nn.Module):
         self.W_out = nn.Linear(d_read, d_llama)
         self.prepend_norm = _NormMatch(d_llama)
         # competition (edges claim distinct pairs) + atom decorrelation (keep vocab spread)
-        self.comp_coef = float(getattr(cfg, "graph_v7_competition_coef", 0.01))
-        self.decorr_coef = float(getattr(cfg, "graph_v7_decorr_coef", 0.01))
+        self.comp_coef = float(getattr(cfg, "graph_v7_competition_coef", 0.1))
+        self.decorr_coef = float(getattr(cfg, "graph_v7_decorr_coef", 0.1))
         self.active_frac = float(getattr(cfg, "graph_v7_active_frac", 0.15))   # tight active set
 
     # ── state ────────────────────────────────────────────────────────────────
@@ -260,7 +260,9 @@ class GraphV7Substrate(nn.Module):
         G = (af @ af.t()).float()
         eye_n = torch.eye(self.K_node, device=G.device, dtype=torch.bool)
         decorr_loss = (G.masked_fill(eye_n, 0.0) ** 2).mean()        # keep the vocabulary spread
-        aux = {"load_balance_loss": self.comp_coef * comp_loss + self.decorr_coef * decorr_loss}
+        # pre-weighted aux added DIRECTLY by compute_qa_loss via the graph_aux path (NOT
+        # re-multiplied by load_balance_coef, which double-scaled it to a ~1e-4 no-op).
+        aux = {"graph_aux": self.comp_coef * comp_loss + self.decorr_coef * decorr_loss}
         with torch.no_grad():
             def _ent(p):
                 p = p.float().clamp_min(1e-9)

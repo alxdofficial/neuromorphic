@@ -590,6 +590,14 @@ def train_one_variant(
         for key in _graph_v6_scalar_keys:
             if key in out and out[key] is not None:
                 row[key] = float(out[key])
+        # graph_v7 telemetry (variant == graph_v7_baseline) — emitted every step.
+        _graph_v7_scalar_keys = (
+            "graph_v7_src_entropy", "graph_v7_dst_entropy", "graph_v7_active_frac",
+            "graph_v7_competition_loss", "graph_v7_decorr_loss", "graph_v7_atom_collapse_cos",
+        )
+        for key in _graph_v7_scalar_keys:
+            if key in out and out[key] is not None:
+                row[key] = float(out[key])
         # v5.4: per-round MP telemetry — log final-round value as a scalar so
         # it shows up in jsonl plotting. Full arrays kept in aux for probes.
         for arr_key, scalar_key in [

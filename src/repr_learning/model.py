@@ -971,6 +971,8 @@ class ReprLearningModel(nn.Module):
                     graph_telemetry[k] = v
                 elif k.startswith("graph_v6_") and k != "graph_v6_facts":
                     graph_telemetry[k] = v
+                elif k.startswith("graph_v7_"):
+                    graph_telemetry[k] = v
         # Vanilla has no trainable params in the QA loss path (Llama is frozen
         # and mask_embed isn't used without a [MASK] token in the input). Add
         # a zero-weighted mask_embed term so backward has a grad to compute;
