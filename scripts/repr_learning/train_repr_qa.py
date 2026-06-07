@@ -1057,6 +1057,7 @@ def main():
     cfg.icae_n_slots = M
     cfg.ccm_n_comp = M
     cfg.graph_v6_K_edge = M          # graph prepends M fact-tokens (matched read)
+    cfg.n_flat_codes = M             # flat/continuous/MT prepend M too (was 192 -> mismatch)
     cfg.beacon_ratio = max(1, args.chunk_size // M)
     _ceil = lambda a, b: -(-a // b)
     _beacon_M = (_ceil(args.chunk_size, args.window_size)

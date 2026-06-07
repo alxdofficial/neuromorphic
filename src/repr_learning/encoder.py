@@ -1117,9 +1117,11 @@ class ICAEBaselineEncoder(nn.Module):
             alpha=cfg.icae_lora_alpha,
             target_names=tuple(cfg.llama_lora_target_names),
         )
-        if getattr(cfg, "grad_checkpoint_llama", False):
-            base.model.gradient_checkpointing_enable(
-                gradient_checkpointing_kwargs={"use_reentrant": False})
+        # Per-layer gradient checkpointing on the encoder base: finalize runs ONE 1B forward
+        # over the whole chunk (T+M ~8320 tokens) -> an uncheckpointed peak OOMs at
+        # chunk=8192/BS>=8. Unconditional (the old grad_checkpoint_llama flag was never set).
+        base.model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False})
         self.base = base
         self.M = cfg.icae_n_slots or cfg.n_flat_codes
         # Slot embeddings: init at the base embedding-table mean (centered in
@@ -1415,6 +1417,8 @@ class BeaconBaselineEncoder(nn.Module):
         base, _ = load_frozen_llama(cfg.llama_model)
         for p in base.parameters():
             p.requires_grad_(False)
+        base.model.gradient_checkpointing_enable(   # cap the 1B-forward activation peak (~100M beacon proj)
+            gradient_checkpointing_kwargs={"use_reentrant": False})
         self._mask = [None]
         # cfg.beacon_param uses the paper's short names ("q","k","v"); normalize
         # to HF projection names so the wrap loop matches.

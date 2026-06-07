@@ -77,7 +77,7 @@ class GraphV7Substrate(nn.Module):
         self.d_node = cfg.graph_v6_d_node
         self.d_state = cfg.graph_v6_d_state
         self.d_val = self.d_state
-        d = cfg.graph_v6_d_updater
+        d = int(getattr(cfg, "graph_v7_d_updater", 800))   # ~48M trainable (matches the hand-built cluster)
         d_read = cfg.graph_v6_d_read
         d_llama = cfg.d_llama
         self.scope_size = int(getattr(cfg, "graph_v7_scope_size", 16))
