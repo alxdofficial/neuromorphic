@@ -506,9 +506,11 @@ class ReprConfig:
     # (partners' HRR self-binds weighted by the node's coact column), keys AND
     # values delta-written, real NLL surprise, K/V-split cross-attn read
     # (same-layer K_ℓ/V_ℓ reads via shared routers; GraphV8SymReader).
-    # Sizing (all dims multiples of 32): atoms 2·1024·3072 + bases 6·1024·3072 +
-    # proj_in + 2-layer reader @ inner 928 + LoRA ≈ 52.17M ≈ v7's 52.12M (+0.1%).
-    graph_v8_d_mem: int = 2880          # 90*32; sized with the 4th router to ~52.2M
+    # High-capacity graph_v8 anchor: final read memory is
+    # n_layers · n_nodes · 2 · d_mem = 3 · 1024 · 2 · 2048
+    # = 12,582,912 floats. Baseline comparison runs should scale their memory
+    # budgets to this number rather than using the old 128-token prepend default.
+    graph_v8_d_mem: int = 2048
     graph_v8_n_nodes: int = 1024
     graph_v8_n_layers: int = 3          # persistent layers above L0 (4 incl. L0)
     graph_v8_chunk: int = 256           # chunkwise-parallel token batch (also ckpt unit)
