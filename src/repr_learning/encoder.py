@@ -2415,7 +2415,60 @@ class GraphV8ColumnEncoder(nn.Module):
         # ℓ via ITS OWN keys K_ℓ (same-layer pairing) and fetches V_ℓ.
         per_layer = [torch.cat([sub["keys"][l], sub["values"][l]], dim=-1)
                      for l in range(1, self.sub.depth + 1)]
-        return torch.stack(per_layer, dim=1), {}             # [B,S,N,2·d_mem]
+        aux = {}
+        with torch.no_grad():
+            eps = 1e-9
+
+            def _entropy_eff_frac(x: Tensor, denom: int) -> tuple[Tensor, Tensor]:
+                xf = x.float().clamp_min(0)
+                mass = xf.sum().clamp_min(eps)
+                p = xf.reshape(-1) / mass
+                nz = p > 0
+                ent = -(p[nz] * p[nz].log()).sum() if nz.any() else torch.zeros((), device=xf.device)
+                return ent, (ent.exp() / max(denom, 1)).clamp(max=1.0)
+
+            def _offdiag_cos_abs_mean(x: Tensor) -> Tensor:
+                xu = F.normalize(x.float(), dim=-1, eps=1e-6)
+                cos = xu @ xu.transpose(1, 2)                         # [B,N,N]
+                N = cos.shape[-1]
+                if N <= 1:
+                    return torch.zeros((), device=cos.device)
+                eye = torch.eye(N, dtype=torch.bool, device=cos.device).unsqueeze(0)
+                return cos.masked_select(~eye).abs().mean()
+
+            N = self.cfg.graph_v8_n_nodes
+            for l in range(1, self.sub.depth + 1):
+                k = sub["keys"][l].float()
+                v = sub["values"][l].float()
+                bk = self.sub.base_keys[l - 1].float().unsqueeze(0)
+                bv = self.sub.base_values[l - 1].float().unsqueeze(0)
+                aux[f"graph_v8_key_rms_L{l}"] = k.pow(2).mean().sqrt()
+                aux[f"graph_v8_value_rms_L{l}"] = v.pow(2).mean().sqrt()
+                aux[f"graph_v8_key_collapse_cos_L{l}"] = _offdiag_cos_abs_mean(k)
+                aux[f"graph_v8_value_collapse_cos_L{l}"] = _offdiag_cos_abs_mean(v)
+                aux[f"graph_v8_state_effect_L{l}"] = (
+                    ((k - bk).pow(2).mean() + (v - bv).pow(2).mean()) / 2.0
+                ).sqrt()
+
+            for src in range(self.sub.depth):
+                co = sub["coact"][src].float()
+                mass = co.sum().clamp_min(eps)
+                ent, eff = _entropy_eff_frac(co, N * N)
+                diag = co.diagonal(dim1=-2, dim2=-1).sum()
+                aux[f"graph_v8_coact_mass_L{src}"] = mass
+                aux[f"graph_v8_coact_entropy_L{src}"] = ent
+                aux[f"graph_v8_coact_eff_edge_frac_L{src}"] = eff
+                aux[f"graph_v8_coact_diag_share_L{src}"] = diag / mass
+                aux[f"graph_v8_coact_top_edge_share_L{src}"] = co.max() / mass
+
+                col_ent, col_eff = _entropy_eff_frac(sub["colsum"][src], N)
+                win_ent, win_eff = _entropy_eff_frac(sub["windowed"][src], N)
+                aux[f"graph_v8_colsum_entropy_L{src}"] = col_ent
+                aux[f"graph_v8_colsum_eff_node_frac_L{src}"] = col_eff
+                aux[f"graph_v8_window_entropy_L{src}"] = win_ent
+                aux[f"graph_v8_window_eff_node_frac_L{src}"] = win_eff
+
+        return torch.stack(per_layer, dim=1), aux          # [B,S,N,2·d_mem]
 
     def forward(self, token_embeds, attention_mask=None, mask_positions=None):
         del mask_positions

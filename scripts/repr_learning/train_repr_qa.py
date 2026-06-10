@@ -99,6 +99,7 @@ def run_val(model, val_set, device, n_batches: int, window_size: int,
     last_mp_cos: float | None = None  # eval-only telemetry (gated in MP readout)
     last_v5_eval: dict[str, float] = {}  # eval-only encoder telemetry
     last_v6_eval: dict[str, float] = {}  # graph_v6 eval-only health telemetry
+    last_v8_eval: dict[str, float] = {}  # graph_v8 read/write health telemetry
     # Deterministic-eval seed (audit fix 2026-05-27): graph_v5's chunk-fresh
     # init was sampling fresh noise per call → same model + same batch produced
     # ~0.2 loss variance. Seeding torch RNG per batch makes eval reproducible.
@@ -152,6 +153,13 @@ def run_val(model, val_set, device, n_batches: int, window_size: int,
             v = out.get(k)
             if v is not None:
                 last_v6_eval[k] = float(v)
+        for k, v in out.items():
+            if not k.startswith("graph_v8_") or v is None:
+                continue
+            if isinstance(v, (int, float)):
+                last_v8_eval[k] = float(v)
+            elif torch.is_tensor(v) and v.numel() == 1:
+                last_v8_eval[k] = float(v.detach())
         # Per-family: use per-row loss instead of batch-wide mean (a 2-row
         # batch with rows from families X and Y was previously credited
         # the same mean to both, hiding genuine per-family differences).
@@ -189,6 +197,8 @@ def run_val(model, val_set, device, n_batches: int, window_size: int,
     for k, v in last_v5_eval.items():
         result[f"val_{k}"] = v
     for k, v in last_v6_eval.items():
+        result[f"val_{k}"] = v
+    for k, v in last_v8_eval.items():
         result[f"val_{k}"] = v
     return result
 
@@ -577,7 +587,7 @@ def train_one_variant(
         row = {
             "step": step,
             "variant": variant,
-            "loss": float(out["loss"]),
+            "loss": float(out["loss"].detach()),
             "loss_recon": float(out["loss_recon"]),
             "loss_aux": float(out["loss_aux"]),               # load_balance only (unweighted)
             "top1_acc": float(out["top1_acc"]),
@@ -670,6 +680,13 @@ def train_one_variant(
         for key in _graph_v7_scalar_keys:
             if key in out and out[key] is not None:
                 row[key] = float(out[key])
+        for key, value in out.items():
+            if not key.startswith("graph_v8_") or value is None:
+                continue
+            if isinstance(value, (int, float)):
+                row[key] = float(value)
+            elif torch.is_tensor(value) and value.numel() == 1:
+                row[key] = float(value.detach())
         # v5.4: per-round MP telemetry — log final-round value as a scalar so
         # it shows up in jsonl plotting. Full arrays kept in aux for probes.
         for arr_key, scalar_key in [

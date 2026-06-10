@@ -1346,6 +1346,15 @@ class ReprLearningModel(nn.Module):
                     # graph_v7_bound_content is a [B,Kn,d_val] read tensor, not a
                     # scalar telemetry value — consumed by the unbind read, not logged.
                     graph_telemetry[k] = v
+        graph_v8_telemetry = {
+            k: v for k, v in finalize_aux.items() if k.startswith("graph_v8_")
+        }
+        if getattr(self, "graph_v8_reader", None) is not None:
+            gates = self.graph_v8_reader.gates.detach().float()
+            graph_v8_telemetry["graph_v8_reader_gate_mean"] = gates.mean()
+            graph_v8_telemetry["graph_v8_reader_gate_abs_max"] = gates.abs().max()
+            for i, g in enumerate(gates):
+                graph_v8_telemetry[f"graph_v8_reader_gate_L{i + 1}"] = g
         # Vanilla has no trainable params in the QA loss path (Llama is frozen
         # and mask_embed isn't used without a [MASK] token in the input). Add
         # a zero-weighted mask_embed term so backward has a grad to compute;
@@ -1381,6 +1390,8 @@ class ReprLearningModel(nn.Module):
             out.update(splat_telemetry)
         if graph_telemetry is not None:
             out.update(graph_telemetry)
+        if graph_v8_telemetry:
+            out.update(graph_v8_telemetry)
         # flat_baseline codebook health → top-level so the trainer logs it to
         # jsonl (codes_active = #live codes; collapse = the flat analogue of
         # graph routing collapse).
