@@ -977,7 +977,7 @@ def main():
     # need the larger window to fit evidence + distractors).
     ap.add_argument("--chunk-size", type=int, default=8192)
     ap.add_argument("--window-size", type=int, default=1024)
-    ap.add_argument("--mem-tokens", type=int, default=128,
+    ap.add_argument("--mem-tokens", type=int, default=144,
                     help="EMAT matched MEMORY budget: M memory tokens × d_llama, "
                          "matched across ICAE/CCM/AutoCompressor/Beacon "
                          "(and graph_v6 if selected). Graph V8 has its own "

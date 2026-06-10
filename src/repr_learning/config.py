@@ -512,12 +512,15 @@ class ReprConfig:
     # (partners' HRR self-binds weighted by the node's coact column), keys AND
     # values delta-written, real NLL surprise, K/V-split cross-attn read
     # (same-layer K_ℓ/V_ℓ reads via shared routers; GraphV8SymReader).
-    # High-capacity graph_v8 anchor: final read memory is
-    # n_layers · n_nodes · 2 · d_mem = 3 · 1024 · 2 · 2048
-    # = 12,582,912 floats. Baseline comparison runs should scale their memory
-    # budgets to this number rather than using the old 128-token prepend default.
-    graph_v8_d_mem: int = 2048
-    graph_v8_n_nodes: int = 1024
+    # Fast compressed graph_v8 anchor: final read memory is
+    # n_layers · n_nodes · 2 · d_mem = 3 · 768 · 2 · 64
+    # = 294,912 floats = 144 Llama-token-equivalent memory vectors. Including
+    # the encoder's per-example coact/traces state, the streaming graph state is
+    # ~2,068,992 floats, just below the default EMAT-bio input budget
+    # (1024 · 2048 = 2,097,152 floats), while preserving the multiple-of-32
+    # substrate contract.
+    graph_v8_d_mem: int = 64
+    graph_v8_n_nodes: int = 768
     graph_v8_n_layers: int = 3          # persistent layers above L0 (4 incl. L0)
     graph_v8_chunk: int = 256           # chunkwise-parallel token batch (also ckpt unit)
     # LAYER-MATCHED splice points, one per MEMORY LAYER incl. L0 (same-layer K/V
