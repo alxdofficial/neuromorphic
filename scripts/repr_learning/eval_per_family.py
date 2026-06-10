@@ -54,17 +54,13 @@ from src.repr_learning.data_qa import (                                # noqa: E
 COMPOSITE_VAL_P = ROOT / "data/wave1/composite_v1/val/passages.jsonl"
 COMPOSITE_VAL_Q = ROOT / "data/wave1/composite_v1/val/questions.jsonl"
 
-# Joint sweep — all arms scored with identical decode params so the
-# floor/ceiling are produced in the SAME run as the comparison arms (EM/
-# Containment/Judge), not only on reconstruction NLL.
+# Joint sweep — all active compressor arms scored with identical decode params.
 DEFAULT_VARIANTS = [
-    "graph_v8_baseline",     # primary
-    "flat_baseline",
-    "continuous_baseline",
-    "recurrent_baseline",
-    "memorizing_baseline",
-    "vanilla_llama",         # floor (no context)
-    "vanilla_full_context",  # ceiling (full evidence)
+    "graph_v8_baseline",          # primary
+    "icae_baseline",
+    "ccm_baseline",
+    "autocompressor_baseline",
+    "beacon_baseline",
 ]
 
 # Doubly-nested path comes from `--out outputs/repr_learning/tranche4_<v>`

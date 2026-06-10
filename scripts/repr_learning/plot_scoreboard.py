@@ -22,17 +22,15 @@ from typing import Optional
 import numpy as np
 
 
-# (variant_label, variant_key, color, group) — the 7 live v2.1 arms. The run
+# (variant_label, variant_key, color, group) — the active memory-experiment arms. The run
 # dir is derived as f"{out_tag}_{variant_key}" and the jsonl as f"{variant_key}.jsonl",
 # matching the trainer's output layout, so pass --out-tag for a given sweep.
 VARIANTS = [
-    ("graph_v6 (primary)",        "graph_v6_baseline",     "#d62728", "graph_v6"),
-    ("flat (VQ codebook)",        "flat_baseline",         "#8c564b", "baseline"),
-    ("continuous (slot-attn)",    "continuous_baseline",   "#2ca02c", "baseline"),
-    ("mamba (recurrent SSM)",     "recurrent_baseline",    "#1f77b4", "baseline"),
-    ("memorizing (top-K KV)",     "memorizing_baseline",   "#9467bd", "baseline"),
-    ("vanilla (no context)",      "vanilla_llama",         "#7f7f7f", "vanilla"),
-    ("vanilla (full context)",    "vanilla_full_context",  "#17becf", "vanilla"),
+    ("graph_v8 (primary)",        "graph_v8_baseline",          "#d62728", "graph_v8"),
+    ("ICAE",                      "icae_baseline",              "#1f77b4", "published"),
+    ("CCM",                       "ccm_baseline",               "#2ca02c", "published"),
+    ("AutoCompressor",            "autocompressor_baseline",    "#9467bd", "published"),
+    ("Activation Beacon",         "beacon_baseline",            "#ff7f0e", "published"),
 ]
 
 

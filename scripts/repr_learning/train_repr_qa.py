@@ -949,17 +949,15 @@ def main():
     # which silently baked a full relative path into the tag and re-nested every
     # run under outputs/repr_learning/outputs/repr_learning/.
     ap = argparse.ArgumentParser(allow_abbrev=False)
-    # Active suite: latest graph + baselines, plus the two frozen-Llama
-    # reference points. Retired graph/plastic/splat variants remain selectable
-    # via explicit --variants if needed.
+    # Active suite: latest graph + published closed-book compressor baselines.
+    # Retired graph/plastic/splat and older flat/continuous/MT/Mamba variants
+    # remain selectable via explicit --variants if needed.
     ap.add_argument("--variants", nargs="+", default=[
-        "graph_v8_baseline",      # primary architecture (columnar K/V read)
-        "flat_baseline",
-        "continuous_baseline",
-        "memorizing_baseline",
-        "recurrent_baseline",
-        "vanilla_llama",          # loss floor (no context)
-        "vanilla_full_context",   # frozen-LM reference (sees raw context)
+        "graph_v8_baseline",          # primary architecture (columnar K/V read)
+        "icae_baseline",              # ICAE (ICLR'24)
+        "ccm_baseline",               # CCM (ICLR'24)
+        "autocompressor_baseline",    # AutoCompressor/RMT-style recurrent summary
+        "beacon_baseline",            # Activation Beacon
     ])
     ap.add_argument("--steps", type=int, default=8_000)
     ap.add_argument("--batch-size", type=int, default=8)
@@ -981,8 +979,10 @@ def main():
     ap.add_argument("--window-size", type=int, default=1024)
     ap.add_argument("--mem-tokens", type=int, default=128,
                     help="EMAT matched MEMORY budget: M memory tokens × d_llama, "
-                         "matched across the prepend arms (ICAE/CCM/Beacon/graph). "
-                         "Derives icae_n_slots, ccm_n_comp, and Beacon's α.")
+                         "matched across ICAE/CCM/AutoCompressor/Beacon "
+                         "(and graph_v6 if selected). Graph V8 has its own "
+                         "K/V read budget. Derives icae_n_slots, "
+                         "ccm_n_comp, autocompressor_n_slots, and Beacon's α.")
     ap.add_argument("--passages-per-chunk", type=int, default=0,
                     help="composite_v1 passages sampled per chunk. 0 = auto: "
                          "scales with chunk_size (~75 per 1024 tokens). "
@@ -998,7 +998,7 @@ def main():
                          "emat_bio = biographical key-phrase→fact-dense-sentence (binding); "
                          "continuation = compress N → predict next (AutoComp/Beacon gist/LM); "
                          "ae = compress N → reconstruct same N (ICAE autoencoding); "
-                         "mae = compress N → fill ~85%-masked N (denoising, leak-free).")
+                         "mae = compress N → fill ~85%%-masked N (denoising, leak-free).")
     ap.add_argument("--mae-mask-ratio", type=float, default=0.85,
                     help="mae: fraction of answer tokens replaced by <mask> in the forward.")
     ap.add_argument("--emat-n-pairs", type=int, default=64,
@@ -1299,6 +1299,7 @@ def main():
     M = args.mem_tokens
     cfg.icae_n_slots = M
     cfg.ccm_n_comp = M
+    cfg.autocompressor_n_slots = M
     cfg.graph_v6_K_edge = M          # graph prepends M fact-tokens (matched read)
     cfg.n_flat_codes = M             # flat/continuous/MT prepend M too (was 192 -> mismatch)
     cfg.beacon_ratio = max(1, args.chunk_size // M)
@@ -1317,8 +1318,9 @@ def main():
                  * _ceil(args.window_size, cfg.beacon_ratio))
     print(f"[EMAT budget] mem_tokens={M} × d_llama={cfg.d_llama} = "
           f"{M * cfg.d_llama:,} prepend decoder-read floats/arm")
-    for _a, _m in (("graph_v6", M), ("icae", M), ("ccm", M), ("beacon", _beacon_M)):
-        print(f"   {_a:<8} M={_m:<4} → {_m * cfg.d_llama:,} floats")
+    for _a, _m in (("graph_v6", M), ("icae", M), ("ccm", M),
+                   ("autocompressor", M), ("beacon", _beacon_M)):
+        print(f"   {_a:<16} M={_m:<4} → {_m * cfg.d_llama:,} floats")
     if "graph_v8_baseline" in args.variants:
         _v8_read = cfg.graph_v8_n_layers * cfg.graph_v8_n_nodes * 2 * cfg.graph_v8_d_mem
         print(f"   graph_v8 K/V read → {_v8_read:,} floats "

@@ -189,6 +189,12 @@ class ReprConfig:
     icae_lora_alpha: int = 64       # scale = alpha / rank = 2.0
     icae_n_slots: int = 0           # 0 ⇒ fall back to n_flat_codes (matched budget)
 
+    # AutoCompressor / RMT-style recurrent summary port. Same frozen-backbone +
+    # encoder-LoRA setup as ICAE, but the M summary tokens recur across windows.
+    autocompressor_lora_rank: int = 32
+    autocompressor_lora_alpha: int = 64
+    autocompressor_n_slots: int = 0 # 0 ⇒ fall back to n_flat_codes (matched budget)
+
     # ── CCM baseline (Compressed Context Memory, Kim et al. ICLR 2024) ──────
     # Recurrent compression via a conditional LoRA gated to fire ONLY on <COMP>
     # token positions (CCM's signature), recipe-faithful rank 8 / q,k,v,o.
