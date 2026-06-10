@@ -1,6 +1,6 @@
 # EMAT-first baseline comparison — execution plan
 
-*Branch: `emat-baselines` (off `main`). Direction: [[project_stage_a_direction_emat]]. Diagnosis behind it: docs/mamba_two_lenses_memory.md.*
+*Branch: `memory-experiment` (off `main`). Direction: [[project_stage_a_direction_emat]]. Diagnosis behind it: docs/mamba_two_lenses_memory.md.*
 
 ## Goal
 

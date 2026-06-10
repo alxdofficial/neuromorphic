@@ -1,6 +1,6 @@
 # graph_v7 — design doctrine (vocabulary-atoms + co-activation edges)
 
-*Branch: `emat-baselines`. Supersedes the graph_v6 write path. Read interface (prepend) and the ⊙ bind are already landed (commits a0124bc, 89ba4f2). This doc is the spec for the write redesign.*
+*Branch: `memory-experiment`. Supersedes the graph_v6 write path. Read interface (prepend) and the ⊙ bind are already landed (commits a0124bc, 89ba4f2). This doc is the spec for the write redesign.*
 
 ## 0. Thesis (why this shape)
 

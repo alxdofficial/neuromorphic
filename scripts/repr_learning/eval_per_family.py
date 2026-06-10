@@ -42,7 +42,9 @@ ROOT = Path("/home/alex/code/neuromorphic")
 sys.path.insert(0, str(ROOT))
 
 from src.repr_learning.config import ReprConfig                        # noqa: E402
-from src.repr_learning.model import ReprLearningModel                  # noqa: E402
+from src.repr_learning.model import (                                  # noqa: E402
+    ReprLearningModel, contextualize_write_input,
+)
 from src.repr_learning.data_qa import (                                # noqa: E402
     HotpotQADataset, MuSiQueDataset, NarrativeQADataset, QADataset,
     BABILongDataset, RULERNIAHDataset, LoCoMoQADataset,
@@ -52,11 +54,11 @@ from src.repr_learning.data_qa import (                                # noqa: E
 COMPOSITE_VAL_P = ROOT / "data/wave1/composite_v1/val/passages.jsonl"
 COMPOSITE_VAL_Q = ROOT / "data/wave1/composite_v1/val/questions.jsonl"
 
-# v2.1 joint sweep — all 7 arms scored with identical decode params so the
+# Joint sweep — all arms scored with identical decode params so the
 # floor/ceiling are produced in the SAME run as the comparison arms (EM/
 # Containment/Judge), not only on reconstruction NLL.
 DEFAULT_VARIANTS = [
-    "graph_v6_baseline",     # primary
+    "graph_v8_baseline",     # primary
     "flat_baseline",
     "continuous_baseline",
     "recurrent_baseline",
@@ -391,14 +393,27 @@ def _stream_encode_batch(model, batch_samples: list[EvalSample],
 
     with torch.no_grad():
         token_embeds = embed(ctx)
+        ctx_surprise = None
+        if getattr(model, "variant", None) == "graph_v8_baseline":
+            ctx_surprise = enc.context_surprise(ctx, mask)
+        # E1: apply the SAME graph_v7 WRITE-contextualization as training so the
+        # eval-path memory matches the train-path memory (no-op unless variant is
+        # graph_v7_baseline AND cfg.graph_write_context == "contextualized").
+        enc_input = token_embeds
+        if getattr(model, "variant", None) == "graph_v7_baseline":
+            enc_input = contextualize_write_input(model.decoder, model.cfg, token_embeds, mask)
         state = enc.init_streaming_state(B, device=device,
                                           dtype=token_embeds.dtype)
         for s in range(0, T, window_size):
             e = min(s + window_size, T)
+            extra = {}
+            if ctx_surprise is not None:
+                extra["surprise"] = ctx_surprise[:, s:e]
             state, _ = enc.streaming_write(
-                state, token_embeds[:, s:e, :],
+                state, enc_input[:, s:e, :],
                 attention_mask=mask[:, s:e],
                 chunk_offset=s,
+                **extra,
             )
         # v5.6: hand the question to the encoder (graph_v5 reads it for the
         # question-conditioned readout). NullEncoder/Mamba use a non-dict state
@@ -490,6 +505,8 @@ def generate_answers(llama, tokenizer, memory: torch.Tensor,
                       adaptive_budget: bool = True,
                       chat_template=None,   # ChatTemplate or None
                       inject=None,          # graph_v6 per-token read: {encoder,facts,layer_idx}
+                      graph_reader=None,    # graph_v7 cross_attn read: GraphCrossAttnReader (NO prepend)
+                      graph_v8_reader=None,  # graph_v8/V8 symmetric K/V read (NO prepend)
                       ) -> tuple[list[str], list[str]]:
     """Greedy AR-decode per sample. When chat_template is set, prefix is:
        [pre_mem; memory; post_mem; question; post_q]
@@ -534,7 +551,9 @@ def generate_answers(llama, tokenizer, memory: torch.Tensor,
             masks.append(torch.ones(1, pre_mem_embeds.shape[0],
                                      dtype=torch.long, device=device))
 
-        if memory.shape[1] > 0:
+        # graph_v7/v8 reader modes: memory is read via installed hooks, NOT
+        # prepended. Otherwise prepend as usual.
+        if memory.shape[1] > 0 and graph_reader is None and graph_v8_reader is None:
             m_i = memory[i:i+1].to(q_emb.dtype)
             parts.append(m_i)
             if memory_mask is not None:
@@ -578,6 +597,15 @@ def generate_answers(llama, tokenizer, memory: torch.Tensor,
 
             hook_handle = llama.model.layers[lidx].register_forward_pre_hook(
                 _pre_hook, with_kwargs=True)
+        # graph_v7 cross_attn: set THIS sample's memory + install the read hooks
+        # on the decoder layers (mirrors compute_qa_loss's 2c branch). Removed +
+        # cleared in the finally so the shared Llama is left clean across samples.
+        if graph_reader is not None:
+            graph_reader.set_memory(memory[i:i+1].to(q_emb.dtype))
+            graph_reader.install_hooks(llama)
+        if graph_v8_reader is not None:
+            graph_v8_reader.set_memory(memory[i:i+1])
+            graph_v8_reader.install_hooks(llama)
         try:
             gen = llama.generate(
                 inputs_embeds=full, attention_mask=attn,
@@ -588,6 +616,12 @@ def generate_answers(llama, tokenizer, memory: torch.Tensor,
         finally:
             if hook_handle is not None:
                 hook_handle.remove()
+            if graph_reader is not None:
+                graph_reader.remove_hooks()
+                graph_reader.clear_memory()
+            if graph_v8_reader is not None:
+                graph_v8_reader.remove_hooks()
+                graph_v8_reader.clear_memory()
         # `generate` with inputs_embeds returns only NEW tokens (no prefix).
         raw = tokenizer.decode(gen[0].tolist(), skip_special_tokens=True).strip()
         clean = _truncate_at_natural_end(raw)
@@ -727,6 +761,16 @@ def main():
                 if facts is not None:
                     inject = {"encoder": model.encoder, "facts": facts,
                               "layer_idx": model.encoder.inject_layer_idx}
+                # graph_v7 cross_attn reads via the trainable GraphCrossAttnReader
+                # (not prepend) — pass it so decode installs the read hooks and
+                # does NOT prepend memory (mirrors compute_qa_loss's 2c branch).
+                graph_reader = None
+                if (getattr(model, "graph_reader", None) is not None
+                        and getattr(model.cfg, "graph_read_mode", "prepend") == "cross_attn"):
+                    graph_reader = model.graph_reader
+                graph_v8_reader = None
+                if getattr(model, "graph_v8_reader", None) is not None:
+                    graph_v8_reader = model.graph_v8_reader
                 # Decode with THIS variant's LoRA-wrapped Llama (not the shared
                 # base) so the trained rank-16 adapter is applied.
                 raw_preds, clean_preds = generate_answers(
@@ -734,6 +778,8 @@ def main():
                     args.max_new_tokens, device, memory_mask=mem_mask,
                     chat_template=getattr(model, "chat_template", None),
                     inject=inject,
+                    graph_reader=graph_reader,
+                    graph_v8_reader=graph_v8_reader,
                 )
                 for i, s in enumerate(batch):
                     raw = raw_preds[i]

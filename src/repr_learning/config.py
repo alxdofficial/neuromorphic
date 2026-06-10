@@ -153,6 +153,17 @@ class ReprConfig:
     # a non-canonical crutch. Re-enable small only if a retrain shows collapse.
     mt_diversity_scale: float = 0.0
 
+    # ── Faithful Memorizing Transformers (mt_faithful) ───────────────────
+    # The REAL Wu et al. (2022) mechanism (see src/repr_learning/mt_attention.py),
+    # replacing the broken `memorizing_baseline`. A single decoder layer's
+    # self-attention is augmented with a kNN read over a per-token (key, value)
+    # datastore gathered from the context, blended into the local attention via
+    # a learned per-KV-head sigmoid gate (the ONLY trainable param this baseline
+    # adds — 8 scalars for Llama-3.2-1B).
+    mt_layer: int = 8          # which Llama decoder layer hosts the kNN read
+    mt_topk: int = 32          # k for top-k kNN retrieval per query
+    mt_gate_init_bias: float = 0.0   # gate = sigmoid(bias); 0 → 0.5 (equal mix)
+
     # ── Role embeddings on V2.1 memory tokens ──────────────────────────────
     # Llama receives 96 memory tokens but has no built-in way to tell src
     # from edge from dst. A learned per-role bias (added at projection time)
@@ -198,6 +209,8 @@ class ReprConfig:
     beacon_param: tuple = ("q", "k", "v")   # which projections get a separate beacon copy
     beacon_ratio: int = 0                   # condensing ratio α (beacons/window=W/α); 0 ⇒ auto from n_flat_codes
     beacon_window: int = 0                  # 0 ⇒ use trainer window_size
+    beacon_wrap_layers: tuple = ()          # layer indices to wrap; () ⇒ ALL layers (capacity knob)
+    mae_mask_ratio: float = 0.85            # mae task: fraction of answer tokens masked in the forward
 
     # ── Activation efficiency ───────────────────────────────────────────────
     # Activation-checkpoint each streaming-write window so we don't retain all
@@ -383,8 +396,8 @@ class ReprConfig:
     # (274,944 substrate floats); re-match baselines once the arch is frozen.
     graph_v6_K_node: int = 128
     graph_v6_K_edge: int = 196
-    graph_v6_d_node: int = 384
-    graph_v6_d_state: int = 384
+    graph_v6_d_node: int = 480    # widened 384→480 to MATCH the ports' 262,144-float memory
+    graph_v6_d_state: int = 480    # (per-example state = C + content + a_accum + q_src/q_dst/state)
     graph_v6_d_updater: int = 640          # write-transformer token dim
     graph_v6_updater_layers: int = 5
     graph_v6_updater_heads: int = 16
@@ -400,6 +413,119 @@ class ReprConfig:
     graph_v6_inject_layer: int = 13        # v6.1: late-layer inject (was 8 = mid-stack "conform
                                            # zone" where a wrong read flips the answer; 13/16 ≈
                                            # top-third "ignore zone", Ben-Artzy — a bad read is harmless)
+
+    # ── graph_v7 READ mode (cross-attention read vs prepend) ───────────────
+    # "prepend" (default, existing behavior): the K_edge memory tokens are
+    # prepended to the decode sequence and the frozen Llama self-attention is
+    # relied on to use them. Empirically it doesn't — the memory gradient
+    # collapses (grad_norm_memory 56→0.15) and the write never learns.
+    # "cross_attn": skip the prepend (M=0) and instead install a dedicated,
+    # TRAINABLE multi-head cross-attention read at a few decoder layers. Each
+    # decode token queries the graph's memory vectors; the result is
+    # gated-added into Llama's residual stream so gradient flows back to the
+    # graph encoder from step 0 (gate init NONZERO). graph_v7 only.
+    graph_read_mode: str = "prepend"
+    graph_read_n_layers: int = 4                       # informational (len of indices)
+    graph_read_layer_indices: tuple = (3, 7, 11, 15)   # which decoder layers host a read
+    graph_read_inner_dim: int = 512                    # per-read q/k/v projection width
+    graph_read_n_heads: int = 8                        # cross-attention heads
+    graph_read_gate_init: float = 0.1                  # learnable scalar gate init (NONZERO — load-bearing)
+
+    # ── graph_v7 WRITE contextualization (encoder INPUT, not the read) ─────
+    # "raw" (default, existing behavior): the graph substrate builds its memory
+    # from RAW Llama token embeddings (context-free lookups). EVERY port
+    # (ICAE/CCM/AutoComp/Beacon) instead writes from CONTEXTUALIZED hidden
+    # states (input run through a frozen Llama → last_hidden_state). This flag
+    # gives the graph the same option: when "contextualized", run the FROZEN
+    # DECODER Llama over the context (one extra no_grad pass — no second base,
+    # avoiding the ports' OOM) and feed its hidden states into route_enc/
+    # content_enc IN PLACE of raw embeds (same [B,T,d_llama] shape, so the graph
+    # pipeline — routing, co-activation C, TokenGT edge update, ⊙ bind, the
+    # cross-attn read — is UNCHANGED). The Llama stays frozen: gradient does NOT
+    # flow into the base; the graph's own route_enc/content_enc remain the
+    # trainable write. Contextualization is WRITE-side ONLY — the decoder still
+    # decodes the ORIGINAL raw embeds. Composes independently with
+    # graph_read_mode. graph_v7 only.
+    graph_write_context: str = "raw"             # "raw" | "contextualized"
+    # 0 = full/all decoder layers → use last_hidden_state ("full contextualize").
+    # N>0 = run only the first N layers and read hidden_states[N] ("lower attune"
+    # mode — hidden_states[0] = embeds, [k] = after layer k; clamped to n_layers).
+    graph_write_context_layers: int = 0
+
+    # ── graph_v7 bind-early / unbind-late associative memory (HRR) ──────────
+    # The diagnosis: graph_v7's content accumulator MEAN-POOLS token values into
+    # shared type-atoms → per-example memory is near-constant across passages
+    # (cross-passage cosine 0.999) → SHUF=REAL (no binding). The fix: tag each
+    # token's value with its entity-KEY via an HRR (circular-convolution) bind
+    # the instant BEFORE it pools, so each atom holds a recoverable superposition
+    # (Plate 1995, Holographic Reduced Representations); UNBIND by the question's
+    # key (circular correlation) at read. When True, the WRITE pools BOUND pairs
+    # and a dedicated unbind READ replaces the cross-attn read; the structural
+    # TokenGT/edge/materialize path is left in place but RECALL goes through the
+    # unbind (the Hadamard ⊙ fact_builder is bypassed — not cleanly invertible).
+    # REQUIRES graph_write_context=="contextualized" (the entity-key needs
+    # Llama's contextualization). graph_v7_baseline only.
+    graph_v7_bind: bool = False
+    # NONZERO learnable scalar gate init for the unbind read (load-bearing — lets
+    # gradient reach key_proj/value_proj/W_recover/route_enc from step 0).
+    graph_v7_bind_gate_init: float = 0.1
+
+    # ── graph_v7 substrate hyperparameters (hoisted from getattr-buried defaults) ──
+    # Co-activation accumulator decay applied once per WINDOW (encode-once EMAT
+    # favors a long-memory accumulator; the within-scope outer-product structure
+    # is the load-bearing part regardless of cadence).
+    graph_v7_decay: float = 0.98
+    # Aux-loss weights (added directly via the graph_aux path; NOT re-scaled by
+    # load_balance_coef). Edge competition (claim distinct (src,dst) pairs) and
+    # atom decorrelation (keep the vocabulary spread). Aux-loss-as-fallback.
+    graph_v7_competition_coef: float = 0.1
+    graph_v7_decorr_coef: float = 0.1
+    # Split routing/endpoint temperatures (learnable; these set the INIT).
+    # Routing over normalized-cosine logits needs a SMALL tau to peak — a sharp
+    # per-token assignment is what lets atoms specialize (SHUF=REAL root cause).
+    # Endpoint materialization tolerates a larger tau (it pools over the active
+    # set, not a single atom). Both are learnable nn.Parameters from these inits.
+    graph_v7_route_tau_init: float = 0.1
+    graph_v7_endpoint_tau_init: float = 0.3
+    # FIXED top-k active set: the |active| atoms (by accumulated activation) that
+    # endpoints may address. Replaces the relative-fraction mask (a > frac·amax),
+    # which was budget-unstable. Used in BOTH materialize and the edge-update KV
+    # mask so the two stay consistent.
+    graph_v7_active_topk: int = 32
+    # TokenGT updater hidden width (~48M trainable at 800, matches the hand-built
+    # cluster) and the per-window scope (# tokens whose outer-product co-activation
+    # is accumulated). Hoisted from getattr-buried defaults.
+    graph_v7_d_updater: int = 800
+    graph_v7_scope_size: int = 16
+
+    # ── graph_v8 (corrected columnar V8; implementation: graph_substrate_v8.py) ──
+    # The 2026-06-09 design-correction of v8: same N nodes at EVERY layer (concept
+    # columns, positional upward writes — no write-time matching), per-token
+    # input-driven routing + co-activation at every layer (no consolidation clock;
+    # timescales = learnable per-layer decay ladder), per-NODE fusion proposals
+    # (partners' HRR self-binds weighted by the node's coact column), keys AND
+    # values delta-written, real NLL surprise, K/V-split cross-attn read
+    # (same-layer K_ℓ/V_ℓ reads via shared routers; GraphV8SymReader).
+    # Sizing (all dims multiples of 32): atoms 2·1024·3072 + bases 6·1024·3072 +
+    # proj_in + 2-layer reader @ inner 928 + LoRA ≈ 52.17M ≈ v7's 52.12M (+0.1%).
+    graph_v8_d_mem: int = 2880          # 90*32; sized with the 4th router to ~52.2M
+    graph_v8_n_nodes: int = 1024
+    graph_v8_n_layers: int = 3          # persistent layers above L0 (4 incl. L0)
+    graph_v8_chunk: int = 256           # chunkwise-parallel token batch (also ckpt unit)
+    # LAYER-MATCHED splice points, one per MEMORY LAYER incl. L0 (same-layer K/V
+    # read, 2026-06-10): WRITE-side routing for source layer i consumes encoder
+    # hiddens at layers[i] (i=0..2: atoms, K1, K2); READ of memory layer ℓ hooks
+    # the decoder at layers[ℓ] and routes over K_ℓ via router ℓ (router 3 over K3
+    # is read-only — L3 never writes upward). (3, 6, 10, 14): atoms earliest
+    # (most concrete), spacing so Llama digests each read, ≥1 layer + final norm
+    # after the deepest read.
+    graph_v8_reader_layers: tuple = (3, 6, 10, 14)
+    graph_v8_reader_inner_dim: int = 224      # 7*32; v/o-only reader (routers are shared)
+
+    # ── JEPA loss coefficients (dormant path; hoisted for hygiene) ──────────
+    # VicReg variance/covariance anti-collapse weights on the online memory.
+    jepa_var_coef: float = 5.0
+    jepa_cov_coef: float = 0.5
 
     # ── Gaussian Splat substrate (Exp 3) ──────────────────────────────────
     # See docs/exp3_gaussian_splat_baseline.md for full design.

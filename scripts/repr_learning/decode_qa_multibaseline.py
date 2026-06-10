@@ -32,7 +32,9 @@ ROOT = Path("/home/alex/code/neuromorphic")
 sys.path.insert(0, str(ROOT))
 
 from src.repr_learning.config import ReprConfig                        # noqa: E402
-from src.repr_learning.model import ReprLearningModel                  # noqa: E402
+from src.repr_learning.model import (                                  # noqa: E402
+    ReprLearningModel, contextualize_write_input,
+)
 from src.repr_learning.data_qa import (                                # noqa: E402
     HotpotQADataset, MixedQADataset, QADataset, collate_qa,
 )
@@ -82,14 +84,20 @@ def encode_memory(model, batch, device, window_size: int = 1024):
     embed = model.decoder.llama.get_input_embeddings()
     with torch.no_grad():
         token_embeds = embed(batch.context_ids.to(device))
+        ctx_mask = batch.context_mask.to(device)
         T = token_embeds.shape[1]
+        # E1: apply the SAME graph_v7 WRITE-contextualization as training so the
+        # decode-path memory matches the train-path memory.
+        enc_input = token_embeds
+        if getattr(model, "variant", None) == "graph_v7_baseline":
+            enc_input = contextualize_write_input(model.decoder, model.cfg, token_embeds, ctx_mask)
         state = enc.init_streaming_state(token_embeds.shape[0],
                                           device=device, dtype=token_embeds.dtype)
         for s in range(0, T, window_size):
             e = min(s + window_size, T)
             state, _ = enc.streaming_write(
-                state, token_embeds[:, s:e, :],
-                attention_mask=batch.context_mask[:, s:e].to(device),
+                state, enc_input[:, s:e, :],
+                attention_mask=ctx_mask[:, s:e],
                 chunk_offset=s,
             )
         # v5.6: hand the question to graph_v5's question-conditioned readout
@@ -111,10 +119,16 @@ def encode_memory(model, batch, device, window_size: int = 1024):
 
 def generate_qa_answer(llama, tokenizer, memory: torch.Tensor,
                         question_ids: list[int], max_new_tokens: int,
-                        device, chat_template=None) -> str:
+                        device, chat_template=None, graph_reader=None) -> str:
     """Single-sample generation. When chat_template is set the prefix is
        [pre_mem; memory; post_mem; question; post_q]
     matching tranche-4+ training. Otherwise legacy [memory; question].
+
+    graph_v7 cross_attn (graph_reader set): memory is read via the installed
+    cross-attn hooks, NOT prepended → skip the memory prepend and install/remove
+    the read hooks around generate (mirrors compute_qa_loss's 2c branch). NOTE:
+    `llama` MUST then be the per-variant model.decoder.llama (the reader's host),
+    not the shared base.
     """
     embed = llama.get_input_embeddings()
     q = torch.tensor(question_ids, dtype=torch.long, device=device).unsqueeze(0)
@@ -122,7 +136,8 @@ def generate_qa_answer(llama, tokenizer, memory: torch.Tensor,
     parts = []
     if chat_template is not None:
         parts.append(embed(chat_template.pre_memory_ids.to(device)).unsqueeze(0).to(q_emb.dtype))
-    if memory.shape[1] > 0:
+    # cross_attn: do NOT prepend memory (read happens via hooks below, M=0).
+    if memory.shape[1] > 0 and graph_reader is None:
         parts.append(memory.to(q_emb.dtype))
     if chat_template is not None:
         parts.append(embed(chat_template.post_memory_ids.to(device)).unsqueeze(0).to(q_emb.dtype))
@@ -133,13 +148,21 @@ def generate_qa_answer(llama, tokenizer, memory: torch.Tensor,
     attn = torch.ones(full.shape[:2], dtype=torch.long, device=device)
     stop_token_id = (chat_template.eot_id if chat_template is not None
                       else tokenizer.eos_token_id)
-    with torch.no_grad():
-        gen = llama.generate(
-            inputs_embeds=full, attention_mask=attn,
-            max_new_tokens=max_new_tokens, do_sample=False,
-            pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
-            eos_token_id=stop_token_id,
-        )
+    if graph_reader is not None:
+        graph_reader.set_memory(memory.to(q_emb.dtype))
+        graph_reader.install_hooks(llama)
+    try:
+        with torch.no_grad():
+            gen = llama.generate(
+                inputs_embeds=full, attention_mask=attn,
+                max_new_tokens=max_new_tokens, do_sample=False,
+                pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
+                eos_token_id=stop_token_id,
+            )
+    finally:
+        if graph_reader is not None:
+            graph_reader.remove_hooks()
+            graph_reader.clear_memory()
     return tokenizer.decode(gen[0].tolist(), skip_special_tokens=True)
 
 
@@ -227,12 +250,20 @@ def main():
         print(f"  ckpt step={step}  memory shape={tuple(memory.shape)}")
         per_variant_gens[variant] = []
         ct = getattr(model, "chat_template", None)
+        # graph_v7 cross_attn reads via the GraphCrossAttnReader (NO prepend) on
+        # the variant's OWN decoder llama — not the shared base passed below.
+        graph_reader = None
+        gen_llama = llama
+        if (getattr(model, "graph_reader", None) is not None
+                and getattr(model.cfg, "graph_read_mode", "prepend") == "cross_attn"):
+            graph_reader = model.graph_reader
+            gen_llama = model.decoder.llama
         for b in range(args.chunks):
             q_ids = samples[b]["question_ids"].tolist()
             gen = generate_qa_answer(
-                llama, tokenizer, memory[b:b+1],
+                gen_llama, tokenizer, memory[b:b+1],
                 q_ids, args.max_new_tokens, device,
-                chat_template=ct,
+                chat_template=ct, graph_reader=graph_reader,
             )
             per_variant_gens[variant].append(gen.strip())
         del model

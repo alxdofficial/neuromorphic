@@ -191,10 +191,12 @@ class GraphV6FactBuilder(nn.Module):
     which-src-with-which-dst-with-which-relation — so each fact token distinctly
     encodes its (subject, relation, object) instead of smearing them into a SUM
     (the membership→binding fix: a multiply preserves which-with-which where the
-    add averages it away). `(1 + W_rel·state)`: zero-init W_rel ⇒ relation
-    transparent at init (fact ≈ src⊙dst) and W_rel still gets gradient from
-    step 0; it then MODULATES multiplicatively — un-ignorable, can't null a fact
-    (same role the old (1+gamma) FiLM played). Returns [B, K_edge, d_read].
+    add averages it away). `(1 + W_rel·state)`: W_rel is 1/√d_state-init (B4) so
+    it starts near-transparent (fact ≈ src⊙dst) but the relation pathway is
+    gradient-LIVE from step 0 — zero-init left k_rel≡0 with a zero local
+    derivative, so state got no gradient until perturbed elsewhere. It then
+    MODULATES multiplicatively — un-ignorable, can't null a fact (same role the
+    old (1+gamma) FiLM played). Returns [B, K_edge, d_read].
     film_hidden kept only for call-site compatibility (unused)."""
 
     def __init__(self, d_node: int, d_state: int, d_read: int,
@@ -203,7 +205,13 @@ class GraphV6FactBuilder(nn.Module):
         self.W_src = nn.Linear(d_node, d_read)
         self.W_dst = nn.Linear(d_node, d_read)
         self.W_rel = nn.Linear(d_state, d_read)
-        nn.init.zeros_(self.W_rel.weight)   # relation transparent at init: (1+0)=1
+        # B4: small-NONZERO weight (std = 1/√d_state) so the edge-state→loss
+        # gradient is live from step 0. W_rel was zero-init, which made the
+        # relation pathway start gradient-dead — k_rel≡0 ⇒ the multiplicative
+        # (1 + k_rel) term is exactly 1 with a zero local derivative, so state
+        # received no gradient until something else perturbed it. A 1/√fan_in
+        # init keeps the relation near-transparent (small) but live.
+        nn.init.normal_(self.W_rel.weight, std=1.0 / math.sqrt(d_state))
         nn.init.zeros_(self.W_rel.bias)
         self.fact_norm = nn.LayerNorm(d_read)
         self.mlp_norm = nn.LayerNorm(d_read)

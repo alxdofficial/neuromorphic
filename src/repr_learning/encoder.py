@@ -18,6 +18,7 @@ All five return:
 from __future__ import annotations
 import functools
 import math
+import weakref
 from typing import Optional
 
 import torch
@@ -1082,6 +1083,122 @@ class MemorizingBaselineEncoder(nn.Module):
         return memory, aux
 
 
+class FaithfulMTEncoder(nn.Module):
+    """Faithful Memorizing Transformers (Wu et al., ICLR 2022).
+
+    Replaces the broken `memorizing_baseline` (a content-free-trigger prepend —
+    a port artifact, see MEMORY.md `project_mt_baseline_invalid`). The REAL
+    mechanism: a kNN datastore of per-token (key, value) pairs gathered from the
+    context, read at ONE Llama decoder layer whose self-attention is augmented
+    with a top-k retrieval blended into the local attention via a learned
+    per-KV-head sigmoid gate (the only trainable param — 8 scalars).
+
+    Unlike ICAE/CCM/Beacon (which load their OWN frozen base copy), MT MUST
+    operate on the DECODER's Llama: the datastore keys/values come from running
+    that same frozen Llama over the context, and the read is installed IN one of
+    its layers. So this encoder takes the decoder's `llama_model` and holds a
+    weakref to it (no parameter duplication, no ownership cycle). The wrapper it
+    installs (`mt_attn_wrapper`) is registered as a child so its gate is in
+    `.parameters()` and moves with `.to(device)`.
+
+    Contract:
+      * streaming_write captures PRE-RoPE keys + values from a no_grad pass of
+        the frozen Llama over each context window (the datastore is
+        non-differentiable, faithful to Wu et al. — gradient reaches MT only via
+        the gate at read time).
+      * finalize_memory returns a [B, 0, d_llama] placeholder (M=0, NO prepend)
+        plus the gathered bank under `mt_faithful_bank`; model.py installs it
+        into the wrapper as the read datastore around the decoder forward.
+    """
+
+    def __init__(self, cfg: ReprConfig, llama_model: nn.Module):
+        super().__init__()
+        self.cfg = cfg
+        # weakref → the decoder's Llama (don't register it as a child: it's the
+        # decoder's, and registering would double-count its frozen params).
+        self._llama_ref = weakref.ref(llama_model)
+        from .mt_attention import MTKNNGate, install_mt_wrapper
+        n_kv_heads = llama_model.config.num_key_value_heads
+        self.gate = MTKNNGate(n_kv_heads, cfg.mt_gate_init_bias)
+        # install the kNN read at cfg.mt_layer; the wrapper holds the (frozen)
+        # base attention by reference, so registering it as our child does NOT
+        # duplicate base params — only the gate (already self.gate) is trainable.
+        self.mt_attn_wrapper = install_mt_wrapper(
+            llama_model, cfg.mt_layer, self.gate, cfg.mt_topk)
+        print(f"[MT-faithful] kNN read @ layer {cfg.mt_layer}, top-k={cfg.mt_topk}, "
+              f"per-head gate ({n_kv_heads} scalars)")
+
+    def _llama(self) -> nn.Module:
+        m = self._llama_ref()
+        if m is None:
+            raise RuntimeError("FaithfulMTEncoder: decoder Llama was garbage-collected")
+        return m
+
+    def init_streaming_state(self, batch_size: int, device, dtype):
+        del batch_size, device, dtype
+        return {"k": [], "v": [], "mask": []}
+
+    def streaming_write(self, state, token_embeds, attention_mask=None,
+                        chunk_offset=0, **extra):
+        """Capture PRE-RoPE keys + values at cfg.mt_layer by running the frozen
+        Llama over this context window under no_grad. The wrapper stashes the
+        captured kv in capture mode; we pull it into the bank."""
+        del chunk_offset, extra
+        B, W, _ = token_embeds.shape
+        if attention_mask is None:
+            attention_mask = torch.ones(B, W, device=token_embeds.device, dtype=torch.bool)
+        wrapper = self.mt_attn_wrapper
+        wrapper._capture_mode = True
+        wrapper._captured_kv = None
+        try:
+            with torch.no_grad():
+                self._llama().model(
+                    inputs_embeds=token_embeds,
+                    attention_mask=attention_mask.long(),
+                    use_cache=False,
+                )
+        finally:
+            wrapper._capture_mode = False
+        if wrapper._captured_kv is None:
+            raise RuntimeError("MT capture pass produced no kv (wrapper not hit?)")
+        k, v = wrapper._captured_kv              # each [B, W, Hkv, d]
+        wrapper._captured_kv = None
+        state["k"].append(k)
+        state["v"].append(v)
+        state["mask"].append(attention_mask.bool())
+        return state, {}
+
+    def finalize_memory(self, state) -> tuple[Tensor, dict]:
+        if not state["k"]:
+            raise RuntimeError("MT-faithful finalize_memory called with no writes")
+        keys = torch.cat(state["k"], dim=1)        # [B, n_ctx, Hkv, d]
+        values = torch.cat(state["v"], dim=1)      # [B, n_ctx, Hkv, d]
+        ctx_mask = torch.cat(state["mask"], dim=1)  # [B, n_ctx] bool
+        B = keys.shape[0]
+        placeholder = torch.zeros(
+            B, 0, self.cfg.d_llama, device=keys.device, dtype=values.dtype)
+        aux = {
+            "load_balance_loss": torch.zeros(
+                (), device=keys.device, dtype=torch.float32),
+            "mt_faithful_bank": {
+                "keys": keys,
+                "values": values,
+                "ctx_mask": ctx_mask,
+            },
+        }
+        return placeholder, aux
+
+    def forward(self, token_embeds, attention_mask=None, mask_positions=None):
+        """Legacy single-window path (recon/JEPA/HSM). MT-faithful reads via the
+        decoder-layer datastore, so there is no prepend memory to return here —
+        emit the [B, 0, d] placeholder so non-QA loss paths don't crash."""
+        del mask_positions
+        B = token_embeds.shape[0]
+        state = self.init_streaming_state(B, token_embeds.device, token_embeds.dtype)
+        state, _ = self.streaming_write(state, token_embeds, attention_mask)
+        return self.finalize_memory(state)
+
+
 class ICAEBaselineEncoder(nn.Module):
     """ICAE — In-Context Autoencoder (Ge et al., ICLR 2024) as a memory encoder.
 
@@ -1500,9 +1617,12 @@ class BeaconBaselineEncoder(nn.Module):
         # cfg.beacon_param uses the paper's short names ("q","k","v"); normalize
         # to HF projection names so the wrap loop matches.
         targets = {t if t.endswith("_proj") else f"{t}_proj" for t in cfg.beacon_param}
+        wrap_layers = set(getattr(cfg, "beacon_wrap_layers", ()) or ())   # () = all (capacity knob)
         self._beacon_layers = []
         n_wrapped = 0
-        for layer in base.model.layers:
+        for li, layer in enumerate(base.model.layers):
+            if wrap_layers and li not in wrap_layers:
+                continue
             attn = layer.self_attn
             for name in ("q_proj", "k_proj", "v_proj", "o_proj"):
                 if name in targets and hasattr(attn, name):
@@ -2161,6 +2281,13 @@ class GraphV7BaselineEncoder(nn.Module):
             gen.manual_seed(int(seed))
         return self.sub.init_state(batch_size, device, dtype, gen)
 
+    def maybe_init_atoms(self, token_embeds, attention_mask):
+        """Eager (NOT checkpointed) one-shot k-means seed of the atom bank. Called
+        before the windowed streaming loop so the stateful no_grad side-effect
+        never lands inside activation checkpointing (which would corrupt the
+        saved/recomputed metadata). Idempotent + training-only (guarded inside)."""
+        self.sub._maybe_kmeans_init(token_embeds, attention_mask)
+
     def streaming_write(self, state, token_embeds, attention_mask, chunk_offset=0, **kwargs):
         del chunk_offset, kwargs              # v7 routing is content-based; no positional offset
         state = self.sub.streaming_write(state, token_embeds, attention_mask)
@@ -2178,3 +2305,120 @@ class GraphV7BaselineEncoder(nn.Module):
         memory, aux = self.finalize_memory(state)   # keep the real aux (load_balance + telemetry)
         return memory, aux
 
+
+class GraphV8ColumnEncoder(nn.Module):
+    """graph_v8: the CORRECTED columnar v8 (graph_substrate_v8) — see its header.
+
+    Own FROZEN base contextualizes the window under no_grad (same separate-frozen-
+    copy pattern as v8/ICAE/CCM) AND provides the REAL surprise signal: per-token
+    next-token NLL under the pure frozen base, per-row z-scored over the window,
+    squashed through a learnable sigmoid(a·z + b) — no running stats, no magic
+    scales (a=1, b=0 init → gate≈σ(z)∈(0,1)).
+
+    finalize_memory returns the stacked per-layer (keys ‖ values) [B, S, N,
+    2·d_mem]: the harness's graph_v8 branch hands it to GraphV8SymReader
+    (same-layer K/V reads through the substrate's own routers) and sets M=0 —
+    nothing is prepended. REAL/SHUF/OFF: roll / skip the stacked tensor.
+    """
+
+    def __init__(self, cfg: ReprConfig):
+        super().__init__()
+        self.cfg = cfg
+        from .decoder import load_frozen_llama
+        from .graph_substrate_v8 import GraphV8Config, GraphV8Substrate
+        base, _ = load_frozen_llama(cfg.llama_model)
+        for p in base.parameters():
+            p.requires_grad_(False)
+        self.base = base                                   # frozen contextualizer + surprise source
+        v8 = GraphV8Config(
+            d_model=cfg.d_llama, d_mem=cfg.graph_v8_d_mem, n_nodes=cfg.graph_v8_n_nodes,
+            n_layers=cfg.graph_v8_n_layers, chunk=cfg.graph_v8_chunk)
+        self.sub = GraphV8Substrate(v8)
+        # learnable surprise squash: gate = sigmoid(a·z + b) over the per-row
+        # z-scored NLL. a=1/b=0 init is the identity operating point.
+        self.surprise_a = nn.Parameter(torch.tensor(1.0))
+        self.surprise_b = nn.Parameter(torch.tensor(0.0))
+        self.M = 0                                          # nothing prepended (reader-only)
+        print(f"[graph_v8] columnar substrate: N={cfg.graph_v8_n_nodes} nodes x "
+              f"{cfg.graph_v8_n_layers + 1} layers (incl. L0), d_mem={cfg.graph_v8_d_mem}, "
+              f"chunk={cfg.graph_v8_chunk}; read = K/V cross-attn (keys ‖ values)")
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        self.base.train(False)                              # base ALWAYS in eval (frozen)
+        return self
+
+    # ---- real surprise: next-token NLL under the pure frozen base ------------
+    @torch.no_grad()
+    def context_surprise(self, context_ids, context_mask, slice_len: int = 128):
+        """[B,T] raw per-token NLL (fp32). Position 0 (no prefix) gets its row's
+        mean real-token NLL (z=0 after standardization). Sliced lm_head matmul so
+        the [B,T,vocab] logits tensor is never materialized whole."""
+        B, T = context_ids.shape
+        out = self.base.model(input_ids=context_ids, attention_mask=context_mask.long(),
+                              use_cache=False)
+        hidden = out.last_hidden_state                                       # [B,T,d]
+        w = self.base.lm_head.weight                                         # tied [V,d]
+        nll = torch.zeros(B, T, device=context_ids.device, dtype=torch.float32)
+        for s in range(0, T - 1, slice_len):
+            e = min(s + slice_len, T - 1)
+            # bf16 matmul, fp32 cast only on the [B,c,V] slice — w.float() inside the
+            # loop materialized a 1.05GB fp32 lm_head copy PER SLICE (sweep finding).
+            logits = (hidden[:, s:e] @ w.t()).float()                        # [B,c,V]
+            nll[:, s + 1:e + 1] = F.cross_entropy(
+                logits.transpose(1, 2), context_ids[:, s + 1:e + 1], reduction="none")
+        real = context_mask.bool()
+        denom = real.float().sum(dim=1, keepdim=True).clamp_min(1.0)
+        row_mean = (nll * real.float()).sum(dim=1, keepdim=True) / denom
+        nll[:, 0] = row_mean[:, 0]
+        return nll
+
+    def init_streaming_state(self, batch_size: int, device, dtype):
+        del dtype                                           # substrate state is fp32
+        return {"sub": self.sub.init_state(batch_size, device)}
+
+    def streaming_write(self, state, token_embeds, attention_mask=None, chunk_offset=0,
+                        surprise=None, **extra):
+        del chunk_offset, extra
+        B, W = token_embeds.shape[:2]
+        if attention_mask is None:
+            attention_mask = torch.ones(B, W, device=token_embeds.device, dtype=torch.bool)
+        real = attention_mask.bool()
+        if surprise is None:                                # fallback: z=0 → gate = σ(b)
+            z = torch.zeros(B, W, device=token_embeds.device, dtype=torch.float32)
+        else:                                               # per-row masked z-score (no magic scales)
+            s = surprise.float()
+            denom = real.float().sum(dim=1, keepdim=True).clamp_min(1.0)
+            mean = (s * real.float()).sum(dim=1, keepdim=True) / denom
+            var = (((s - mean) * real.float()) ** 2).sum(dim=1, keepdim=True) / denom
+            z = (s - mean) / (var.sqrt() + 1e-6)
+        gate = torch.sigmoid(self.surprise_a * z + self.surprise_b)          # (0,1), learnable a/b
+        with torch.no_grad():                               # frozen base; substrate trains on fixed hiddens
+            out = self.base.model(inputs_embeds=token_embeds,
+                                  attention_mask=attention_mask.long(),
+                                  output_hidden_states=True,
+                                  use_cache=False)
+            # LAYER-MATCHED write inputs: source layer i (atoms, K1, K2) routes the
+            # hiddens of its matched Llama layer = reader_layers[i] (the FIRST 3 of
+            # the 4-tuple; the 4th is the read-only K3 router's decoder hook depth).
+            # hidden_states[0] = embeddings -> layer lam output = hidden_states[lam+1].
+            h_stack = torch.stack(
+                [out.hidden_states[l + 1]
+                 for l in self.cfg.graph_v8_reader_layers[:self.sub.depth]],
+                dim=2)                                       # [B,W,S,d_llama]
+        sub = self.sub(h_stack.float(), gate, attention_mask.float(), state=state["sub"])
+        return {"sub": sub}, {}
+
+    def finalize_memory(self, state):
+        sub = state["sub"]
+        # stacked per-layer (keys ‖ values) for ℓ=1..S: the reader addresses layer
+        # ℓ via ITS OWN keys K_ℓ (same-layer pairing) and fetches V_ℓ.
+        per_layer = [torch.cat([sub["keys"][l], sub["values"][l]], dim=-1)
+                     for l in range(1, self.sub.depth + 1)]
+        return torch.stack(per_layer, dim=1), {}             # [B,S,N,2·d_mem]
+
+    def forward(self, token_embeds, attention_mask=None, mask_positions=None):
+        del mask_positions
+        st = self.init_streaming_state(token_embeds.shape[0], token_embeds.device, token_embeds.dtype)
+        st, _ = self.streaming_write(st, token_embeds, attention_mask)
+        return self.finalize_memory(st)

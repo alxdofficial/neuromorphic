@@ -9,6 +9,7 @@ Llama is loaded from HuggingFace, parameters frozen. The decoder:
 The mask_embed and the encoder are the only trainable components.
 """
 from __future__ import annotations
+from contextlib import contextmanager
 from typing import Optional
 
 import torch
@@ -51,6 +52,13 @@ class LoRALinear(nn.Module):
     Models" (arXiv:2106.09685).
     """
 
+    # Process-wide switch: when True, ALL LoRALinear forwards bypass the adapter
+    # and return the PURE FROZEN base. Used by the graph_v7 write-contextualization
+    # pass (C2): that pass must shape the write input with the frozen base only,
+    # not the trainable read-LoRA (otherwise the write input is a moving target
+    # shaped by a read adapter). Toggled via the `disable_lora()` context manager.
+    _lora_disabled: bool = False
+
     def __init__(self, base_linear: nn.Linear, rank: int, alpha: float):
         super().__init__()
         if not isinstance(base_linear, nn.Linear):
@@ -69,11 +77,25 @@ class LoRALinear(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         base_out = self.base(x)
+        if LoRALinear._lora_disabled:
+            return base_out                                       # pure frozen base (C2)
         # Compute update in float32 for stability, cast back to match base
         x32 = x.to(self.lora_A.dtype)
         update = (x32 @ self.lora_A.T) @ self.lora_B.T            # [..., d_out]
         update = update.to(base_out.dtype) * self.scale
         return base_out + update
+
+
+@contextmanager
+def disable_lora():
+    """Context manager that bypasses every LoRALinear adapter, exposing the PURE
+    FROZEN base. Restores the prior state on exit (re-entrant-safe)."""
+    prev = LoRALinear._lora_disabled
+    LoRALinear._lora_disabled = True
+    try:
+        yield
+    finally:
+        LoRALinear._lora_disabled = prev
 
 
 def apply_lora_to_llama(
