@@ -60,11 +60,29 @@ at identical k and identical MAE objective. Must beat, or match-with-a-named-ben
 not just sentences; JEPA-readiness; interpretability). Else it's ICAE with extra
 steps.
 
-## Open decisions (before building)
-- single vs pair vs either (lean: pair, for coverage).
-- Pile vs FineWeb-EDU (lean: FineWeb-EDU, cleaner; already wired).
-- exact length band + ratio (lean: 24–128 tok, ratio 8).
-- our code readout: what ARE the k vectors, and how is coactivation load-bearing in
-  forming them (the root-cause-#4 trap: must be continuous readouts, not bag-of-
-  vocab). UNRESOLVED — the key design step.
-- start flat (no pyramid) for sentences. Add hierarchy only if flat works.
+## Decisions (LOCKED 2026-06-12)
+- Unit: **sentence PAIR**.
+- Corpus: **FineWeb-EDU** (clean prose; already wired in data_continuation).
+- Band/ratio: **24 ≤ tokens ≤ 128, ratio 8** → k = ceil(len/8) ∈ [3,16], bucketed by k.
+- OUR model readout: **DEFERRED — our compressor is being redesigned.** Build the
+  measurement apparatus (data + capacity-relative baselines + SmolLM2) first; the
+  baseline floor/ceiling/quality curve is the reference our redesign competes against.
+- start flat (no pyramid) when our model returns.
+
+## Build order
+1. **DONE: sentence-pair dataloader** (`src/repr_learning/data_sentence.py`).
+   FineWeb-EDU local parquet → decode (Llama tok, cached) → segment → SmolLM2
+   re-tokenize → filter 24-128 → length-bucket by k=ceil(len/8) (uniform-k
+   batches, M=k per batch). Emits QABatch + `k_slots`/`n_tokens`. Smoke: clean
+   pairs, batches uniform-k, k range 4-15 (val 720 docs; train has 13k).
+2. **NEXT — the one design fork (need a nod):** the OBJECTIVE decode path.
+   - AE (free now): teacher-forced reconstruct-the-pair via the existing QA
+     forward — BUT teacher forcing lets the local prior cheat (the ⅔-guessable
+     trap). Usable immediately as a baseline-of-the-baseline.
+   - true MAE (recommended): mask ~85% of the span, predict masked positions in
+     ONE forward; the decoder sees [MASK]/anchors at j<i, NOT the true token, so
+     the local-prior cheat is removed. Needs a NEW forward (doesn't fit
+     context→Q→A). Causal-decoder MAE is valid (position i sees its mostly-masked
+     causal prefix + memory). + the no-memory floor control (same mask, mem off).
+3. Capacity-relative baselines: ICAE/AutoComp/CCM prefix-of-M_max = k; Beacon α=ratio.
+4. SmolLM2 backbone wiring + floor/ceiling band scan (135M/360M/1B).
