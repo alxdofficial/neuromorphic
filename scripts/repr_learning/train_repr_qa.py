@@ -1040,6 +1040,8 @@ def main():
                     help="enable per-node routing-logit centering")
     ap.add_argument("--graph-v9-surprise-coact", action="store_true",
                     help="surprise-weight the coactivation table")
+    ap.add_argument("--graph-v9-dirs-blend", type=str, default=None,
+                    choices=["mass", "gated"], help="absorption direction blending")
     ap.add_argument("--emat-bio-world-seed", type=int, default=0,
                     help="emat_bio: world-build seed (train uses this; val uses +10000 → disjoint).")
     ap.add_argument("--compress-len", type=int, default=1024,
@@ -1387,6 +1389,8 @@ def main():
         cfg.graph_v9_route_centering = True
     if args.graph_v9_surprise_coact:
         cfg.graph_v9_surprise_coact = True
+    if args.graph_v9_dirs_blend is not None:
+        cfg.graph_v9_dirs_blend = args.graph_v9_dirs_blend
     cfg.graph_read_mode = args.graph_read_mode
     cfg.graph_read_gate_init = args.graph_read_gate_init
     if args.graph_read_layer_indices is not None:

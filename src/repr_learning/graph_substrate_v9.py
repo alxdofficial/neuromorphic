@@ -164,6 +164,12 @@ class GraphV9Config:
     # doc-specific entity pairs dominate. Predictive-coding-faithful Hebbian
     # (local plasticity x prediction error). Apply/routing still use raw scores.
     surprise_coact: bool = False
+    # GATED DIRECTION BLENDING (overnight run-6 verdict): mass-ratio blending
+    # froze directions (~1e-5/boundary) in every run — the last untested doc-
+    # identity channel. "gated": absorber slots rotate toward their incoming
+    # donor mix at a learnable scale-free rate (relative landed share x
+    # sigmoid(rate), init 0.5); STRENGTHS STAY CONSERVED. "mass": original.
+    dirs_blend: str = "mass"
     wy_block: int = 64                     # factors per WY block in the fast apply
 
     def __post_init__(self):
@@ -333,6 +339,8 @@ class GraphV9Substrate(nn.Module):
         # a*(cos*sqrt(d_code)*(strength/2)) + b*(room/2); a,b learnable, init 1.
         self.match_weight = nn.Parameter(torch.ones(n_active))
         self.room_weight = nn.Parameter(torch.ones(n_active))
+        if config.dirs_blend == "gated":
+            self.dirs_blend_logit = nn.Parameter(torch.zeros(n_active))  # sigmoid -> 0.5
         if config.absorb_gate in ("npmi_sharp",):
             # donor-softmax temperature, DERIVED at init (data-free, same pattern
             # as route temps): perplexity of softmax(U[0,1]/temp) over the donor
@@ -682,6 +690,16 @@ class GraphV9Substrate(nn.Module):
         # direction untouched; only their strength was debited.
         dirs_new = ((factor_strengths.unsqueeze(-1) * factor_dirs + incoming_dirs)
                     / (factor_strengths + landed).clamp_min(eps).unsqueeze(-1))
+        if self.config.dirs_blend == "gated":
+            # scale-free per-slot blend rate: the top-landing slot rotates at
+            # sigma(rate) toward its incoming mix, others proportionally less.
+            landed_rel = landed / landed.amax(dim=(1, 2), keepdim=True).clamp_min(eps)
+            blend = (torch.sigmoid(self.dirs_blend_logit[self._active_idx(layer_idx)])
+                     * landed_rel).unsqueeze(-1)
+            incoming_unit = _unit(incoming_dirs)
+            has_incoming = (landed > eps).unsqueeze(-1).float()
+            dirs_new = ((1.0 - blend * has_incoming) * factor_dirs
+                        + blend * has_incoming * incoming_unit)
         if tele_prefix is not None:
             with torch.no_grad():
                 t = self._tele

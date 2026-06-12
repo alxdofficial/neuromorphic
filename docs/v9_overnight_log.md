@@ -235,3 +235,28 @@ srp·plast — absorbers with strong above-chance partners take a lot, most take
 ~nothing ⇒ intake totals become doc-dependent ⇒ strengths carry doc identity.
 Conservation + donor outflow cap stay (still a transfer; still bounded).
 → Run 6: full stack with absorb_gate="npmi_raw".
+
+---
+## Run 6 — npmi_raw, unnormalized intake (emat_bio_v9c5_raw) — FLAT; closes the
+## strength-relocation question
+SHUF−REAL = +0.0002, sep_cos = 1.0000 (sixth consecutive). Unnormalized gates
+RAISED flux (11.8 → 25) but LOWERED net displacement (0.045 → 0.014): real NPMI
+affinities are diffuse-and-weak at this routing sharpness, so freed intake
+flowed more symmetrically and netted out harder. Conservation budget exact
+throughout (1728.0 ± 0.1).
+
+**Writer-side verdict after 6 controlled runs: conserving STRENGTH relocation
+over a shared base — under every gate form tried (rowfrac / npmi-sharpened /
+npmi-raw, with and without centering and surprise-filtering) — does not encode
+document identity at this scale. The doc-identity channel that remains is
+DIRECTION motion, frozen at ~1e-5/boundary by mass-ratio blending in every run.**
+
+→ Run 7 (last writer-side variant): GATED DIRECTION BLENDING — keep strength
+conservation, but let absorber slots rotate toward their incoming donor mix at
+a learnable, scale-free rate (top-landing slot blends at σ(rate), others
+proportionally; init 0.5). Trades "directions move ~0" for "the top absorbing
+slot genuinely takes its donors' content each boundary." Strengths stay
+conserved; the invariant survives.
+→ Run 8 (closer): best-shot hybrid — arm B deposits (content, sep 0.91) +
+absorption bridge (key→value) + centering + surprise-coact + n_query=4 +
+1200 steps (binding pressure × horizon).
