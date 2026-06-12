@@ -197,3 +197,15 @@ predictable after line 1, contribute ~nothing; entity values dominate the
 table). This is predictive-coding-faithful Hebbian (local plasticity × predict-
 ion error — the project's founding research lesson) applied at the right site.
 → Run 5: centering + npmi_sharp + SURPRISE-WEIGHTED COACT.
+
+---
+## Probe — does surprise discriminate content from template? (frozen base, init squash)
+Grouped per-token surprise gates on a val batch: repeated/template-ish tokens
+0.390, unique/content-ish 0.546, key-ish 0.445. **Ratio 1.40 per token (~2.0
+for content-content coact pairs).** The signal run 5 leans on EXISTS but is
+modest at the init squash; the learnable sigmoid (a·z+b) can sharpen it if
+training asks. Calibrated expectation: surprise-coact shifts the table's
+composition partially — watch state_sep_cos for degree, not a binary flip.
+Note: 0.39 vs 0.55 also means the template still gets ~40% weight per token —
+a candidate refinement (if needed) is squaring/sharpening the gate for the
+TABLE only (pair products already help).
