@@ -86,3 +86,36 @@ driven by raw co-occurrence, which is dominated by what's common to every doc.
   template-shared component. (Precedent: our own NPMI plasticity, wave1 SDPA.)
 - H-SHARP: concentrate transfers (softmax over donors w/ learnable temp instead
   of row-fraction) so doc-specific pairs move REAL mass and directions rotate.
+
+---
+## Run 2 — arm B control (deposits, absorb OFF, emat_bio_v9b1) — FLAT, and the
+## discriminating result of the night so far
+SHUF−REAL = **+0.0001**, OFF−REAL +3.03, recon 1.03 (numerically identical
+profile to arm C and v8c5). BUT: `state_sep_cos_L1` = **0.89–0.94**, not 1.0 —
+deposits DO produce measurably doc-specific states, and the gate is STILL flat.
+
+**What this splits apart:**
+- Arm C fails at the WRITE (states identical, sep=1.0000).
+- Arm B writes doc-specific content (sep≈0.91) and STILL fails ⇒ doc-specific
+  state ≠ ADDRESSABLE binding.
+
+**The bridge hypothesis (now the leading explanation for both arms):**
+A fact's VALUE tokens deposit into the nodes the VALUE routes to; the question
+routes via the KEY phrasing into the KEY's nodes. Without a mechanism that moves
+value content INTO key-routed nodes, the query never visits the content. That
+bridge is exactly what absorption-with-lagged-coactivation is FOR (key-fired
+nodes absorb the value-fired nodes that follow them) — but in run 1 the bridge
+carried template traffic (marginal-driven gate) and no real content (diffuse).
+Arm B has content but NO bridge at all (absorb off). Neither configuration has
+both halves.
+
+**Secondary arm-B observations:** beta_eff_top only 0.09–0.16 (zero-init
+strengths grow slowly via deposits — the chain is weak all run);
+L0 atom-usage collapse reproduces (0.17 → 0.07); read loudness ≈ 0.16.
+
+**Queue (synthesis experiments):**
+- Run 3: arm C + npmi_sharp (doc-specific bridge + concentrated mass).
+- Run 4: arm B + absorb ON + npmi_sharp — deposits supply content, absorption
+  supplies the key→value bridge. The two halves together. (Still in-thesis:
+  this is the original full design, with the diagnosed gate fix.)
+- Arm A control deferred (B already isolates deposits; A adds leaf-content only).
