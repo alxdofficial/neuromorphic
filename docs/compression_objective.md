@@ -99,3 +99,29 @@ CAN do zero-shot) = 3.46 / ppl 31.7 on the pairs → backbone+data sane, prior i
 strong (the thing we bottleneck against). CONSEQUENCE: the floor/ceiling band
 scan becomes a short TRAINING run (trained no-memory floor vs trained
 full-length-memory ceiling), built alongside the MAE training path.
+
+
+## Baseline setup (instantiated on SmolLM2-135M, d=576, M_max=16) — 2026-06-12
+All four construct cleanly on SmolLM2 (Llama-arch holds; chat template auto-off).
+
+| baseline | trainable | mechanism | capacity/bin (k = ceil(len/8) ∈ [3,16]) |
+|---|---|---|---|
+| CCM | 0.93M | rank-8 COMP-gated LoRA (120 linears) + k comp slots | k slots × d = k·576 floats |
+| ICAE | 1.85M | rank-32 LoRA (60 layers) + M_max learned slots | k of M_max=16 slots, k·576 floats |
+| AutoCompressor | 3.71M | LoRA (120 layers) + M_max recurrent slots | k slots, k·576 floats |
+| Beacon | 16.59M | full q/k/v beacon projections (NOT LoRA) + α=8 | native α=8 ⇒ ~ceil(len/8) summary vecs |
+
+Code size per bin (floats) = k · d: k=3 → 1,728 … k=16 → 9,216 (135M). Trainable
+params are per-MODEL, fixed across bins (slots allocate M_max, use first k).
+
+**FAIRNESS FLAG (echoes the overnight param-asymmetry):** trainable params span
+0.93M–16.6M — an 18× spread. Beacon's 16.6M is full q/k/v projections, not LoRA.
+A clean compression comparison needs these closer (match LoRA rank / Beacon to a
+budget) OR param count reported as a first-class axis. DECISION NEEDED.
+
+## Honest status (2026-06-12 end)
+DONE+VALIDATED: sentence-pair dataloader; true-MAE mechanic; SmolLM2 drop-in;
+baseline instantiation + param counts. NOT YET BUILT: compute_mae_loss decode
+path (the new forward), capacity-relative per-batch-k wiring (use first k slots),
+trainer task="sentence_mae", the trained floor/ceiling band scan. Our compressor:
+deferred (redesign).
