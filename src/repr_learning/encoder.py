@@ -2512,7 +2512,8 @@ class GraphV9PyramidEncoder(nn.Module):
             chunk=cfg.graph_v9_chunk, arm=cfg.graph_v9_arm,
             effective_k=cfg.graph_v9_effective_k,
             absorb_enabled=cfg.graph_v9_absorb_enabled,
-            absorb_gate=getattr(cfg, "graph_v9_absorb_gate", "rowfrac"))
+            absorb_gate=getattr(cfg, "graph_v9_absorb_gate", "rowfrac"),
+            route_centering=getattr(cfg, "graph_v9_route_centering", False))
         self.sub = GraphV9Substrate(v9)
         # learnable surprise squash: gate = sigmoid(a·z + b) over the per-row
         # z-scored NLL. a=1/b=0 init is the identity operating point.

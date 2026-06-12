@@ -151,6 +151,12 @@ class GraphV9Config:
     #                 and directions actually rotate).
     absorb_gate: str = "rowfrac"
     effective_k_donors: float = 4.0        # npmi_sharp: target #donors at init (derived temp)
+    # HUB-CONVERGENCE fix (overnight, bridge-probe finding): per-node routing-
+    # logit CENTERING with running statistics (BN-style, center only, standard
+    # BN momentum). Removes each node's always-hot logit component so routing
+    # encodes token-RELATIVE structure; running stats are used identically at
+    # write and read (symmetry preserved — a per-window mean would break it).
+    route_centering: bool = False
     wy_block: int = 64                     # factors per WY block in the fast apply
 
     def __post_init__(self):
@@ -341,6 +347,11 @@ class GraphV9Substrate(nn.Module):
                             high = mid
                     self.log_donor_temp.data[slot_i] = 0.5 * (low + high)
 
+        if config.route_centering:
+            for layer_idx, n_nodes in enumerate(config.nodes):
+                self.register_buffer(f"route_logit_mean_L{layer_idx}",
+                                     torch.zeros(n_nodes))
+
         # ── telemetry (docs/graph_v9_ideas.md §8) ──────────────────────────────
         # Per-chunk dynamics metrics, written into a keyed buffer under no_grad.
         # Keys embed the chunk offset so gradient-checkpoint RECOMPUTE overwrites
@@ -449,6 +460,13 @@ class GraphV9Substrate(nn.Module):
             query = _unit(self.route_projs[layer_idx](routing_input.float()))
             keys = _unit(self.node_keys[layer_idx].float())
             logits = torch.einsum("...d,nd->...n", query, keys) * math.sqrt(self.config.d_key)
+            if self.config.route_centering:
+                running = getattr(self, f"route_logit_mean_L{layer_idx}")
+                if self.training:
+                    with torch.no_grad():
+                        batch_mean = logits.reshape(-1, logits.shape[-1]).mean(0)
+                        running.mul_(0.9).add_(batch_mean, alpha=0.1)  # BN convention
+                logits = logits - running
             return torch.softmax(logits / self._route_temp(layer_idx), dim=-1)
 
     # ── the APPLY: chain of generalized Householder factors ────────────────────
