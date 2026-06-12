@@ -1034,7 +1034,7 @@ def main():
     ap.add_argument("--graph-v9-absorb", type=str, default=None, choices=["on", "off"],
                     help="override cfg.graph_v9_absorb_enabled")
     ap.add_argument("--graph-v9-absorb-gate", type=str, default=None,
-                    choices=["rowfrac", "npmi_sharp"],
+                    choices=["rowfrac", "npmi_sharp", "npmi_raw"],
                     help="override cfg.graph_v9_absorb_gate")
     ap.add_argument("--graph-v9-route-centering", action="store_true",
                     help="enable per-node routing-logit centering")

@@ -333,7 +333,7 @@ class GraphV9Substrate(nn.Module):
         # a*(cos*sqrt(d_code)*(strength/2)) + b*(room/2); a,b learnable, init 1.
         self.match_weight = nn.Parameter(torch.ones(n_active))
         self.room_weight = nn.Parameter(torch.ones(n_active))
-        if config.absorb_gate == "npmi_sharp":
+        if config.absorb_gate in ("npmi_sharp",):
             # donor-softmax temperature, DERIVED at init (data-free, same pattern
             # as route temps): perplexity of softmax(U[0,1]/temp) over the donor
             # count ~= effective_k_donors.
@@ -612,7 +612,7 @@ class GraphV9Substrate(nn.Module):
         # backwards pressure on the write (review finding, 2026-06-12).
         diagonal = torch.eye(n_nodes, device=factor_dirs.device, dtype=torch.bool)
         coact_offdiag = coact.masked_fill(diagonal, 0.0)
-        if self.config.absorb_gate == "npmi_sharp":
+        if self.config.absorb_gate in ("npmi_sharp", "npmi_raw"):
             # NPMI vs independence: positive part = co-firing ABOVE what the two
             # nodes' marginal traffic predicts — the doc-specific signal; the
             # hot-node/template component cancels by construction.
@@ -623,13 +623,21 @@ class GraphV9Substrate(nn.Module):
             pmi = p_joint.clamp_min(1e-12).log() - (p_row * p_col).log()
             npmi = (pmi / p_joint.clamp_min(1e-12).log().neg().clamp_min(1e-12))
             affinity = npmi.clamp(0.0, 1.0).masked_fill(diagonal, 0.0)
-            temp = self.log_donor_temp[self._active_idx(layer_idx)] \
-                .clamp(math.log(1e-3), math.log(10.0)).exp()
-            # donor-softmax: concentrate each absorber's intake on its top
-            # above-chance partners (real mass moves; directions rotate)
-            coact_rownorm = torch.softmax(
-                affinity.masked_fill(diagonal, -1e4) / temp, dim=-1)
-            coact_rownorm = coact_rownorm.masked_fill(diagonal, 0.0)
+            if self.config.absorb_gate == "npmi_raw":
+                # UNNORMALIZED (run-5 finding): row-normalized gates fix each
+                # absorber's total intake to a constant — an identity that makes
+                # net relocation doc-INVARIANT under conservation. Raw affinity
+                # lets intake totals vary with the doc's above-chance structure:
+                # the doc-specific channel the normalized forms destroyed.
+                coact_rownorm = affinity
+            else:
+                temp = self.log_donor_temp[self._active_idx(layer_idx)] \
+                    .clamp(math.log(1e-3), math.log(10.0)).exp()
+                # donor-softmax: concentrate each absorber's intake on its top
+                # above-chance partners (real mass moves; directions rotate)
+                coact_rownorm = torch.softmax(
+                    affinity.masked_fill(diagonal, -1e4) / temp, dim=-1)
+                coact_rownorm = coact_rownorm.masked_fill(diagonal, 0.0)
         else:
             coact_rownorm = coact_offdiag / coact_offdiag.sum(-1, keepdim=True).clamp_min(eps)
         unit_keys = _unit(self.node_keys[layer_idx].float())

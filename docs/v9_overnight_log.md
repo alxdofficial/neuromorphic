@@ -209,3 +209,29 @@ composition partially — watch state_sep_cos for degree, not a binary flip.
 Note: 0.39 vs 0.55 also means the template still gets ~40% weight per token —
 a candidate refinement (if needed) is squaring/sharpening the gate for the
 TABLE only (pair products already help).
+
+---
+## Run 5 — + SURPRISE-COACT (emat_bio_v9c4_surpco) — FLAT; but it exposed a
+## STRUCTURAL NULL in arm C's write
+SHUF−REAL = +0.0001. The mechanism itself worked: coact mass 4150 → **890**
+(template traffic filtered, 4.7×), asymmetry 0.47. sep_cos still ~0.996.
+
+**The smoking gun was in plain sight across ALL runs: absorb_flux ≈ 11.8 in
+every configuration** (rowfrac, npmi, centering, surprise-coact — identical).
+Row-normalized gates (rowfrac AND donor-softmax both) fix each absorber's
+TOTAL intake to ~σ(as)·s̄rp·strength̄ by construction — an identity, independent
+of the gate's distribution. Combined with conservation (debit ≈ landed in
+aggregate, every node both donor and absorber at similar rates) and frozen
+directions, the NET strength relocation is nearly doc-invariant: state → base +
+shared drift. Doc identity survives only in WHICH donors fed each absorber —
+the dirs-blend channel — which is ~100× too weak (0.01 incoming vs 1.5
+existing). **Arm C as configured has a structural null: normalized intake ×
+conservation × frozen dirs ⇒ doc-agnostic state. The flat gates were
+guaranteed.** This is the kind of negative result worth the night: precise,
+mechanistic, reproducible.
+
+**Fix (one line, in-thesis): UNNORMALIZED gate.** gate = σ(as)·NPMI_affinity·
+srp·plast — absorbers with strong above-chance partners take a lot, most take
+~nothing ⇒ intake totals become doc-dependent ⇒ strengths carry doc identity.
+Conservation + donor outflow cap stay (still a transfer; still bounded).
+→ Run 6: full stack with absorb_gate="npmi_raw".
