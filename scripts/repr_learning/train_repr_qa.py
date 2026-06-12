@@ -307,6 +307,7 @@ def train_one_variant(
     emat_n_pairs: int = 64, emat_n_query: int = 1, emat_value_len: int = 1,
     emat_bio_n_facts: int = 3, emat_bio_world_seed: int = 0,
     compress_len: int = 2048, predict_len: int = 512,
+    mae_src_tok: str = "meta-llama/Llama-3.2-1B",
 ) -> dict:
     device = "cuda"
     # LoRA wraps Llama's q/v in place (LoRALinear). The base `llama` is shared
@@ -316,6 +317,8 @@ def train_one_variant(
     # LoRA off → keep sharing the single read-only frozen Llama (fast).
     llama_arg = None if cfg.use_llama_lora else llama
     model = ReprLearningModel(cfg, variant=variant, llama_model=llama_arg).to(device)
+    if getattr(cfg, "task_mode", None) == "sentence_mae":
+        model.task_mode = "sentence_mae"   # route compute_qa_loss → compute_mae_loss
     n_trainable = model.n_trainable_params()
     # A variant is eval-only iff it has no trainable params. With LoRA-all on, the
     # two vanilla references DO train (their ~1.7M LoRA) — they become the LoRA'd
@@ -325,7 +328,8 @@ def train_one_variant(
     # memory arms), so LoRA-training it OOMs under backward — and a frozen
     # full-context Llama is already a valid upper bound. Its zero-init LoRA, if
     # built, is an identity no-op. vanilla_llama (the floor) still LoRA-trains.
-    is_eval_only = (n_trainable == 0) or variant == "vanilla_full_context"
+    is_eval_only = (n_trainable == 0) or (
+        variant == "vanilla_full_context" and task != "sentence_mae")
     print(f"\n{'='*78}")
     print(f"Variant: {variant}  ({n_trainable:,} trainable, {n_steps} steps)")
     print(f"{'='*78}")
@@ -374,6 +378,17 @@ def train_one_variant(
         train_dl = None if is_eval_only else make_continuation_dataloader(
             tokenizer, split="train", seed=42, **_cont)
         val_dl = make_continuation_dataloader(tokenizer, split="validation", seed=7, **_cont)
+    elif task == "sentence_mae":
+        # sentence-pair compression (FineWeb-EDU, MAE). Variable code size k per
+        # bucket; the loader yields fully-collated uniform-k batches.
+        from src.repr_learning.data_sentence import make_sentence_dataloader
+        _pad = cfg.pad_token_id if cfg.pad_token_id is not None else 0
+        train_dl = None if is_eval_only else make_sentence_dataloader(
+            tokenizer, batch_size=cfg.batch_size, src_tokenizer_name=mae_src_tok,
+            split="train", seed=42, pad_token_id=_pad, num_workers=2)
+        val_dl = make_sentence_dataloader(
+            tokenizer, batch_size=cfg.batch_size, src_tokenizer_name=mae_src_tok,
+            split="val", seed=7, pad_token_id=_pad, num_workers=0)
     else:
         train_dl = None if is_eval_only else make_mixed_qa_dataloader(
             cfg, tokenizer,
@@ -1039,6 +1054,12 @@ def main():
                     help="EMAT: words per value (1 = single-token value).")
     ap.add_argument("--emat-bio-n-facts", type=int, default=3,
                     help="emat_bio: random facts packed per value sentence (2-4).")
+    ap.add_argument("--backbone", type=str, default=None,
+                    help="override cfg.llama_model (e.g. HuggingFaceTB/SmolLM2-135M for "
+                         "the compression line). Auto-sets d_llama from the config.")
+    ap.add_argument("--src-tokenizer", type=str, default="meta-llama/Llama-3.2-1B",
+                    help="tokenizer that produced the FineWeb-EDU parquet ids (for "
+                         "decode→retokenize in the sentence loader).")
     ap.add_argument("--graph-v9-arm", type=str, default=None, choices=["A", "B", "C"],
                     help="override cfg.graph_v9_arm for this run (overnight sweep)")
     ap.add_argument("--graph-v9-absorb", type=str, default=None, choices=["on", "off"],
@@ -1394,6 +1415,36 @@ def main():
     # Plumb the read-mode knobs onto cfg so ReprLearningModel builds the
     # GraphCrossAttnReader (graph_v7_baseline only). Without this the reader is
     # never built and the cross_attn path stays inert (cfg default "prepend").
+    # ── compression line: SmolLM2 backbone + param-matched baselines ──────────
+    if args.backbone is not None:
+        cfg.llama_model = args.backbone
+        from transformers import AutoConfig as _AC, AutoTokenizer as _AT
+        _bc = _AC.from_pretrained(args.backbone)
+        cfg.d_llama = _bc.hidden_size
+        cfg.llama_vocab_size = _bc.vocab_size
+        _bt = _AT.from_pretrained(args.backbone)
+        # SmolLM2 has no pad token → use eos (masked out of attention/loss anyway)
+        cfg.pad_token_id = _bt.pad_token_id if _bt.pad_token_id is not None else _bt.eos_token_id
+        print(f"[backbone] {args.backbone}  d_llama={cfg.d_llama}  "
+              f"vocab={cfg.llama_vocab_size}  pad={cfg.pad_token_id}")
+    if args.task == "sentence_mae":
+        cfg.task_mode = "sentence_mae"
+        # decoder LoRA: a frozen decoder can't learn the MAE protocol (mask
+        # handling + memory-use) — the band-needs-training finding. Every variant
+        # (incl. the vanilla floor/ceiling) gets a shared-size decoder LoRA so the
+        # PROTOCOL is learnable; competitors ADD their ~2M compression encoder.
+        cfg.use_llama_lora = True
+        cfg.llama_lora_rank = 16; cfg.llama_lora_alpha = 32
+        # M_max = 16 (k in [3,16]); param-matched ranks (~2M on 135M, d=576).
+        cfg.n_flat_codes = 16
+        cfg.icae_n_slots = 16; cfg.icae_lora_rank = 34; cfg.icae_lora_alpha = 68
+        cfg.ccm_n_comp = 16; cfg.ccm_lora_rank = 17; cfg.ccm_lora_alpha = 34
+        cfg.autocompressor_n_slots = 16
+        cfg.autocompressor_lora_rank = 17; cfg.autocompressor_lora_alpha = 34
+        cfg.beacon_ratio = 8; cfg.beacon_wrap_layers = (0, 10, 19, 29)
+        if cfg.d_llama != 576:
+            print(f"[WARN] param-matched ranks calibrated for d=576; d={cfg.d_llama} "
+                  "→ trainable counts will differ, RECALIBRATE before claims.")
     if args.graph_v9_arm is not None:
         cfg.graph_v9_arm = args.graph_v9_arm
     if args.graph_v9_absorb is not None:
@@ -1477,6 +1528,8 @@ def main():
 
     print(f"\nLoading tokenizer {cfg.llama_model}...")
     tokenizer = AutoTokenizer.from_pretrained(cfg.llama_model)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
     print("Loading Llama (shared across variants, frozen)...")
     llama, _ = load_frozen_llama(cfg.llama_model, dtype=torch.bfloat16)
 
@@ -1513,6 +1566,7 @@ def main():
             emat_value_len=args.emat_value_len,
             emat_bio_n_facts=args.emat_bio_n_facts, emat_bio_world_seed=args.emat_bio_world_seed,
             compress_len=args.compress_len, predict_len=args.predict_len,
+            mae_src_tok=args.src_tokenizer,
         )
         summaries.append(s)
 

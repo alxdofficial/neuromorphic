@@ -715,6 +715,104 @@ class ReprLearningModel(nn.Module):
             "mt_memory_bk": mt_memory_bk,
         }
 
+    # compressor variants whose memory is a [B, M, d] prepend (capacity-relative
+    # slicing applies to these; vanillas pass through at M=0 / M=T).
+    _MAE_COMPRESSORS = ("icae_baseline", "ccm_baseline",
+                        "autocompressor_baseline", "beacon_baseline")
+
+    def compute_mae_loss(
+        self,
+        batch,                          # sentence-pair batch (data_sentence.py)
+        window_size: int = None,        # unused (single-window sentences); kept for dispatch parity
+        zero_memory: bool = False,
+        shuffle_memory: bool = False,
+        mask_ratio: float = 0.85,
+    ) -> dict:
+        """True MAE compression objective (docs/compression_objective.md).
+
+        Compress the sentence pair → k-slot memory; mask ~mask_ratio of the span
+        with the learned mask_embed; decode [memory ; masked_span] causally and
+        predict the TRUE token at masked positions (position p from hidden p-1,
+        whose causal prefix is masks/anchors + memory — NOT true tokens, so the
+        teacher-forcing local-prior cheat is removed). REAL/SHUF/OFF and the
+        no-memory floor share this path. Capacity-relative: memory sliced to
+        batch.k_slots for the compressor variants; vanilla_llama → M=0 (floor),
+        vanilla_full_context → M=T (ceiling).
+        """
+        device = batch.context_ids.device
+        B, T = batch.context_ids.shape
+        embed = self.decoder.llama.get_input_embeddings()
+        with torch.no_grad():
+            ctx_embeds = embed(batch.context_ids)                       # [B,T,d]
+
+        # ---- 1. encode the span → memory [B, M, d] (single window) ----
+        state = self.encoder.init_streaming_state(B, device, ctx_embeds.dtype)
+        state, _ = self.encoder.streaming_write(state, ctx_embeds, batch.context_mask)
+        memory, _aux = self.encoder.finalize_memory(state)              # [B, M, d]
+        memory = memory.to(ctx_embeds.dtype)
+
+        # capacity-relative: use the first k slots (prefix/Matryoshka code)
+        k = getattr(batch, "k_slots", None)
+        if k is not None and self.variant in self._MAE_COMPRESSORS:
+            memory = memory[:, :int(k)]
+        # memory attention mask: real for compressor slots; context_mask for the
+        # full-context ceiling (its M=T memory has padded positions)
+        if self.variant == "vanilla_full_context":
+            mem_mask = batch.context_mask.float()
+        else:
+            mem_mask = torch.ones(B, memory.shape[1], device=device)
+
+        # ---- 2. REAL / SHUF / OFF ----
+        if zero_memory:
+            memory = memory[:, :0]
+            mem_mask = mem_mask[:, :0]
+        elif shuffle_memory and B > 1:
+            memory = torch.roll(memory, shifts=1, dims=0)
+            mem_mask = torch.roll(mem_mask, shifts=1, dims=0)
+        M = memory.shape[1]
+
+        # ---- 3. masked decoder input ----
+        mask_vec = self.decoder.mask_embed.to(ctx_embeds.dtype)
+        rnd = torch.rand(B, T, device=device)                          # eval: seeded in run_val
+        masked = (rnd < mask_ratio) & batch.context_mask
+        dec_in = torch.where(masked.unsqueeze(-1), mask_vec.view(1, 1, -1), ctx_embeds)
+        full = torch.cat([memory, dec_in], dim=1)                      # [B, M+T, d]
+        attn = torch.cat([mem_mask, batch.context_mask.float()], dim=1).long()
+
+        base_out = self.decoder.llama.model(
+            inputs_embeds=full, attention_mask=attn, use_cache=False)
+        span_hidden = base_out.last_hidden_state[:, M:]                 # [B,T,d]
+
+        # ---- 4. CE on masked positions (predict t_p from hidden p-1) ----
+        pred_hidden = span_hidden[:, :-1]                              # predicts t_1..t_{T-1}
+        targets = batch.context_ids[:, 1:]
+        loss_mask = masked[:, 1:] & batch.context_mask[:, 1:]
+        if loss_mask.sum() == 0:                                        # degenerate batch
+            loss_mask[:, 0] = batch.context_mask[:, 1]
+        sel_hidden = pred_hidden[loss_mask]                            # [N,d]
+        sel_targets = targets[loss_mask]                              # [N]
+        logits = self.decoder.llama.lm_head(sel_hidden).float()        # [N,V]
+        per_tok = F.cross_entropy(logits, sel_targets, reduction="none")
+        loss_recon = per_tok.mean()
+
+        with torch.no_grad():
+            top1 = (logits.argmax(-1) == sel_targets).float().mean()
+            rows = loss_mask.nonzero(as_tuple=False)[:, 0]
+            per_ex = torch.zeros(B, device=device)
+            cnt = torch.zeros(B, device=device)
+            per_ex.scatter_add_(0, rows, per_tok.detach())
+            cnt.scatter_add_(0, rows, torch.ones_like(per_tok))
+            per_ex = per_ex / cnt.clamp_min(1.0)
+
+        # keep mask_embed in-graph even when no positions select it
+        loss = loss_recon + 0.0 * self.decoder.mask_embed.float().sum()
+        return {
+            "loss": loss, "loss_recon": loss_recon.detach(),
+            "top1_acc": top1, "per_example_loss": per_ex,
+            "loss_aux": torch.zeros((), device=device),
+            "mae_n_masked": float(loss_mask.sum()), "mae_M": float(M),
+        }
+
     def compute_qa_loss(
         self,
         batch,                          # QABatch from data_qa.py
@@ -723,6 +821,9 @@ class ReprLearningModel(nn.Module):
         shuffle_memory: bool = False,
     ) -> dict:
         """v1h composite-QA loss.
+
+        (Dispatches to compute_mae_loss when task_mode == "sentence_mae" so the
+        trainer + run_val call sites stay unchanged.)
 
         Pipeline (matches the memory paradigm — decoder never sees raw context):
           1. Encoder ingests context via streaming writes → memory tokens.
@@ -749,6 +850,9 @@ class ReprLearningModel(nn.Module):
             is REAL ≫ SHUF ≫ OFF. Mutually exclusive with zero_memory (zero
             wins). No-op when M == 0 (vanilla/MT-before-retrieve).
         """
+        if getattr(self, "task_mode", None) == "sentence_mae":
+            return self.compute_mae_loss(
+                batch, zero_memory=zero_memory, shuffle_memory=shuffle_memory)
         device = batch.context_ids.device
         B, T_ctx = batch.context_ids.shape
         T_q = batch.question_ids.shape[1]
