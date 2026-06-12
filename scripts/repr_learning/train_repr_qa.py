@@ -558,6 +558,16 @@ def train_one_variant(
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             out = model.compute_qa_loss(batch, window_size=window_size)
         loss = out["loss"]
+        if args.contrastive_shuf_coef > 0:
+            # contrastive binding pressure: gradient flows through BOTH branches
+            # (lower REAL loss AND raise SHUF loss — both require doc-identity in
+            # the state to be expressed by the read). Primary CE on REAL keeps
+            # the help-on-match direction anchored against poison-on-mismatch.
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                out_shuf = model.compute_qa_loss(batch, window_size=window_size,
+                                                 shuffle_memory=True)
+            contrast = F.softplus(out["loss"] - out_shuf["loss"])
+            loss = loss + args.contrastive_shuf_coef * contrast
         if not torch.isfinite(loss):
             print(f"  [step {step}] FATAL: non-finite loss = {float(loss)}")
             break
@@ -1042,6 +1052,11 @@ def main():
                     help="surprise-weight the coactivation table")
     ap.add_argument("--graph-v9-dirs-blend", type=str, default=None,
                     choices=["mass", "gated"], help="absorption direction blending")
+    ap.add_argument("--contrastive-shuf-coef", type=float, default=0.0,
+                    help="add coef*softplus(L_real - L_shuf) to the loss: makes the "
+                         "binding gate ITSELF a training objective (2x step cost; "
+                         "the sanctioned aux-loss fallback after the architectural "
+                         "ladder, 2026-06-12). Needs batch>1 for the roll.")
     ap.add_argument("--emat-bio-world-seed", type=int, default=0,
                     help="emat_bio: world-build seed (train uses this; val uses +10000 → disjoint).")
     ap.add_argument("--compress-len", type=int, default=1024,

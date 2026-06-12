@@ -334,3 +334,22 @@ write thesis.
 - New mechanisms (all config-gated, all smoke-tested): npmi_sharp / npmi_raw
   absorption, route centering, surprise-coact, gated dirs blending, arm/CLI
   overrides, the full telemetry panel.
+
+---
+## Day-after addendum 1 — MEASUREMENT AUDIT of state separability (user request)
+Corrected protocol on trained ckpts: compare DEVIATIONS from the arm-C base
+(raw state is base-dominated), include dirs, and establish the noise floor
+(same passage twice → bit-identical, max|Δ| = 0.0e0 — encoding deterministic,
+so all separation numbers are signal).
+- run 7 arm C: ||delta||/||base|| = **0.60** (the state moves a LOT) but
+  deviation sep_cos = **0.976** — big, SHARED, doc-invariant relocation; only
+  ~2–3% doc-specific. **Overnight conclusion survives the fair re-measurement.**
+- run 8 hybrid: deviation sep = 0.848 (~15% doc-specific). Consistent.
+- Telemetry metric upgraded: graph_v9_state_sep_cos now measures deviation-
+  from-base in arm C.
+
+## Day-after addendum 2 — contrastive SHUF−REAL objective (user-proposed)
+The binding gate becomes a training loss: coef·softplus(L_real − L_shuf),
+gradient through both branches. Per the avoid-aux-losses doctrine this is the
+sanctioned FALLBACK moment: 8 runs of endogenous/architectural fixes preceded
+it. 2× step cost. Run 9 = hybrid stack + contrastive 1.0.

@@ -2620,7 +2620,15 @@ class GraphV9PyramidEncoder(nn.Module):
                 if strengths.shape[0] > 1:
                     delta = (strengths - strengths.mean(dim=0, keepdim=True)).reshape(
                         strengths.shape[0], -1)
-                    flat = F.normalize(strengths.reshape(strengths.shape[0], -1),
+                    # MEASUREMENT FIX (2026-06-12 eve): separate the state from its
+                    # arm-C trained base before comparing — raw-state cosine is
+                    # base-dominated. Deviation-from-INIT is the doc-borne signal.
+                    sep_ref = strengths
+                    if self.cfg.graph_v9_arm == "C" and layer_idx > 0:
+                        base_s = (2.0 * torch.sigmoid(
+                            self.sub.base_strength_logit[layer_idx - 1])).unsqueeze(0)
+                        sep_ref = strengths - base_s
+                    flat = F.normalize(sep_ref.reshape(strengths.shape[0], -1),
                                        dim=-1, eps=1e-9)
                     cos = flat @ flat.t()
                     off = cos.masked_select(~torch.eye(strengths.shape[0],
