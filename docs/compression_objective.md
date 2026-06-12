@@ -86,3 +86,16 @@ steps.
      causal prefix + memory). + the no-memory floor control (same mask, mem off).
 3. Capacity-relative baselines: ICAE/AutoComp/CCM prefix-of-M_max = k; Beacon α=ratio.
 4. SmolLM2 backbone wiring + floor/ceiling band scan (135M/360M/1B).
+
+
+## Finding — the MAE band requires TRAINING (not a zero-shot probe), 2026-06-12
+Validated the true-MAE mechanic + SmolLM2 + data end to end. Key correction:
+a FROZEN model can't do MAE zero-shot (it has never seen [MASK] or a memory
+prefix), so BOTH floor and ceiling are TRAINED quantities. Evidence: with no
+memory + 85% masked, frozen CE = 10.76 ≈ ln(49152) (uniform — correctly nothing
+to predict); "ceiling" with a raw memory prefix is WORSE because the frozen model
+can't exploit an untrained memory format. Plain next-token CE (which the model
+CAN do zero-shot) = 3.46 / ppl 31.7 on the pairs → backbone+data sane, prior is
+strong (the thing we bottleneck against). CONSEQUENCE: the floor/ceiling band
+scan becomes a short TRAINING run (trained no-memory floor vs trained
+full-length-memory ceiling), built alongside the MAE training path.
