@@ -157,6 +157,13 @@ class GraphV9Config:
     # encodes token-RELATIVE structure; running stats are used identically at
     # write and read (symmetry preserved — a per-window mean would break it).
     route_centering: bool = False
+    # SURPRISE-WEIGHTED COACTIVATION (overnight run-4 finding): weight each
+    # token's contribution to trace/coact by its own surprise, so the table
+    # records "which nodes co-fired on NEWS" instead of all co-firing — the
+    # template's role-pair traffic (shared across docs) drops out and the
+    # doc-specific entity pairs dominate. Predictive-coding-faithful Hebbian
+    # (local plasticity x prediction error). Apply/routing still use raw scores.
+    surprise_coact: bool = False
     wy_block: int = 64                     # factors per WY block in the fast apply
 
     def __post_init__(self):
@@ -754,6 +761,10 @@ class GraphV9Substrate(nn.Module):
             return _unit_rms(operated) * mask.unsqueeze(-1), \
                 factor_dirs0, factor_strengths0, coact0, trace0
         decay = self._coact_decay(layer_idx)
+        if config.surprise_coact:
+            # the table sees surprise-weighted firing (news only); apply and
+            # deposits saw the raw scores above — selection vs plasticity split
+            routing_scores = routing_scores * surprise.unsqueeze(-1)
         position = mask.cumsum(dim=1)                                         # [B,C]
         position_last = position[:, -1]
         if reference:

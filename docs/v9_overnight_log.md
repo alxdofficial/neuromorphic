@@ -172,3 +172,28 @@ variance, not enough).
 lever): per-node logit centering removes the hubs' constant advantage at write
 AND read simultaneously — attacks L0 usage collapse, coact marginal domination,
 and read addressing in one mechanism.
+
+---
+## Run 4 — arm C + npmi_sharp + ROUTE CENTERING (emat_bio_v9c3_center) — FLAT,
+## but the centering fix WORKED — which isolates the last culprit
+SHUF−REAL = −0.0004. BUT: L0 usage_eff_frac **0.05 → 0.45–0.62** (hub collapse
+cured, ~10× more effective atoms), token overlap 0.03 (distinct routing),
+coact asymmetry up to 0.43. Addressing is now healthy by every metric we have —
+and `state_sep_cos_L1` is STILL 1.0000.
+
+**Decisive separation:** routing differentiates tokens; relocation still does
+not differentiate DOCUMENTS. Remaining explanation: the coact table aggregates
+ALL co-firing — and emat_bio docs share one template, so ROLE-pair traffic
+(identical across docs) dominates the lexical/entity pairs (doc-specific).
+Aggregated over 640 tokens, relocation is a low-pass of routing; doc identity
+lives in the fine structure and is averaged away. (Arm B's sep=0.91 fits: its
+deposits carry lexical content directly, skipping the aggregation.)
+
+**The in-thesis fix we already own: surprise-gate the TABLE, not the boundary.**
+Currently surprise multiplies the absorb gate as a per-chunk SCALAR — the coact
+table itself accumulates template traffic at full weight. Fix: weight each
+token's contribution to trace/coact by ITS OWN surprise (template tokens,
+predictable after line 1, contribute ~nothing; entity values dominate the
+table). This is predictive-coding-faithful Hebbian (local plasticity × predict-
+ion error — the project's founding research lesson) applied at the right site.
+→ Run 5: centering + npmi_sharp + SURPRISE-WEIGHTED COACT.
