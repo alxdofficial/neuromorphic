@@ -260,3 +260,77 @@ conserved; the invariant survives.
 → Run 8 (closer): best-shot hybrid — arm B deposits (content, sep 0.91) +
 absorption bridge (key→value) + centering + surprise-coact + n_query=4 +
 1200 steps (binding pressure × horizon).
+
+---
+## Run 7 — arm C + gated direction blending (emat_bio_v9c6_dirs) — FLAT
+SHUF−REAL +0.0007, sep_cos 1.0000. Directions now genuinely rotate (dirs_rot
+0.004/window — 400× the frozen rate; the mechanism works) — but they rotate
+THE SAME WAY for every doc. Conclusion: it was never the choice of channel
+(strengths vs directions); the relocation DRIVER — aggregate coactivation
+structure — is doc-invariant at this protocol even after de-hubbing, NPMI,
+and surprise filtering. The arm C writer question is now CLOSED, negatively,
+with a complete mechanistic account.
+
+## Run 8 — best-shot hybrid (emat_bio_v9h1_hybrid): arm B deposits + absorption
+## bridge + all fixes + n_query=4 + 1200 steps — FLAT
+SHUF−REAL +0.0010 at step 1200 (noise-level), sep_cos ~0.88 (doc-specific
+states confirmed again), recon 1.06→1.16 after step 500 (plateau/overfit under
+the 4-query protocol). Even with content, bridge, healthy addressing, and 4×
+binding pressure over 2× horizon: no binding.
+
+---
+# MORNING REPORT (for Alex)
+
+## Bottom line
+**8 controlled runs, 3 probes: graph_v9 does not bind on the emat_bio gate at
+this scale/protocol, in any arm, under any of the diagnosed-and-fixed write
+mechanisms. SHUF−REAL ∈ [−0.0006, +0.0010] everywhere (v8c5: −0.0007;
+Beacon: +2.07).** What the night BOUGHT is a precise, telemetry-verified account
+of why — three pathologies found and cured, one structural theorem about
+conserving relocation, and one suspect left standing.
+
+## What was established (each with its telemetry receipt)
+1. **Hub convergence in routing** (bridge probe): questions/keys/values all
+   routed into ~32 shared hot nodes. CURED by per-node logit centering
+   (L0 usage 0.05 → 0.45–0.62). Cure verified; gate unchanged.
+2. **Template domination of coactivation**: the table aggregated role-pair
+   traffic shared by every doc. CURED by surprise-weighting the table
+   (coact mass −4.7×). Cure verified; gate unchanged.
+3. **The structural null of normalized conserving relocation** (the night's
+   main theoretical result): row-normalized intake fixes every absorber's
+   total (flux invariant ≈11.8 across ALL configs — the smoking gun), and with
+   conservation + mass-ratio direction blending, net state → base + doc-
+   invariant drift. Unnormalized gates (run 6) and gated direction motion
+   (run 7) freed each ingredient; states REMAINED doc-invariant because the
+   aggregate coact driver itself is. **Conserving relocation over a shared
+   base cannot encode doc identity on a templated corpus at this signal
+   ratio.** This kills a whole design family, cleanly.
+4. **Deposits DO write doc-specific states** (sep 0.88–0.94, runs 2/8) and
+   STILL don't produce binding → doc-specific ≠ addressable.
+
+## The suspect left standing (recommend investigating FIRST tomorrow)
+**The read is a whisper in every run:** read_rotation_cos 0.99+ always —
+queries are steered ~1% by the memory, injection ratio ~0.15 into two of 16
+decoder layers. Beacon (the only binder) reads with full pretrained per-layer
+ATTENTION; our flow-through read must learn to express bindings through
+~1%-magnitude rotations decoded by a zero-init projection, against an
+objective that is ⅔ guessable without memory (floor memory). The binding
+economics may never engage at this read bandwidth. Candidate next steps:
+more hook depths, stronger/learnable-per-channel injection, or a hybrid read
+(flow-through addressing + attention-style fetch) — all compatible with the
+write thesis.
+
+## Standing caveats (alternative explanations not yet excluded)
+- Params: ~3M vs 52M (v8c) / 102M (Beacon) — intentional, but unexcluded.
+- Horizon: 600–1200 steps with a read waking from zero vs Beacon's pretrained
+  read; the attractor (recon ≈ 1.03, identical in every run incl. v8c) may
+  simply be where short runs go.
+- Protocol: emat_bio is ⅔ guessable (weak binding pressure; the floor memory
+  prescribed sharpening beyond n_query — strict emat / filler-only masking).
+
+## Where everything lives
+- Branch `v9-overnight-auto` (every change committed stepwise, with rationale);
+  main is untouched at a3bc7bd. All runs: outputs/repr_learning/emat_bio_v9*.
+- New mechanisms (all config-gated, all smoke-tested): npmi_sharp / npmi_raw
+  absorption, route centering, surprise-coact, gated dirs blending, arm/CLI
+  overrides, the full telemetry panel.
