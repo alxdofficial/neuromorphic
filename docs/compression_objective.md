@@ -125,3 +125,22 @@ baseline instantiation + param counts. NOT YET BUILT: compute_mae_loss decode
 path (the new forward), capacity-relative per-batch-k wiring (use first k slots),
 trainer task="sentence_mae", the trained floor/ceiling band scan. Our compressor:
 deferred (redesign).
+
+
+## Param-MATCHED config (~2M trainable, SmolLM2-135M) — applied 2026-06-12
+User decision: match trainable params so the comparison measures MECHANISM, not
+capacity (label: "param-matched mechanism comparison", NOT paper-faithful).
+Anchor 2M (above CCM's natural 0.93M so it gains capacity; matching mostly
+SHRINKS the heavy ones — the safe direction). Calibrated on 135M (d=576):
+
+| baseline | setting | trainable |
+|---|---|---|
+| ICAE | lora_rank 34 / alpha 68 | ~1.97M |
+| CCM | lora_rank 17 / alpha 34 | ~1.97M |
+| AutoCompressor | lora_rank 17 / alpha 34 | ~1.98M |
+| Beacon | wrap 4 layers (0,10,19,29), α=8 | ~2.21M (structural floor; flagged) |
+
+Beacon can't LoRA-shrink (full q/k/v projections); 4 wrapped layers is the
+min sensible (3 → 1.66M, too low). Matched within ~10%; reported per-model.
+NOTE: ranks are d-dependent — RECALIBRATE for 360M (d=960) before those runs.
+Our eventual compressor targets the same ~2M.
