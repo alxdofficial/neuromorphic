@@ -149,3 +149,26 @@ attractor, now located precisely in the routing projections.
   always-hot logit component; running stats used identically at write and read
   (symmetry preserved — a per-window mean would break it). The v8c audit
   proposed mean-centered routing; this is its symmetric, principled form.
+
+---
+## Run 3 — arm C + npmi_sharp (emat_bio_v9c2_npmi) — FLAT; npmi alone insufficient
+SHUF−REAL = **−0.0001**. Telemetry: absorb_gate_mean unchanged (~1e-4 — row-
+normalized gates have fixed mean by construction; only the distribution moved),
+flux ~11.7 (≈ rowfrac), refusal 0.753 (identical), `dirs_rot_L1` still 0.0000,
+sep_cos 0.996–1.0 (doc_var did double 0.9 → 2.1 — slightly more doc-specific
+variance, not enough).
+
+**Why (two compounding reasons):**
+1. Concentration was per-ABSORBER (each absorber's top-4 donors) but all 288
+   absorbers still absorb ⇒ incoming-per-slot still ≈ flux/(N·S) ≈ 0.01 vs
+   existing 1.5 ⇒ directions still frozen. Needs ABSORBER-side selectivity too
+   (only strongly-coactivated/surprised absorbers take mass) if pursued further.
+2. The deeper one: npmi de-hubs the GATE but coactivation itself is computed
+   from hub-collapsed routing (bridge-probe finding), so even above-chance
+   pairs are similar across docs ⇒ sep_cos ≈ 1 persists. ROOT CAUSE remains
+   routing hub convergence.
+
+**Decision: run 4 = arm C + npmi_sharp + ROUTE CENTERING** (the root-cause
+lever): per-node logit centering removes the hubs' constant advantage at write
+AND read simultaneously — attacks L0 usage collapse, coact marginal domination,
+and read addressing in one mechanism.
