@@ -571,6 +571,7 @@ class ReprConfig:
     graph_v9_arm: str = "C"             # "C" vocab-by-absorption | "B" deposits | "A" control
     graph_v9_effective_k: float = 8.0   # target #active nodes at init → route temp DERIVED
     graph_v9_absorb_enabled: bool = True    # arm C REQUIRES True (absorption IS the write)
+    graph_v9_absorb_gate: str = "rowfrac"   # "rowfrac" | "npmi_sharp" (overnight H-PMI)
     graph_v9_tap_layer: int = 13        # the ONE mid-stack write tap (inject@13 lore)
     # one Llama decoder hook per pyramid layer (read injection depths). Point 0
     # hooks the SAME depth as the write tap (13): route_projs[0]/seed_proj see

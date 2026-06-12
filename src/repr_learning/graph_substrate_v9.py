@@ -139,6 +139,18 @@ class GraphV9Config:
     mlp_hidden: int = 16                   # update-gate + plasticity MLP hidden
     absorb_enabled: bool = True            # arm C: REQUIRED (absorption IS the write);
     #                                      # arms A/B probe: OFF (binding only)
+    # absorption gate form (overnight H-PMI/H-SHARP, run-1 diagnosis):
+    #  "rowfrac"    — row-normalized coactivation (run 1: too diffuse + marginal-
+    #                 driven; the template-shared component dominates -> states
+    #                 identical across docs -> SHUF==REAL structurally)
+    #  "npmi_sharp" — NPMI vs the independence baseline (kills the hot-node/
+    #                 template component; only ABOVE-CHANCE co-firing absorbs,
+    #                 which is exactly the doc-specific signal) + donor-softmax
+    #                 with a calibrated learnable temperature (concentrates each
+    #                 absorber's intake on its top partners so real mass moves
+    #                 and directions actually rotate).
+    absorb_gate: str = "rowfrac"
+    effective_k_donors: float = 4.0        # npmi_sharp: target #donors at init (derived temp)
     wy_block: int = 64                     # factors per WY block in the fast apply
 
     def __post_init__(self):
@@ -308,6 +320,26 @@ class GraphV9Substrate(nn.Module):
         # a*(cos*sqrt(d_code)*(strength/2)) + b*(room/2); a,b learnable, init 1.
         self.match_weight = nn.Parameter(torch.ones(n_active))
         self.room_weight = nn.Parameter(torch.ones(n_active))
+        if config.absorb_gate == "npmi_sharp":
+            # donor-softmax temperature, DERIVED at init (data-free, same pattern
+            # as route temps): perplexity of softmax(U[0,1]/temp) over the donor
+            # count ~= effective_k_donors.
+            self.log_donor_temp = nn.Parameter(torch.zeros(n_active))
+            with torch.no_grad():
+                for slot_i, layer_idx in enumerate(self.active_layers):
+                    n_donors = config.nodes[layer_idx] - 1
+                    aff = torch.rand(4096, n_donors)
+                    low, high = math.log(1e-3), math.log(10.0)
+                    target = math.log(min(max(config.effective_k_donors, 1.0), n_donors))
+                    for _ in range(30):
+                        mid = 0.5 * (low + high)
+                        probs = torch.softmax(aff / math.exp(mid), dim=-1)
+                        ent = -(probs * probs.clamp_min(1e-12).log()).sum(-1).mean().item()
+                        if ent < target:
+                            low = mid
+                        else:
+                            high = mid
+                    self.log_donor_temp.data[slot_i] = 0.5 * (low + high)
 
         # ── telemetry (docs/graph_v9_ideas.md §8) ──────────────────────────────
         # Per-chunk dynamics metrics, written into a keyed buffer under no_grad.
@@ -555,7 +587,26 @@ class GraphV9Substrate(nn.Module):
         # backwards pressure on the write (review finding, 2026-06-12).
         diagonal = torch.eye(n_nodes, device=factor_dirs.device, dtype=torch.bool)
         coact_offdiag = coact.masked_fill(diagonal, 0.0)
-        coact_rownorm = coact_offdiag / coact_offdiag.sum(-1, keepdim=True).clamp_min(eps)
+        if self.config.absorb_gate == "npmi_sharp":
+            # NPMI vs independence: positive part = co-firing ABOVE what the two
+            # nodes' marginal traffic predicts — the doc-specific signal; the
+            # hot-node/template component cancels by construction.
+            total = coact_offdiag.sum(dim=(1, 2), keepdim=True).clamp_min(eps)
+            p_joint = coact_offdiag / total
+            p_row = p_joint.sum(-1, keepdim=True).clamp_min(1e-12)
+            p_col = p_joint.sum(-2, keepdim=True).clamp_min(1e-12)
+            pmi = p_joint.clamp_min(1e-12).log() - (p_row * p_col).log()
+            npmi = (pmi / p_joint.clamp_min(1e-12).log().neg().clamp_min(1e-12))
+            affinity = npmi.clamp(0.0, 1.0).masked_fill(diagonal, 0.0)
+            temp = self.log_donor_temp[self._active_idx(layer_idx)] \
+                .clamp(math.log(1e-3), math.log(10.0)).exp()
+            # donor-softmax: concentrate each absorber's intake on its top
+            # above-chance partners (real mass moves; directions rotate)
+            coact_rownorm = torch.softmax(
+                affinity.masked_fill(diagonal, -1e4) / temp, dim=-1)
+            coact_rownorm = coact_rownorm.masked_fill(diagonal, 0.0)
+        else:
+            coact_rownorm = coact_offdiag / coact_offdiag.sum(-1, keepdim=True).clamp_min(eps)
         unit_keys = _unit(self.node_keys[layer_idx].float())
         key_cos = (unit_keys @ unit_keys.t()).unsqueeze(0).expand(batch_size, -1, -1)
         grammar = self.plasticity_mlps[str(layer_idx)](

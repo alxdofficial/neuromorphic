@@ -1033,6 +1033,9 @@ def main():
                     help="override cfg.graph_v9_arm for this run (overnight sweep)")
     ap.add_argument("--graph-v9-absorb", type=str, default=None, choices=["on", "off"],
                     help="override cfg.graph_v9_absorb_enabled")
+    ap.add_argument("--graph-v9-absorb-gate", type=str, default=None,
+                    choices=["rowfrac", "npmi_sharp"],
+                    help="override cfg.graph_v9_absorb_gate")
     ap.add_argument("--emat-bio-world-seed", type=int, default=0,
                     help="emat_bio: world-build seed (train uses this; val uses +10000 → disjoint).")
     ap.add_argument("--compress-len", type=int, default=1024,
@@ -1374,6 +1377,8 @@ def main():
         cfg.graph_v9_arm = args.graph_v9_arm
     if args.graph_v9_absorb is not None:
         cfg.graph_v9_absorb_enabled = (args.graph_v9_absorb == "on")
+    if args.graph_v9_absorb_gate is not None:
+        cfg.graph_v9_absorb_gate = args.graph_v9_absorb_gate
     cfg.graph_read_mode = args.graph_read_mode
     cfg.graph_read_gate_init = args.graph_read_gate_init
     if args.graph_read_layer_indices is not None:
