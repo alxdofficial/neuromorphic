@@ -154,7 +154,7 @@ def run_val(model, val_set, device, n_batches: int, window_size: int,
             if v is not None:
                 last_v6_eval[k] = float(v)
         for k, v in out.items():
-            if not k.startswith("graph_v8_") or v is None:
+            if not k.startswith(("graph_v8_", "graph_v9_")) or v is None:
                 continue
             if isinstance(v, (int, float)):
                 last_v8_eval[k] = float(v)
@@ -681,7 +681,7 @@ def train_one_variant(
             if key in out and out[key] is not None:
                 row[key] = float(out[key])
         for key, value in out.items():
-            if not key.startswith("graph_v8_") or value is None:
+            if not key.startswith(("graph_v8_", "graph_v9_")) or value is None:
                 continue
             if isinstance(value, (int, float)):
                 row[key] = float(value)
@@ -981,6 +981,9 @@ def main():
     ap.add_argument("--lr", type=float, default=None,
                     help="Override cfg.learning_rate (default 1e-4). Scale with "
                          "BS — e.g. sqrt rule: 1e-4×sqrt(BS/2) → BS=16 ≈ 2.5e-4.")
+    ap.add_argument("--warmup", type=int, default=500,
+                    help="LR warmup steps (default 500). Recurrent ports "
+                         "(autocompressor) need a longer warmup for stability.")
     ap.add_argument("--log-every", type=int, default=50)
     ap.add_argument("--val-every", type=int, default=500)
     ap.add_argument("--save-every", type=int, default=2000)
@@ -1260,7 +1263,7 @@ def main():
         fixed_window_size=args.window_size,
         max_window_size=args.chunk_size,
         max_steps=args.steps,
-        warmup_steps=500,
+        warmup_steps=args.warmup,
         # Bottleneck: 192 memory slots × 1432 = 274,944 state floats across all
         # fixed-footprint variants (flat / continuous / Mamba / graph), matched to
         # graph_v6's substrate. MT exempt (see header).
@@ -1343,6 +1346,16 @@ def main():
         print(f"   graph_v8 K/V read → {_v8_read:,} floats "
               f"({(_v8_read / max(1, M * cfg.d_llama)):.1f}× prepend budget; "
               "not controlled by --mem-tokens)")
+    if "graph_v9_baseline" in args.variants:
+        # arms B/C: layer 0 is slow params (the static alphabet), not fast state.
+        _v9_skip_l0 = 1 if cfg.graph_v9_arm in ("B", "C") else 0
+        _v9_state = sum(n * s * (cfg.graph_v9_d_code + 1)
+                        for n, s in list(zip(cfg.graph_v9_nodes,
+                                             cfg.graph_v9_slots))[_v9_skip_l0:])
+        print(f"   graph_v9 writable fast state (arm {cfg.graph_v9_arm}) → "
+              f"{_v9_state:,} floats "
+              f"({(_v9_state / max(1, M * cfg.d_llama)):.2f}× prepend budget; "
+              "read = flow-through apply-to-query, not --mem-tokens-controlled)")
     if abs(_beacon_M - M) > max(1, M // 10):
         raise SystemExit(
             f"[EMAT budget] beacon M={_beacon_M} is >10% off mem_tokens={M} "

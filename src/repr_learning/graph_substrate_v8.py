@@ -139,7 +139,18 @@ class GraphV8Config:
     # Init from window retention: delta = exp(ln(0.9)/640) ≈ 0.99984 → ~0.9 of a
     # write surviving a full 640-token window. Recalibrate if windows change.
     value_decay_init: float = 0.99984
-    write_strength_init: float = 0.10   # max per-write rate, in (0,1)
+    # OPENED 2026-06-11: was 0.10 — measured INERT (write_strength stayed exactly at
+    # init over 600 steps; state_effect ~0.005; the reader rode the generic base bank,
+    # so there was zero gradient pressure to open the write). 0.50 forces per-passage
+    # content into memory from step 0; the online-mixing delta is stable for any ws<1.
+    write_strength_init: float = 0.50   # max per-write rate, in (0,1)
+    # ── PLASTICITY: a learned per-edge module gates the Hebbian coactivation
+    # increment (reinforce / keep / COUNTER the "fired-together" edge), so the graph
+    # grows episodic topology instead of recomputing edges from content each step.
+    # gate = 1 + eta·tanh(MLP); fc2 zero-init ⇒ gate==1 at start (identity) ⇒ no
+    # perturbation to the verified substrate; it only LEARNS to intervene where it helps.
+    plasticity_eta: float = 0.50
+    plasticity_hidden: int = 16
 
     def __post_init__(self):
         for name in ("d_model", "d_mem", "n_nodes"):
@@ -148,6 +159,48 @@ class GraphV8Config:
                 raise ValueError(f"GraphV8Config.{name}={v} must be a multiple of 32")
         if len(self.coact_decay_inits) < self.n_layers:
             raise ValueError("need one coact_decay init per source layer (L0..L_{n_layers-1})")
+
+
+class _EdgePlasticity(nn.Module):
+    """Per-edge learned modulator of the Hebbian coactivation increment.
+
+    A SHARED tiny MLP applied independently to every edge (i,j) — a 1×1 conv over
+    the N×N grid, separate per source layer. It sees ONLY local per-edge scalars
+    (incl. the two nodes' marginal traffic — the anti-hub signal), so it is
+    permutation-equivariant and ~100 params. Output m∈(−1,1); the proposed Hebbian
+    increment `fresh` is scaled by (1 + eta·m): reinforce (m>0), keep (m≈0), or
+    COUNTER (m<0) the "fired-together" edge. fc2 zero-init ⇒ gate==1 at start
+    (unmodulated Hebbian, no perturbation) ⇒ it only learns to intervene where the
+    task gradient says the reinforcement helped. Count-like features are fed as
+    log1p so NPMI (log H − log r_i − log r_j) is a LINEAR function of the inputs.
+    """
+    N_FEAT = 6   # log1p(fresh), log1p(c0), log1p(r_i), log1p(r_j), cos(k_i,k_j), surprise
+
+    def __init__(self, n_layers: int, eta: float, hidden: int):
+        super().__init__()
+        self.eta = float(eta)
+        self.fc1 = nn.ModuleList(nn.Linear(self.N_FEAT, hidden) for _ in range(n_layers))
+        self.fc2 = nn.ModuleList(nn.Linear(hidden, 1) for _ in range(n_layers))
+        for f in self.fc2:                       # zero-init ⇒ gate==1 (identity) at start
+            nn.init.zeros_(f.weight); nn.init.zeros_(f.bias)
+
+    def gate(self, src: int, fresh: Tensor, c0: Tensor, src_keys: Tensor,
+             surprise_chunk: Tensor) -> Tensor:
+        """fresh,c0 [B,N,N] (partner i = dim 1, target j = dim 2, both ≥0).
+        src_keys [N,d] (atoms) or [B,N,d]. surprise_chunk [B]. Returns gate [B,N,N]."""
+        ku = _unit(src_keys.float())
+        if ku.dim() == 2:
+            kcos = (ku @ ku.t()).unsqueeze(0).expand_as(fresh)
+        else:
+            kcos = torch.einsum("bid,bjd->bij", ku, ku)
+        ri = fresh.sum(dim=2, keepdim=True).expand_as(fresh)     # partner i total traffic
+        rj = fresh.sum(dim=1, keepdim=True).expand_as(fresh)     # target j total traffic
+        sp = surprise_chunk.view(-1, 1, 1).expand_as(fresh)
+        feat = torch.stack([torch.log1p(fresh.clamp_min(0.0)), torch.log1p(c0.clamp_min(0.0)),
+                            torch.log1p(ri.clamp_min(0.0)), torch.log1p(rj.clamp_min(0.0)),
+                            kcos, sp], dim=-1)                   # [B,N,N,6]
+        m = torch.tanh(self.fc2[src](torch.relu(self.fc1[src](feat))).squeeze(-1))
+        return 1.0 + self.eta * m                                # [B,N,N]; ==1 at init
 
 
 class GraphV8Substrate(nn.Module):
@@ -189,6 +242,10 @@ class GraphV8Substrate(nn.Module):
         # init 0.5 (logit 0) — the node's OWN key / self-bind is half the proposal
         # at init, learnable thereafter (user decision: self must be part of it).
         self.self_mix_logit = nn.Parameter(torch.zeros(L))
+
+        # learned per-edge plasticity modulator of the Hebbian coactivation (see
+        # _EdgePlasticity). Identity at init (gate==1) — adds nothing until trained.
+        self.plasticity = _EdgePlasticity(L, config.plasticity_eta, config.plasticity_hidden)
 
     # ── bounded accessors ──────────────────────────────────────────────────────
     def _route_temp(self, src: int) -> Tensor:
@@ -270,13 +327,21 @@ class GraphV8Substrate(nn.Module):
 
         h_src [B,C,d_model] fp32 — the matched Llama layer's hiddens for THIS source.
         Returns (r, src_keys, bound) — r is mask-zeroed routing [B,C,N] fp32;
-        src_keys/bound are the chunk-frozen key bank and unit-norm self-binds.
+        src_keys is the chunk-frozen key bank, `bound` the unit-norm node CONTENT.
+
+        CONTENT-ADDRESSABLE (2026-06-11): `bound` is the node's RAW value content
+        (unit-normalized), NOT a key⊗value HRR self-bind. Fusion therefore
+        attention-POOLS raw content (coactivation = the attention weights) and the
+        reader content-matches clean values — replacing the HRR bind, which the
+        open-write gate proved cannot manufacture addressability (SHUF−REAL flat at
+        +0.027 even with a 4× write + plasticity). Keys stay the separate per-node
+        addresses; the thesis (coactivation-driven plasticity) is untouched.
         """
         src_keys = self.source_keys(src, state)
         if src == 0:
-            bound = _unit(hrr_bind(self.atom_keys, self.atom_values))           # [N,d]
+            bound = _unit(self.atom_values.float())                            # [N,d] raw content
         else:
-            bound = _unit(hrr_bind(src_keys, state["values"][src]))             # [B,N,d]
+            bound = _unit(state["values"][src])                                # [B,N,d] raw content
         r = self.route(src, h_src, src_keys) * mask.unsqueeze(-1)               # pads: r = 0
         return r, src_keys, bound
 
@@ -390,8 +455,13 @@ class GraphV8Substrate(nn.Module):
             # chunk-end carries for coact / windowed / colsum
             e_end = (gamma ** p_last).view(B, 1)
             fg = (gamma ** (p_last.view(B, 1) - p))                             # [B,C]
-            new_coact[src] = (e_end.unsqueeze(-1) * c0
-                              + torch.einsum("bcn,bcm->bnm", fg.unsqueeze(-1) * r, old_w))
+            fresh = torch.einsum("bcn,bcm->bnm", fg.unsqueeze(-1) * r, old_w)   # Hebbian increment
+            # PLASTICITY: learned per-edge gate on the proposed Hebbian increment.
+            # Chunk-end pointwise op (identical in the reference path) ⇒ chunkwise≡
+            # reference preserved; gate==1 at init ⇒ exactly the prior behavior.
+            srp_chunk = (surprise * mask).sum(1) / mask.sum(1).clamp_min(1.0)   # [B]
+            gate = self.plasticity.gate(src, fresh, c0, src_keys, srp_chunk)    # [B,N,N]
+            new_coact[src] = e_end.unsqueeze(-1) * c0 + gate * fresh
             new_windowed[src] = e_end * w0 + (fg.unsqueeze(-1) * r).sum(dim=1)
             new_colsum[src] = e_end * s0 + (fg * mask).unsqueeze(-1).mul(old_w).sum(dim=1)
 
@@ -437,6 +507,7 @@ class GraphV8Substrate(nn.Module):
             base_k = self.base_keys[tgt - 1].float()
             base_v = self.base_values[tgt - 1].float()
             coact, windowed, colsum = state["coact"][src], state["windowed"][src], state["colsum"][src]
+            c0_start = coact                                                    # chunk-start coact
             tK, tV = state["keys"][tgt], state["values"][tgt]
             for i in range(C):
                 r = r_all[:, i]                                                 # [B,N]
@@ -465,6 +536,13 @@ class GraphV8Substrate(nn.Module):
                 tV_new = (1 - gate) * (base_v + delta * (tV - base_v)) + gate * prop_v
                 tK = torch.where(keep3, tK_new, tK)
                 tV = torch.where(keep3, tV_new, tV)
+            # PLASTICITY (carry-out): SAME gate as _chunk_forward on the fresh
+            # increment, recovered by subtraction (fresh = coact − e_end·c0).
+            e_end = (gamma ** mask.sum(1)).view(B, 1, 1)
+            fresh = coact - e_end * c0_start
+            srp_chunk = (surprise * mask).sum(1) / mask.sum(1).clamp_min(1.0)
+            gate = self.plasticity.gate(src, fresh, c0_start, src_keys, srp_chunk)
+            coact = e_end * c0_start + gate * fresh
             state["coact"][src], state["windowed"][src], state["colsum"][src] = coact, windowed, colsum
             state["keys"][tgt], state["values"][tgt] = tK, tV
         return state

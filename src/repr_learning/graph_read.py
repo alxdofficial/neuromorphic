@@ -565,3 +565,129 @@ class GraphV7UnbindReader(nn.Module):
         for h in getattr(self, "_handles", []):
             h.remove()
         self._handles = []
+
+
+class GraphV9FlowReader(nn.Module):
+    """FLOW-THROUGH apply-to-query read for graph_v9 (docs/graph_v9_ideas.md §7).
+
+    Nothing is retrieved: the question's hidden state is projected into code
+    space and run through the SAME circuit the writes ran (shared substrate
+    params — routing by parameter identity, the v8 addressing lesson), and the
+    read result for pyramid layer ℓ is the query code AFTER layers 0..ℓ's stored
+    factor chains have transformed it (apply-to-query — degree-2 in
+    query × stored content, the bilinear step v8's read structurally lacked).
+
+    Hook at the MATCHED Llama decoder layer per pyramid layer:
+        x = unit_rms(seed_proj(hidden))                # shared seed projection
+        for l in 0..point: x = apply(l, x) (+ inter-layer unit_rms)
+        hidden += gate_p * o_proj_p(v_proj_p(unit_rms(x)))
+    o_proj ZERO-init => Llama is bit-identical to no-memory at step 0 (the §7c
+    init contract); gradient reaches o_proj first (gate nonzero), then upstream.
+
+    set_memory takes the substrate's pack_state tensor [B, L, N_max, width]:
+    rolling on dim 0 (SHUF) swaps the passages' ENTIRE fast state (slow keys are
+    shared vocabulary and correctly stay put). OFF = memory unset = true no-op.
+    """
+
+    def __init__(self, substrate: nn.Module, layer_indices, inner_dim: int = 64):
+        super().__init__()
+        self.sub = substrate                            # SHARED params (do NOT clone)
+        self.layer_indices = tuple(int(i) for i in layer_indices)
+        if len(self.layer_indices) != substrate.depth:
+            raise ValueError(
+                f"need one matched Llama layer per pyramid layer: got "
+                f"{len(self.layer_indices)} for depth {substrate.depth}")
+        d_code = substrate.config.d_code
+        d_model = substrate.config.d_model
+        self.v_projs = nn.ModuleList(
+            [nn.Linear(d_code, inner_dim, bias=False) for _ in self.layer_indices])
+        self.o_projs = nn.ModuleList(
+            [nn.Linear(inner_dim, d_model, bias=False) for _ in self.layer_indices])
+        for lin in self.v_projs:
+            nn.init.normal_(lin.weight, std=1.0 / math.sqrt(lin.in_features))
+        for lin in self.o_projs:
+            nn.init.zeros_(lin.weight)                  # Llama-identical at step 0
+        self.gates = nn.Parameter(torch.ones(len(self.layer_indices)))
+        self._memory: Optional[Tensor] = None           # packed state or None (OFF)
+        self._handles: list = []
+        # read-side telemetry (overwritten per read call — one decoder forward
+        # per compute_qa_loss, so last-write-wins is exact). Harvested by the
+        # model.py graph_v9 telemetry block after the decoder forward.
+        self.tele: dict = {}
+
+    def set_memory(self, memory: Tensor) -> None:
+        self._memory = memory
+
+    def clear_memory(self) -> None:
+        self._memory = None
+
+    def read(self, point: int, hidden: Tensor) -> Tensor:
+        """hidden [batch, seq, d_llama] at the matched Llama layer of pyramid
+        layer `point`. Returns the gated injection (zeros when OFF).
+
+        MIRRORS the write side exactly (the addressing guarantee): the query
+        token is projected into code space by the SAME seed projection the write
+        used, layer-0 routing reads the raw hiddens, and layers >= 1 route from
+        the operated codes — identical circuit, per token, all arms."""
+        if self._memory is None:
+            return hidden.new_zeros(hidden.shape)
+        from .graph_substrate_v9 import _unit_rms
+        packed = self._memory
+        with torch.autocast(device_type=hidden.device.type, enabled=False):
+            codes = _unit_rms(self.sub.seed_proj(hidden.float()))
+            codes_in = codes
+            for layer_idx in range(point + 1):
+                routing_input = hidden.float() if layer_idx == 0 else codes
+                routing_scores = self.sub.route(layer_idx, routing_input)
+                factor_dirs, factor_strengths = self.sub.unpack_layer(
+                    packed.float(), layer_idx)
+                codes = self.sub.apply_chain(
+                    codes, factor_dirs, factor_strengths, routing_scores)
+                if getattr(self.sub, "telemetry_enabled", False):
+                    with torch.no_grad():
+                        ent = -(routing_scores.clamp_min(1e-12)
+                                * routing_scores.clamp_min(1e-12).log()).sum(-1)
+                        self.tele[f"p{point}_eff_k_L{layer_idx}"] = float(ent.mean().exp())
+                if layer_idx < point:
+                    codes = _unit_rms(codes)
+            out_code = _unit_rms(codes)
+            if getattr(self.sub, "telemetry_enabled", False):
+                with torch.no_grad():
+                    # read rotation: 1.0 = memory not steering queries (dead read)
+                    rot = F.cosine_similarity(codes_in, codes, dim=-1)
+                    self.tele[f"p{point}_read_rotation_cos"] = float(rot.mean())
+        out = self.o_projs[point](self.v_projs[point](out_code.to(hidden.dtype)))
+        out = self.gates[point].to(hidden.dtype) * out
+        if getattr(self.sub, "telemetry_enabled", False):
+            with torch.no_grad():
+                # injection loudness vs the residual stream (the gate=1.0 risk)
+                inj = out.float().pow(2).mean(-1).sqrt().mean()
+                stream = hidden.float().pow(2).mean(-1).sqrt().mean()
+                self.tele[f"p{point}_inj_ratio"] = float(inj / stream.clamp_min(1e-9))
+        return out
+
+    def install_hooks(self, llama_model: nn.Module) -> None:
+        if self._handles:
+            raise RuntimeError("GraphV9FlowReader hooks already installed "
+                               "(call remove_hooks first)")
+        layers = llama_model.model.layers
+        n = len(layers)
+        bad = [i for i in self.layer_indices if i < 0 or i >= n]
+        if bad:
+            raise ValueError(
+                f"graph_v9_reader_layers entries {bad} out of range for {n}-layer Llama")
+        for point, layer_idx in enumerate(self.layer_indices):
+
+            def _hook(module, args, output, _p=point):
+                if isinstance(output, tuple):
+                    hidden = output[0]
+                    hidden = hidden + self.read(_p, hidden)
+                    return (hidden, *output[1:])
+                return output + self.read(_p, output)
+
+            self._handles.append(layers[layer_idx].register_forward_hook(_hook))
+
+    def remove_hooks(self) -> None:
+        for h in self._handles:
+            h.remove()
+        self._handles = []

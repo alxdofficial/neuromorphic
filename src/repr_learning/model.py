@@ -26,6 +26,7 @@ from .encoder import (
     GraphV6BaselineEncoder,
     GraphV7BaselineEncoder,
     GraphV8ColumnEncoder,
+    GraphV9PyramidEncoder,
     ICAEBaselineEncoder,
     MemorizingBaselineEncoder,
     NullEncoder,
@@ -94,6 +95,8 @@ class ReprLearningModel(nn.Module):
         "graph_v7_baseline": GraphV7BaselineEncoder,  # stable atoms + co-activation edges + ⊙ bind
         # Corrected columnar V8. The obsolete pre-correction V8 substrate was removed.
         "graph_v8_baseline": GraphV8ColumnEncoder,
+        # Operator-node pyramid (graph_substrate_v9; docs/graph_v9_ideas.md).
+        "graph_v9_baseline": GraphV9PyramidEncoder,
         "icae_baseline": ICAEBaselineEncoder,  # ICAE (ICLR'24) compressor, EMAT-retrained
         "ccm_baseline": CCMBaselineEncoder,    # CCM (ICLR'24) recurrent compressor, EMAT-retrained
         "beacon_baseline": BeaconBaselineEncoder,  # Activation Beacon (BAAI) per-layer beacon attn
@@ -188,6 +191,20 @@ class ReprLearningModel(nn.Module):
                   f"{len(read_layers)} reads @ layers {read_layers} "
                   f"(inner_dim={cfg.graph_v8_reader_inner_dim})")
 
+        # graph_v9 flow-through apply-to-query READ (the v9 design's read: the
+        # question runs the SAME circuit as the writes; nothing is retrieved).
+        self.graph_v9_reader = None
+        if variant == "graph_v9_baseline":
+            from .graph_read import GraphV9FlowReader
+            self.graph_v9_reader = GraphV9FlowReader(
+                self.encoder.sub,
+                tuple(cfg.graph_v9_reader_layers),
+                inner_dim=cfg.graph_v9_reader_inner_dim,
+            )
+            print(f"[graph_v9] flow-through read at Llama layers "
+                  f"{tuple(cfg.graph_v9_reader_layers)} "
+                  f"(inner_dim={cfg.graph_v9_reader_inner_dim}, o_proj zero-init)")
+
         # Optional HF per-layer gradient checkpointing on the Llama base model
         # (recompute in backward, use_reentrant=False; HF gates on self.training so
         # eval is unaffected). Flag-controlled, off by default. vanilla_full_context
@@ -205,7 +222,8 @@ class ReprLearningModel(nn.Module):
             # if someone enables both. Fix would require keeping memory alive
             # until after backward (e.g. clear in a backward hook, not finally).
             if (self.graph_reader is not None or self.graph_unbind_reader is not None
-                    or self.graph_v8_reader is not None):
+                    or self.graph_v8_reader is not None
+                    or self.graph_v9_reader is not None):
                 raise ValueError(
                     "grad_checkpoint_llama is incompatible with the graph_v7 "
                     "cross_attn read: the read memory is cleared in a finally "
@@ -522,7 +540,7 @@ class ReprLearningModel(nn.Module):
                        # graph_v8 streaming state is a nested dict/list (with None) that
                        # torch.utils.checkpoint can't trace; both self-manage memory
                        # (internally checkpointed chunk loops).
-                       and self.variant != "graph_v8_baseline")
+                       and self.variant not in ("graph_v8_baseline", "graph_v9_baseline"))
         for w in range(n_windows):
             s = w * window_size
             e = min(s + window_size, T)
@@ -750,6 +768,9 @@ class ReprLearningModel(nn.Module):
         if getattr(self, "graph_v8_reader", None) is not None:
             self.graph_v8_reader.remove_hooks()
             self.graph_v8_reader.clear_memory()
+        if getattr(self, "graph_v9_reader", None) is not None:
+            self.graph_v9_reader.remove_hooks()
+            self.graph_v9_reader.clear_memory()
 
         embed = self.decoder.llama.get_input_embeddings()
 
@@ -761,7 +782,7 @@ class ReprLearningModel(nn.Module):
             # PURE frozen base (not the LoRA'd decoder — a stable signal that does
             # not drift with training). Raw NLL here; the encoder z-scores per row
             # and squashes through its learnable sigmoid(a·z+b) in streaming_write.
-            if self.variant == "graph_v8_baseline":
+            if self.variant in ("graph_v8_baseline", "graph_v9_baseline"):
                 ctx_surprise = self.encoder.context_surprise(
                     batch.context_ids, batch.context_mask)
 
@@ -800,7 +821,7 @@ class ReprLearningModel(nn.Module):
                        # graph_v8 streaming state is a nested dict/list (with None) that
                        # torch.utils.checkpoint can't trace; both self-manage memory
                        # (internally checkpointed chunk loops).
-                       and self.variant != "graph_v8_baseline")
+                       and self.variant not in ("graph_v8_baseline", "graph_v9_baseline"))
         for w in range(n_windows):
             s = w * window_size
             e = min(s + window_size, T_ctx)
@@ -918,6 +939,30 @@ class ReprLearningModel(nn.Module):
             # reader mode never prepends — drop the memory slots (M=0). The
             # substrate still trains: gradient reaches it through the reader's
             # K/V projections of `read_mem`, not through the decode sequence.
+            M = 0
+
+        # ---- 2c3. graph_v9 flow-through read branch ----
+        # `memory` here is the substrate's packed fast state [B,L,N_max,width].
+        # Nothing is prepended; GraphV9FlowReader runs the question through the
+        # shared circuit (apply-to-query) at cfg.graph_v9_reader_layers.
+        #   REAL: row-aligned pack.  SHUF: roll by 1 on dim 0 (right question,
+        #   wrong passage's fast state; slow keys are shared vocabulary and stay).
+        #   OFF: leave unset → reads are a true no-op (output == vanilla Llama).
+        use_v9_reader = (
+            getattr(self, "graph_v9_reader", None) is not None
+            and self.variant == "graph_v9_baseline"
+        )
+        if use_v9_reader and M > 0:
+            if not zero_memory:
+                read_mem = memory
+                if shuffle_memory:
+                    if B <= 1:
+                        raise ValueError(
+                            "shuffle_memory (SHUF control) needs batch size > 1; "
+                            "roll-by-1 at B==1 is a no-op (SHUF would equal REAL).")
+                    read_mem = torch.roll(memory, shifts=1, dims=0)
+                self.graph_v9_reader.set_memory(read_mem)
+            # reader mode never prepends — drop the memory slots (M=0).
             M = 0
 
         # ---- 2d. graph_v7 BIND read branch (HRR unbind) ----
@@ -1194,6 +1239,10 @@ class ReprLearningModel(nn.Module):
         # the reads are no-ops → output == vanilla Llama. Removed in the finally.
         if use_v8_reader:
             self.graph_v8_reader.install_hooks(self.decoder.llama)
+        # graph_v9: install the flow-through read hooks. In OFF mode (memory
+        # unset) the reads are no-ops → output == vanilla Llama.
+        if use_v9_reader:
+            self.graph_v9_reader.install_hooks(self.decoder.llama)
 
         try:
             # Selective lm_head: run base model for hidden states, then only
@@ -1231,6 +1280,10 @@ class ReprLearningModel(nn.Module):
             if use_v8_reader:
                 self.graph_v8_reader.remove_hooks()
                 self.graph_v8_reader.clear_memory()
+            # graph_v9: remove the flow-through read hooks + clear memory.
+            if use_v9_reader:
+                self.graph_v9_reader.remove_hooks()
+                self.graph_v9_reader.clear_memory()
 
         pred_hidden_all = hidden[:, :-1, :]                # [B, T_total-1, d_llama]
 
@@ -1355,6 +1408,19 @@ class ReprLearningModel(nn.Module):
             graph_v8_telemetry["graph_v8_reader_gate_abs_max"] = gates.abs().max()
             for i, g in enumerate(gates):
                 graph_v8_telemetry[f"graph_v8_reader_gate_L{i + 1}"] = g
+        # graph_v9 telemetry: encoder finalize aux (state geometry + write-path
+        # dynamics) + read-side buffer (populated during the decoder forward).
+        graph_v9_telemetry = {
+            k: v for k, v in finalize_aux.items() if k.startswith("graph_v9_")
+        }
+        if (getattr(self, "graph_v9_reader", None) is not None
+                and self.variant == "graph_v9_baseline"):
+            gates9 = self.graph_v9_reader.gates.detach().float()
+            graph_v9_telemetry["graph_v9_reader_gate_mean"] = gates9.mean()
+            for i, g in enumerate(gates9):
+                graph_v9_telemetry[f"graph_v9_reader_gate_p{i}"] = g
+            for k, v in self.graph_v9_reader.tele.items():
+                graph_v9_telemetry[f"graph_v9_read_{k}"] = torch.tensor(float(v))
         # Vanilla has no trainable params in the QA loss path (Llama is frozen
         # and mask_embed isn't used without a [MASK] token in the input). Add
         # a zero-weighted mask_embed term so backward has a grad to compute;
@@ -1392,6 +1458,8 @@ class ReprLearningModel(nn.Module):
             out.update(graph_telemetry)
         if graph_v8_telemetry:
             out.update(graph_v8_telemetry)
+        if graph_v9_telemetry:
+            out.update(graph_v9_telemetry)
         # flat_baseline codebook health → top-level so the trainer logs it to
         # jsonl (codes_active = #live codes; collapse = the flat analogue of
         # graph routing collapse).

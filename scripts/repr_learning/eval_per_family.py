@@ -330,10 +330,17 @@ def _verify_ckpt_metadata(variant: str, sd: dict, cfg: ReprConfig, model):
 
 
 def _frozen_base_key(k: str) -> bool:
-    """A frozen-Llama BASE weight (not saved in ckpt): decoder.llama.* without
-    a LoRA adapter in the name. LoRA keys (decoder.llama.*lora*) ARE saved and
-    must match, so they are NOT treated as freely-missing."""
-    return k.startswith("decoder.llama.") and "lora" not in k.lower()
+    """A frozen-Llama BASE weight (not saved in ckpt): the decoder's Llama
+    (decoder.llama.*) OR each port's own frozen base copy (encoder.base.*, e.g.
+    ICAE/CCM/AutoCompressor/Beacon option-A, and graph_v8's write/surprise base),
+    without a LoRA adapter in the name. LoRA keys (*lora*) ARE saved and must
+    match, so they are NOT treated as freely-missing. Mirrors the trainer's
+    keep()/resume guard (train_repr_qa.py:268-273, 479-482), which drops BOTH
+    frozen prefixes — the eval side previously only excused decoder.llama.*, so
+    every memory arm's dropped encoder.base.* weights tripped 'ckpt drift' and
+    were silently SKIPped at eval."""
+    return ((k.startswith("decoder.llama.") or k.startswith("encoder.base."))
+            and "lora" not in k.lower())
 
 
 def load_variant(variant: str, ckpt_path: Path, base_cfg: ReprConfig, llama):
@@ -363,7 +370,14 @@ def load_variant(variant: str, ckpt_path: Path, base_cfg: ReprConfig, llama):
     missing, unexpected = model.load_state_dict(state, strict=False)
     # Frozen base weights are legitimately absent (not saved); LoRA + memory keys
     # must match. Anything else missing/unexpected is real ckpt drift → abort.
-    bad_missing = [k for k in missing if not _frozen_base_key(k)]
+    # For MISSING keys, gate on requires_grad (not just the name prefix): a frozen
+    # base weight under decoder.llama.*/encoder.base.* is fine to be absent, but a
+    # TRAINABLE param that's missing is real drift even under those prefixes (e.g.
+    # a non-LoRA-named port adapter living inside encoder.base) — never silently
+    # leave a trainable param at its random init.
+    _trainable_names = {n for n, p in model.named_parameters() if p.requires_grad}
+    bad_missing = [k for k in missing
+                   if k in _trainable_names or not _frozen_base_key(k)]
     bad_unexpected = [k for k in unexpected
                       if k not in allow and not _frozen_base_key(k)]
     if bad_missing or bad_unexpected:

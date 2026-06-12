@@ -185,14 +185,18 @@ class ReprConfig:
     # Encoder = a SEPARATE frozen base copy + its OWN encoder-LoRA + M slots
     # (option A, docs/emat_baselines_plan.md). Distinct from the decoder LoRA
     # above so the two adapters can't collide on a shared base.
-    icae_lora_rank: int = 32
-    icae_lora_alpha: int = 64       # scale = alpha / rank = 2.0
+    icae_lora_rank: int = 32        # r32 CONVERGES within the 600-step gate (REAL 1.97); r64 (paper-faithful
+    icae_lora_alpha: int = 64       # asymptotic ≈ hidden-scaled from r128@7B) UNDERTRAINS at 600 → REAL 2.55, still
+                                    # descending. r32 is the fair matched-budget config; use r64 only with ≥1500 steps.
     icae_n_slots: int = 0           # 0 ⇒ fall back to n_flat_codes (matched budget)
 
     # AutoCompressor / RMT-style recurrent summary port. Same frozen-backbone +
     # encoder-LoRA setup as ICAE, but the M summary tokens recur across windows.
     autocompressor_lora_rank: int = 32
     autocompressor_lora_alpha: int = 64
+    # AutoCompressor's official Llama-2 recipe wraps q,k,v,o (we previously shared
+    # the q,v-only list). Own target list so this doesn't touch ICAE/decoder.
+    autocompressor_lora_targets: tuple = ("q_proj", "k_proj", "v_proj", "o_proj")
     autocompressor_n_slots: int = 0 # 0 ⇒ fall back to n_flat_codes (matched budget)
 
     # ── CCM baseline (Compressed Context Memory, Kim et al. ICLR 2024) ──────
@@ -532,6 +536,45 @@ class ReprConfig:
     # after the deepest read.
     graph_v8_reader_layers: tuple = (3, 6, 10, 14)
     graph_v8_reader_inner_dim: int = 224      # 7*32; v/o-only reader (routers are shared)
+
+    # ── graph_v9 (operator-node pyramid; implementation: graph_substrate_v9.py;
+    # design: docs/graph_v9_ideas.md, 2026-06-12) ────────────────────────────────
+    # Nodes = slow key + ordered generalized-Householder factor slots (direction,
+    # strength∈[0,2]); apply = score-scaled factor chain (fixed node-index order);
+    # flow-through (ONE Llama tap, layer ℓ+1 reads layer ℓ's operated codes);
+    # surprise-gated deposits (the only injection), within-layer conserving
+    # absorption at chunk boundaries; read = flow-through apply-to-query
+    # (GraphV9FlowReader), zero-init out-proj.
+    # ARM C IS PRIMARY (vocabulary-by-absorption, pivot 2026-06-12): NO deposits
+    # anywhere. Layer 0 = static trained atom alphabet (1 factor each — atoms are
+    # indivisible); apply input = PROJECTED SEED (unit-RMS projection of Llama
+    # hiddens, per token — mirrors the read, where queries project into code
+    # space and travel up). Writable layers initialize from a TRAINED random
+    # base vocabulary; the ONLY write is within-layer conserving absorption —
+    # binding IS the relocation pattern; total strength per layer is constant
+    # per document (strict invariant). Words store PROGRAMS, never blended
+    # points. Projected content rides the STREAM but never lands in a NODE —
+    # the memory stays selection-pure.
+    # Arm B (composed-code deposits at layers >= 1) and arm A (content-channel
+    # leaves) kept as comparison arms. PROBE: atoms + ONE writable layer; arm C
+    # runs absorb ON (absorption IS its write); arms A/B probe with absorb OFF.
+    # Writable fast state: 128 nodes · 4 slots · (64+1) = 33,280 floats.
+    graph_v9_d_code: int = 64           # the shared code space (operators act here)
+    graph_v9_d_key: int = 64            # addressing space (separate knob)
+    graph_v9_nodes: tuple = (256, 128)  # per-layer node counts (pyramid: decreasing)
+    graph_v9_slots: tuple = (1, 4)      # per-layer factor slots (atoms = 1 = indivisible)
+    graph_v9_chunk: int = 128           # chunkwise execution unit (cadence is part of the model)
+    graph_v9_arm: str = "C"             # "C" vocab-by-absorption | "B" deposits | "A" control
+    graph_v9_effective_k: float = 8.0   # target #active nodes at init → route temp DERIVED
+    graph_v9_absorb_enabled: bool = True    # arm C REQUIRES True (absorption IS the write)
+    graph_v9_tap_layer: int = 13        # the ONE mid-stack write tap (inject@13 lore)
+    # one Llama decoder hook per pyramid layer (read injection depths). Point 0
+    # hooks the SAME depth as the write tap (13): route_projs[0]/seed_proj see
+    # the same hidden-state distribution at write and read time — parameter
+    # identity needs input-distribution identity too (the v8 layer-matched
+    # lesson). The writable layer reads one layer deeper.
+    graph_v9_reader_layers: tuple = (13, 14)
+    graph_v9_reader_inner_dim: int = 64
 
     # ── JEPA loss coefficients (dormant path; hoisted for hygiene) ──────────
     # VicReg variance/covariance anti-collapse weights on the online memory.

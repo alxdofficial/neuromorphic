@@ -1342,7 +1342,8 @@ class AutoCompressorBaselineEncoder(nn.Module):
             base,
             rank=int(getattr(cfg, "autocompressor_lora_rank", cfg.icae_lora_rank)),
             alpha=int(getattr(cfg, "autocompressor_lora_alpha", cfg.icae_lora_alpha)),
-            target_names=tuple(cfg.llama_lora_target_names),
+            target_names=tuple(getattr(cfg, "autocompressor_lora_targets",
+                                       cfg.llama_lora_target_names)),
         )
         base.model.gradient_checkpointing_enable(
             gradient_checkpointing_kwargs={"use_reentrant": False})
@@ -2469,6 +2470,185 @@ class GraphV8ColumnEncoder(nn.Module):
                 aux[f"graph_v8_window_eff_node_frac_L{src}"] = win_eff
 
         return torch.stack(per_layer, dim=1), aux          # [B,S,N,2·d_mem]
+
+    def forward(self, token_embeds, attention_mask=None, mask_positions=None):
+        del mask_positions
+        st = self.init_streaming_state(token_embeds.shape[0], token_embeds.device, token_embeds.dtype)
+        st, _ = self.streaming_write(st, token_embeds, attention_mask)
+        return self.finalize_memory(st)
+
+class GraphV9PyramidEncoder(nn.Module):
+    """graph_v9: operator-node pyramid (graph_substrate_v9) — see its header and
+    docs/graph_v9_ideas.md.
+
+    Own FROZEN base contextualizes the window under no_grad (the v8/ICAE/CCM
+    separate-frozen-copy pattern) AND provides the REAL surprise signal: per-token
+    next-token NLL under the pure frozen base, per-row z-scored over the window,
+    squashed through a learnable sigmoid(a·z + b) — relative surprise, no magic
+    scales (§7c of the design doc).
+
+    ONE mid-stack tap (flow-through design): the substrate's layer 0 sees the
+    hiddens of cfg.graph_v9_tap_layer; every higher pyramid layer sees only the
+    operated codes from below — never Llama directly.
+
+    finalize_memory returns the substrate's packed fast state
+    [B, L, N_max, S_max*(d_code+1)]: the harness's graph_v9 branch hands it to
+    GraphV9FlowReader and sets M=0 — nothing is prepended. REAL/SHUF/OFF: roll /
+    skip the packed tensor (slow keys are shared vocabulary and stay put).
+    """
+
+    def __init__(self, cfg: ReprConfig):
+        super().__init__()
+        self.cfg = cfg
+        from .decoder import load_frozen_llama
+        from .graph_substrate_v9 import GraphV9Config, GraphV9Substrate
+        base, _ = load_frozen_llama(cfg.llama_model)
+        for p in base.parameters():
+            p.requires_grad_(False)
+        self.base = base                                   # frozen contextualizer + surprise source
+        v9 = GraphV9Config(
+            d_model=cfg.d_llama, d_code=cfg.graph_v9_d_code, d_key=cfg.graph_v9_d_key,
+            nodes=tuple(cfg.graph_v9_nodes), slots=tuple(cfg.graph_v9_slots),
+            chunk=cfg.graph_v9_chunk, arm=cfg.graph_v9_arm,
+            effective_k=cfg.graph_v9_effective_k,
+            absorb_enabled=cfg.graph_v9_absorb_enabled)
+        self.sub = GraphV9Substrate(v9)
+        # learnable surprise squash: gate = sigmoid(a·z + b) over the per-row
+        # z-scored NLL. a=1/b=0 init is the identity operating point.
+        self.surprise_a = nn.Parameter(torch.tensor(1.0))
+        self.surprise_b = nn.Parameter(torch.tensor(0.0))
+        self.M = 0                                          # nothing prepended (reader-only)
+        print(f"[graph_v9] pyramid substrate: nodes={tuple(cfg.graph_v9_nodes)} "
+              f"slots={tuple(cfg.graph_v9_slots)} arm={cfg.graph_v9_arm} "
+              f"d_code={cfg.graph_v9_d_code} chunk={cfg.graph_v9_chunk} "
+              f"absorb={'on' if cfg.graph_v9_absorb_enabled else 'OFF'} "
+              f"tap=L{cfg.graph_v9_tap_layer}; read = flow-through apply-to-query")
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        self.base.train(False)                              # base ALWAYS in eval (frozen)
+        return self
+
+    # ---- real surprise: next-token NLL under the pure frozen base ------------
+    @torch.no_grad()
+    def context_surprise(self, context_ids, context_mask, slice_len: int = 128):
+        """[B,T] raw per-token NLL (fp32). Position 0 (no prefix) gets its row's
+        mean real-token NLL (z=0 after standardization). Sliced lm_head matmul so
+        the [B,T,vocab] logits tensor is never materialized whole."""
+        B, T = context_ids.shape
+        out = self.base.model(input_ids=context_ids, attention_mask=context_mask.long(),
+                              use_cache=False)
+        hidden = out.last_hidden_state                                       # [B,T,d]
+        w = self.base.lm_head.weight                                         # tied [V,d]
+        nll = torch.zeros(B, T, device=context_ids.device, dtype=torch.float32)
+        for s in range(0, T - 1, slice_len):
+            e = min(s + slice_len, T - 1)
+            logits = (hidden[:, s:e] @ w.t()).float()                        # [B,c,V]
+            nll[:, s + 1:e + 1] = F.cross_entropy(
+                logits.transpose(1, 2), context_ids[:, s + 1:e + 1], reduction="none")
+        real = context_mask.bool()
+        denom = real.float().sum(dim=1, keepdim=True).clamp_min(1.0)
+        row_mean = (nll * real.float()).sum(dim=1, keepdim=True) / denom
+        nll[:, 0] = row_mean[:, 0]
+        return nll
+
+    def init_streaming_state(self, batch_size: int, device, dtype):
+        del dtype                                           # substrate state is fp32
+        return {"sub": self.sub.init_state(batch_size, device)}
+
+    def streaming_write(self, state, token_embeds, attention_mask=None, chunk_offset=0,
+                        surprise=None, **extra):
+        del chunk_offset, extra
+        B, W = token_embeds.shape[:2]
+        if attention_mask is None:
+            attention_mask = torch.ones(B, W, device=token_embeds.device, dtype=torch.bool)
+        real = attention_mask.bool()
+        if surprise is None:                                # fallback: z=0 → gate = σ(b)
+            z = torch.zeros(B, W, device=token_embeds.device, dtype=torch.float32)
+        else:                                               # per-row masked z-score (no magic scales)
+            s = surprise.float()
+            denom = real.float().sum(dim=1, keepdim=True).clamp_min(1.0)
+            mean = (s * real.float()).sum(dim=1, keepdim=True) / denom
+            var = (((s - mean) * real.float()) ** 2).sum(dim=1, keepdim=True) / denom
+            z = (s - mean) / (var.sqrt() + 1e-6)
+        gate = torch.sigmoid(self.surprise_a * z + self.surprise_b)          # (0,1), learnable a/b
+        with torch.no_grad():                               # frozen base; substrate trains on fixed hiddens
+            out = self.base.model(inputs_embeds=token_embeds,
+                                  attention_mask=attention_mask.long(),
+                                  output_hidden_states=True,
+                                  use_cache=False)
+            # ONE mid-stack tap (flow-through): hidden_states[0] = embeddings →
+            # layer k's output = hidden_states[k+1].
+            h = out.hidden_states[self.cfg.graph_v9_tap_layer + 1]           # [B,W,d_llama]
+        sub = self.sub(h.float(), gate, attention_mask.float(), state=state["sub"])
+        return {"sub": sub}, {}
+
+    def finalize_memory(self, state):
+        sub = state["sub"]
+        packed = self.sub.pack_state(sub)                  # [B, L, N_max, width]
+        aux = {}
+        with torch.no_grad():
+            for layer_idx in range(self.sub.depth):
+                strengths = sub["factor_strengths"][layer_idx].float()
+                aux[f"graph_v9_strength_budget_L{layer_idx}"] = strengths.sum(dim=(1, 2)).mean()
+                aux[f"graph_v9_slot_occupancy_L{layer_idx}"] = (strengths > 0.05).float().mean()
+                aux[f"graph_v9_strength_max_L{layer_idx}"] = strengths.max()
+                unit_dirs = F.normalize(sub["factor_dirs"][layer_idx].float(), dim=-1, eps=1e-6)
+                batch_size, n_nodes, n_slots, d_code = unit_dirs.shape
+                flat = unit_dirs.reshape(batch_size, n_nodes * n_slots, d_code)
+                cos = torch.einsum("bnd,bmd->bnm", flat, flat)
+                eye = torch.eye(n_nodes * n_slots, dtype=torch.bool,
+                                device=cos.device).unsqueeze(0)
+                aux[f"graph_v9_dir_collapse_cos_L{layer_idx}"] = \
+                    cos.masked_select(~eye).abs().mean()
+                coact = sub["coact"][layer_idx].float()
+                mass = coact.sum().clamp_min(1e-9)
+                probs = (coact.reshape(-1) / mass).clamp_min(0)
+                nonzero = probs > 0
+                entropy = (-(probs[nonzero] * probs[nonzero].log()).sum()
+                           if nonzero.any() else coact.sum() * 0.0)
+                aux[f"graph_v9_coact_mass_L{layer_idx}"] = mass
+                aux[f"graph_v9_coact_entropy_L{layer_idx}"] = entropy
+                # STATE SEPARABILITY — the gate-deciding number: how different is
+                # this doc's relocated state from its batchmates'? 1.0 = identical
+                # = SHUF will equal REAL by construction. Measured ~1.0000 at init
+                # (template-dominated coact); training must drive it DOWN.
+                if strengths.shape[0] > 1:
+                    delta = (strengths - strengths.mean(dim=0, keepdim=True)).reshape(
+                        strengths.shape[0], -1)
+                    flat = F.normalize(strengths.reshape(strengths.shape[0], -1),
+                                       dim=-1, eps=1e-9)
+                    cos = flat @ flat.t()
+                    off = cos.masked_select(~torch.eye(strengths.shape[0],
+                                                       dtype=torch.bool, device=cos.device))
+                    aux[f"graph_v9_state_sep_cos_L{layer_idx}"] = off.mean()
+                    aux[f"graph_v9_state_doc_var_L{layer_idx}"] = delta.norm(dim=-1).mean()
+                # KEY GEOMETRY — addressing collapse: nearest-neighbor key cosine
+                # rising toward 1 = keys merging = routes indistinguishable.
+                keys_u = F.normalize(self.sub.node_keys[layer_idx].float(), dim=-1, eps=1e-9)
+                key_cos = keys_u @ keys_u.t()
+                key_cos.fill_diagonal_(-1.0)
+                aux[f"graph_v9_key_nn_cos_L{layer_idx}"] = key_cos.max(dim=-1).values.mean()
+                # DISPLACEMENT FROM BASE (arm C) — how far did THIS doc move the
+                # vocabulary? strength relocation + direction rotation. Zero =
+                # the write did nothing; SHUF=REAL guaranteed.
+                if self.cfg.graph_v9_arm == "C" and layer_idx > 0:
+                    base_s = (2.0 * torch.sigmoid(
+                        self.sub.base_strength_logit[layer_idx - 1])).unsqueeze(0)
+                    aux[f"graph_v9_strength_disp_L{layer_idx}"] = \
+                        ((strengths - base_s).norm(dim=(1, 2))
+                         / base_s.norm().clamp_min(1e-9)).mean()
+                    base_d = F.normalize(self.sub.base_dirs[layer_idx - 1].float(),
+                                         dim=-1, eps=1e-9).unsqueeze(0)
+                    cur_d = unit_dirs
+                    aux[f"graph_v9_dirs_rot_L{layer_idx}"] = \
+                        (1.0 - (cur_d * base_d).sum(-1)).mean()
+            # per-chunk dynamics aggregates from the substrate buffer (routing /
+            # apply / coact / absorb — last window's; see substrate §telemetry)
+            for name, value in sub.get("telemetry", {}).items():
+                aux[f"graph_v9_{name}"] = (value if torch.is_tensor(value)
+                                           else torch.tensor(float(value)))
+        return packed, aux
 
     def forward(self, token_embeds, attention_mask=None, mask_positions=None):
         del mask_positions
