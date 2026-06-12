@@ -9,6 +9,12 @@ change as a hypothesis probe.
 2. Run the 600-step emat_bio gate; analyze SHUF−REAL.
 3. If flat: explore all plausible reasons, autonomously, documenting as I go.
 
+## Research posture (user, added at launch)
+Stay true to the thesis: vocabulary-as-memory, input enters by selection,
+lifelong-compatible mechanisms. PREFER novel ideas and clean negative results
+over regressing to known-good architectures (no "just make it DeltaNet/Mamba"
+fallbacks). Failures are findings if diagnosed; out-there ideas are in scope.
+
 ## The bar
 - v8c5 (last graph attempt): SHUF−REAL = **−0.0007** (flat), OFF−REAL +3.30,
   recon 1.03, 52.2M trainable.

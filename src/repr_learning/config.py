@@ -559,9 +559,13 @@ class ReprConfig:
     # leaves) kept as comparison arms. PROBE: atoms + ONE writable layer; arm C
     # runs absorb ON (absorption IS its write); arms A/B probe with absorb OFF.
     # Writable fast state: 128 nodes · 4 slots · (64+1) = 33,280 floats.
-    graph_v9_d_code: int = 64           # the shared code space (operators act here)
-    graph_v9_d_key: int = 64            # addressing space (separate knob)
-    graph_v9_nodes: tuple = (256, 128)  # per-layer node counts (pyramid: decreasing)
+    # GATE SCALE (overnight 2026-06-12): writable fast state 288*4*257 = 296,064
+    # floats == the v8c read-budget anchor (294,912) within 0.4%. Params ~3M —
+    # intentionally far below v8c's 52M (doc §12: binding at far below baseline
+    # params is the claim); asymmetry favors the baselines.
+    graph_v9_d_code: int = 256          # the shared code space (operators act here)
+    graph_v9_d_key: int = 256           # addressing space (separate knob)
+    graph_v9_nodes: tuple = (576, 288)  # per-layer node counts (pyramid: decreasing)
     graph_v9_slots: tuple = (1, 4)      # per-layer factor slots (atoms = 1 = indivisible)
     graph_v9_chunk: int = 128           # chunkwise execution unit (cadence is part of the model)
     graph_v9_arm: str = "C"             # "C" vocab-by-absorption | "B" deposits | "A" control
@@ -574,7 +578,7 @@ class ReprConfig:
     # identity needs input-distribution identity too (the v8 layer-matched
     # lesson). The writable layer reads one layer deeper.
     graph_v9_reader_layers: tuple = (13, 14)
-    graph_v9_reader_inner_dim: int = 64
+    graph_v9_reader_inner_dim: int = 256
 
     # ── JEPA loss coefficients (dormant path; hoisted for hygiene) ──────────
     # VicReg variance/covariance anti-collapse weights on the online memory.
