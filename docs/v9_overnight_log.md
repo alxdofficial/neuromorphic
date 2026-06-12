@@ -50,3 +50,39 @@ fallbacks). Failures are findings if diagnosed; out-there ideas are in scope.
 
 ## Run index
 (appended as runs complete)
+
+---
+## Run 1 — arm C gate (emat_bio_v9c1) — FLAT, with a precise diagnosis
+600 steps, BS=8, state-matched budget. **SHUF−REAL = −0.0004** (v8c5: −0.0007),
+OFF−REAL +3.05, recon 1.04, top1 0.725 — numerically the v8c profile.
+
+**Telemetry tells the story (the panel earned its keep):**
+1. `state_sep_cos_L1` = **1.0000 at every step, never moved.** Different docs
+   produce identical states → SHUF≡REAL is structural, not a read failure.
+2. `dirs_rot_L1` = 0.0000 throughout: **direction content never moved off base.**
+   Absorption relocated strengths (flux ≈ 11/boundary) but spread over
+   288 nodes × 4 slots ⇒ per-slot incoming ≈ 0.01 vs existing 1.5 ⇒ ~0.6%
+   blend/boundary ⇒ directions frozen. In effect we ran STRENGTHS-ONLY
+   relocation — which the design analysis already predicted cannot bind
+   (content must sit at the nodes the query activates).
+3. The shared/template component dominates coactivation: emat_bio docs share
+   one template, so row-normalized coact (a per-MARGINAL measure) is nearly
+   doc-agnostic; the doc-specific part (state_doc_var ≈ 0.9) is negligible
+   against the shared relocation.
+4. Secondary: **L0 atom usage collapsing** (eff frac 0.20 → 0.05, ~26 of 576
+   atoms doing everything — v8c5's disease relocated to the alphabet);
+   L1 routing actually specializes per token (overlap 0.126 → 0.049, healthy).
+5. Read alive (inj_ratio → 0.15; OFF−REAL +3.05 = generic steering).
+   Grammar MLP barely moved (dev 0.004) — 600 steps too few for it.
+
+**Diagnosis: absorption is too DIFFUSE and too MARGINAL-DRIVEN.** The write
+spreads tiny transfers across all pairs (gate_mean ≈ 2e-4), and the gate is
+driven by raw co-occurrence, which is dominated by what's common to every doc.
+
+**Next (in-thesis, queued):**
+- Arms B/A controls (deposits) — same seeding/routing, isolates write philosophy.
+- H-PMI: normalize coactivation by MARGINALS (PMI/NPMI-style) so the absorb gate
+  responds to doc-specific co-firing BEYOND what hot nodes predict — kills the
+  template-shared component. (Precedent: our own NPMI plasticity, wave1 SDPA.)
+- H-SHARP: concentrate transfers (softmax over donors w/ learnable temp instead
+  of row-fraction) so doc-specific pairs move REAL mass and directions rotate.

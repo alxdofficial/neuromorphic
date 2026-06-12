@@ -1029,6 +1029,10 @@ def main():
                     help="EMAT: words per value (1 = single-token value).")
     ap.add_argument("--emat-bio-n-facts", type=int, default=3,
                     help="emat_bio: random facts packed per value sentence (2-4).")
+    ap.add_argument("--graph-v9-arm", type=str, default=None, choices=["A", "B", "C"],
+                    help="override cfg.graph_v9_arm for this run (overnight sweep)")
+    ap.add_argument("--graph-v9-absorb", type=str, default=None, choices=["on", "off"],
+                    help="override cfg.graph_v9_absorb_enabled")
     ap.add_argument("--emat-bio-world-seed", type=int, default=0,
                     help="emat_bio: world-build seed (train uses this; val uses +10000 → disjoint).")
     ap.add_argument("--compress-len", type=int, default=1024,
@@ -1366,6 +1370,10 @@ def main():
     # Plumb the read-mode knobs onto cfg so ReprLearningModel builds the
     # GraphCrossAttnReader (graph_v7_baseline only). Without this the reader is
     # never built and the cross_attn path stays inert (cfg default "prepend").
+    if args.graph_v9_arm is not None:
+        cfg.graph_v9_arm = args.graph_v9_arm
+    if args.graph_v9_absorb is not None:
+        cfg.graph_v9_absorb_enabled = (args.graph_v9_absorb == "on")
     cfg.graph_read_mode = args.graph_read_mode
     cfg.graph_read_gate_init = args.graph_read_gate_init
     if args.graph_read_layer_indices is not None:
