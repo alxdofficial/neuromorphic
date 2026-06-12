@@ -31,11 +31,13 @@ device = "cuda"
 cfg = ReprConfig()
 cfg.graph_v9_arm = ARM
 enc = GraphV9PyramidEncoder(cfg).to(device).eval()
-state = torch.load(CKPT, map_location="cpu", weights_only=True)  # our own ckpt; tensors only
-enc_sd = {k[len("encoder."):]: v for k, v in state.items() if k.startswith("encoder.")} \
-    if isinstance(state, dict) and any(k.startswith("encoder.") for k in state) else state
+ckpt = torch.load(CKPT, map_location="cpu", weights_only=True)  # our own ckpt; tensors only
+sd = ckpt.get("model_state_dict", ckpt) if isinstance(ckpt, dict) else ckpt
+enc_sd = {k[len("encoder."):]: v for k, v in sd.items() if k.startswith("encoder.")}
 missing, unexpected = enc.load_state_dict(enc_sd, strict=False)
-print(f"[ckpt] loaded; missing={len(missing)} unexpected={len(unexpected)}")
+own_missing = [m for m in missing if not m.startswith("base.")]
+print(f"[ckpt] step {ckpt.get('step')}: loaded {len(enc_sd)} tensors; "
+      f"non-base missing={len(own_missing)} ({own_missing[:4]}) unexpected={len(unexpected)}")
 
 tok = AutoTokenizer.from_pretrained(cfg.llama_model)
 dl = make_emat_bio_dataloader(tok, context_len=640, batch_size=8, n_pairs=12,

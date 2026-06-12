@@ -119,3 +119,33 @@ L0 atom-usage collapse reproduces (0.17 → 0.07); read loudness ≈ 0.16.
   supplies the key→value bridge. The two halves together. (Still in-thesis:
   this is the original full design, with the diagnosed gate fix.)
 - Arm A control deferred (B already isolates deposits; A adds leaf-content only).
+
+---
+## Probe — bridge hypothesis on the TRAINED arm-B encoder (step 599)
+Method: key-ish ctx positions = token ids appearing in the question (verbatim
+key); value-ish = other real tokens; compare question routing vs each group.
+- L0: cos(Q, key) = 0.698, cos(Q, value) = **0.741** — the question routes more
+  like VALUE tokens than key tokens. Q-mass on top-32 key-nodes 0.76 vs value
+  0.71 (i.e., ~75% of question routing mass fits in 32 of 576 nodes EITHER way).
+- L1: cos(Q,key)=0.353 vs value 0.295; mass 0.42 vs 0.32 — mild key preference
+  emerges at L1, but absolute selectivity is LOW.
+
+**Revised diagnosis — the bridge hypothesis is downstream of a deeper problem:
+HUB CONVERGENCE in routing space.** Questions, key tokens, and value tokens all
+concentrate on a small shared hot-node set (matches L0 usage_eff_frac 0.05).
+Even a perfect key→value bridge would deliver content into hubs shared across
+all facts/entities → retrieval mixes bindings. The marginal-driven absorption
+gate (run 1) was a SYMPTOM of the same root: marginals dominated by hubs.
+Economics: generic hub steering improves loss (OFF−REAL +3) while specific
+binding doesn't pay until addressing separates — the collapse-to-generic
+attractor, now located precisely in the routing projections.
+
+**Implications for the queue:**
+- Run 3 (arm C npmi_sharp, in flight): prediction — sep_cos may lift off 1.0
+  (gate de-hubbed) but SHUF−REAL likely stays small because READ addressing
+  still flows through hub space. Watch exactly this.
+- Run 4 candidate (addressing fix, in-thesis): per-node routing-logit CENTERING
+  with running statistics (BN-style, centering only — no scale). Removes the
+  always-hot logit component; running stats used identically at write and read
+  (symmetry preserved — a per-window mean would break it). The v8c audit
+  proposed mean-centered routing; this is its symmetric, principled form.
