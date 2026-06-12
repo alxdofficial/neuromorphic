@@ -558,7 +558,7 @@ def train_one_variant(
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             out = model.compute_qa_loss(batch, window_size=window_size)
         loss = out["loss"]
-        if args.contrastive_shuf_coef > 0:
+        if getattr(cfg, "contrastive_shuf_coef", 0.0) > 0:
             # contrastive binding pressure: gradient flows through BOTH branches
             # (lower REAL loss AND raise SHUF loss — both require doc-identity in
             # the state to be expressed by the read). Primary CE on REAL keeps
@@ -566,8 +566,8 @@ def train_one_variant(
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                 out_shuf = model.compute_qa_loss(batch, window_size=window_size,
                                                  shuffle_memory=True)
-            contrast = F.softplus(out["loss"] - out_shuf["loss"])
-            loss = loss + args.contrastive_shuf_coef * contrast
+            contrast = torch.nn.functional.softplus(out["loss"] - out_shuf["loss"])
+            loss = loss + cfg.contrastive_shuf_coef * contrast
         if not torch.isfinite(loss):
             print(f"  [step {step}] FATAL: non-finite loss = {float(loss)}")
             break
@@ -1406,6 +1406,7 @@ def main():
         cfg.graph_v9_surprise_coact = True
     if args.graph_v9_dirs_blend is not None:
         cfg.graph_v9_dirs_blend = args.graph_v9_dirs_blend
+    cfg.contrastive_shuf_coef = args.contrastive_shuf_coef
     cfg.graph_read_mode = args.graph_read_mode
     cfg.graph_read_gate_init = args.graph_read_gate_init
     if args.graph_read_layer_indices is not None:
