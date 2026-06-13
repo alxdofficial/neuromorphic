@@ -1,3 +1,8 @@
+> **SUPERSEDED (2026-06-13).** graph_v9 was repurposed from this operator/
+> Householder pyramid (which failed the emat_bio binding gate, SHUF−REAL≈0) to
+> the **Compression-by-Vocabulary** design — see `docs/compression_model_design.md`.
+> This file is kept for the record of the operator line + its overnight diagnosis.
+
 # Graph V9 — Operator-Node Memory (current design)
 
 **Status:** design COMPLETE (architecture level), not built. Supersedes the 2026-06-11 operator-graph

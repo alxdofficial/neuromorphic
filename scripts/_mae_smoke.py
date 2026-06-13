@@ -35,6 +35,9 @@ def matched(cfg):
     cfg.autocompressor_n_slots = 16
     cfg.autocompressor_lora_rank = 17; cfg.autocompressor_lora_alpha = 34
     cfg.beacon_ratio = 8; cfg.beacon_wrap_layers = (0, 10, 19, 29)
+    # graph_v9 (compression-by-vocabulary): smaller vocab for the 135M smoke
+    cfg.graph_v9_d_code = 256; cfg.graph_v9_nodes = (512, 256, 128)
+    cfg.graph_v9_top_k = 4; cfg.graph_v9_m_max = 16; cfg.graph_v9_tap_layer = 6
     return cfg
 
 
@@ -59,8 +62,9 @@ def to_dev(b):
 batch = to_dev(batch)
 print(f"batch: context {tuple(batch.context_ids.shape)}, k_slots={batch.k_slots}")
 
-VARIANTS = ["icae_baseline", "ccm_baseline", "autocompressor_baseline",
-            "beacon_baseline", "vanilla_llama", "vanilla_full_context"]
+VARIANTS = ["graph_v9_baseline", "icae_baseline", "ccm_baseline",
+            "autocompressor_baseline", "beacon_baseline",
+            "vanilla_llama", "vanilla_full_context"]
 for variant in VARIANTS:
     print(f"\n=== {variant} ===")
     cfg = matched(ReprConfig())

@@ -1061,19 +1061,6 @@ def main():
     ap.add_argument("--src-tokenizer", type=str, default="meta-llama/Llama-3.2-1B",
                     help="tokenizer that produced the FineWeb-EDU parquet ids (for "
                          "decode→retokenize in the sentence loader).")
-    ap.add_argument("--graph-v9-arm", type=str, default=None, choices=["A", "B", "C"],
-                    help="override cfg.graph_v9_arm for this run (overnight sweep)")
-    ap.add_argument("--graph-v9-absorb", type=str, default=None, choices=["on", "off"],
-                    help="override cfg.graph_v9_absorb_enabled")
-    ap.add_argument("--graph-v9-absorb-gate", type=str, default=None,
-                    choices=["rowfrac", "npmi_sharp", "npmi_raw"],
-                    help="override cfg.graph_v9_absorb_gate")
-    ap.add_argument("--graph-v9-route-centering", action="store_true",
-                    help="enable per-node routing-logit centering")
-    ap.add_argument("--graph-v9-surprise-coact", action="store_true",
-                    help="surprise-weight the coactivation table")
-    ap.add_argument("--graph-v9-dirs-blend", type=str, default=None,
-                    choices=["mass", "gated"], help="absorption direction blending")
     ap.add_argument("--contrastive-shuf-coef", type=float, default=0.0,
                     help="add coef*softplus(L_real - L_shuf) to the loss: makes the "
                          "binding gate ITSELF a training objective (2x step cost; "
@@ -1397,15 +1384,11 @@ def main():
               f"({(_v8_read / max(1, M * cfg.d_llama)):.1f}× prepend budget; "
               "not controlled by --mem-tokens)")
     if "graph_v9_baseline" in args.variants:
-        # arms B/C: layer 0 is slow params (the static alphabet), not fast state.
-        _v9_skip_l0 = 1 if cfg.graph_v9_arm in ("B", "C") else 0
-        _v9_state = sum(n * s * (cfg.graph_v9_d_code + 1)
-                        for n, s in list(zip(cfg.graph_v9_nodes,
-                                             cfg.graph_v9_slots))[_v9_skip_l0:])
-        print(f"   graph_v9 writable fast state (arm {cfg.graph_v9_arm}) → "
-              f"{_v9_state:,} floats "
-              f"({(_v9_state / max(1, M * cfg.d_llama)):.2f}× prepend budget; "
-              "read = flow-through apply-to-query, not --mem-tokens-controlled)")
+        _v9_vocab = sum(cfg.graph_v9_nodes)
+        print(f"   graph_v9 (Compression-by-Vocabulary): {_v9_vocab} nodes over "
+              f"{len(cfg.graph_v9_nodes)} layers, d_code={cfg.graph_v9_d_code}, "
+              f"top_k={cfg.graph_v9_top_k}; emits up to m_max={cfg.graph_v9_m_max} "
+              f"node-tokens, sliced to k. Prepend compressor (sentence_mae).")
     if abs(_beacon_M - M) > max(1, M // 10):
         raise SystemExit(
             f"[EMAT budget] beacon M={_beacon_M} is >10% off mem_tokens={M} "
@@ -1446,18 +1429,6 @@ def main():
         if cfg.d_llama != 576:
             print(f"[WARN] param-matched ranks calibrated for d=576; d={cfg.d_llama} "
                   "→ trainable counts will differ, RECALIBRATE before claims.")
-    if args.graph_v9_arm is not None:
-        cfg.graph_v9_arm = args.graph_v9_arm
-    if args.graph_v9_absorb is not None:
-        cfg.graph_v9_absorb_enabled = (args.graph_v9_absorb == "on")
-    if args.graph_v9_absorb_gate is not None:
-        cfg.graph_v9_absorb_gate = args.graph_v9_absorb_gate
-    if args.graph_v9_route_centering:
-        cfg.graph_v9_route_centering = True
-    if args.graph_v9_surprise_coact:
-        cfg.graph_v9_surprise_coact = True
-    if args.graph_v9_dirs_blend is not None:
-        cfg.graph_v9_dirs_blend = args.graph_v9_dirs_blend
     cfg.contrastive_shuf_coef = args.contrastive_shuf_coef
     cfg.graph_read_mode = args.graph_read_mode
     cfg.graph_read_gate_init = args.graph_read_gate_init

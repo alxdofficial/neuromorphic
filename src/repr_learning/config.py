@@ -537,52 +537,20 @@ class ReprConfig:
     graph_v8_reader_layers: tuple = (3, 6, 10, 14)
     graph_v8_reader_inner_dim: int = 224      # 7*32; v/o-only reader (routers are shared)
 
-    # ── graph_v9 (operator-node pyramid; implementation: graph_substrate_v9.py;
-    # design: docs/graph_v9_ideas.md, 2026-06-12) ────────────────────────────────
-    # Nodes = slow key + ordered generalized-Householder factor slots (direction,
-    # strength∈[0,2]); apply = score-scaled factor chain (fixed node-index order);
-    # flow-through (ONE Llama tap, layer ℓ+1 reads layer ℓ's operated codes);
-    # surprise-gated deposits (the only injection), within-layer conserving
-    # absorption at chunk boundaries; read = flow-through apply-to-query
-    # (GraphV9FlowReader), zero-init out-proj.
-    # ARM C IS PRIMARY (vocabulary-by-absorption, pivot 2026-06-12): NO deposits
-    # anywhere. Layer 0 = static trained atom alphabet (1 factor each — atoms are
-    # indivisible); apply input = PROJECTED SEED (unit-RMS projection of Llama
-    # hiddens, per token — mirrors the read, where queries project into code
-    # space and travel up). Writable layers initialize from a TRAINED random
-    # base vocabulary; the ONLY write is within-layer conserving absorption —
-    # binding IS the relocation pattern; total strength per layer is constant
-    # per document (strict invariant). Words store PROGRAMS, never blended
-    # points. Projected content rides the STREAM but never lands in a NODE —
-    # the memory stays selection-pure.
-    # Arm B (composed-code deposits at layers >= 1) and arm A (content-channel
-    # leaves) kept as comparison arms. PROBE: atoms + ONE writable layer; arm C
-    # runs absorb ON (absorption IS its write); arms A/B probe with absorb OFF.
-    # Writable fast state: 128 nodes · 4 slots · (64+1) = 33,280 floats.
-    # GATE SCALE (overnight 2026-06-12): writable fast state 288*4*257 = 296,064
-    # floats == the v8c read-budget anchor (294,912) within 0.4%. Params ~3M —
-    # intentionally far below v8c's 52M (doc §12: binding at far below baseline
-    # params is the claim); asymmetry favors the baselines.
-    graph_v9_d_code: int = 256          # the shared code space (operators act here)
-    graph_v9_d_key: int = 256           # addressing space (separate knob)
-    graph_v9_nodes: tuple = (576, 288)  # per-layer node counts (pyramid: decreasing)
-    graph_v9_slots: tuple = (1, 4)      # per-layer factor slots (atoms = 1 = indivisible)
-    graph_v9_chunk: int = 128           # chunkwise execution unit (cadence is part of the model)
-    graph_v9_arm: str = "C"             # "C" vocab-by-absorption | "B" deposits | "A" control
-    graph_v9_effective_k: float = 8.0   # target #active nodes at init → route temp DERIVED
-    graph_v9_absorb_enabled: bool = True    # arm C REQUIRES True (absorption IS the write)
-    graph_v9_absorb_gate: str = "rowfrac"   # "rowfrac" | "npmi_sharp" (overnight H-PMI)
-    graph_v9_route_centering: bool = False  # per-node logit centering (hub-convergence fix)
-    graph_v9_surprise_coact: bool = False   # surprise-weighted coact table (template filter)
-    graph_v9_dirs_blend: str = "mass"       # "mass" | "gated" (content-motion fix)
-    graph_v9_tap_layer: int = 13        # the ONE mid-stack write tap (inject@13 lore)
-    # one Llama decoder hook per pyramid layer (read injection depths). Point 0
-    # hooks the SAME depth as the write tap (13): route_projs[0]/seed_proj see
-    # the same hidden-state distribution at write and read time — parameter
-    # identity needs input-distribution identity too (the v8 layer-matched
-    # lesson). The writable layer reads one layer deeper.
-    graph_v9_reader_layers: tuple = (13, 14)
-    graph_v9_reader_inner_dim: int = 256
+    # ── graph_v9 (Compression-by-Vocabulary; graph_substrate_v9.py; design:
+    # docs/compression_model_design.md, 2026-06-13) ──────────────────────────────
+    # REPLACES the retired operator pyramid. v1 = nodes-only soft-clustering
+    # compressor: a learned multi-layer node vocabulary; tokens routed against
+    # node keys, re-described (residual+top-k+norm), passed up; code = the m_max
+    # most-present node-clusters across layers (NPMI-anti-hub), each carrying its
+    # assigned tokens' centroid. Prepend compressor for sentence_mae (sliced to
+    # k=ceil(L/ratio) by the harness). v2 adds STDP edges + graph reader.
+    graph_v9_d_code: int = 256           # shared code space (vocabulary)
+    graph_v9_nodes: tuple = (512, 256, 128)  # nodes per layer (low->high)
+    graph_v9_top_k: int = 4              # perturbation sparsity (active nodes/token)
+    graph_v9_m_max: int = 16             # max emitted node-tokens (>= max k)
+    graph_v9_effective_k: float = 8.0    # target #active nodes at init -> route temp
+    graph_v9_tap_layer: int = 6          # mid-stack tap for the frozen contextualizer
 
     # ── JEPA loss coefficients (dormant path; hoisted for hygiene) ──────────
     # VicReg variance/covariance anti-collapse weights on the online memory.
