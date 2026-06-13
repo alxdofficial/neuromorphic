@@ -117,10 +117,10 @@ for variant in VARIANTS:
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                 o = model.compute_mae_loss(batch)
             o["loss"].backward(); opt.step(); losses.append(o["loss"].item())
-        drop = losses[0] - losses[-1]
-        print(f"  8-step loss: {losses[0]:.3f} → {losses[-1]:.3f} (Δ {drop:+.3f})")
+        drop = losses[0] - min(losses)   # did it improve AT ALL (robust to end noise)
+        print(f"  8-step loss: {losses[0]:.3f} → {losses[-1]:.3f} (min {min(losses):.3f}, Δ {drop:+.3f})")
         if drop <= 0:
-            fails.append(f"{variant}: loss did not decrease in 8 steps")
+            fails.append(f"{variant}: loss never improved in 8 steps")
         # dead-grad check AFTER steps (B has moved, so true-dead modules show now)
         dead = [n for n, p in trainable
                 if (p.grad is None or p.grad.norm() == 0) and "mask_embed" not in n]

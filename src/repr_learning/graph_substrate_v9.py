@@ -149,9 +149,12 @@ class GraphV9Substrate(nn.Module):
                     marg.mul_(cfg.ema_decay).add_(act_mass.mean(0), alpha=1 - cfg.ema_decay)
             npmi = act_mass / marg                                  # >1 = above baseline
             presence = torch.sigmoid(self.presence_a[l] * npmi + self.presence_b[l])
-            token = self.emit_projs[l](centroid)                   # [B,N_l,d_llama]
-            # re-describe the stream for the next layer
-            x = self._perturb(l, x, scores) * m
+            # token carries node IDENTITY (value) + its assigned CONTENT (centroid)
+            token = self.emit_projs[l](centroid + self.node_values[l].unsqueeze(0))
+            # re-describe the stream for the next layer (skip on the last layer —
+            # its output would be unused)
+            if l < self.depth - 1:
+                x = self._perturb(l, x, scores) * m
             cand_tokens.append(token)
             cand_presence.append(presence)
             with torch.no_grad():
