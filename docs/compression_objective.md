@@ -192,3 +192,25 @@ Band = floor(7.07) → ceiling(2.93), width 4.14. "band %" = (floor−recon)/4.1
 
 **Next:** longer run (3-5k steps) to plateau + get a decisive baseline ranking
 and a real "best baseline to beat"; then our redesigned compressor vs this band.
+
+
+## RESULTS — 4000 steps (CONVERGED), SmolLM2-135M, MAE ratio-8 (2026-06-13)
+Band: FLOOR 6.96 → CEILING 0.81 (ppl 2.2), width 6.15. Curves plateaued by ~3500.
+| variant | recon ↓ | band% | OFF−REAL | SHUF−REAL |
+|---|---|---|---|---|
+| vanilla_llama (FLOOR) | 6.96 | 0% | +0.06 | +0.03 |
+| **autocompressor** | **4.64** | **38%** | +6.10 | +4.75 |
+| beacon | 4.94 | 33% | +4.76 | +4.16 |
+| icae | 5.13 | 30% | +5.17 | +3.78 |
+| ccm | 5.61 | 22% | +3.53 | +2.87 |
+| vanilla_full_context (CEILING) | 0.81 | 100% | +10.40 | +15.31 |
+
+**The benchmark is now proven:** wide band (6.15), converged, DECISIVE ranking
+(autocomp > beacon > icae > ccm), healthy gates (OFF−REAL +3.5..+6.1 memory
+helps; SHUF−REAL +2.9..+4.8 codes passage-specific). Contrast EMAT where nothing
+separated.
+
+**THE TARGET TO BEAT: AutoCompressor (recurrent), 4.64 recon = 38% of band**,
+at ~2.9M params / M=k slots × d=576. Compressors capture only 22-38% of band →
+big headroom (ratio-8 + 85%-mask is genuinely lossy). Our redesigned vocabulary
+compressor competes against this number.
