@@ -162,3 +162,33 @@ LoRA on all variants), argparse choices missing sentence_mae, logger keys
 infra so the protocol is learnable; competitors = ~2M encoder + shared decoder
 LoRA (icae total 2.89M). RUN LAUNCHED: 6 variants × 800 steps, SmolLM2-135M,
 out-tag mae_135m. Headline metric = val_loss_recon (masked-reconstruction CE).
+
+
+## RESULTS — 6-variant, 800 steps, SmolLM2-135M, MAE ratio-8 (2026-06-13)
+| variant | params | val recon | OFF−REAL | SHUF−REAL | band % |
+|---|---|---|---|---|---|
+| vanilla_llama (FLOOR) | 0.92M | 7.07 | +0.06 | +0.05 | 0% |
+| autocompressor | 2.90M | **6.57** | +0.95 | +1.01 | 12% |
+| beacon | 3.14M | 6.67 | +0.80 | +0.82 | 10% |
+| ccm | 2.89M | 6.72 | +0.75 | +0.75 | 8% |
+| icae | 2.89M | 6.74 | +0.65 | +0.73 | 8% |
+| vanilla_full_context (CEILING) | 0.92M | 2.93 | +6.99 | +7.54 | 100% |
+
+Band = floor(7.07) → ceiling(2.93), width 4.14. "band %" = (floor−recon)/4.14.
+
+**Three findings:**
+1. **The benchmark is HEALTHY + discriminating** (vs EMAT): wide band (4.14);
+   controls sane (floor OFF/SHUF−REAL ≈ 0 — no memory, correctly nothing to
+   ablate; ceiling +7 — full context highly passage-specific).
+2. **The compressors produce PASSAGE-SPECIFIC codes** — SHUF−REAL > 0 for ALL
+   (+0.7 to +1.0), ≈ OFF−REAL. This is EXACTLY the property the EMAT graph runs
+   never got (SHUF≈REAL). The MAE compression objective elicits specific codes
+   where binding-EMAT could not. Methodological win for the pivot.
+3. **But UNDERTRAINED at 800 steps + weak absolute compression:** every curve is
+   still dropping (autocomp 6.75→6.57, ceiling 3.23→2.93 — not plateaued), and
+   the compressors capture only ~8-12% of the band (barely above the no-memory
+   floor). Either much longer training needed or ratio-8 + 85%-mask is hard at
+   135M. Ranking (autocomp > beacon > ccm > icae) is PRELIMINARY — gaps ~noise.
+
+**Next:** longer run (3-5k steps) to plateau + get a decisive baseline ranking
+and a real "best baseline to beat"; then our redesigned compressor vs this band.
