@@ -144,3 +144,21 @@ Beacon can't LoRA-shrink (full q/k/v projections); 4 wrapped layers is the
 min sensible (3 → 1.66M, too low). Matched within ~10%; reported per-model.
 NOTE: ranks are d-dependent — RECALIBRATE for 360M (d=960) before those runs.
 Our eventual compressor targets the same ~2M.
+
+
+## Capacity-matching VERIFIED (2026-06-13) + MAE wiring complete
+M (memory vectors) == k = ceil(len/8) EXACTLY for all 4 compressors across
+k=3..16 (L=24,40,64,96,128 → M=3,5,8,12,16 for icae/ccm/autocomp/beacon). All
+vecs d=576 ⇒ capacity-in-floats = k·576, identical per-example. Enforced by:
+data computes k + buckets by it; ICAE/CCM/AutoComp allocate M_max=16 + slice to
+first k (prefix/Matryoshka code); Beacon native α=8 also sliced to k. Vanillas
+deliberately unmatched (floor M=0, ceiling M=full).
+
+MAE training path complete + trainer-smoke validated end-to-end (train+eval+
+save+summary; peak VRAM 1.8GB at bs16). Pre-flight bugs caught & fixed:
+pad-token/vocab mismatch (SmolLM2), frozen-decoder-can't-learn-MAE (→ decoder
+LoRA on all variants), argparse choices missing sentence_mae, logger keys
+(n_content_positions/memory_shape). Decoder LoRA (rank16, ~0.9M) is shared
+infra so the protocol is learnable; competitors = ~2M encoder + shared decoder
+LoRA (icae total 2.89M). RUN LAUNCHED: 6 variants × 800 steps, SmolLM2-135M,
+out-tag mae_135m. Headline metric = val_loss_recon (masked-reconstruction CE).
