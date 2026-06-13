@@ -214,3 +214,30 @@ separated.
 at ~2.9M params / M=k slots × d=576. Compressors capture only 22-38% of band →
 big headroom (ratio-8 + 85%-mask is genuinely lossy). Our redesigned vocabulary
 compressor competes against this number.
+
+## RESULT — graph_v9 (compression-by-vocabulary v1), 4000 steps (2026-06-13)
+2.249M trainable (param-matched), nodes (512,256,128) / d_code 256 / top_k 4 /
+m_max 16 / tap_layer 6. Same MAE harness, ratio-8, 85% mask, SmolLM2-135M.
+| variant | recon ↓ | band% | OFF−REAL | SHUF−REAL |
+|---|---|---|---|---|
+| graph_v9 (v1) | **6.276** | **11%** | +1.32 | +1.55 |
+For comparison: floor 6.96 (0%), ccm 5.61 (22%), …, autocomp 4.64 (38%).
+
+**VERDICT: it BINDS but is a WEAK compressor (last place, ~0.68 below floor).**
+- Gates clean + monotone over training (OFF−REAL +0.46→+1.32, SHUF−REAL
+  +0.29→+1.55). This is the binding signal the operator-graph and ALL EMAT
+  attempts never produced. So the vocabulary-routing write IS addressable.
+- UNIQUE: SHUF−REAL (+1.55) > OFF−REAL (+1.32) — mismatched memory hurts MORE
+  than empty memory. The decoder over-trusts the channel; the channel is just
+  thin. ⇒ the READ is not the bottleneck; the WRITE is.
+- ROOT CAUSE = the centroid. Each emitted slot is an activation-weighted MEAN
+  of all tokens routed to that node — a blurry average that can't be un-merged
+  for per-token MAE reconstruction. Project's oldest wall ([[research_memory_sidecar_binding]]:
+  pool-then-address = membership-only). v1 escapes PURE membership (each node
+  also carries its slow node_value identity + presence gate ⇒ addressable), but
+  per-token CONTENT is averaged away. Channel bandwidth ≈ 1 token/slot.
+- NEXT: decisive ablation BEFORE building v2 — feed the top-k token codes
+  directly as memory (select-don't-compress control). If that scores much
+  higher, centroid pooling is destroying info (build a higher-bandwidth write:
+  per-token-preserving / outer-product key⊗value binding, or v2 edges+roles).
+  If similar, bottleneck is elsewhere (mask/read).
