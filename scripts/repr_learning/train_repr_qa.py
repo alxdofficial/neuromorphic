@@ -1038,7 +1038,8 @@ def main():
     ap.add_argument("--b-diversity-scale", type=float, default=0.0)
     ap.add_argument("--mt-diversity-scale", type=float, default=0.0)
     ap.add_argument("--task", type=str, default="qa",
-                    choices=["qa", "emat", "emat_bio", "continuation", "ae", "mae"],
+                    choices=["qa", "emat", "emat_bio", "continuation", "ae", "mae",
+                             "sentence_mae"],
                     help="qa = composite-QA mix (default); emat = random-word key→value (MQAR); "
                          "emat_bio = biographical key-phrase→fact-dense-sentence (binding); "
                          "continuation = compress N → predict next (AutoComp/Beacon gist/LM); "
