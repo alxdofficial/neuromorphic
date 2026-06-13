@@ -810,6 +810,8 @@ class ReprLearningModel(nn.Module):
             "loss": loss, "loss_recon": loss_recon.detach(),
             "top1_acc": top1, "per_example_loss": per_ex,
             "loss_aux": torch.zeros((), device=device),
+            "n_content_positions": int(loss_mask.sum()),   # masked positions = the CE targets
+            "memory_shape": (B, M),                        # (batch, code size) for the logger
             "mae_n_masked": float(loss_mask.sum()), "mae_M": float(M),
         }
 
