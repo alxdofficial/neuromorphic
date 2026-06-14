@@ -1,8 +1,7 @@
 """Top-level ReprLearningModel — wires encoder + decoder together.
 
-The model takes an encoder (V21Encoder, FlatBaselineEncoder, or
-ContinuousBaselineEncoder) and the frozen Llama decoder, and produces
-the reconstruction loss for training.
+The model takes one of the encoder variants (see VARIANTS) and the frozen
+Llama decoder, and produces the reconstruction loss for training.
 """
 from __future__ import annotations
 from typing import Optional
@@ -15,21 +14,13 @@ from torch import Tensor
 
 from .chat_template import ChatTemplate, build_chat_template
 from .config import ReprConfig
-from .encoder import (
-    AutoCompressorBaselineEncoder,
-    BeaconBaselineEncoder,
-    CCMBaselineEncoder,
-    ContinuousBaselineEncoder,
-    FaithfulMTEncoder,
-    FlatBaselineEncoder,
-    FullContextEncoder,
-    HLVocabEncoder,
-    ICAEBaselineEncoder,
-    MemorizingBaselineEncoder,
-    NullEncoder,
-    RecurrentBaselineEncoder,
-    SoftPointerGraphEncoder,
-)
+from .models.autocompressor import AutoCompressorBaselineEncoder
+from .models.beacon import BeaconBaselineEncoder
+from .models.ccm import CCMBaselineEncoder
+from .models.hierarchical_learned_vocab import HLVocabEncoder
+from .models.icae import ICAEBaselineEncoder
+from .models.soft_pointer_graph import SoftPointerGraphEncoder
+from .models.vanilla import FullContextEncoder, NullEncoder
 from .decoder import FrozenLlamaDecoder
 from .jepa import (
     JEPAPredictor, init_ema_target, update_ema_target,
@@ -42,20 +33,15 @@ class ReprLearningModel(nn.Module):
 
     Args:
         cfg: ReprConfig instance
-        variant: one of "v21", "flat_baseline", "continuous_baseline",
-                 "memorizing_baseline", "recurrent_baseline", "vanilla_llama"
+        variant: one of the keys in VARIANTS (e.g. "soft_pointer_graph_baseline",
+                 "hlvocab_baseline", "icae_baseline", "vanilla_llama")
         llama_model: optional pre-loaded Llama (for sharing across models)
     """
 
     VARIANTS = {
-        "flat_baseline": FlatBaselineEncoder,
-        "continuous_baseline": ContinuousBaselineEncoder,
-        "memorizing_baseline": MemorizingBaselineEncoder,
-        "mt_faithful": FaithfulMTEncoder,      # Faithful Memorizing Transformers (Wu et al. 2022)
-        "recurrent_baseline": RecurrentBaselineEncoder,
-        # soft-pointer graph memory (soft_pointer_graph.py; docs/graph_v6.md).
+        # soft-pointer graph memory (models/soft_pointer_graph/; docs/graph_v6.md).
         "soft_pointer_graph_baseline": SoftPointerGraphEncoder,
-        # Compression-by-Vocabulary (hierarchical_learned_vocab.py;
+        # Compression-by-Vocabulary (models/hierarchical_learned_vocab/;
         # docs/compression_model_design.md) — the active model.
         "hlvocab_baseline": HLVocabEncoder,
         "icae_baseline": ICAEBaselineEncoder,  # ICAE (ICLR'24) compressor, EMAT-retrained
@@ -82,18 +68,8 @@ class ReprLearningModel(nn.Module):
                 f"Unknown variant {variant!r}. Must be one of {list(self.VARIANTS)}."
             )
 
-        # mt_faithful (Faithful Memorizing Transformers) must operate ON the
-        # decoder's Llama: it installs a kNN read in one of the decoder's layers
-        # and captures the datastore from that same frozen base. So build the
-        # decoder FIRST, then hand its Llama to the encoder (analogous to how
-        # ICAE/CCM/Beacon get a base — except MT shares the decoder's, not a
-        # separate copy). Every other variant takes cfg only.
-        if variant == "mt_faithful":
-            self.decoder = FrozenLlamaDecoder(cfg, llama_model=llama_model)
-            self.encoder = FaithfulMTEncoder(cfg, self.decoder.llama)
-        else:
-            self.encoder = self.VARIANTS[variant](cfg)
-            self.decoder = FrozenLlamaDecoder(cfg, llama_model=llama_model)
+        self.encoder = self.VARIANTS[variant](cfg)
+        self.decoder = FrozenLlamaDecoder(cfg, llama_model=llama_model)
 
         # hlvocab and soft_pointer_graph both read via the PREPEND path (memory
         # tokens prepended to the decode sequence) — no dedicated cross-attn

@@ -153,9 +153,10 @@ class ReprConfig:
     # a non-canonical crutch. Re-enable small only if a retrain shows collapse.
     mt_diversity_scale: float = 0.0
 
-    # ── Faithful Memorizing Transformers (mt_faithful) ───────────────────
-    # The REAL Wu et al. (2022) mechanism (see src/repr_learning/mt_attention.py),
-    # replacing the broken `memorizing_baseline`. A single decoder layer's
+    # ── Faithful Memorizing Transformers (mt_faithful) [RETIRED] ─────────
+    # Encoder + mt_attention.py removed; these fields are retained only so old
+    # configs/checkpoints still load. The REAL Wu et al. (2022) mechanism was a
+    # single decoder layer's
     # self-attention is augmented with a kNN read over a per-token (key, value)
     # datastore gathered from the context, blended into the local attention via
     # a learned per-KV-head sigmoid gate (the ONLY trainable param this baseline

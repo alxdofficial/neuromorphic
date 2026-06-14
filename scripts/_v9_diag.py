@@ -8,7 +8,7 @@ from transformers import AutoTokenizer
 from src.repr_learning.config import ReprConfig
 from src.repr_learning.model import ReprLearningModel
 from src.repr_learning.data_sentence import make_sentence_dataloader
-from src.repr_learning.hierarchical_learned_vocab import _unit_rms, _unit
+from src.repr_learning.models.hierarchical_learned_vocab.substrate import _unit_rms, _unit
 
 dev = "cuda"
 BACKBONE = "HuggingFaceTB/SmolLM2-135M"; SRC = "meta-llama/Llama-3.2-1B"

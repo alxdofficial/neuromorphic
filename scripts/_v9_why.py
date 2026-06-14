@@ -80,7 +80,7 @@ with torch.no_grad():
             M = c.shape[0]; mem_cos.append(((c.sum() - M) / (M * (M - 1))).item())
         # node usage = argmax routing per layer
         m = mask.unsqueeze(-1); x = sub._unit_rms_in(emb) if hasattr(sub, "_unit_rms_in") else None
-        from src.repr_learning.hierarchical_learned_vocab import _unit_rms
+        from src.repr_learning.models.hierarchical_learned_vocab.substrate import _unit_rms
         x = _unit_rms(sub.seed_proj(hiddens.float())) * m
         for l in range(sub.depth):
             sc = sub.route(l, (hiddens.float() if l == 0 else x)) * m

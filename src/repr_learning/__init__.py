@@ -9,33 +9,23 @@ Design doc: docs/v2.1_repr_learning.md
 """
 from .config import ReprConfig
 from .model import ReprLearningModel
-from .encoder import (
-    AutoCompressorBaselineEncoder,
-    BeaconBaselineEncoder,
-    CCMBaselineEncoder,
-    ContinuousBaselineEncoder,
-    FlatBaselineEncoder,
-    FullContextEncoder,
-    HLVocabEncoder,
-    ICAEBaselineEncoder,
-    MemorizingBaselineEncoder,
-    NullEncoder,
-    RecurrentBaselineEncoder,
-    SoftPointerGraphEncoder,
-)
+from .models.autocompressor import AutoCompressorBaselineEncoder
+from .models.beacon import BeaconBaselineEncoder
+from .models.ccm import CCMBaselineEncoder
+from .models.hierarchical_learned_vocab import HLVocabEncoder
+from .models.icae import ICAEBaselineEncoder
+from .models.soft_pointer_graph import SoftPointerGraphEncoder
+from .models.vanilla import FullContextEncoder, NullEncoder
 
 __all__ = [
     "ReprConfig",
     "ReprLearningModel",
-    "FlatBaselineEncoder",
-    "ContinuousBaselineEncoder",
-    "MemorizingBaselineEncoder",
-    "RecurrentBaselineEncoder",
     "SoftPointerGraphEncoder",
     "HLVocabEncoder",
     "ICAEBaselineEncoder",
     "CCMBaselineEncoder",
     "BeaconBaselineEncoder",
+    "AutoCompressorBaselineEncoder",
     "NullEncoder",
     "FullContextEncoder",
 ]
