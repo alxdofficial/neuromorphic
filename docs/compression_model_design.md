@@ -116,3 +116,29 @@ LoRA; mask_embed.
   plasticity keeps assemblies DISTINCT, the anti-collapse fix). Graph-as-tokens
   decode = TokenGT. The novel combination: emergent STDP graph over a learned
   vocabulary, stateless ordered edges, as a compression memory.
+
+## v2 IMPLEMENTED + design evolution (2026-06-14)
+Full v2 built (use_graph=True default). Two design changes from §3-4, both forced by
+debug sweeps + the "make it learnable" principle:
+
+1. **Edge selection = a learnable TRANSFORMER selector, not the hard-coded NPMI+gate.**
+   Cheap STDP-lift prefilter → top-48 candidate edges → a small bidirectional
+   transformer over the candidates (the "whole-list view": each edge scored WITH
+   attention to all others → learns grammar + non-redundant coverage) → keep-logit
+   → STE-top-8 (discrete graph forward, soft gradient back). STDP lift/C are kept as
+   INPUT FEATURES (thesis intact); the plasticity bilinear is subsumed by the
+   selector. Reason: independent per-edge scoring (even a learned MLP) is myopic to
+   redundancy; PMI/lift optimizes surprise, not reconstruction-relevance.
+
+2. **Edges carry a learned contextual summary (mild 'stateless' relaxation).**
+   A score-only selector is gradient-starved: keep-logit only gates token magnitude,
+   which token_norm washes out (selector+τ+keys at grad/param 5e-5). FIX: the
+   selector's contextualized edge rep feeds token content (sel_to_tok) → it's
+   load-bearing → node_keys 1.9e-4→0.059, τ 5e-5→0.02, selector 3.7e-3→0.67. A
+   learned summary is NOT the content-free pointer §6 rejected.
+
+Params 4.59M (3.67M substrate + 0.92M LoRA); anchor raised to ~5M (still tiny) —
+baselines to be re-matched up at launch for a fair comparison. Known-weak: sel_head
+(which-edge decision) is weakly trained — inherent to hard top-k; Gumbel-top-k is
+the upgrade IF the run shows selection is the bottleneck. Diagnostics: scripts/
+_v9v2_diag.py (gradient/selection health), _v9_why.py (eff_rank / per-slot value).
