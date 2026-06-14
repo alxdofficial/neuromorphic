@@ -555,8 +555,11 @@ class ReprConfig:
     # (within+inter-layer) + plasticity grammar + stateless instance-tag node-tokens
     # + dedicated trainable graph reader (docs/compression_model_design.md §3-4).
     graph_v9_use_graph: bool = True      # True = v2 full graph; False = v1 nodes-only
-    graph_v9_d_id: int = 64              # plasticity-grammar projection width
-    graph_v9_edge_topP: int = 32         # edges only among top-P active nodes/layer
+    graph_v9_edge_topP: int = 32         # node prefilter: edges among top-P active nodes/layer
+    graph_v9_edge_cand: int = 48         # candidate edges after the cheap STDP-lift prefilter
+    graph_v9_d_sel: int = 192            # context-aware edge-selector transformer width
+    graph_v9_sel_layers: int = 2
+    graph_v9_sel_heads: int = 4
     graph_v9_d_read: int = 192           # dedicated graph-reader width
     graph_v9_reader_layers: int = 2
     graph_v9_reader_heads: int = 4

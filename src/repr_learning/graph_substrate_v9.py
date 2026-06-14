@@ -73,10 +73,17 @@ class GraphV9Config:
     perturb_gate_init: float = 0.1  # ReZero gate on the stream re-description
     # ── v2 graph ────────────────────────────────────────────────────────────
     use_graph: bool = True          # v2 (edges+reader) vs v1 (nodes-only ablation)
-    d_id: int = 64                  # plasticity-grammar projection width
-    edge_topP: int = 32             # prefilter: edges only among top-P active nodes/layer
+    edge_topP: int = 32             # node prefilter: edges only among top-P active nodes/layer
     stdp_tau_init: tuple = (1.0, 2.0, 4.0)   # per-layer decay ladder (tokens; small->large)
-    d_read: int = 192               # dedicated graph-reader width (small, param budget)
+    # learnable, context-aware EDGE SELECTOR (transformer over candidate edges —
+    # "whole-list view": each candidate is scored with attention to all the others,
+    # so it can learn non-redundant coverage instead of independent per-edge scores).
+    edge_cand: int = 48             # candidate edges after the cheap STDP-lift prefilter
+    d_sel: int = 192                # selector transformer width
+    sel_layers: int = 2
+    sel_heads: int = 4
+    # dedicated graph reader (over the SELECTED stateless node-tokens)
+    d_read: int = 192               # graph-reader width
     reader_layers: int = 2
     reader_heads: int = 4
 
@@ -90,6 +97,10 @@ class GraphV9Config:
                 raise ValueError(f"d_read={self.d_read} must be divisible by reader_heads={self.reader_heads}")
             if len(self.stdp_tau_init) < len(self.nodes):
                 raise ValueError(f"stdp_tau_init needs >= {len(self.nodes)} entries (one τ per layer)")
+            if self.d_sel % self.sel_heads != 0:
+                raise ValueError(f"d_sel={self.d_sel} must be divisible by sel_heads={self.sel_heads}")
+            if self.edge_cand < self.m_max // 2:
+                raise ValueError(f"edge_cand={self.edge_cand} must be >= n_edges={self.m_max // 2}")
 
 
 class GraphV9Substrate(nn.Module):
@@ -135,15 +146,24 @@ class GraphV9Substrate(nn.Module):
                 [cfg.stdp_tau_init[l] for l in range(L)])))
             self.log_tau_inter = nn.Parameter(torch.log(torch.tensor(
                 [cfg.stdp_tau_init[l] for l in range(L - 1)])))
-            # plasticity-bias grammar: id projection (per layer, key->shared d_id) +
-            # an ASYMMETRIC bilinear form M -> a learned DIRECTED co-activation prior.
-            self.id_projs = nn.ModuleList(
-                nn.Linear(cfg.d_code, cfg.d_id, bias=False) for _ in range(L))
-            for lin in self.id_projs:
-                nn.init.normal_(lin.weight, std=1.0 / math.sqrt(cfg.d_code))
-            self.plasticity_M = nn.Parameter(torch.eye(cfg.d_id) / math.sqrt(cfg.d_id))
-            self.plasticity_scale = nn.Parameter(torch.tensor(1.0))
-            self.edge_score_temp = nn.Parameter(torch.tensor(0.0))   # recon-trained selection
+            # context-aware EDGE SELECTOR: a transformer over the candidate edges.
+            # Each candidate edge token = [src value, dst value, STDP scalar feats];
+            # self-attention gives every candidate a view of all the others, so the
+            # keep-logit is scored IN CONTEXT (learns the grammar + non-redundancy,
+            # replacing the hard-coded log(lift)+log(gate) and the bilinear prior).
+            self._n_edge_scalar = 3                              # log_lift, log_C, is_inter
+            self.edge_in = nn.Linear(2 * cfg.d_llama + self._n_edge_scalar, cfg.d_sel)
+            self.selector = nn.ModuleList(
+                nn.TransformerEncoderLayer(
+                    cfg.d_sel, cfg.sel_heads, dim_feedforward=4 * cfg.d_sel,
+                    dropout=0.0, batch_first=True, norm_first=True, activation="gelu")
+                for _ in range(cfg.sel_layers))
+            self.sel_head = nn.Linear(cfg.d_sel, 1)
+            # the selector's CONTEXTUALIZED edge rep feeds token content (not just the
+            # keep-logit) — else the selector only gates magnitude, which token_norm
+            # washes out, starving the selector + STDP grammar of gradient.
+            self.sel_to_tok = nn.Linear(cfg.d_sel, cfg.d_llama)
+            self.edge_score_temp = nn.Parameter(torch.tensor(0.0))   # selection softmax temp (recon-trained)
             # stateless-token embeddings: role (src/dst/standalone) + instance-tags.
             # init at norm ~1 (1/sqrt d) to MATCH the unit value-token scale — else
             # the structural tags are ~2% of the signal and the reader can't see them.
@@ -252,63 +272,78 @@ class GraphV9Substrate(nn.Module):
         P = min(cfg.edge_topP, *cfg.nodes)
         E = self.n_edges
 
+        Cand = min(cfg.edge_cand, len(self.edge_sources) * P * P)
         # Phase 2 (STDP + edge selection) in float32 — selection must be stable.
         with torch.autocast(device_type=device.type, enabled=False):
             # prefilter: top-P ACTIVE nodes per layer (edges form among active concepts)
-            idxP, AP, valtokP, idP, margP = [], [], [], [], []
+            AP, valtokP, margP = [], [], []
             for l in range(self.depth):
                 act = A_list[l].float().sum(dim=1)             # [B,N] total activation mass
                 ti = act.topk(P, dim=1).indices                # [B,P]
-                idxP.append(ti)
                 AP.append(torch.gather(A_list[l].float(), 2, ti.unsqueeze(1).expand(B, L, P)))
                 valtokP.append(self.emit_projs[l](self.node_values[l][ti].float()))   # [B,P,d_llama]
-                idP.append(_unit(self.id_projs[l](self.node_values[l][ti].float())))  # [B,P,d_id]
                 margP.append(margs[l].float()[ti])                                   # [B,P]
-
-            # unified STDP edge scores per directed (src_layer, dst_layer) source
+            valstack = torch.stack(valtokP, dim=0)             # [depth,B,P,d_llama]
             src_layers = torch.tensor([s for s, _ in self.edge_sources], device=device)
             dst_layers = torch.tensor([d for _, d in self.edge_sources], device=device)
-            M = self.plasticity_M.float()
+
+            # unified STDP co-activation per directed source -> lift (the cheap prefilter
+            # signal AND a feature for the learned selector). τ learnable per source.
             eye = torch.eye(P, device=device, dtype=torch.bool)
-            scores_per_src = []
+            C_list, lift_list = [], []
             for (ls, ld) in self.edge_sources:
                 tau = self.log_tau_within[ls].exp() if ls == ld else self.log_tau_inter[ls].exp()
                 W = self._decay_kernel(L, tau, device)         # [L,L]
                 C = torch.einsum("bti,tu,buj->bij", AP[ls], W, AP[ld])    # [B,P,P]
-                lift = C / (margP[ls].unsqueeze(2) * margP[ld].unsqueeze(1)).clamp_min(1e-9)
-                gate = torch.sigmoid(self.plasticity_scale
-                                     * torch.einsum("bik,kq,bjq->bij", idP[ls], M, idP[ld]))
-                score = lift.clamp_min(1e-9).log() + torch.log(gate.clamp_min(1e-6))
+                lift = (C / (margP[ls].unsqueeze(2) * margP[ld].unsqueeze(1)).clamp_min(1e-9)).clamp_min(1e-9).log()
                 if ls == ld:                                   # mask self-loops i->i [merge #3]
-                    score = score.masked_fill(eye, -1e30)      # (standalone covers "node present")
-                scores_per_src.append(score)
-            all_scores = torch.stack(scores_per_src, dim=1)    # [B,S,P,P]
-            S = all_scores.shape[1]
+                    lift = lift.masked_fill(eye, -1e30)
+                C_list.append(C); lift_list.append(lift)
+            all_C = torch.stack(C_list, dim=1).reshape(B, -1)          # [B, S*P*P]
+            all_lift = torch.stack(lift_list, dim=1).reshape(B, -1)    # [B, S*P*P] (prefilter score)
+            PP = P * P
 
-            # select top-E directed edges across all sources (E = m_max//2)
-            edge_w_raw, sel = all_scores.reshape(B, S * P * P).topk(E, dim=1)   # [B,E]
-            s_idx = sel // (P * P); ij = sel % (P * P)
-            i_idx = ij // P; j_idx = ij % P
-            # gate = softmax OVER the selected edges (×E so mean≈1), NOT sigmoid of
-            # each score — the selected ARE the top scores, so sigmoid saturates at 1
-            # and starves the STDP/plasticity/routing grammar of gradient. Softmax is
-            # non-saturating and couples all selected scores -> grammar learns. The
-            # temperature (recon-trained) controls selection sharpness.
+            # cheap prefilter: top-Cand candidate edges by STDP lift (recall step)
+            cand_lift, cand = all_lift.topk(Cand, dim=1)       # [B,Cand]
+            cs = cand // PP; cij = cand % PP; ci = cij // P; cj = cij % P
+            srcLc = src_layers[cs]; dstLc = dst_layers[cs]     # [B,Cand]
+            bC = torch.arange(B, device=device).unsqueeze(1).expand(B, Cand)
+            src_val = valstack[srcLc, bC, ci]                  # [B,Cand,d_llama]
+            dst_val = valstack[dstLc, bC, cj]
+            log_C = torch.gather(all_C.clamp_min(1e-9).log(), 1, cand)
+            feats = torch.stack([cand_lift, log_C, (srcLc != dstLc).float()], -1)   # [B,Cand,3]
+
+            # context-aware SELECTOR: transformer over the candidate edges. Each edge
+            # is scored WITH attention to all the others (whole-list view), so it can
+            # learn the grammar + non-redundant coverage instead of independent scores.
+            e = self.edge_in(torch.cat([_unit(src_val), _unit(dst_val), feats], dim=-1))
+            for layer in self.selector:
+                e = layer(e)                                   # bidirectional (sees all candidates)
+            keep_logit = self.sel_head(e).squeeze(-1)          # [B,Cand]
+
+            # STE soft-top-k: hard top-E forward (discrete graph), softmax-over-Cand
+            # backward so reconstruction can push a near-miss candidate over a chosen one.
             temp = self.edge_score_temp.exp().clamp(0.1, 10.0)
-            edge_w = E * torch.softmax(edge_w_raw / temp, dim=1)                # [B,E]
+            keep_soft = torch.softmax(keep_logit / temp, dim=1)               # [B,Cand]
+            _, top = keep_logit.topk(E, dim=1)                 # [B,E] best-first
+            p_sel = torch.gather(keep_soft, 1, top)            # [B,E]
+            edge_w = 1.0 + p_sel - p_sel.detach()              # STE: fwd≈1, grad=∂(softmax over Cand)
 
-            # gather endpoint value tokens (src from src_layer, dst from dst_layer)
-            valstack = torch.stack(valtokP, dim=0)             # [depth,B,P,d_llama]
-            bidx = torch.arange(B, device=device).unsqueeze(1).expand(B, E)
-            srcL = src_layers[s_idx]; dstL = dst_layers[s_idx]                  # [B,E]
-            src_val = valstack[srcL, bidx, i_idx]              # [B,E,d_llama]
-            dst_val = valstack[dstL, bidx, j_idx]
+            # gather the selected edges' endpoints (back to global layer/local index)
+            bE = torch.arange(B, device=device).unsqueeze(1).expand(B, E)
+            srcL = torch.gather(srcLc, 1, top); dstL = torch.gather(dstLc, 1, top)
+            i_idx = torch.gather(ci, 1, top); j_idx = torch.gather(cj, 1, top)
+            s_val = valstack[srcL, bE, i_idx]                  # [B,E,d_llama]
+            d_val = valstack[dstL, bE, j_idx]
+            # contextualized edge summary from the selector (puts it in the content
+            # path -> strong gradient to selector + STDP grammar). Shared by the pair.
+            e_sel = torch.gather(e, 1, top.unsqueeze(-1).expand(-1, -1, cfg.d_sel))   # [B,E,d_sel]
+            edge_ctx = self.sel_to_tok(e_sel)                  # [B,E,d_llama]
 
-            # stateless node-tokens: [role, value, instance-tag], emitted src-then-dst.
-            # unit the value so role/value/tag are comparable magnitude (balanced add).
+            # node-tokens: [role, value, tag, edge-context], emitted src-then-dst.
             tags = torch.arange(E, device=device)              # one tag per edge
-            src_tok = (_unit(src_val) + self.role_emb[0] + self.tag_emb[tags]) * edge_w.unsqueeze(-1)
-            dst_tok = (_unit(dst_val) + self.role_emb[1] + self.tag_emb[tags]) * edge_w.unsqueeze(-1)
+            src_tok = (_unit(s_val) + self.role_emb[0] + self.tag_emb[tags] + edge_ctx) * edge_w.unsqueeze(-1)
+            dst_tok = (_unit(d_val) + self.role_emb[1] + self.tag_emb[tags] + edge_ctx) * edge_w.unsqueeze(-1)
             tokens = torch.stack([src_tok, dst_tok], dim=2).reshape(B, 2 * E, d_llama)
 
             # dedicated graph reader — CAUSAL mask so the first-k memory tokens form a
@@ -333,6 +368,7 @@ class GraphV9Substrate(nn.Module):
             aux["graph_v9_edge_inter_frac"] = (srcL != dstL).float().mean()
             aux["graph_v9_self_loop_frac"] = ((srcL == dstL) & (i_idx == j_idx)).float().mean()  # [merge #3 telem]
             aux["graph_v9_edge_uniq_nodes"] = uniq
+            aux["graph_v9_keep_logit_spread"] = keep_logit.std()   # selector discrimination
             aux["graph_v9_tau_within"] = self.log_tau_within.exp().mean()
             aux["graph_v9_memory_norm"] = memory.float().norm(dim=-1).mean()
             # multi-element diagnostics (dropped by the JSONL logger; read by _v9v2_diag)

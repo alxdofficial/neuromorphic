@@ -2502,9 +2502,11 @@ class GraphV9PyramidEncoder(nn.Module):
             d_model=cfg.d_llama, d_llama=cfg.d_llama, d_code=cfg.graph_v9_d_code,
             nodes=tuple(cfg.graph_v9_nodes), top_k=cfg.graph_v9_top_k,
             m_max=cfg.graph_v9_m_max, effective_k=cfg.graph_v9_effective_k,
-            use_graph=cfg.graph_v9_use_graph, d_id=cfg.graph_v9_d_id,
-            edge_topP=cfg.graph_v9_edge_topP, d_read=cfg.graph_v9_d_read,
-            reader_layers=cfg.graph_v9_reader_layers, reader_heads=cfg.graph_v9_reader_heads)
+            use_graph=cfg.graph_v9_use_graph, edge_topP=cfg.graph_v9_edge_topP,
+            edge_cand=cfg.graph_v9_edge_cand, d_sel=cfg.graph_v9_d_sel,
+            sel_layers=cfg.graph_v9_sel_layers, sel_heads=cfg.graph_v9_sel_heads,
+            d_read=cfg.graph_v9_d_read, reader_layers=cfg.graph_v9_reader_layers,
+            reader_heads=cfg.graph_v9_reader_heads)
         self.sub = GraphV9Substrate(v9)
         self.M = v9.m_max
         # norm-match TARGET = the active backbone's embedding scale, NOT the
