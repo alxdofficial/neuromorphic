@@ -112,11 +112,17 @@ for variant in VARIANTS:
     # a few optimizer steps reduce the loss
     if opt is not None:
         losses = []
+        alive = set()   # params with nonzero grad on ANY step (selection-conditional
+                        # params like inter-layer τ only fire when their edge is picked)
         for _ in range(8):
             model.zero_grad(set_to_none=True)
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                 o = model.compute_mae_loss(batch)
-            o["loss"].backward(); opt.step(); losses.append(o["loss"].item())
+            o["loss"].backward()
+            for n, p in trainable:
+                if p.grad is not None and p.grad.norm() > 0:
+                    alive.add(n)
+            opt.step(); losses.append(o["loss"].item())
         drop = losses[0] - min(losses)   # did it improve AT ALL (robust to end noise)
         print(f"  8-step loss: {losses[0]:.3f} → {losses[-1]:.3f} (min {min(losses):.3f}, Δ {drop:+.3f})")
         if drop <= 0:
@@ -128,8 +134,8 @@ for variant in VARIANTS:
         # v1-only selection gate (presence_*) is unused when graph_v9 runs in v2
         # (use_graph=True) mode — legitimately no grad there.
         _exempt = ("mask_embed", "log_route_temp", "presence_a", "presence_b")
-        dead = [n for n, p in trainable
-                if (p.grad is None or p.grad.norm() == 0) and not any(e in n for e in _exempt)]
+        dead = [n for n, _ in trainable
+                if n not in alive and not any(e in n for e in _exempt)]
         if dead:
             fails.append(f"{variant}: {len(dead)} dead-grad params (post-steps)")
             print(f"  DEAD post-steps: {dead[:5]}")
