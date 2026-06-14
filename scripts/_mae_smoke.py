@@ -122,8 +122,12 @@ for variant in VARIANTS:
         if drop <= 0:
             fails.append(f"{variant}: loss never improved in 8 steps")
         # dead-grad check AFTER steps (B has moved, so true-dead modules show now)
+        # exempt clamped scalars: at a clamp boundary their grad is legitimately
+        # 0 (mask_embed = no-positions-selected; log_route_temp = temp hit its
+        # bound under the high-LR/no-warmup 8-step transient).
+        _exempt = ("mask_embed", "log_route_temp")
         dead = [n for n, p in trainable
-                if (p.grad is None or p.grad.norm() == 0) and "mask_embed" not in n]
+                if (p.grad is None or p.grad.norm() == 0) and not any(e in n for e in _exempt)]
         if dead:
             fails.append(f"{variant}: {len(dead)} dead-grad params (post-steps)")
             print(f"  DEAD post-steps: {dead[:5]}")

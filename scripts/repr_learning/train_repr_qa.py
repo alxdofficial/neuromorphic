@@ -121,12 +121,18 @@ def run_val(model, val_set, device, n_batches: int, window_size: int,
         # Positive gap = memory helps (control loss higher than REAL).
         if i < gate_batches:
             real_l = float(out["loss_recon"])
+            # REAL/OFF/SHUF must differ ONLY in memory, NOT in the random MAE
+            # mask. The eval path's sole RNG draw is the mask (torch.rand in
+            # compute_mae_loss); re-seeding to the SAME value before each control
+            # makes all three predict the IDENTICAL masked positions [fix B].
             with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                torch.manual_seed(20260527 + i)
                 off = model.compute_qa_loss(batch, window_size=window_size,
                                             zero_memory=True)
                 off_abs.append(float(off["loss_recon"]))
                 off_gap.append(float(off["loss_recon"]) - real_l)
                 if batch.context_ids.shape[0] > 1:
+                    torch.manual_seed(20260527 + i)
                     shuf = model.compute_qa_loss(batch, window_size=window_size,
                                                  shuffle_memory=True)
                     shuf_abs.append(float(shuf["loss_recon"]))
@@ -1347,6 +1353,22 @@ def main():
         **({"learning_rate": args.lr} if args.lr is not None else {}),
     )
 
+    # ── backbone resolution (MUST precede budget reporting) ──────────────────
+    # Resolve --backbone d_llama/vocab/pad BEFORE the budget block so the printed
+    # decoder-read float budget uses the real d_llama (was printing the 2048
+    # default even on SmolLM2 d=576) [fix I].
+    if args.backbone is not None:
+        cfg.llama_model = args.backbone
+        from transformers import AutoConfig as _AC, AutoTokenizer as _AT
+        _bc = _AC.from_pretrained(args.backbone)
+        cfg.d_llama = _bc.hidden_size
+        cfg.llama_vocab_size = _bc.vocab_size
+        _bt = _AT.from_pretrained(args.backbone)
+        # SmolLM2 has no pad token → use eos (masked out of attention/loss anyway)
+        cfg.pad_token_id = _bt.pad_token_id if _bt.pad_token_id is not None else _bt.eos_token_id
+        print(f"[backbone] {args.backbone}  d_llama={cfg.d_llama}  "
+              f"vocab={cfg.llama_vocab_size}  pad={cfg.pad_token_id}")
+
     # ── EMAT matched MEMORY budget (decoder-read M × d_llama) ────────────────
     # mem_tokens is the single knob; the prepend EMAT arms all emit ~M tokens at
     # d_llama, so the decoder reads the SAME float budget from each — only the
@@ -1358,6 +1380,7 @@ def main():
     cfg.ccm_n_comp = M
     cfg.autocompressor_n_slots = M
     cfg.graph_v6_K_edge = M          # graph prepends M fact-tokens (matched read)
+    cfg.graph_v9_m_max = M           # graph_v9 obeys the matched budget too [fix G]
     cfg.n_flat_codes = M             # flat/continuous/MT prepend M too (was 192 -> mismatch)
     cfg.beacon_ratio = max(1, args.chunk_size // M)
     if args.beacon_param is not None:
@@ -1399,18 +1422,7 @@ def main():
     # Plumb the read-mode knobs onto cfg so ReprLearningModel builds the
     # GraphCrossAttnReader (graph_v7_baseline only). Without this the reader is
     # never built and the cross_attn path stays inert (cfg default "prepend").
-    # ── compression line: SmolLM2 backbone + param-matched baselines ──────────
-    if args.backbone is not None:
-        cfg.llama_model = args.backbone
-        from transformers import AutoConfig as _AC, AutoTokenizer as _AT
-        _bc = _AC.from_pretrained(args.backbone)
-        cfg.d_llama = _bc.hidden_size
-        cfg.llama_vocab_size = _bc.vocab_size
-        _bt = _AT.from_pretrained(args.backbone)
-        # SmolLM2 has no pad token → use eos (masked out of attention/loss anyway)
-        cfg.pad_token_id = _bt.pad_token_id if _bt.pad_token_id is not None else _bt.eos_token_id
-        print(f"[backbone] {args.backbone}  d_llama={cfg.d_llama}  "
-              f"vocab={cfg.llama_vocab_size}  pad={cfg.pad_token_id}")
+    # ── compression line: param-matched baselines (backbone resolved above) ───
     if args.task == "sentence_mae":
         cfg.task_mode = "sentence_mae"
         # decoder LoRA: a frozen decoder can't learn the MAE protocol (mask
@@ -1426,6 +1438,7 @@ def main():
         cfg.autocompressor_n_slots = 16
         cfg.autocompressor_lora_rank = 17; cfg.autocompressor_lora_alpha = 34
         cfg.beacon_ratio = 8; cfg.beacon_wrap_layers = (0, 10, 19, 29)
+        cfg.graph_v9_m_max = 16          # sentence_mae: emit up to 16, sliced to k [fix G]
         if cfg.d_llama != 576:
             print(f"[WARN] param-matched ranks calibrated for d=576; d={cfg.d_llama} "
                   "→ trainable counts will differ, RECALIBRATE before claims.")

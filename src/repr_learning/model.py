@@ -739,7 +739,7 @@ class ReprLearningModel(nn.Module):
         # ---- 1. encode the span → memory [B, M, d] (single window) ----
         state = self.encoder.init_streaming_state(B, device, ctx_embeds.dtype)
         state, _ = self.encoder.streaming_write(state, ctx_embeds, batch.context_mask)
-        memory, _aux = self.encoder.finalize_memory(state)              # [B, M, d]
+        memory, mem_aux = self.encoder.finalize_memory(state)          # [B, M, d]
         memory = memory.to(ctx_embeds.dtype)
 
         # capacity-relative: use the first k slots (prefix/Matryoshka code)
@@ -797,7 +797,7 @@ class ReprLearningModel(nn.Module):
 
         # keep mask_embed in-graph even when no positions select it
         loss = loss_recon + 0.0 * self.decoder.mask_embed.float().sum()
-        return {
+        out = {
             "loss": loss, "loss_recon": loss_recon.detach(),
             "top1_acc": top1, "per_example_loss": per_ex,
             "loss_aux": torch.zeros((), device=device),
@@ -805,6 +805,14 @@ class ReprLearningModel(nn.Module):
             "memory_shape": (B, M),                        # (batch, code size) for the logger
             "mae_n_masked": float(loss_mask.sum()), "mae_M": float(M),
         }
+        # surface encoder telemetry (graph_v9_* collapse/presence canaries) so the
+        # trainer's graph_v9_ glob logs it to JSONL [fix C]. Scalars only.
+        for _k, _v in (mem_aux or {}).items():
+            if torch.is_tensor(_v) and _v.numel() == 1:
+                out[_k] = _v.detach()
+            elif isinstance(_v, (int, float)):
+                out[_k] = _v
+        return out
 
     def compute_qa_loss(
         self,

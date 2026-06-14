@@ -82,7 +82,12 @@ class ContinuationDataset(IterableDataset):
 
     def _gen(self, rng: np.random.Generator) -> dict:
         d = self.docs[rng.integers(len(self.docs))]
-        s = int(rng.integers(0, len(d) - self.compress_len - self.predict_len + 1))
+        # ae/mae compress & target the SAME span → span need = compress_len only
+        # (must match the filter's `need`, else docs of len==compress_len crash
+        # with high<=0 because predict_len==compress_len here) [fix H].
+        span_need = (self.compress_len if self.objective in ("ae", "mae")
+                     else self.compress_len + self.predict_len)
+        s = int(rng.integers(0, len(d) - span_need + 1))
         compress = d[s: s + self.compress_len]
         if self.objective in ("ae", "mae"):
             predict = compress                                    # target the same span (mae masks in fwd)
