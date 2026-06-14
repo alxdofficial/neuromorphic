@@ -125,7 +125,9 @@ for variant in VARIANTS:
         # exempt clamped scalars: at a clamp boundary their grad is legitimately
         # 0 (mask_embed = no-positions-selected; log_route_temp = temp hit its
         # bound under the high-LR/no-warmup 8-step transient).
-        _exempt = ("mask_embed", "log_route_temp")
+        # v1-only selection gate (presence_*) is unused when graph_v9 runs in v2
+        # (use_graph=True) mode — legitimately no grad there.
+        _exempt = ("mask_embed", "log_route_temp", "presence_a", "presence_b")
         dead = [n for n, p in trainable
                 if (p.grad is None or p.grad.norm() == 0) and not any(e in n for e in _exempt)]
         if dead:

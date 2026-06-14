@@ -1,45 +1,36 @@
-"""graph_substrate_v9.py — Compression-by-Vocabulary (graph_v9, 2026-06-13).
+"""graph_substrate_v9.py — Compression-by-Vocabulary (graph_v9).
 
-Full design: docs/compression_model_design.md. This REPLACES the operator/
-Householder pyramid (retired — operators bought state-tracking, which compression
-doesn't need).
+Build spec: docs/compression_model_design.md. Compress a passage into its OWN
+learned vocabulary — a directed graph of concept-nodes — and reconstruct via MAE.
 
-v1 (THIS FILE) — nodes-only soft-clustering compressor:
-  A learned NODE vocabulary across a few layers. Each input token is scored
-  against the layer's node keys (routing), RE-DESCRIBED by the nodes it activates
-  (residual + top-k + norm) and passed up; the sequence length stays L (layers
-  re-describe, they don't shorten). The code = the M most-PRESENT node-clusters
-  across ALL layers (multi-resolution), each carrying its assigned tokens' content
-  (the activation-weighted centroid). Selection is anti-hub (a node earns a slot
-  by firing ABOVE its corpus baseline, not by being a hub).
+STAGING (config.use_graph):
+  v2 (use_graph=True, DEFAULT) — the FULL graph:
+    Phase 1 (signal processing): tokens -> frozen-LM hiddens -> per-layer routing
+      activations A_l [L x N_l]; each token re-described (residual+top-k+norm) and
+      passed up; sequence stays length L (multi-resolution, low->high).
+    Phase 2 (graph-code, read off the activation traces):
+      unified STDP  C[i->j] = Σ_t Σ_{Δ>0} exp(−Δ/τ)·A[t,i]·A[t+Δ,j]  over the token
+      axis — WITHIN-layer = relational edges, INTER-layer = compositional (low->high
+      prior). Shaped by a learned plasticity-bias grammar. Score edges by NPMI
+      (above-chance co-activation) × a reconstruction-trained gate; select the top
+      directed edges within budget. Emit STATELESS node-tokens [role, value,
+      instance-tag]: an edge = a (src,dst) pair sharing a tag, in firing order.
+    Phase 3 (decode): a dedicated FULLY-trainable graph-reader (groups by tag,
+      orients by role) -> M soft memory tokens in Llama space -> prepend -> MAE CE.
+  v1 (use_graph=False) — nodes-only ablation: no edges/reader; slots = anti-hub
+    activation-weighted node centroids, prepended directly (baseline decode path).
 
-v2 (LATER) — adds directed STDP edges (within + inter-layer), stateless
-  instance-tag node-tokens, and a dedicated graph reader. The layer/routing/
-  perturbation machinery here is the shared base v2 extends.
+Three timescales: backprop (vocabulary/reader/LoRA = WHAT each concept is) ·
+plasticity bias (corpus co-activation grammar = WHICH relate) · per-input STDP
+(the instantaneous directed graph = the CODE).
 
-DEBUG-SWEEP FIXES (2026-06-14) — the v1 first run BOUND but was a WEAK compressor
-(11% band). Root causes found + fixed here:
-  E  node_keys frozen (grad/param 3e-5): cosine-normalized LARGE-init keys get a
-     negligible step. -> keys init small (1/sqrt(d_code)) so the unit-direction moves.
-  K  routing double-scaled (x sqrt(d_code) AND a learnable temp) -> logits +-16,
-     intrinsically peaky. -> pure cosine + calibrated temp ONLY (CLIP/QK-norm style).
-  D  routing collapse (L2 entropy 0.006, one node = 99.7% mass): the perturbation
-     homogenized the stream up the layers (rich-get-richer). -> ReZero-gated
-     perturbation (small init) keeps token identity; nodes nudge gently.
-  F  presence ~ const 0.5 -> arbitrary selection: act_mass was a SUM over tokens
-     (length-confounded). -> length-normalized mean routing prob; marginal init
-     at the uniform 1/N so the anti-hub lift is centered at 1.
-  A  memory 6.6x louder than real embeddings: raw emit projections were prepended
-     un-normed (the baselines all _NormMatch). -> norm-match selected tokens to the
-     embedding scale BEFORE presence-gating (keeps presence's gradient path).
-
-INTERFACE: forward(hiddens [B,L,d_model], mask [B,L]) -> memory [B, m_max, d_llama]
-ranked by presence (best first); the harness slices to k = ceil(L/ratio).
+INTERFACE: forward(hiddens [B,L,d_model], mask [B,L]) -> (memory [B, m_max, d_llama]
+ranked best-first, aux); the harness slices the decoder-read to k = ceil(L/ratio).
 """
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 import torch.nn as nn
@@ -56,10 +47,9 @@ def _unit_rms(x: Tensor) -> Tensor:
 
 
 class _NormMatch(nn.Module):
-    """Put memory tokens in the decoder's token-embedding magnitude region.
-    Mirrors encoder._NormMatch (the baselines use it): LayerNorm for centering +
-    L2-normalize + a learnable scale (init 0.9, grows toward the backbone's embed
-    norm during training). Self-contained here so the substrate imports standalone."""
+    """Put memory tokens in the decoder's token-embedding magnitude region
+    (LayerNorm + L2-normalize + learnable scale). Mirrors encoder._NormMatch; the
+    target scale is set to the backbone embed norm by the encoder after build."""
 
     def __init__(self, d: int, target: float = 0.9):
         super().__init__()
@@ -80,7 +70,15 @@ class GraphV9Config:
     m_max: int = 16                 # max emitted tokens (>= max k in the data)
     effective_k: float = 8.0        # target #active nodes at init -> route temp DERIVED
     ema_decay: float = 0.99         # corpus node-activation marginal (anti-hub)
-    perturb_gate_init: float = 0.1  # ReZero gate on the stream re-description (anti-collapse)
+    perturb_gate_init: float = 0.1  # ReZero gate on the stream re-description
+    # ── v2 graph ────────────────────────────────────────────────────────────
+    use_graph: bool = True          # v2 (edges+reader) vs v1 (nodes-only ablation)
+    d_id: int = 64                  # plasticity-grammar projection width
+    edge_topP: int = 32             # prefilter: edges only among top-P active nodes/layer
+    stdp_tau_init: tuple = (1.0, 2.0, 4.0)   # per-layer decay ladder (tokens; small->large)
+    d_read: int = 192               # dedicated graph-reader width (small, param budget)
+    reader_layers: int = 2
+    reader_heads: int = 4
 
     def __post_init__(self):
         if self.d_code % 32 != 0:
@@ -95,53 +93,76 @@ class GraphV9Substrate(nn.Module):
         L = len(cfg.nodes)
         self.depth = L
 
-        # ── slow vocabulary ────────────────────────────────────────────────────
-        # keys: SMALL init (norm ~1) so the cosine-unit direction actually moves
-        # under backprop (large init -> grad scaled by 1/||u|| -> frozen). [fix E]
+        # ── slow vocabulary (small-init keys: cosine-unit direction must move) ──
         self.node_keys = nn.ParameterList(
             nn.Parameter(torch.randn(n, cfg.d_code) / math.sqrt(cfg.d_code)) for n in cfg.nodes)
         self.node_values = nn.ParameterList(
             nn.Parameter(torch.randn(n, cfg.d_code) / math.sqrt(cfg.d_code)) for n in cfg.nodes)
-        # layer-0 reads d_model hiddens; higher layers read d_code codes
         self.route_projs = nn.ModuleList(
             [nn.Linear(cfg.d_model, cfg.d_code, bias=False)]
             + [nn.Linear(cfg.d_code, cfg.d_code, bias=False) for _ in range(L - 1)])
         self.seed_proj = nn.Linear(cfg.d_model, cfg.d_code, bias=False)
         for lin in (*self.route_projs, self.seed_proj):
             nn.init.normal_(lin.weight, std=1.0 / math.sqrt(lin.in_features))
-        # per-layer emit projection (cluster centroid in d_code -> d_llama token)
         self.emit_projs = nn.ModuleList(
             nn.Linear(cfg.d_code, cfg.d_llama, bias=False) for _ in range(L))
         for lin in self.emit_projs:
             nn.init.normal_(lin.weight, std=1.0 / math.sqrt(cfg.d_code))
-        # norm-match the emitted tokens to the decoder embedding scale [fix A]
         self.token_norm = _NormMatch(cfg.d_llama)
-        # per-layer presence gate: sigmoid(a*lift + b), trains the selection
-        self.presence_a = nn.Parameter(torch.ones(L))
+        self.presence_a = nn.Parameter(torch.ones(L))      # v1 selection gate
         self.presence_b = nn.Parameter(torch.zeros(L))
-        # ReZero gate on the stream re-description — keeps token identity so the
-        # stream does not homogenize up the layers (the collapse feedback). [fix D]
         self.perturb_gate = nn.Parameter(torch.full((L,), float(cfg.perturb_gate_init)))
 
-        # ── learnable-but-bounded routing temperature (derived at init) ─────────
+        # routing temperature (calibrated at init; pure cosine, no sqrt(d))
         self.log_route_temp = nn.Parameter(torch.zeros(L))
         self._calibrate_route_temps()
-        # corpus node-activation marginal (EMA buffer) — the anti-hub denominator.
-        # init at 0 + Adam-style bias correction (count buffer) so the marginal
-        # equals the TRUE running mean_act from step 1; without it the 1/N prior
-        # makes lift~64 at cold-start -> presence saturates -> presence_a/b get no
-        # gradient for ~100 steps. [fix F cold-start]
+        # bias-corrected corpus node marginals (anti-hub denominator)
         self.register_buffer("marg_count", torch.zeros(()))
         for l, n in enumerate(cfg.nodes):
             self.register_buffer(f"act_marginal_L{l}", torch.zeros(n))
 
+        # ── v2 graph machinery ─────────────────────────────────────────────────
+        if cfg.use_graph:
+            # learnable STDP decay ladder (within-layer τ_l, inter-layer τ_{l->l+1})
+            self.log_tau_within = nn.Parameter(torch.log(torch.tensor(
+                [cfg.stdp_tau_init[l] for l in range(L)])))
+            self.log_tau_inter = nn.Parameter(torch.log(torch.tensor(
+                [cfg.stdp_tau_init[l] for l in range(L - 1)])))
+            # plasticity-bias grammar: id projection (per layer, key->shared d_id) +
+            # an ASYMMETRIC bilinear form M -> a learned DIRECTED co-activation prior.
+            self.id_projs = nn.ModuleList(
+                nn.Linear(cfg.d_code, cfg.d_id, bias=False) for _ in range(L))
+            for lin in self.id_projs:
+                nn.init.normal_(lin.weight, std=1.0 / math.sqrt(cfg.d_code))
+            self.plasticity_M = nn.Parameter(torch.eye(cfg.d_id) / math.sqrt(cfg.d_id))
+            self.plasticity_scale = nn.Parameter(torch.tensor(1.0))
+            self.edge_score_temp = nn.Parameter(torch.tensor(0.0))   # recon-trained selection
+            # stateless-token embeddings: role (src/dst/standalone) + instance-tags.
+            # init at norm ~1 (1/sqrt d) to MATCH the unit value-token scale — else
+            # the structural tags are ~2% of the signal and the reader can't see them.
+            self.role_emb = nn.Parameter(torch.randn(3, cfg.d_llama) / math.sqrt(cfg.d_llama))
+            n_edges = cfg.m_max // 2
+            self.n_edges = n_edges
+            self.tag_emb = nn.Parameter(torch.randn(n_edges, cfg.d_llama) / math.sqrt(cfg.d_llama))
+            # directed (src,dst) layer pairs: within-layer + adjacent inter-layer
+            self.edge_sources = ([(l, l) for l in range(L)]
+                                 + [(l, l + 1) for l in range(L - 1)])
+            # dedicated FULLY-trainable graph reader (small width)
+            self.read_in = nn.Linear(cfg.d_llama, cfg.d_read)
+            self.reader = nn.ModuleList(
+                nn.TransformerEncoderLayer(
+                    cfg.d_read, cfg.reader_heads, dim_feedforward=4 * cfg.d_read,
+                    dropout=0.0,   # memory module: no stochastic noise (MAE mask regularizes)
+                    batch_first=True, norm_first=True, activation="gelu")
+                for _ in range(cfg.reader_layers))
+            self.read_out = nn.Linear(cfg.d_read, cfg.d_llama)
+
+    # ── routing ────────────────────────────────────────────────────────────────
     def _route_temp(self, l: int) -> Tensor:
         return self.log_route_temp[l].clamp(math.log(0.02), math.log(20.0)).exp()
 
     @torch.no_grad()
     def _calibrate_route_temps(self, n_query: int = 4096, iters: int = 30):
-        # pure cosine logits (no sqrt(d) — that was fix K); find the temp whose
-        # softmax has entropy ~ log(effective_k).
         for l, keys in enumerate(self.node_keys):
             q = _unit(torch.randn(n_query, self.config.d_code))
             logits = q @ _unit(keys.float()).t()
@@ -155,8 +176,6 @@ class GraphV9Substrate(nn.Module):
             self.log_route_temp.data[l] = 0.5 * (lo + hi)
 
     def route(self, l: int, x: Tensor) -> Tensor:
-        """x [B,L,d_in] -> routing scores [B,L,N_l] (softmax over nodes).
-        Pure cosine similarity / learnable temperature (no sqrt(d) double-scale). [K]"""
         with torch.autocast(device_type=x.device.type, enabled=False):
             q = _unit(self.route_projs[l](x.float()))
             k = _unit(self.node_keys[l].float())
@@ -164,76 +183,179 @@ class GraphV9Substrate(nn.Module):
             return torch.softmax(logits / self._route_temp(l), dim=-1)
 
     def _perturb(self, l: int, x: Tensor, scores: Tensor) -> Tensor:
-        """Re-describe each token by its top-k activated node values: residual +
-        ReZero-gated sparse add + norm (no smear, identity-preserving). [D]"""
         k = min(self.config.top_k, scores.shape[-1])
-        topv, topi = scores.topk(k, dim=-1)                         # [B,L,k]
-        vals = self.node_values[l].to(x.dtype)                      # [N,d_code]
-        gathered = vals[topi]                                       # [B,L,k,d_code]
-        add = (topv.unsqueeze(-1) * gathered).sum(dim=2)            # [B,L,d_code]
+        topv, topi = scores.topk(k, dim=-1)
+        vals = self.node_values[l].to(x.dtype)
+        add = (topv.unsqueeze(-1) * vals[topi]).sum(dim=2)
         return _unit_rms(x + self.perturb_gate[l].to(x.dtype) * add)
 
-    def forward(self, hiddens: Tensor, mask: Tensor) -> tuple[Tensor, dict]:
-        """hiddens [B,L,d_model] (frozen-LM contextualized span), mask [B,L].
-        Returns (memory [B, m_max, d_llama] ranked by presence, aux)."""
+    # ── phase 1: signal processing (shared by v1/v2) ─────────────────────────────
+    def _phase1(self, hiddens: Tensor, mask: Tensor):
+        """Returns A_list[l] = routing scores [B,L,N_l] (mask-zeroed), per-node
+        bias-corrected marginal margs[l] [N_l], and the per-layer code stream
+        (unused downstream but kept for telemetry)."""
         cfg = self.config
-        B, L = hiddens.shape[:2]
-        m = mask.float().unsqueeze(-1)                              # [B,L,1]
-        n_tok = mask.float().sum(1, keepdim=True).clamp_min(1.0)    # [B,1] real tokens
-        x = _unit_rms(self.seed_proj(hiddens.float())) * m         # layer-0 input codes
-
+        m = mask.float().unsqueeze(-1)
+        n_tok = mask.float().sum(1, keepdim=True).clamp_min(1.0)
+        x = _unit_rms(self.seed_proj(hiddens.float())) * m
         if self.training:
             self.marg_count += 1
-        # Adam-style bias correction for the EMA marginals (init 0).
         bias_corr = (1.0 - cfg.ema_decay ** self.marg_count.clamp_min(1.0)).clamp_min(1e-6)
 
-        cand_tokens, cand_presence, aux = [], [], {}
+        A_list, margs, aux = [], [], {}
         for l in range(self.depth):
-            route_in = hiddens.float() if l == 0 else x
-            scores = self.route(l, route_in) * m                   # [B,L,N_l]
-            # cluster centroid per node = activation-weighted mean of token codes
-            denom = scores.sum(dim=1).clamp_min(1e-6)              # [B,N_l]
-            centroid = torch.einsum("bln,bld->bnd", scores, x) / denom.unsqueeze(-1)
-            # mean routing prob per token to each node — LENGTH-INVARIANT. [fix F]
-            mean_act = scores.sum(dim=1) / n_tok                   # [B,N_l], sums to 1 over N
+            scores = self.route(l, hiddens.float() if l == 0 else x) * m   # [B,L,N]
+            mean_act = scores.sum(dim=1) / n_tok
             marg_buf = getattr(self, f"act_marginal_L{l}")
             if self.training:
                 with torch.no_grad():
                     marg_buf.mul_(cfg.ema_decay).add_(mean_act.mean(0), alpha=1 - cfg.ema_decay)
-            marg = (marg_buf / bias_corr).clamp_min(1e-9)          # bias-corrected baseline
-            lift = mean_act / marg                                  # >1 = above corpus baseline
-            presence = torch.sigmoid(self.presence_a[l] * lift + self.presence_b[l])
-            # token carries node IDENTITY (value) + its assigned CONTENT (centroid)
-            token = self.emit_projs[l](centroid + self.node_values[l].unsqueeze(0))
-            # re-describe the stream for the next layer (skip on the last layer —
-            # its output would be unused)
+            marg = (marg_buf / bias_corr).clamp_min(1e-9)
+            A_list.append(scores)
+            margs.append(marg)
             if l < self.depth - 1:
                 x = self._perturb(l, x, scores) * m
-            cand_tokens.append(token)
-            cand_presence.append(presence)
             with torch.no_grad():
-                # collapse canaries (now surfaced via aux -> JSONL) [fix C telemetry]
                 p = scores.clamp_min(1e-12)
-                ent = ((-(p * p.log()).sum(-1)) * mask).sum() / mask.sum()
-                hub = (mean_act / mean_act.sum(-1, keepdim=True).clamp_min(1e-9)).max(-1).values.mean()
-                cov = scores.argmax(-1)[mask.bool()].unique().numel() / scores.shape[-1]
-                aux[f"graph_v9_route_entropy_L{l}"] = ent
-                aux[f"graph_v9_hub_share_L{l}"] = hub
-                aux[f"graph_v9_coverage_L{l}"] = torch.tensor(cov, device=hiddens.device)
-                aux[f"graph_v9_lift_max_L{l}"] = lift.max()
+                aux[f"graph_v9_route_entropy_L{l}"] = ((-(p * p.log()).sum(-1)) * mask).sum() / mask.sum()
+                ms = mean_act
+                aux[f"graph_v9_hub_share_L{l}"] = (ms / ms.sum(-1, keepdim=True).clamp_min(1e-9)).max(-1).values.mean()
+                aux[f"graph_v9_coverage_L{l}"] = torch.tensor(
+                    scores.argmax(-1)[mask.bool()].unique().numel() / scores.shape[-1], device=hiddens.device)
+        return A_list, margs, aux
 
-        tokens = torch.cat(cand_tokens, dim=1)                     # [B, sumN, d_llama]
-        pres = torch.cat(cand_presence, dim=1)                     # [B, sumN]
-        # select the m_max most-present nodes across ALL layers (multi-resolution),
-        # ranked best-first.
-        topp, topi = pres.topk(min(cfg.m_max, pres.shape[1]), dim=1)   # [B,m_max]
-        sel = tokens.gather(1, topi.unsqueeze(-1).expand(-1, -1, cfg.d_llama))
-        # norm-match to the embedding scale, THEN presence-gate (keeps presence's
-        # gradient via magnitude while removing the 6.6x OOD distractor). [fix A]
-        sel = self.token_norm(sel)
-        memory = sel * topp.unsqueeze(-1)
+    @staticmethod
+    def _decay_kernel(L: int, tau: Tensor, device) -> Tensor:
+        """Causal STDP kernel W[t,u] = exp(−(u−t)/τ) for u>t else 0. [L,L]."""
+        t = torch.arange(L, device=device)
+        delta = (t.view(1, L) - t.view(L, 1)).float()          # u−t
+        return torch.where(delta > 0, torch.exp(-delta / tau.clamp_min(0.1)), torch.zeros_like(delta))
+
+    # ── v2 forward ───────────────────────────────────────────────────────────────
+    def _forward_v2(self, hiddens: Tensor, mask: Tensor) -> tuple[Tensor, dict]:
+        cfg = self.config
+        B, L = hiddens.shape[:2]
+        device = hiddens.device
+        d_llama = cfg.d_llama
+        A_list, margs, aux = self._phase1(hiddens, mask)
+        P = min(cfg.edge_topP, *cfg.nodes)
+        E = self.n_edges
+
+        # Phase 2 (STDP + edge selection) in float32 — selection must be stable.
+        with torch.autocast(device_type=device.type, enabled=False):
+            # prefilter: top-P ACTIVE nodes per layer (edges form among active concepts)
+            idxP, AP, valtokP, idP, margP = [], [], [], [], []
+            for l in range(self.depth):
+                act = A_list[l].float().sum(dim=1)             # [B,N] total activation mass
+                ti = act.topk(P, dim=1).indices                # [B,P]
+                idxP.append(ti)
+                AP.append(torch.gather(A_list[l].float(), 2, ti.unsqueeze(1).expand(B, L, P)))
+                valtokP.append(self.emit_projs[l](self.node_values[l][ti].float()))   # [B,P,d_llama]
+                idP.append(_unit(self.id_projs[l](self.node_values[l][ti].float())))  # [B,P,d_id]
+                margP.append(margs[l].float()[ti])                                   # [B,P]
+
+            # unified STDP edge scores per directed (src_layer, dst_layer) source
+            src_layers = torch.tensor([s for s, _ in self.edge_sources], device=device)
+            dst_layers = torch.tensor([d for _, d in self.edge_sources], device=device)
+            M = self.plasticity_M.float()
+            scores_per_src = []
+            for (ls, ld) in self.edge_sources:
+                tau = self.log_tau_within[ls].exp() if ls == ld else self.log_tau_inter[ls].exp()
+                W = self._decay_kernel(L, tau, device)         # [L,L]
+                C = torch.einsum("bti,tu,buj->bij", AP[ls], W, AP[ld])    # [B,P,P]
+                lift = C / (margP[ls].unsqueeze(2) * margP[ld].unsqueeze(1)).clamp_min(1e-9)
+                gate = torch.sigmoid(self.plasticity_scale
+                                     * torch.einsum("bik,kq,bjq->bij", idP[ls], M, idP[ld]))
+                scores_per_src.append(lift.clamp_min(1e-9).log() + torch.log(gate.clamp_min(1e-6)))
+            all_scores = torch.stack(scores_per_src, dim=1)    # [B,S,P,P]
+            S = all_scores.shape[1]
+
+            # select top-E directed edges across all sources (E = m_max//2)
+            edge_w_raw, sel = all_scores.reshape(B, S * P * P).topk(E, dim=1)   # [B,E]
+            s_idx = sel // (P * P); ij = sel % (P * P)
+            i_idx = ij // P; j_idx = ij % P
+            # gate = softmax OVER the selected edges (×E so mean≈1), NOT sigmoid of
+            # each score — the selected ARE the top scores, so sigmoid saturates at 1
+            # and starves the STDP/plasticity/routing grammar of gradient. Softmax is
+            # non-saturating and couples all selected scores -> grammar learns. The
+            # temperature (recon-trained) controls selection sharpness.
+            temp = self.edge_score_temp.exp().clamp(0.1, 10.0)
+            edge_w = E * torch.softmax(edge_w_raw / temp, dim=1)                # [B,E]
+
+            # gather endpoint value tokens (src from src_layer, dst from dst_layer)
+            valstack = torch.stack(valtokP, dim=0)             # [depth,B,P,d_llama]
+            bidx = torch.arange(B, device=device).unsqueeze(1).expand(B, E)
+            srcL = src_layers[s_idx]; dstL = dst_layers[s_idx]                  # [B,E]
+            src_val = valstack[srcL, bidx, i_idx]              # [B,E,d_llama]
+            dst_val = valstack[dstL, bidx, j_idx]
+
+            # stateless node-tokens: [role, value, instance-tag], emitted src-then-dst.
+            # unit the value so role/value/tag are comparable magnitude (balanced add).
+            tags = torch.arange(E, device=device)              # one tag per edge
+            src_tok = (_unit(src_val) + self.role_emb[0] + self.tag_emb[tags]) * edge_w.unsqueeze(-1)
+            dst_tok = (_unit(dst_val) + self.role_emb[1] + self.tag_emb[tags]) * edge_w.unsqueeze(-1)
+            tokens = torch.stack([src_tok, dst_tok], dim=2).reshape(B, 2 * E, d_llama)
+
+            # dedicated graph reader (groups by tag / orients by role via self-attn)
+            h = self.read_in(tokens)
+            for layer in self.reader:
+                h = layer(h)
+            memory = self.token_norm(self.read_out(h))         # [B, 2E=m_max, d_llama]
+
         with torch.no_grad():
-            aux["graph_v9_presence_top_mean"] = topp.mean()
+            uniq = torch.tensor(
+                [torch.cat([i_idx[b], j_idx[b]]).unique().numel() for b in range(B)],
+                device=device, dtype=torch.float).mean()
+            aux["graph_v9_edge_w_mean"] = edge_w.mean()
+            aux["graph_v9_edge_w_spread"] = edge_w.std()
+            aux["graph_v9_edge_inter_frac"] = (srcL != dstL).float().mean()
+            aux["graph_v9_edge_uniq_nodes"] = uniq
+            aux["graph_v9_tau_within"] = self.log_tau_within.exp().mean()
+            aux["graph_v9_memory_norm"] = memory.float().norm(dim=-1).mean()
+            # multi-element diagnostics (dropped by the JSONL logger; read by _v9v2_diag)
+            aux["_sel_i"] = i_idx; aux["_sel_j"] = j_idx
+            aux["_sel_srcL"] = srcL; aux["_sel_dstL"] = dstL; aux["_edge_w"] = edge_w
+        return memory, aux
+
+    # ── v1 forward (nodes-only ablation) ────────────────────────────────────────
+    def _forward_v1(self, hiddens: Tensor, mask: Tensor) -> tuple[Tensor, dict]:
+        cfg = self.config
+        B, L = hiddens.shape[:2]
+        m = mask.float().unsqueeze(-1)
+        n_tok = mask.float().sum(1, keepdim=True).clamp_min(1.0)
+        x = _unit_rms(self.seed_proj(hiddens.float())) * m
+        if self.training:
+            self.marg_count += 1
+        bias_corr = (1.0 - cfg.ema_decay ** self.marg_count.clamp_min(1.0)).clamp_min(1e-6)
+
+        cand_tokens, cand_presence, aux = [], [], {}
+        for l in range(self.depth):
+            scores = self.route(l, hiddens.float() if l == 0 else x) * m
+            denom = scores.sum(dim=1).clamp_min(1e-6)
+            centroid = torch.einsum("bln,bld->bnd", scores, x) / denom.unsqueeze(-1)
+            mean_act = scores.sum(dim=1) / n_tok
+            marg_buf = getattr(self, f"act_marginal_L{l}")
+            if self.training:
+                with torch.no_grad():
+                    marg_buf.mul_(cfg.ema_decay).add_(mean_act.mean(0), alpha=1 - cfg.ema_decay)
+            marg = (marg_buf / bias_corr).clamp_min(1e-9)
+            lift = mean_act / marg
+            presence = torch.sigmoid(self.presence_a[l] * lift + self.presence_b[l])
+            token = self.emit_projs[l](centroid + self.node_values[l].unsqueeze(0))
+            if l < self.depth - 1:
+                x = self._perturb(l, x, scores) * m
+            cand_tokens.append(token); cand_presence.append(presence)
+        tokens = torch.cat(cand_tokens, dim=1)
+        pres = torch.cat(cand_presence, dim=1)
+        topp, topi = pres.topk(min(cfg.m_max, pres.shape[1]), dim=1)
+        sel = tokens.gather(1, topi.unsqueeze(-1).expand(-1, -1, cfg.d_llama))
+        memory = self.token_norm(sel) * topp.unsqueeze(-1)
+        with torch.no_grad():
             aux["graph_v9_presence_spread"] = pres.std()
             aux["graph_v9_memory_norm"] = memory.float().norm(dim=-1).mean()
         return memory, aux
+
+    def forward(self, hiddens: Tensor, mask: Tensor) -> tuple[Tensor, dict]:
+        if self.config.use_graph:
+            return self._forward_v2(hiddens, mask)
+        return self._forward_v1(hiddens, mask)
