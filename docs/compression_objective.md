@@ -1,4 +1,11 @@
-# Compression-objective direction (2026-06-12)
+# Compression-objective direction (2026-06-12 →)
+
+> **STATUS / how to read this doc:** chronological objective + baseline + results
+> ledger. Dated "status / build-order / NEXT" blocks are point-in-time snapshots —
+> later RESULTS sections supersede them. The **current model design** lives in
+> `compression_model_design.md`; the **active baseline band** (floor 6.96 → ceiling
+> 0.81; AutoCompressor 4.64 = the target) and the graph_v9 v1 result are below and
+> are current. v2 (full graph) is now BUILT (see the design doc), not a future plan.
 
 **Pivot rationale:** separate the two confounded concerns — (A) *what is the best
 mechanism for compressing human language* and (B) *how to persist a fixed-footprint
@@ -119,7 +126,7 @@ params are per-MODEL, fixed across bins (slots allocate M_max, use first k).
 A clean compression comparison needs these closer (match LoRA rank / Beacon to a
 budget) OR param count reported as a first-class axis. DECISION NEEDED.
 
-## Honest status (2026-06-12 end)
+## Honest status (2026-06-12 end) — SUPERSEDED (all "NOT YET BUILT" items below are now built; see RESULTS)
 DONE+VALIDATED: sentence-pair dataloader; true-MAE mechanic; SmolLM2 drop-in;
 baseline instantiation + param counts. NOT YET BUILT: compute_mae_loss decode
 path (the new forward), capacity-relative per-batch-k wiring (use first k slots),
@@ -266,6 +273,7 @@ reconstruction (pool-then-address = gist, not detail — research_memory_sidecar
 Scalar gates (perturb_gate 0.10, presence_a 1.0, token_norm.scale 3.19) under-learn
 but that's polish; the wall is the pooled write.
 
-**NEXT = v2 (richer write that preserves per-token detail):** stateless directed
-edges + roles + instance-tag node-tokens + dedicated graph reader, OR outer-product
-key⊗value binding per node. Mechanism-patching v1 is exhausted.
+**NEXT = v2 (richer write that preserves per-token detail)** — DONE (2026-06-14):
+built the full graph (STDP edges + sharp-softmax edge selection + TokenGT tokens +
+graph reader). See `compression_model_design.md` for the as-built spec. v2 is awaiting
+its first 4000-step run (vs the band) + the v1-vs-v2 ablation.
