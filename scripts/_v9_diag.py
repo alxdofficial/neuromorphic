@@ -1,4 +1,4 @@
-"""graph_v9 debug sweep — load the trained 4k checkpoint and measure the things
+"""hlvocab debug sweep — load the trained 4k checkpoint and measure the things
 static review can't: gradient flow per module, routing collapse, node/centroid
 collapse, presence saturation, multi-resolution selection, memory-norm OOD."""
 import sys, os, math
@@ -8,7 +8,7 @@ from transformers import AutoTokenizer
 from src.repr_learning.config import ReprConfig
 from src.repr_learning.model import ReprLearningModel
 from src.repr_learning.data_sentence import make_sentence_dataloader
-from src.repr_learning.graph_substrate_v9 import _unit_rms, _unit
+from src.repr_learning.hierarchical_learned_vocab import _unit_rms, _unit
 
 dev = "cuda"
 BACKBONE = "HuggingFaceTB/SmolLM2-135M"; SRC = "meta-llama/Llama-3.2-1B"
@@ -19,15 +19,15 @@ def matched(cfg):
     cfg.llama_model = BACKBONE; cfg.d_llama = 576; cfg.llama_vocab_size = 49152
     cfg.pad_token_id = 0; cfg.task_mode = "sentence_mae"
     cfg.use_llama_lora = True; cfg.llama_lora_rank = 16; cfg.llama_lora_alpha = 32
-    cfg.graph_v9_d_code = 256; cfg.graph_v9_nodes = (512, 256, 128)
-    cfg.graph_v9_top_k = 4; cfg.graph_v9_m_max = 16; cfg.graph_v9_tap_layer = 6
+    cfg.hlvocab_d_code = 256; cfg.hlvocab_nodes = (512, 256, 128)
+    cfg.hlvocab_top_k = 4; cfg.hlvocab_m_max = 16; cfg.hlvocab_tap_layer = 6
     return cfg
 
 
 tok = AutoTokenizer.from_pretrained(BACKBONE)
 if tok.pad_token is None: tok.pad_token = tok.eos_token
 cfg = matched(ReprConfig())
-model = ReprLearningModel(cfg, variant="graph_v9_baseline").to(dev)
+model = ReprLearningModel(cfg, variant="hlvocab_baseline").to(dev)
 if os.environ.get("FRESH"):
     print("=== FRESH (untrained, new architecture) — mechanics check ===")
 else:

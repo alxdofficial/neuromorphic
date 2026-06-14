@@ -1,4 +1,4 @@
-"""Why is graph_v9 v1 a WEAK compressor? Load the trained fix2 model and measure:
+"""Why is hlvocab v1 a WEAK compressor? Load the trained fix2 model and measure:
   1. node collapse — did the LEARNED vocabulary collapse to few directions?
   2. node usage — how many of the N nodes are actually used (effective vocab)?
   3. memory diversity — are the 16 emitted slots distinct or redundant (eff. rank)?
@@ -22,8 +22,8 @@ def matched(cfg):
     cfg.llama_model = BACKBONE; cfg.d_llama = 576; cfg.llama_vocab_size = 49152
     cfg.pad_token_id = 0; cfg.task_mode = "sentence_mae"
     cfg.use_llama_lora = True; cfg.llama_lora_rank = 16; cfg.llama_lora_alpha = 32
-    cfg.graph_v9_d_code = 256; cfg.graph_v9_nodes = (512, 256, 128)
-    cfg.graph_v9_top_k = 4; cfg.graph_v9_m_max = 16; cfg.graph_v9_tap_layer = 6
+    cfg.hlvocab_d_code = 256; cfg.hlvocab_nodes = (512, 256, 128)
+    cfg.hlvocab_top_k = 4; cfg.hlvocab_m_max = 16; cfg.hlvocab_tap_layer = 6
     return cfg
 
 
@@ -36,7 +36,7 @@ def eff_rank(X):  # participation-ratio effective rank of rows of X
 tok = AutoTokenizer.from_pretrained(BACKBONE)
 if tok.pad_token is None: tok.pad_token = tok.eos_token
 cfg = matched(ReprConfig())
-model = ReprLearningModel(cfg, variant="graph_v9_baseline").to(dev)
+model = ReprLearningModel(cfg, variant="hlvocab_baseline").to(dev)
 ck = torch.load(CKPT, map_location="cpu")
 model.load_state_dict(ck["model_state_dict"], strict=False)
 model.eval()
@@ -80,7 +80,7 @@ with torch.no_grad():
             M = c.shape[0]; mem_cos.append(((c.sum() - M) / (M * (M - 1))).item())
         # node usage = argmax routing per layer
         m = mask.unsqueeze(-1); x = sub._unit_rms_in(emb) if hasattr(sub, "_unit_rms_in") else None
-        from src.repr_learning.graph_substrate_v9 import _unit_rms
+        from src.repr_learning.hierarchical_learned_vocab import _unit_rms
         x = _unit_rms(sub.seed_proj(hiddens.float())) * m
         for l in range(sub.depth):
             sc = sub.route(l, (hiddens.float() if l == 0 else x)) * m

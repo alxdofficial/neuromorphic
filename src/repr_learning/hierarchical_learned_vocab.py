@@ -1,4 +1,4 @@
-"""graph_substrate_v9.py — Compression-by-Vocabulary (graph_v9).
+"""hierarchical_learned_vocab.py — Compression-by-Vocabulary (hlvocab).
 
 Build spec: docs/compression_model_design.md (+ design-evolution notes there).
 Compress a passage into its OWN learned vocabulary — a directed graph of
@@ -62,7 +62,7 @@ class _NormMatch(nn.Module):
 
 
 @dataclass
-class GraphV9Config:
+class HLVocabConfig:
     d_model: int = 2048
     d_llama: int = 2048
     d_code: int = 256
@@ -100,8 +100,8 @@ class GraphV9Config:
                 raise ValueError(f"edge_cand={self.edge_cand} must be >= n_edges={self.m_max // 2}")
 
 
-class GraphV9Substrate(nn.Module):
-    def __init__(self, config: GraphV9Config):
+class HLVocabSubstrate(nn.Module):
+    def __init__(self, config: HLVocabConfig):
         super().__init__()
         self.config = config
         cfg = config
@@ -229,10 +229,10 @@ class GraphV9Substrate(nn.Module):
                 x = self._perturb(l, x, scores) * m
             with torch.no_grad():
                 p = scores.clamp_min(1e-12)
-                aux[f"graph_v9_route_entropy_L{l}"] = ((-(p * p.log()).sum(-1)) * mask).sum() / mask.sum().clamp_min(1.0)
+                aux[f"hlvocab_route_entropy_L{l}"] = ((-(p * p.log()).sum(-1)) * mask).sum() / mask.sum().clamp_min(1.0)
                 ms = mean_act
-                aux[f"graph_v9_hub_share_L{l}"] = (ms / ms.sum(-1, keepdim=True).clamp_min(1e-9)).max(-1).values.mean()
-                aux[f"graph_v9_coverage_L{l}"] = torch.tensor(
+                aux[f"hlvocab_hub_share_L{l}"] = (ms / ms.sum(-1, keepdim=True).clamp_min(1e-9)).max(-1).values.mean()
+                aux[f"hlvocab_coverage_L{l}"] = torch.tensor(
                     scores.argmax(-1)[mask.bool()].unique().numel() / scores.shape[-1], device=hiddens.device)
         return A_list, margs, aux
 
@@ -254,7 +254,7 @@ class GraphV9Substrate(nn.Module):
         d_llama = cfg.d_llama
         if L > 1024:
             raise ValueError(
-                f"graph_v9 v2 STDP builds an [L,L] kernel (L={L}); guarded at 1024. "
+                f"hlvocab v2 STDP builds an [L,L] kernel (L={L}); guarded at 1024. "
                 "Use sentence_mae (L<=128); long-context needs a streaming-recurrence STDP.")
         A_list, margs, aux = self._phase1(hiddens, mask)
         P = min(cfg.edge_topP, *cfg.nodes)
@@ -333,14 +333,14 @@ class GraphV9Substrate(nn.Module):
             picked = w.argmax(-1)                              # [B,E] which candidate each slot favors
             ent = -(w.clamp_min(1e-9) * w.clamp_min(1e-9).log()).sum(-1).mean()
             inter_of_pick = (srcLc.gather(1, picked) != dstLc.gather(1, picked)).float().mean()
-            aux["graph_v9_memory_norm"] = memory.float().norm(dim=-1).mean()
-            aux["graph_v9_sel_temp"] = temp
-            aux["graph_v9_sel_attn_entropy"] = ent             # low = sharp (≈ discrete pick)
-            aux["graph_v9_sel_attn_max"] = w.max(-1).values.mean()
-            aux["graph_v9_slot_uniq_edges"] = torch.tensor(
+            aux["hlvocab_memory_norm"] = memory.float().norm(dim=-1).mean()
+            aux["hlvocab_sel_temp"] = temp
+            aux["hlvocab_sel_attn_entropy"] = ent             # low = sharp (≈ discrete pick)
+            aux["hlvocab_sel_attn_max"] = w.max(-1).values.mean()
+            aux["hlvocab_slot_uniq_edges"] = torch.tensor(
                 [picked[b].unique().numel() for b in range(B)], device=device, dtype=torch.float).mean()
-            aux["graph_v9_edge_inter_frac"] = inter_of_pick
-            aux["graph_v9_tau_within"] = self.log_tau_within.exp().mean()
+            aux["hlvocab_edge_inter_frac"] = inter_of_pick
+            aux["hlvocab_tau_within"] = self.log_tau_within.exp().mean()
         return memory, aux
 
     # ── v1 forward (nodes-only ablation) ────────────────────────────────────────
@@ -376,8 +376,8 @@ class GraphV9Substrate(nn.Module):
         sel = tokens.gather(1, topi.unsqueeze(-1).expand(-1, -1, cfg.d_llama))
         memory = self.token_norm(sel) * topp.unsqueeze(-1)
         with torch.no_grad():
-            aux["graph_v9_presence_spread"] = pres.std()
-            aux["graph_v9_memory_norm"] = memory.float().norm(dim=-1).mean()
+            aux["hlvocab_presence_spread"] = pres.std()
+            aux["hlvocab_memory_norm"] = memory.float().norm(dim=-1).mean()
         return memory, aux
 
     def forward(self, hiddens: Tensor, mask: Tensor) -> tuple[Tensor, dict]:

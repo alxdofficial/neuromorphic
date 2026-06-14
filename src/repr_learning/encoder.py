@@ -106,9 +106,9 @@ class SmallBiTransformer(nn.Module):
         # table sized [1, max(window_size_max, max_window_size), d_enc]; at the
         # operative chunk_size=8192 (trainer sets max_window_size=chunk_size) that
         # is [1, 8192, 816] = 6,684,672 trainable floats — load-bearing capacity
-        # that handed flat/continuous/MT a ~13% memory-param edge over graph_v6
+        # that handed flat/continuous/MT a ~13% memory-param edge over soft_pointer_graph
         # (sinusoidal, non-parametric) and mamba (no PE). Sinusoidal matches
-        # graph_v6's substrate exactly and preserves the absolute-position design
+        # soft_pointer_graph's substrate exactly and preserves the absolute-position design
         # intent (token@chunk_pos=p gets the p-th PE) at zero param cost, so the
         # head-to-head compares matched ~48M memory mechanisms.
 
@@ -2010,37 +2010,35 @@ class RecurrentBaselineEncoder(nn.Module):
         return memory, aux
 
 
-class GraphV6BaselineEncoder(nn.Module):
-    """Graph v6: soft-pointer graph memory with a no-op-free, per-token read.
+class SoftPointerGraphEncoder(nn.Module):
+    """soft_pointer_graph: soft-pointer graph memory with a no-op-free, per-token read.
 
-    See docs/graph_v6.md + src/repr_learning/graph_substrate_v6.py.
+    See docs/graph_v6.md + src/repr_learning/soft_pointer_graph.py.
 
-    WRITE (graph_v5 lineage): chunk-fresh (mu,sigma) node bank + soft-pointer edges,
-      updated per window by a unified typed-token transformer (GraphV6Updater) with a
-      per-token FFN readout + anchor gate. No proposal pool, no competitive write head.
-    READ (plastic lineage): finalize_memory builds per-edge FACT-TOKENS (directional
-      FiLM-by-state of materialized endpoints) and returns them in aux with an empty
-      [B,0,d_llama] memory placeholder (M=0); compute_qa_loss installs a per-position
-      pre-hook calling self.inject, which does soft retrieval over the fact-tokens at
-      every decode position and fuses the result into that position's hidden state.
+    WRITE: chunk-fresh (mu,sigma) node bank + soft-pointer edges, updated per window
+      by a unified typed-token transformer (SoftPointerGraphUpdater) with a per-token
+      FFN readout + anchor gate. No proposal pool, no competitive write head.
+    READ: finalize_memory builds per-edge FACT-TOKENS (directional FiLM-by-state of
+      materialized endpoints) and prepends them as [B, K_edge, d_llama] memory.
     """
 
     def __init__(self, cfg: ReprConfig):
         super().__init__()
         self.cfg = cfg
-        self.K_node = cfg.graph_v6_K_node
-        self.K_edge = cfg.graph_v6_K_edge
-        self.d_node = cfg.graph_v6_d_node
-        self.d_state = cfg.graph_v6_d_state
-        d_read = cfg.graph_v6_d_read
-        self.inject_layer_idx = getattr(cfg, "graph_v6_inject_layer", 8)
+        self.K_node = cfg.spg_K_node
+        self.K_edge = cfg.spg_K_edge
+        self.d_node = cfg.spg_d_node
+        self.d_state = cfg.spg_d_state
+        d_read = cfg.spg_d_read
+        self.inject_layer_idx = getattr(cfg, "spg_inject_layer", 8)
 
-        from .graph_substrate_v5 import SoftPointer
-        from .graph_substrate_v6 import (
-            GraphV6Updater, GraphV6Gate, GraphV6FactBuilder, GraphV6FactReader,
+        from .soft_pointer_graph import (
+            SoftPointer,
+            SoftPointerGraphUpdater, SoftPointerGraphGate,
+            SoftPointerGraphFactBuilder, SoftPointerGraphFactReader,
         )
 
-        d_up = cfg.graph_v6_d_updater
+        d_up = cfg.spg_d_updater
         self.pin_encoder = nn.Sequential(
             nn.Linear(cfg.d_llama, d_up * 2, bias=False),
             nn.GELU(),
@@ -2048,7 +2046,7 @@ class GraphV6BaselineEncoder(nn.Module):
             nn.LayerNorm(d_up),
         )
         # chunk-fresh init params (no per-slot trained params)
-        s = float(cfg.graph_v6_init_log_sigma)
+        s = float(cfg.spg_init_log_sigma)
         self.mu_node = nn.Parameter(torch.zeros(self.d_node))
         self.log_sigma_node = nn.Parameter(torch.full((self.d_node,), s))
         self.mu_state = nn.Parameter(torch.zeros(self.d_state))
@@ -2056,26 +2054,26 @@ class GraphV6BaselineEncoder(nn.Module):
         self.mu_q = nn.Parameter(torch.zeros(self.d_node))
         self.log_sigma_q = nn.Parameter(torch.full((self.d_node,), s))
 
-        self.updater = GraphV6Updater(
+        self.updater = SoftPointerGraphUpdater(
             d_node=self.d_node, d_state=self.d_state, d=d_up,
             K_node=self.K_node, K_edge=self.K_edge, d_pin=d_up,
-            n_layers=cfg.graph_v6_updater_layers, n_heads=cfg.graph_v6_updater_heads,
+            n_layers=cfg.spg_updater_layers, n_heads=cfg.spg_updater_heads,
         )
-        self.node_gate = GraphV6Gate(self.d_node, hidden=64,
-                                     init_bias=cfg.graph_v6_node_gate_init_bias)
-        self.edge_gate = GraphV6Gate(2 * self.d_node + self.d_state, hidden=64,
-                                     init_bias=cfg.graph_v6_edge_gate_init_bias)
+        self.node_gate = SoftPointerGraphGate(self.d_node, hidden=64,
+                                              init_bias=cfg.spg_node_gate_init_bias)
+        self.edge_gate = SoftPointerGraphGate(2 * self.d_node + self.d_state, hidden=64,
+                                              init_bias=cfg.spg_edge_gate_init_bias)
         self.read_pointer = SoftPointer(
-            d_node=self.d_node, init_temperature=float(cfg.graph_v6_read_temperature),
+            d_node=self.d_node, init_temperature=float(cfg.spg_read_temperature),
             kv_split=True,
         )
-        self.fact_builder = GraphV6FactBuilder(
+        self.fact_builder = SoftPointerGraphFactBuilder(
             d_node=self.d_node, d_state=self.d_state, d_read=d_read,
-            film_hidden=cfg.graph_v6_film_hidden, mlp_hidden=cfg.graph_v6_builder_mlp_hidden,
+            film_hidden=cfg.spg_film_hidden, mlp_hidden=cfg.spg_builder_mlp_hidden,
         )
-        self.fact_reader = GraphV6FactReader(
+        self.fact_reader = SoftPointerGraphFactReader(
             d_llama=cfg.d_llama, d_read=d_read,
-            n_heads=cfg.graph_v6_read_heads, ffn_mult=cfg.graph_v6_read_ffn_mult,
+            n_heads=cfg.spg_read_heads, ffn_mult=cfg.spg_read_ffn_mult,
         )
         # EMAT prepend read: norm-match the projected fact-tokens to Llama's token
         # scale (same as the baselines) so the graph reads through the IDENTICAL
@@ -2084,21 +2082,21 @@ class GraphV6BaselineEncoder(nn.Module):
 
     # ── Streaming interface ──────────────────────────────────────────────
     def init_streaming_state(self, batch_size, device, dtype, seed=None):
-        from .graph_substrate_v6 import init_graph_v6_state
+        from .soft_pointer_graph import init_soft_pointer_graph_state
         w_dtype = next(self.pin_encoder.parameters()).dtype
         gen = None
         # Deterministic-eval guard: the node/edge/q init noise is symmetry-
         # breaking randomness that SHOULD vary per step during training, but at
         # eval it must be FIXED so metrics are reproducible run-to-run (matches
         # the continuous/MT deterministic-eval-noise convention, v5.4 fix #2).
-        # Without this, graph_v6 eval drew from the global RNG (gen=None) and
-        # graph init changed between eval runs.
+        # Without this, soft_pointer_graph eval drew from the global RNG (gen=None)
+        # and graph init changed between eval runs.
         if seed is None and not self.training:
             seed = 1234
         if seed is not None:
             gen = torch.Generator(device=device)
             gen.manual_seed(int(seed))
-        state = init_graph_v6_state(
+        state = init_soft_pointer_graph_state(
             B=batch_size, K_node=self.K_node, K_edge=self.K_edge,
             d_node=self.d_node, d_state=self.d_state,
             mu_node=self.mu_node, log_sigma_node=self.log_sigma_node,
@@ -2112,8 +2110,7 @@ class GraphV6BaselineEncoder(nn.Module):
                 "edge_gate_mean_accum": zero.clone()}
 
     def streaming_write(self, state, token_embeds, attention_mask=None, chunk_offset=0):
-        from .graph_substrate_v5 import _rmsnorm
-        from .graph_substrate_v6 import _sinusoidal_pe
+        from .soft_pointer_graph import _rmsnorm, _sinusoidal_pe
         w_dtype = next(self.pin_encoder.parameters()).dtype
         token_embeds = token_embeds.to(w_dtype)
         if attention_mask is not None and not attention_mask.any():
@@ -2172,7 +2169,7 @@ class GraphV6BaselineEncoder(nn.Module):
             node_gate_mean_accum=state["node_gate_mean_accum"] + ngm,
             edge_gate_mean_accum=state["edge_gate_mean_accum"] + egm,
         )
-        return new_state, {"graph_v6_node_gate_mean": ngm, "graph_v6_edge_gate_mean": egm}
+        return new_state, {"spg_node_gate_mean": ngm, "spg_edge_gate_mean": egm}
 
     def _build_facts(self, state, zero_state=False):
         """READ Stage A: materialize endpoints + directional FiLM-by-state fact tokens."""
@@ -2192,18 +2189,18 @@ class GraphV6BaselineEncoder(nn.Module):
         # fact-tokens projected to d_llama + norm-matched, returned as
         # [B, K_edge, d_llama] prepend memory. The old per-position inject hook
         # is retired (model.py) so the graph reads like every other arm and
-        # REAL/SHUF/OFF apply to it too. graph_v6_facts stays in aux for telemetry.
+        # REAL/SHUF/OFF apply to it too. spg_facts stays in aux for telemetry.
         memory = self.prepend_norm(self.fact_reader.W_out(fact_value).float())
         n_w = max(state["n_windows"], 1)
         aux = {
             "load_balance_loss": torch.zeros((), device=device, dtype=dtype),
             # graph_aux=0 (no aux loss) — also flips compute_qa_loss's `graph_aux is not
-            # None` guard True so the graph_v6_* telemetry pass-through actually fires.
+            # None` guard True so the spg_* telemetry pass-through actually fires.
             "graph_aux": torch.zeros((), device=device, dtype=dtype),
-            "graph_v6_facts": {"value": fact_value},
-            "graph_v6_node_gate_mean_avg": (state["node_gate_mean_accum"] / n_w).to(torch.float32),
-            "graph_v6_edge_gate_mean_avg": (state["edge_gate_mean_accum"] / n_w).to(torch.float32),
-            "graph_v6_fact_norm": fact_value.detach().float().norm(dim=-1).mean().to(torch.float32),
+            "spg_facts": {"value": fact_value},
+            "spg_node_gate_mean_avg": (state["node_gate_mean_accum"] / n_w).to(torch.float32),
+            "spg_edge_gate_mean_avg": (state["edge_gate_mean_accum"] / n_w).to(torch.float32),
+            "spg_fact_norm": fact_value.detach().float().norm(dim=-1).mean().to(torch.float32),
         }
         # ── Eval-only health telemetry (no grad, zero train-time cost) ────────
         # Diagnose whether the v6 mechanism is alive: dead read (rezero eff≈0),
@@ -2214,32 +2211,32 @@ class GraphV6BaselineEncoder(nn.Module):
             with torch.no_grad():
                 fr = self.fact_reader
                 eff = (fr.scale_max * torch.tanh(fr.scale_raw)).abs().mean()
-                aux["graph_v6_rezero_scale_eff"] = eff.float().to(torch.float32)
+                aux["spg_rezero_scale_eff"] = eff.float().to(torch.float32)
                 # v6.1: per-position read gate mean (from the last decode pass) — should
                 # drop below 1 if the model learns to suppress the read where unhelpful.
                 if getattr(fr, "_last_gate_mean", None) is not None:
-                    aux["graph_v6_read_gate_mean"] = fr._last_gate_mean.to(torch.float32)
+                    aux["spg_read_gate_mean"] = fr._last_gate_mean.to(torch.float32)
                 fact_zero = self._build_facts(state, zero_state=True)
-                aux["graph_v6_state_effect"] = (
+                aux["spg_state_effect"] = (
                     (fact_value - fact_zero).float().norm(dim=-1).mean().to(torch.float32))
                 Nf = N.float()
                 Nf = Nf / Nf.norm(dim=-1, keepdim=True).clamp_min(1e-9)
                 cos = Nf @ Nf.transpose(1, 2)                          # [B, Kn, Kn]
                 Kn = N.shape[1]
                 offmask = ~torch.eye(Kn, dtype=torch.bool, device=N.device)
-                aux["graph_v6_node_collapse_cos"] = cos[:, offmask].mean().to(torch.float32)
+                aux["spg_node_collapse_cos"] = cos[:, offmask].mean().to(torch.float32)
                 sp_k, sp_v = self.read_pointer.project_kv(N)
                 _, a_src = self.read_pointer.attend(state["q_src"], sp_k, sp_v)
                 _, a_dst = self.read_pointer.attend(state["q_dst"], sp_k, sp_v)
                 def _ent(a):                                           # mean read-pointer entropy
                     p = a.float().clamp_min(1e-9)
                     return (-(p * p.log()).sum(-1)).mean()
-                aux["graph_v6_read_src_entropy"] = _ent(a_src).to(torch.float32)
-                aux["graph_v6_read_dst_entropy"] = _ent(a_dst).to(torch.float32)
+                aux["spg_read_src_entropy"] = _ent(a_src).to(torch.float32)
+                aux["spg_read_dst_entropy"] = _ent(a_dst).to(torch.float32)
                 picks = torch.cat([a_src.argmax(-1), a_dst.argmax(-1)], dim=1)  # [B, 2*K_edge]
                 active = torch.zeros(N.shape[0], Kn, dtype=torch.bool, device=N.device)
                 active.scatter_(1, picks, True)
-                aux["graph_v6_node_active_frac"] = active.float().mean().to(torch.float32)
+                aux["spg_node_active_frac"] = active.float().mean().to(torch.float32)
         return memory, aux
 
     def inject(self, hidden_states, facts):
@@ -2261,226 +2258,9 @@ class GraphV6BaselineEncoder(nn.Module):
         return memory, aux
 
 
-class GraphV7BaselineEncoder(nn.Module):
-    """graph_v7: STABLE vocabulary-atom bank + co-activation-masked mobile edges + ⊙ bind.
-
-    Thin streaming wrapper around GraphV7Substrate (docs/graph_v7_doctrine.md). Reads via
-    PREPEND (finalize returns [B, K_edge, d_llama]); no inject hook, no node_gate."""
-
-    def __init__(self, cfg):
-        super().__init__()
-        from .graph_substrate_v7 import GraphV7Substrate
-        self.cfg = cfg
-        self.sub = GraphV7Substrate(cfg)
-
-    def init_streaming_state(self, batch_size, device, dtype, seed=None):
-        gen = None
-        if seed is None and not self.training:
-            seed = 1234                       # deterministic eval (v6 convention)
-        if seed is not None:
-            gen = torch.Generator(device=device)
-            gen.manual_seed(int(seed))
-        return self.sub.init_state(batch_size, device, dtype, gen)
-
-    def maybe_init_atoms(self, token_embeds, attention_mask):
-        """Eager (NOT checkpointed) one-shot k-means seed of the atom bank. Called
-        before the windowed streaming loop so the stateful no_grad side-effect
-        never lands inside activation checkpointing (which would corrupt the
-        saved/recomputed metadata). Idempotent + training-only (guarded inside)."""
-        self.sub._maybe_kmeans_init(token_embeds, attention_mask)
-
-    def streaming_write(self, state, token_embeds, attention_mask, chunk_offset=0, **kwargs):
-        del chunk_offset, kwargs              # v7 routing is content-based; no positional offset
-        state = self.sub.streaming_write(state, token_embeds, attention_mask)
-        return state, {}
-
-    def finalize_memory(self, state):
-        return self.sub.finalize(state)
-
-    def forward(self, token_embeds, attention_mask=None, mask_positions=None):
-        """Non-streaming fallback (recon/HSM paths)."""
-        del mask_positions
-        B, device, dtype = token_embeds.shape[0], token_embeds.device, token_embeds.dtype
-        state = self.init_streaming_state(B, device, dtype)
-        state, _ = self.streaming_write(state, token_embeds, attention_mask)
-        memory, aux = self.finalize_memory(state)   # keep the real aux (load_balance + telemetry)
-        return memory, aux
-
-
-class GraphV8ColumnEncoder(nn.Module):
-    """graph_v8: the CORRECTED columnar v8 (graph_substrate_v8) — see its header.
-
-    Own FROZEN base contextualizes the window under no_grad (same separate-frozen-
-    copy pattern as v8/ICAE/CCM) AND provides the REAL surprise signal: per-token
-    next-token NLL under the pure frozen base, per-row z-scored over the window,
-    squashed through a learnable sigmoid(a·z + b) — no running stats, no magic
-    scales (a=1, b=0 init → gate≈σ(z)∈(0,1)).
-
-    finalize_memory returns the stacked per-layer (keys ‖ values) [B, S, N,
-    2·d_mem]: the harness's graph_v8 branch hands it to GraphV8SymReader
-    (same-layer K/V reads through the substrate's own routers) and sets M=0 —
-    nothing is prepended. REAL/SHUF/OFF: roll / skip the stacked tensor.
-    """
-
-    def __init__(self, cfg: ReprConfig):
-        super().__init__()
-        self.cfg = cfg
-        from .decoder import load_frozen_llama
-        from .graph_substrate_v8 import GraphV8Config, GraphV8Substrate
-        base, _ = load_frozen_llama(cfg.llama_model)
-        for p in base.parameters():
-            p.requires_grad_(False)
-        self.base = base                                   # frozen contextualizer + surprise source
-        v8 = GraphV8Config(
-            d_model=cfg.d_llama, d_mem=cfg.graph_v8_d_mem, n_nodes=cfg.graph_v8_n_nodes,
-            n_layers=cfg.graph_v8_n_layers, chunk=cfg.graph_v8_chunk)
-        self.sub = GraphV8Substrate(v8)
-        # learnable surprise squash: gate = sigmoid(a·z + b) over the per-row
-        # z-scored NLL. a=1/b=0 init is the identity operating point.
-        self.surprise_a = nn.Parameter(torch.tensor(1.0))
-        self.surprise_b = nn.Parameter(torch.tensor(0.0))
-        self.M = 0                                          # nothing prepended (reader-only)
-        print(f"[graph_v8] columnar substrate: N={cfg.graph_v8_n_nodes} nodes x "
-              f"{cfg.graph_v8_n_layers + 1} layers (incl. L0), d_mem={cfg.graph_v8_d_mem}, "
-              f"chunk={cfg.graph_v8_chunk}; read = K/V cross-attn (keys ‖ values)")
-
-    def train(self, mode: bool = True):
-        super().train(mode)
-        self.base.train(False)                              # base ALWAYS in eval (frozen)
-        return self
-
-    # ---- real surprise: next-token NLL under the pure frozen base ------------
-    @torch.no_grad()
-    def context_surprise(self, context_ids, context_mask, slice_len: int = 128):
-        """[B,T] raw per-token NLL (fp32). Position 0 (no prefix) gets its row's
-        mean real-token NLL (z=0 after standardization). Sliced lm_head matmul so
-        the [B,T,vocab] logits tensor is never materialized whole."""
-        B, T = context_ids.shape
-        out = self.base.model(input_ids=context_ids, attention_mask=context_mask.long(),
-                              use_cache=False)
-        hidden = out.last_hidden_state                                       # [B,T,d]
-        w = self.base.lm_head.weight                                         # tied [V,d]
-        nll = torch.zeros(B, T, device=context_ids.device, dtype=torch.float32)
-        for s in range(0, T - 1, slice_len):
-            e = min(s + slice_len, T - 1)
-            # bf16 matmul, fp32 cast only on the [B,c,V] slice — w.float() inside the
-            # loop materialized a 1.05GB fp32 lm_head copy PER SLICE (sweep finding).
-            logits = (hidden[:, s:e] @ w.t()).float()                        # [B,c,V]
-            nll[:, s + 1:e + 1] = F.cross_entropy(
-                logits.transpose(1, 2), context_ids[:, s + 1:e + 1], reduction="none")
-        real = context_mask.bool()
-        denom = real.float().sum(dim=1, keepdim=True).clamp_min(1.0)
-        row_mean = (nll * real.float()).sum(dim=1, keepdim=True) / denom
-        nll[:, 0] = row_mean[:, 0]
-        return nll
-
-    def init_streaming_state(self, batch_size: int, device, dtype):
-        del dtype                                           # substrate state is fp32
-        return {"sub": self.sub.init_state(batch_size, device)}
-
-    def streaming_write(self, state, token_embeds, attention_mask=None, chunk_offset=0,
-                        surprise=None, **extra):
-        del chunk_offset, extra
-        B, W = token_embeds.shape[:2]
-        if attention_mask is None:
-            attention_mask = torch.ones(B, W, device=token_embeds.device, dtype=torch.bool)
-        real = attention_mask.bool()
-        if surprise is None:                                # fallback: z=0 → gate = σ(b)
-            z = torch.zeros(B, W, device=token_embeds.device, dtype=torch.float32)
-        else:                                               # per-row masked z-score (no magic scales)
-            s = surprise.float()
-            denom = real.float().sum(dim=1, keepdim=True).clamp_min(1.0)
-            mean = (s * real.float()).sum(dim=1, keepdim=True) / denom
-            var = (((s - mean) * real.float()) ** 2).sum(dim=1, keepdim=True) / denom
-            z = (s - mean) / (var.sqrt() + 1e-6)
-        gate = torch.sigmoid(self.surprise_a * z + self.surprise_b)          # (0,1), learnable a/b
-        with torch.no_grad():                               # frozen base; substrate trains on fixed hiddens
-            out = self.base.model(inputs_embeds=token_embeds,
-                                  attention_mask=attention_mask.long(),
-                                  output_hidden_states=True,
-                                  use_cache=False)
-            # LAYER-MATCHED write inputs: source layer i (atoms, K1, K2) routes the
-            # hiddens of its matched Llama layer = reader_layers[i] (the FIRST 3 of
-            # the 4-tuple; the 4th is the read-only K3 router's decoder hook depth).
-            # hidden_states[0] = embeddings -> layer lam output = hidden_states[lam+1].
-            h_stack = torch.stack(
-                [out.hidden_states[l + 1]
-                 for l in self.cfg.graph_v8_reader_layers[:self.sub.depth]],
-                dim=2)                                       # [B,W,S,d_llama]
-        sub = self.sub(h_stack.float(), gate, attention_mask.float(), state=state["sub"])
-        return {"sub": sub}, {}
-
-    def finalize_memory(self, state):
-        sub = state["sub"]
-        # stacked per-layer (keys ‖ values) for ℓ=1..S: the reader addresses layer
-        # ℓ via ITS OWN keys K_ℓ (same-layer pairing) and fetches V_ℓ.
-        per_layer = [torch.cat([sub["keys"][l], sub["values"][l]], dim=-1)
-                     for l in range(1, self.sub.depth + 1)]
-        aux = {}
-        with torch.no_grad():
-            eps = 1e-9
-
-            def _entropy_eff_frac(x: Tensor, denom: int) -> tuple[Tensor, Tensor]:
-                xf = x.float().clamp_min(0)
-                mass = xf.sum().clamp_min(eps)
-                p = xf.reshape(-1) / mass
-                nz = p > 0
-                ent = -(p[nz] * p[nz].log()).sum() if nz.any() else torch.zeros((), device=xf.device)
-                return ent, (ent.exp() / max(denom, 1)).clamp(max=1.0)
-
-            def _offdiag_cos_abs_mean(x: Tensor) -> Tensor:
-                xu = F.normalize(x.float(), dim=-1, eps=1e-6)
-                cos = xu @ xu.transpose(1, 2)                         # [B,N,N]
-                N = cos.shape[-1]
-                if N <= 1:
-                    return torch.zeros((), device=cos.device)
-                eye = torch.eye(N, dtype=torch.bool, device=cos.device).unsqueeze(0)
-                return cos.masked_select(~eye).abs().mean()
-
-            N = self.cfg.graph_v8_n_nodes
-            for l in range(1, self.sub.depth + 1):
-                k = sub["keys"][l].float()
-                v = sub["values"][l].float()
-                bk = self.sub.base_keys[l - 1].float().unsqueeze(0)
-                bv = self.sub.base_values[l - 1].float().unsqueeze(0)
-                aux[f"graph_v8_key_rms_L{l}"] = k.pow(2).mean().sqrt()
-                aux[f"graph_v8_value_rms_L{l}"] = v.pow(2).mean().sqrt()
-                aux[f"graph_v8_key_collapse_cos_L{l}"] = _offdiag_cos_abs_mean(k)
-                aux[f"graph_v8_value_collapse_cos_L{l}"] = _offdiag_cos_abs_mean(v)
-                aux[f"graph_v8_state_effect_L{l}"] = (
-                    ((k - bk).pow(2).mean() + (v - bv).pow(2).mean()) / 2.0
-                ).sqrt()
-
-            for src in range(self.sub.depth):
-                co = sub["coact"][src].float()
-                mass = co.sum().clamp_min(eps)
-                ent, eff = _entropy_eff_frac(co, N * N)
-                diag = co.diagonal(dim1=-2, dim2=-1).sum()
-                aux[f"graph_v8_coact_mass_L{src}"] = mass
-                aux[f"graph_v8_coact_entropy_L{src}"] = ent
-                aux[f"graph_v8_coact_eff_edge_frac_L{src}"] = eff
-                aux[f"graph_v8_coact_diag_share_L{src}"] = diag / mass
-                aux[f"graph_v8_coact_top_edge_share_L{src}"] = co.max() / mass
-
-                col_ent, col_eff = _entropy_eff_frac(sub["colsum"][src], N)
-                win_ent, win_eff = _entropy_eff_frac(sub["windowed"][src], N)
-                aux[f"graph_v8_colsum_entropy_L{src}"] = col_ent
-                aux[f"graph_v8_colsum_eff_node_frac_L{src}"] = col_eff
-                aux[f"graph_v8_window_entropy_L{src}"] = win_ent
-                aux[f"graph_v8_window_eff_node_frac_L{src}"] = win_eff
-
-        return torch.stack(per_layer, dim=1), aux          # [B,S,N,2·d_mem]
-
-    def forward(self, token_embeds, attention_mask=None, mask_positions=None):
-        del mask_positions
-        st = self.init_streaming_state(token_embeds.shape[0], token_embeds.device, token_embeds.dtype)
-        st, _ = self.streaming_write(st, token_embeds, attention_mask)
-        return self.finalize_memory(st)
-
-
-class GraphV9PyramidEncoder(nn.Module):
-    """graph_v9: Compression-by-Vocabulary (graph_substrate_v9) — see its header and
-    docs/compression_model_design.md. Replaces the retired operator pyramid.
+class HLVocabEncoder(nn.Module):
+    """hlvocab: Compression-by-Vocabulary (hierarchical_learned_vocab) — see its
+    header and docs/compression_model_design.md.
 
     A FROZEN base contextualizes the full span (the ICAE/CCM separate-frozen-copy
     pattern); the substrate compresses the contextualized hiddens into m_max
@@ -2493,22 +2273,22 @@ class GraphV9PyramidEncoder(nn.Module):
         super().__init__()
         self.cfg = cfg
         from .decoder import load_frozen_llama
-        from .graph_substrate_v9 import GraphV9Config, GraphV9Substrate
+        from .hierarchical_learned_vocab import HLVocabConfig, HLVocabSubstrate
         base, _ = load_frozen_llama(cfg.llama_model)
         for p_ in base.parameters():
             p_.requires_grad_(False)
         self.base = base                                   # frozen contextualizer
-        v9 = GraphV9Config(
-            d_model=cfg.d_llama, d_llama=cfg.d_llama, d_code=cfg.graph_v9_d_code,
-            nodes=tuple(cfg.graph_v9_nodes), top_k=cfg.graph_v9_top_k,
-            m_max=cfg.graph_v9_m_max, effective_k=cfg.graph_v9_effective_k,
-            use_graph=cfg.graph_v9_use_graph, edge_topP=cfg.graph_v9_edge_topP,
-            edge_cand=cfg.graph_v9_edge_cand, d_sel=cfg.graph_v9_d_sel,
-            sel_layers=cfg.graph_v9_sel_layers, sel_heads=cfg.graph_v9_sel_heads,
-            d_read=cfg.graph_v9_d_read, reader_layers=cfg.graph_v9_reader_layers,
-            reader_heads=cfg.graph_v9_reader_heads)
-        self.sub = GraphV9Substrate(v9)
-        self.M = v9.m_max
+        hlv = HLVocabConfig(
+            d_model=cfg.d_llama, d_llama=cfg.d_llama, d_code=cfg.hlvocab_d_code,
+            nodes=tuple(cfg.hlvocab_nodes), top_k=cfg.hlvocab_top_k,
+            m_max=cfg.hlvocab_m_max, effective_k=cfg.hlvocab_effective_k,
+            use_graph=cfg.hlvocab_use_graph, edge_topP=cfg.hlvocab_edge_topP,
+            edge_cand=cfg.hlvocab_edge_cand, d_sel=cfg.hlvocab_d_sel,
+            sel_layers=cfg.hlvocab_sel_layers, sel_heads=cfg.hlvocab_sel_heads,
+            d_read=cfg.hlvocab_d_read, reader_layers=cfg.hlvocab_reader_layers,
+            reader_heads=cfg.hlvocab_reader_heads)
+        self.sub = HLVocabSubstrate(hlv)
+        self.M = hlv.m_max
         # norm-match TARGET = the active backbone's embedding scale, NOT the
         # Llama-era 0.9 default (SmolLM2 embeds have norm ~2.68; 0.9 left memory
         # 3x too quiet and the learnable scalar never grew). In-distribution from
@@ -2516,9 +2296,9 @@ class GraphV9PyramidEncoder(nn.Module):
         with torch.no_grad():
             emb_norm = self.base.get_input_embeddings().weight.float().norm(dim=-1).mean()
         self.sub.token_norm.scale.data.fill_(float(emb_norm))
-        print(f"[graph_v9] compression-by-vocabulary: nodes={tuple(cfg.graph_v9_nodes)} "
-              f"d_code={cfg.graph_v9_d_code} top_k={cfg.graph_v9_top_k} "
-              f"m_max={cfg.graph_v9_m_max} tap=L{cfg.graph_v9_tap_layer} "
+        print(f"[hlvocab] compression-by-vocabulary: nodes={tuple(cfg.hlvocab_nodes)} "
+              f"d_code={cfg.hlvocab_d_code} top_k={cfg.hlvocab_top_k} "
+              f"m_max={cfg.hlvocab_m_max} tap=L{cfg.hlvocab_tap_layer} "
               f"norm_match_target={float(emb_norm):.2f}")
 
     def train(self, mode: bool = True):
@@ -2540,7 +2320,7 @@ class GraphV9PyramidEncoder(nn.Module):
             out = self.base.model(inputs_embeds=token_embeds,
                                   attention_mask=attention_mask.long(),
                                   output_hidden_states=True, use_cache=False)
-            h = out.hidden_states[self.cfg.graph_v9_tap_layer + 1]   # [B,W,d_llama]
+            h = out.hidden_states[self.cfg.hlvocab_tap_layer + 1]   # [B,W,d_llama]
         if state["hiddens"] is None:
             state["hiddens"] = h.float()
             state["mask"] = attention_mask.bool()

@@ -4,12 +4,12 @@
 > ledger. Dated "status / build-order / NEXT" blocks are point-in-time snapshots —
 > later RESULTS sections supersede them. The **current model design** lives in
 > `compression_model_design.md`; the **active baseline band** (floor 6.96 → ceiling
-> 0.81; AutoCompressor 4.64 = the target) and the graph_v9 v1 result are below and
+> 0.81; AutoCompressor 4.64 = the target) and the hierarchical_learned_vocab v1 result are below and
 > are current. v2 (full graph) is now BUILT (see the design doc), not a future plan.
 
 **Pivot rationale:** separate the two confounded concerns — (A) *what is the best
 mechanism for compressing human language* and (B) *how to persist a fixed-footprint
-memory without smearing/overwriting/contradiction*. The overnight graph_v9 failure
+memory without smearing/overwriting/contradiction*. The overnight hierarchical_learned_vocab failure
 was substantially a confound: conservation (a persistence mechanism) destroyed the
 compression signal. **Work A first; drop fixed-footprint for now** (capacity scales
 with input). Householder/operators, conservation, and the apply-to-query read are
@@ -222,12 +222,12 @@ at ~2.9M params / M=k slots × d=576. Compressors capture only 22-38% of band �
 big headroom (ratio-8 + 85%-mask is genuinely lossy). Our redesigned vocabulary
 compressor competes against this number.
 
-## RESULT — graph_v9 (compression-by-vocabulary v1), 4000 steps (2026-06-13)
+## RESULT — hierarchical_learned_vocab (compression-by-vocabulary v1), 4000 steps (2026-06-13)
 2.249M trainable (param-matched), nodes (512,256,128) / d_code 256 / top_k 4 /
 m_max 16 / tap_layer 6. Same MAE harness, ratio-8, 85% mask, SmolLM2-135M.
 | variant | recon ↓ | band% | OFF−REAL | SHUF−REAL |
 |---|---|---|---|---|
-| graph_v9 (v1) | **6.276** | **11%** | +1.32 | +1.55 |
+| hlvocab (v1) | **6.276** | **11%** | +1.32 | +1.55 |
 For comparison: floor 6.96 (0%), ccm 5.61 (22%), …, autocomp 4.64 (38%).
 
 **VERDICT: it BINDS but is a WEAK compressor (last place, ~0.68 below floor).**
@@ -249,7 +249,7 @@ For comparison: floor 6.96 (0%), ccm 5.61 (22%), …, autocomp 4.64 (38%).
   per-token-preserving / outer-product key⊗value binding, or v2 edges+roles).
   If similar, bottleneck is elsewhere (mask/read).
 
-## RESULT — graph_v9 v1 AFTER debug-sweep fixes A-K (2026-06-14)
+## RESULT — hierarchical_learned_vocab v1 AFTER debug-sweep fixes A-K (2026-06-14)
 Two-agent debug sweep (mine: substrate dynamics; other: harness validity) found
 + fixed 11 issues. Mechanism fixes CONFIRMED via new telemetry; norm-match target
 set to backbone embed scale (3.18, not the Llama-era 0.9).

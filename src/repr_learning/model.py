@@ -23,56 +23,18 @@ from .encoder import (
     FaithfulMTEncoder,
     FlatBaselineEncoder,
     FullContextEncoder,
-    GraphV6BaselineEncoder,
-    GraphV7BaselineEncoder,
-    GraphV8ColumnEncoder,
-    GraphV9PyramidEncoder,
+    HLVocabEncoder,
     ICAEBaselineEncoder,
     MemorizingBaselineEncoder,
     NullEncoder,
     RecurrentBaselineEncoder,
+    SoftPointerGraphEncoder,
 )
-from .decoder import FrozenLlamaDecoder, disable_lora
+from .decoder import FrozenLlamaDecoder
 from .jepa import (
     JEPAPredictor, init_ema_target, update_ema_target,
     vicreg_variance_loss, vicreg_covariance_loss,
 )
-
-
-def contextualize_write_input(decoder, cfg, ctx_embeds, context_mask):
-    """Shared graph_v7 WRITE-contextualization helper (used by BOTH the training
-    path in compute_qa_loss AND the eval encode paths — E1: train-memory must
-    equal eval-memory).
-
-    When cfg.graph_write_context == "contextualized", run the input embeds
-    through the PURE FROZEN base Llama (LoRA bypassed via disable_lora — C2: the
-    write input must not be shaped by the trainable read-LoRA, which would make
-    it a moving target) and return the contextualized hidden states as the
-    encoder INPUT, same [B,T,d_llama] shape as the raw embeds. Otherwise returns
-    ctx_embeds unchanged. Always no_grad: the base stays frozen, only the graph's
-    own route_enc/content_enc are the trainable write.
-
-    `context_mask` may be bool or long; cast here.
-    """
-    if getattr(cfg, "graph_write_context", "raw") != "contextualized":
-        return ctx_embeds
-    ctx_layers = int(getattr(cfg, "graph_write_context_layers", 0))
-    with torch.no_grad(), disable_lora():
-        ctx_out = decoder.llama.model(
-            inputs_embeds=ctx_embeds,
-            attention_mask=context_mask.to(torch.long),
-            output_hidden_states=(ctx_layers > 0),
-            use_cache=False,
-        )
-        if ctx_layers <= 0:
-            enc_input = ctx_out.last_hidden_state               # [B,T,d_llama] full contextualize
-        else:
-            # hidden_states[0] = embeds, [k] = after layer k. Clamp k to the
-            # number of decoder layers ("lower attune" partial pass).
-            n_layers = len(ctx_out.hidden_states) - 1
-            k = min(ctx_layers, n_layers)
-            enc_input = ctx_out.hidden_states[k]                # [B,T,d_llama]
-    return enc_input.to(ctx_embeds.dtype)
 
 
 class ReprLearningModel(nn.Module):
@@ -91,12 +53,11 @@ class ReprLearningModel(nn.Module):
         "memorizing_baseline": MemorizingBaselineEncoder,
         "mt_faithful": FaithfulMTEncoder,      # Faithful Memorizing Transformers (Wu et al. 2022)
         "recurrent_baseline": RecurrentBaselineEncoder,
-        "graph_v6_baseline": GraphV6BaselineEncoder,
-        "graph_v7_baseline": GraphV7BaselineEncoder,  # stable atoms + co-activation edges + ⊙ bind
-        # Corrected columnar V8. The obsolete pre-correction V8 substrate was removed.
-        "graph_v8_baseline": GraphV8ColumnEncoder,
-        # Operator-node pyramid (graph_substrate_v9; docs/graph_v9_ideas.md).
-        "graph_v9_baseline": GraphV9PyramidEncoder,
+        # soft-pointer graph memory (soft_pointer_graph.py; docs/graph_v6.md).
+        "soft_pointer_graph_baseline": SoftPointerGraphEncoder,
+        # Compression-by-Vocabulary (hierarchical_learned_vocab.py;
+        # docs/compression_model_design.md) — the active model.
+        "hlvocab_baseline": HLVocabEncoder,
         "icae_baseline": ICAEBaselineEncoder,  # ICAE (ICLR'24) compressor, EMAT-retrained
         "ccm_baseline": CCMBaselineEncoder,    # CCM (ICLR'24) recurrent compressor, EMAT-retrained
         "beacon_baseline": BeaconBaselineEncoder,  # Activation Beacon (BAAI) per-layer beacon attn
@@ -108,7 +69,7 @@ class ReprLearningModel(nn.Module):
     def __init__(
         self,
         cfg: ReprConfig,
-        variant: str = "graph_v6_baseline",
+        variant: str = "soft_pointer_graph_baseline",
         llama_model: Optional[nn.Module] = None,
         chat_template: Optional[ChatTemplate] = None,
     ):
@@ -134,67 +95,10 @@ class ReprLearningModel(nn.Module):
             self.encoder = self.VARIANTS[variant](cfg)
             self.decoder = FrozenLlamaDecoder(cfg, llama_model=llama_model)
 
-        # graph_v7 cross-attention READ: a dedicated trainable read path that
-        # replaces the prepend. Built here so its params are registered (and
-        # land on the model device via .to()); hooks are installed/removed
-        # around each Llama forward inside compute_qa_loss. graph_v7 only.
-        self.graph_reader = None
-        self.graph_unbind_reader = None
-        graph_v7_bind = (variant == "graph_v7_baseline"
-                         and bool(getattr(cfg, "graph_v7_bind", False)))
-        if graph_v7_bind:
-            # bind-early / unbind-late associative-memory fix. The entity-KEY for
-            # the HRR bind needs Llama's contextualization, so the WRITE must be
-            # contextualized (raw embeds have no entity binding). Raise rather
-            # than silently mis-bind.
-            if getattr(cfg, "graph_write_context", "raw") != "contextualized":
-                raise ValueError(
-                    "graph_v7_bind=True requires graph_write_context=='contextualized' "
-                    "(the entity-key for the HRR bind needs Llama's contextualization); "
-                    f"got graph_write_context={getattr(cfg, 'graph_write_context', 'raw')!r}.")
-            from .graph_read import GraphV7UnbindReader
-            self.graph_unbind_reader = GraphV7UnbindReader(
-                substrate=self.encoder.sub,
-                gate_init=cfg.graph_v7_bind_gate_init,
-            )
-            print(f"[graph_v7] BIND read (HRR unbind): {len(cfg.graph_read_layer_indices)} reads "
-                  f"@ layers {tuple(cfg.graph_read_layer_indices)} "
-                  f"(gate_init={cfg.graph_v7_bind_gate_init}); write=contextualized; "
-                  f"⊙ fact_builder/materialize BYPASSED for recall")
-        elif variant == "graph_v7_baseline" and getattr(cfg, "graph_read_mode", "prepend") == "cross_attn":
-            from .graph_read import GraphCrossAttnReader
-            self.graph_reader = GraphCrossAttnReader(
-                d_llama=cfg.d_llama,
-                layer_indices=cfg.graph_read_layer_indices,
-                inner_dim=cfg.graph_read_inner_dim,
-                n_heads=cfg.graph_read_n_heads,
-                gate_init=cfg.graph_read_gate_init,
-            )
-            print(f"[graph_v7] cross_attn read: {len(cfg.graph_read_layer_indices)} reads "
-                  f"@ layers {tuple(cfg.graph_read_layer_indices)} "
-                  f"(inner_dim={cfg.graph_read_inner_dim}, heads={cfg.graph_read_n_heads}, "
-                  f"gate_init={cfg.graph_read_gate_init})")
-        # graph_v8 K/V-split cross-attention READ (the corrected v8's designed
-        # read): K = final layer's refined node keys, V = node values. Built here
-        # so its params are registered; hooks installed/removed around each Llama
-        # forward inside compute_qa_loss (same lifecycle as the v7 readers).
-        self.graph_v8_reader = None
-        if variant == "graph_v8_baseline":
-            from .graph_read import GraphV8SymReader
-            read_layers = tuple(cfg.graph_v8_reader_layers)[1:]   # hooks for memory L1..L3
-            self.graph_v8_reader = GraphV8SymReader(
-                substrate=self.encoder.sub,                  # SHARED routers (symmetric addressing)
-                layer_indices=read_layers,
-                inner_dim=cfg.graph_v8_reader_inner_dim,
-            )
-            print(f"[graph_v8] SAME-LAYER K/V read (shared routers): "
-                  f"{len(read_layers)} reads @ layers {read_layers} "
-                  f"(inner_dim={cfg.graph_v8_reader_inner_dim})")
-
-        # graph_v9 is now a PREPEND compressor (Compression-by-Vocabulary) — no
-        # dedicated reader in v1 (the v2 graph reader is a future add). It joins
-        # the sentence_mae prepend path via _MAE_COMPRESSORS.
-        self.graph_v9_reader = None
+        # hlvocab and soft_pointer_graph both read via the PREPEND path (memory
+        # tokens prepended to the decode sequence) — no dedicated cross-attn
+        # reader module. The v7/v8 readers (GraphCrossAttnReader / GraphV8SymReader
+        # / GraphV7UnbindReader) were retired with their lineages.
 
         # Optional HF per-layer gradient checkpointing on the Llama base model
         # (recompute in backward, use_reentrant=False; HF gates on self.training so
@@ -203,24 +107,6 @@ class ReprLearningModel(nn.Module):
         # (~40x the decoder tokens of the memory arms), so backward OOMs; it runs
         # frozen/eval-only instead (a frozen full-context Llama is a valid ceiling).
         if getattr(cfg, "grad_checkpoint_llama", False):
-            # L3 guard: the graph_v7 cross_attn read clears its memory in a
-            # finally (right after the forward). Under HF Llama gradient
-            # checkpointing the decoder layers are RE-RUN in backward — by then
-            # the read modules' memory is cleared, so the recomputed read
-            # activations would diverge (silent grad corruption). These never
-            # co-occur as wired (grad_checkpoint_llama is not plumbed from the
-            # trainer for graph_v7 runs), but raise rather than silently corrupt
-            # if someone enables both. Fix would require keeping memory alive
-            # until after backward (e.g. clear in a backward hook, not finally).
-            if (self.graph_reader is not None or self.graph_unbind_reader is not None
-                    or self.graph_v8_reader is not None
-                    ):
-                raise ValueError(
-                    "grad_checkpoint_llama is incompatible with the graph_v7 "
-                    "cross_attn read: the read memory is cleared in a finally "
-                    "after the forward, but gradient checkpointing recomputes the "
-                    "host decoder layers in backward → recomputed reads diverge "
-                    "(silent grad corruption). Disable one of them.")
             self.decoder.llama.model.gradient_checkpointing_enable(
                 gradient_checkpointing_kwargs={"use_reentrant": False})
 
@@ -527,11 +413,7 @@ class ReprLearningModel(nn.Module):
         # chunk=8192 OOM for the windowed encoders). Exact gradients; recompute
         # in backward. Skipped under no_grad (eval) — nothing to save for backward.
         ckpt_stream = (getattr(self.cfg, "grad_checkpoint_stream", True)
-                       and self.training and torch.is_grad_enabled()
-                       # graph_v8 streaming state is a nested dict/list (with None) that
-                       # torch.utils.checkpoint can't trace; both self-manage memory
-                       # (internally checkpointed chunk loops).
-                       and self.variant != "graph_v8_baseline")
+                       and self.training and torch.is_grad_enabled())
         for w in range(n_windows):
             s = w * window_size
             e = min(s + window_size, T)
@@ -708,7 +590,7 @@ class ReprLearningModel(nn.Module):
 
     # compressor variants whose memory is a [B, M, d] prepend (capacity-relative
     # slicing applies to these; vanillas pass through at M=0 / M=T).
-    _MAE_COMPRESSORS = ("icae_baseline", "ccm_baseline", "graph_v9_baseline",
+    _MAE_COMPRESSORS = ("icae_baseline", "ccm_baseline", "hlvocab_baseline",
                         "autocompressor_baseline", "beacon_baseline")
 
     def compute_mae_loss(
@@ -807,8 +689,8 @@ class ReprLearningModel(nn.Module):
             "memory_shape": (B, M),                        # (batch, code size) for the logger
             "mae_n_masked": float(loss_mask.sum()), "mae_M": float(M),
         }
-        # surface encoder telemetry (graph_v9_* collapse/presence canaries) so the
-        # trainer's graph_v9_ glob logs it to JSONL [fix C]. Scalars only.
+        # surface encoder telemetry (hlvocab_* collapse/presence canaries) so the
+        # trainer's hlvocab_ glob logs it to JSONL [fix C]. Scalars only.
         for _k, _v in (mem_aux or {}).items():
             if torch.is_tensor(_v) and _v.numel() == 1:
                 out[_k] = _v.detach()
@@ -861,80 +743,30 @@ class ReprLearningModel(nn.Module):
         T_q = batch.question_ids.shape[1]
         T_a = batch.answer_ids.shape[1]
 
-        # L1 defensive reset: set_memory/install_hooks for the graph_v7 cross_attn
-        # read run OUTSIDE the forward try (memory is set before the packing loop,
-        # which can raise). If a prior call died between set_memory and the finally,
-        # stale memory/hooks would leak onto this shared reader and corrupt the next
-        # (e.g. OFF) call. Clearing at the top makes every call start clean.
-        if getattr(self, "graph_reader", None) is not None:
-            self.graph_reader.remove_hooks()
-            self.graph_reader.clear_memory()
-        if getattr(self, "graph_unbind_reader", None) is not None:
-            self.graph_unbind_reader.remove_hooks()
-            self.graph_unbind_reader.clear_memory()
-        if getattr(self, "graph_v8_reader", None) is not None:
-            self.graph_v8_reader.remove_hooks()
-            self.graph_v8_reader.clear_memory()
-
         embed = self.decoder.llama.get_input_embeddings()
 
         # ---- 1. Encode context (no_grad embed lookup) ----
         with torch.no_grad():
             ctx_embeds = embed(batch.context_ids)
             ctx_surprise = None   # was the plastic_baseline neuromod signal (retired)
-            # graph_v8 REAL surprise: per-token next-token NLL under the encoder's
-            # PURE frozen base (not the LoRA'd decoder — a stable signal that does
-            # not drift with training). Raw NLL here; the encoder z-scores per row
-            # and squashes through its learnable sigmoid(a·z+b) in streaming_write.
-            if self.variant == "graph_v8_baseline":
-                ctx_surprise = self.encoder.context_surprise(
-                    batch.context_ids, batch.context_mask)
 
-        # graph_v7 WRITE contextualization (encoder INPUT only). When enabled,
-        # the graph builds its memory from CONTEXTUALIZED hidden states (input
-        # run through the PURE FROZEN base Llama — C2: LoRA bypassed so the write
-        # input is not shaped by the trainable read-LoRA) instead of raw token
-        # embeds — the same write substrate the ICAE/CCM/AutoComp/Beacon ports
-        # use. We REUSE the decoder's own Llama (one extra no_grad pass — NO
-        # second base, which is what OOMs the ports). CRITICAL: only the ENCODER
-        # input (`enc_input`) is contextualized — `ctx_embeds` (and the decoder
-        # side, which decodes raw q/a/scaffold embeds) are untouched. Factored
-        # into a shared helper so the eval encode path produces the SAME memory
-        # (E1). Composes independently with graph_read_mode.
         enc_input = ctx_embeds
-        if self.variant == "graph_v7_baseline":
-            enc_input = contextualize_write_input(
-                self.decoder, self.cfg, ctx_embeds, batch.context_mask)
-            # Lazy k-means atom init: fire EAGERLY (outside the checkpointed loop)
-            # on the first window's tokens so the stateful no_grad re-seed never
-            # lands inside activation checkpointing. One-shot + training-only.
-            if hasattr(self.encoder, "maybe_init_atoms"):
-                w0 = min(window_size, T_ctx)
-                self.encoder.maybe_init_atoms(enc_input[:, :w0, :],
-                                              batch.context_mask[:, :w0])
 
         n_windows = (T_ctx + window_size - 1) // window_size
         state = self.encoder.init_streaming_state(B, device, ctx_embeds.dtype)
         # Activation-checkpoint each window during training so we hold ~one
         # window of encoder activations instead of all n_windows at once (the
         # chunk=8192 OOM for the windowed encoders flat/continuous/MT). Exact
-        # gradients; recompute in backward. Skipped under no_grad (eval) and when
-        # per-window `extra` (plastic surprise) is present.
+        # gradients; recompute in backward. Skipped under no_grad (eval).
         ckpt_stream = (getattr(self.cfg, "grad_checkpoint_stream", True)
-                       and self.training and torch.is_grad_enabled()
-                       # graph_v8 streaming state is a nested dict/list (with None) that
-                       # torch.utils.checkpoint can't trace; both self-manage memory
-                       # (internally checkpointed chunk loops).
-                       and self.variant != "graph_v8_baseline")
+                       and self.training and torch.is_grad_enabled())
+        del ctx_surprise   # retired surprise/contextualization plumbing
         for w in range(n_windows):
             s = w * window_size
             e = min(s + window_size, T_ctx)
-            extra = {}
-            if ctx_surprise is not None:
-                extra["surprise"] = ctx_surprise[:, s:e]
-            win_emb = enc_input[:, s:e, :]   # raw embeds, or contextualized (graph_v7)
+            win_emb = enc_input[:, s:e, :]
             win_mask = batch.context_mask[:, s:e]
-            if ckpt_stream and not extra:
+            if ckpt_stream:
                 def _write(st, em, mk, off=s):
                     new_st, _ = self.encoder.streaming_write(st, em, mk, chunk_offset=off)
                     return new_st
@@ -942,10 +774,9 @@ class ReprLearningModel(nn.Module):
                     _write, state, win_emb, win_mask, use_reentrant=False)
             else:
                 state, _ = self.encoder.streaming_write(
-                    state, win_emb, win_mask, chunk_offset=s, **extra)
-        # v5.6: hand the question to the encoder (graph_v5 reads it for the
-        # question-conditioned readout; dict-state variants ignore the keys).
-        # NullEncoder (Tensor state) and Mamba (list state) are non-dict — guard.
+                    state, win_emb, win_mask, chunk_offset=s)
+        # Hand the question to the encoder (dict-state variants may read it;
+        # NullEncoder (Tensor state) and Mamba (list state) are non-dict — guard).
         if isinstance(state, dict):
             state["question_embeds"] = embed(batch.question_ids)
             state["question_mask"] = batch.question_mask
@@ -988,97 +819,6 @@ class ReprLearningModel(nn.Module):
                 ds_values = torch.roll(ds_values, shifts=1, dims=0)
                 ds_ctx_mask = torch.roll(ds_ctx_mask, shifts=1, dims=0)
             self.encoder.mt_attn_wrapper.set_datastore(ds_keys, ds_values, ds_ctx_mask)
-
-        # ---- 2c. graph_v7 cross-attention READ branch ----
-        # The graph's K_edge memory tokens are NOT prepended (M stays 0). Instead
-        # each decode token reads them via the dedicated trainable cross-attn
-        # modules installed at cfg.graph_read_layer_indices (hooks installed just
-        # before the Llama forward below, removed in the finally).
-        #   REAL (neither)                  : set the row-aligned memory.
-        #   SHUF (shuffle_memory, not zero) : roll memory by 1 on dim 0 so each
-        #                                     row reads another row's memory.
-        #   OFF  (zero_memory)              : leave memory unset → reads are a
-        #                                     true no-op (output == vanilla Llama).
-        use_graph_cross_attn = (
-            getattr(self, "graph_reader", None) is not None
-            and self.variant == "graph_v7_baseline"
-            and getattr(self.cfg, "graph_read_mode", "prepend") == "cross_attn"
-        )
-        if use_graph_cross_attn and M > 0:
-            if not zero_memory:
-                read_mem = memory
-                if shuffle_memory:
-                    if B <= 1:
-                        raise ValueError(
-                            "shuffle_memory (SHUF control) needs batch size > 1; "
-                            "roll-by-1 at B==1 is a no-op (SHUF would equal REAL).")
-                    read_mem = torch.roll(memory, shifts=1, dims=0)
-                self.graph_reader.set_memory(read_mem)
-            # cross_attn mode never prepends — drop the memory slots (M=0). The
-            # graph still trains: gradient reaches it through the read modules'
-            # K/V projections of `read_mem`, not through the decode sequence.
-            M = 0
-
-        # ---- 2c2. graph_v8 K/V-split read branch ----
-        # `memory` here is the final layer's (keys ‖ values) concat [B,N,2·d_mem].
-        # Nothing is prepended; the GraphV8KVReader cross-attends it (K from the
-        # keys half, V from the values half) at cfg.graph_v8_reader_layers.
-        #   REAL: row-aligned concat.  SHUF: roll by 1 on dim 0 (both halves roll
-        #   together — right question, wrong passage's memory).  OFF: leave unset
-        #   → reads are a true no-op (output == vanilla Llama).
-        use_v8_reader = (
-            getattr(self, "graph_v8_reader", None) is not None
-            and self.variant == "graph_v8_baseline"
-        )
-        if use_v8_reader and M > 0:
-            if not zero_memory:
-                read_mem = memory
-                if shuffle_memory:
-                    if B <= 1:
-                        raise ValueError(
-                            "shuffle_memory (SHUF control) needs batch size > 1; "
-                            "roll-by-1 at B==1 is a no-op (SHUF would equal REAL).")
-                    read_mem = torch.roll(memory, shifts=1, dims=0)
-                self.graph_v8_reader.set_memory(read_mem)
-            # reader mode never prepends — drop the memory slots (M=0). The
-            # substrate still trains: gradient reaches it through the reader's
-            # K/V projections of `read_mem`, not through the decode sequence.
-            M = 0
-
-
-        # ---- 2d. graph_v7 BIND read branch (HRR unbind) ----
-        # The per-atom HRR-bound content `M[atom]` is NOT prepended (M stays 0).
-        # Instead each decode token UNBINDS it by its own question-derived key via
-        # the dedicated GraphV7UnbindReader installed at the read layers (hooks
-        # installed just before the Llama forward, removed in the finally).
-        #   REAL (neither)                  : set the row-aligned bound content.
-        #   SHUF (shuffle_memory, not zero) : roll the bound content by 1 on dim 0.
-        #   OFF  (zero_memory)              : leave it unset → reads are a true
-        #                                     no-op (output == vanilla Llama).
-        use_graph_unbind = (
-            getattr(self, "graph_unbind_reader", None) is not None
-            and self.variant == "graph_v7_baseline"
-            and bool(getattr(self.cfg, "graph_v7_bind", False))
-        )
-        if use_graph_unbind:
-            bound_content = finalize_aux.get("graph_v7_bound_content")
-            if bound_content is None:
-                raise RuntimeError(
-                    "graph_v7_bind read expected 'graph_v7_bound_content' in finalize_aux "
-                    "but it was absent — the substrate did not export the bound content.")
-            if not zero_memory:
-                read_mem = bound_content
-                if shuffle_memory:
-                    if B <= 1:
-                        raise ValueError(
-                            "shuffle_memory (SHUF control) needs batch size > 1; "
-                            "roll-by-1 at B==1 is a no-op (SHUF would equal REAL).")
-                    read_mem = torch.roll(bound_content, shifts=1, dims=0)
-                self.graph_unbind_reader.set_memory(read_mem)
-            # bind mode never prepends — drop the prepend memory slots (M=0). The
-            # graph still trains: gradient reaches key_proj/value_proj/route_enc/
-            # W_recover through the unbind read of `read_mem`, not the decode seq.
-            M = 0
 
         # shuffle_memory (SHUF control): roll memory along the batch so each
         # row is decoded with another row's memory. Applied AFTER the MT
@@ -1293,33 +1033,12 @@ class ReprLearningModel(nn.Module):
                     pred_targets[i, pred_pos] = answer_ids_for_loss[i, k]
 
         # ---- 4. Llama forward (causal mask is native; padding via attn_mask) ----
-        # graph_v6: install a forward_pre_hook on the chosen Llama decoder layer
-        # that calls encoder.inject(hidden_states, facts) at every position. The
-        # hook is removed in finally so the shared Llama module is unmodified
-        # across variants.
-        # graph_v6 now reads via the SAME prepend path as the baselines — its
+        # soft_pointer_graph reads via the SAME prepend path as the baselines: its
         # finalize_memory returns [B, K_edge, d_llama] memory that is prepended
-        # like every other arm. The old per-position inject hook (a privileged,
-        # separately-trained read the baselines never got) is RETIRED so the
+        # like every other arm (no privileged per-position inject hook), so the
         # comparison isolates the write mechanism and the REAL/SHUF/OFF binding
-        # gate applies to the graph too (EMAT fairness fix).
+        # gate applies to the graph too.
         hook_handle = None
-
-        # graph_v7 cross_attn: install the read hooks on the chosen decoder
-        # layers so each runs during the Llama forward and adds gate*read to the
-        # residual stream. In OFF mode (memory unset) the reads are no-ops →
-        # output == vanilla Llama. Removed in the finally to leave Llama clean.
-        if use_graph_cross_attn:
-            self.graph_reader.install_hooks(self.decoder.llama)
-        # graph_v7 bind: install the unbind-read hooks on the chosen decoder
-        # layers. In OFF mode (memory unset) the reads are no-ops → vanilla Llama.
-        if use_graph_unbind:
-            self.graph_unbind_reader.install_hooks(
-                self.decoder.llama, self.cfg.graph_read_layer_indices)
-        # graph_v8: install the K/V-split read hooks. In OFF mode (memory unset)
-        # the reads are no-ops → output == vanilla Llama. Removed in the finally.
-        if use_v8_reader:
-            self.graph_v8_reader.install_hooks(self.decoder.llama)
 
         try:
             # Selective lm_head: run base model for hidden states, then only
@@ -1343,20 +1062,6 @@ class ReprLearningModel(nn.Module):
             # Llama is left in OFF/vanilla state for the next variant or call.
             if hasattr(self.encoder, "mt_attn_wrapper"):
                 self.encoder.mt_attn_wrapper.clear_datastore()
-            # graph_v7 cross_attn: remove the read hooks + clear memory so the
-            # shared Llama is unmodified for the next variant/call.
-            if use_graph_cross_attn:
-                self.graph_reader.remove_hooks()
-                self.graph_reader.clear_memory()
-            # graph_v7 bind: remove the unbind-read hooks + clear memory so the
-            # shared Llama is unmodified for the next variant/call.
-            if use_graph_unbind:
-                self.graph_unbind_reader.remove_hooks()
-                self.graph_unbind_reader.clear_memory()
-            # graph_v8: remove the K/V read hooks + clear memory likewise.
-            if use_v8_reader:
-                self.graph_v8_reader.remove_hooks()
-                self.graph_v8_reader.clear_memory()
 
         pred_hidden_all = hidden[:, :-1, :]                # [B, T_total-1, d_llama]
 
@@ -1459,32 +1164,16 @@ class ReprLearningModel(nn.Module):
                 if k.startswith("graph_g_mean_w") or k.startswith("graph_frac_"):
                     if k not in graph_telemetry:   # don't clobber the _avg keys
                         graph_telemetry[k] = v
-            # v5.1 telemetry pass-through — all graph_v5_* keys from finalize_aux
-            # (node/edge gates, pick affinity/entropy, soft-pointer sharpness +
-            # reuse, cross-role overlap). Lifted to top-level out so the trainer
-            # can log them via out.get(key) without unpacking aux dict.
+            # soft_pointer_graph telemetry pass-through — all spg_* keys from
+            # finalize_aux (node/edge gates, fact norm, read-side health probes).
+            # Lifted to top-level out so the trainer can log them via out.get(key).
             for k, v in finalize_aux.items():
-                if k.startswith("graph_v5_"):
+                if k.startswith("spg_") and k != "spg_facts":
                     graph_telemetry[k] = v
-                elif k.startswith("graph_v6_") and k != "graph_v6_facts":
-                    graph_telemetry[k] = v
-                elif k.startswith("graph_v7_") and k != "graph_v7_bound_content":
-                    # graph_v7_bound_content is a [B,Kn,d_val] read tensor, not a
-                    # scalar telemetry value — consumed by the unbind read, not logged.
-                    graph_telemetry[k] = v
-        graph_v8_telemetry = {
-            k: v for k, v in finalize_aux.items() if k.startswith("graph_v8_")
-        }
-        if getattr(self, "graph_v8_reader", None) is not None:
-            gates = self.graph_v8_reader.gates.detach().float()
-            graph_v8_telemetry["graph_v8_reader_gate_mean"] = gates.mean()
-            graph_v8_telemetry["graph_v8_reader_gate_abs_max"] = gates.abs().max()
-            for i, g in enumerate(gates):
-                graph_v8_telemetry[f"graph_v8_reader_gate_L{i + 1}"] = g
-        # graph_v9 telemetry: encoder finalize aux (state geometry + write-path
-        # dynamics) + read-side buffer (populated during the decoder forward).
-        graph_v9_telemetry = {
-            k: v for k, v in finalize_aux.items() if k.startswith("graph_v9_")
+        # hlvocab telemetry: encoder finalize aux (state geometry + write-path
+        # dynamics + collapse/presence canaries).
+        hlvocab_telemetry = {
+            k: v for k, v in finalize_aux.items() if k.startswith("hlvocab_")
         }
         # Vanilla has no trainable params in the QA loss path (Llama is frozen
         # and mask_embed isn't used without a [MASK] token in the input). Add
@@ -1521,10 +1210,8 @@ class ReprLearningModel(nn.Module):
             out.update(splat_telemetry)
         if graph_telemetry is not None:
             out.update(graph_telemetry)
-        if graph_v8_telemetry:
-            out.update(graph_v8_telemetry)
-        if graph_v9_telemetry:
-            out.update(graph_v9_telemetry)
+        if hlvocab_telemetry:
+            out.update(hlvocab_telemetry)
         # flat_baseline codebook health → top-level so the trainer logs it to
         # jsonl (codes_active = #live codes; collapse = the flat analogue of
         # graph routing collapse).

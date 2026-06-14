@@ -96,13 +96,10 @@ def run_val(model, val_set, device, n_batches: int, window_size: int,
     losses, accs, per_fam_stats = [], [], {}
     # REAL/SHUF/OFF binding gate, accumulated over the first gate_batches.
     shuf_abs, shuf_gap, off_abs, off_gap = [], [], [], []
-    last_mp_cos: float | None = None  # eval-only telemetry (gated in MP readout)
-    last_v5_eval: dict[str, float] = {}  # eval-only encoder telemetry
-    last_v6_eval: dict[str, float] = {}  # graph_v6 eval-only health telemetry
-    last_v8_eval: dict[str, float] = {}  # graph_v8 read/write health telemetry
-    # Deterministic-eval seed (audit fix 2026-05-27): graph_v5's chunk-fresh
-    # init was sampling fresh noise per call → same model + same batch produced
-    # ~0.2 loss variance. Seeding torch RNG per batch makes eval reproducible.
+    last_spg_eval: dict[str, float] = {}  # soft_pointer_graph eval-only health telemetry
+    last_hlvocab_eval: dict[str, float] = {}  # hlvocab read/write health telemetry
+    # Deterministic-eval seed: the soft_pointer_graph chunk-fresh init samples
+    # fresh noise per call → seeding torch RNG per batch makes eval reproducible.
     # In eval mode (model.train(False)) dropout is off so this is safe.
     rng_state = torch.get_rng_state()
     cuda_rng_state = torch.cuda.get_rng_state() if torch.cuda.is_available() else None
@@ -137,35 +134,22 @@ def run_val(model, val_set, device, n_batches: int, window_size: int,
                                                  shuffle_memory=True)
                     shuf_abs.append(float(shuf["loss_recon"]))
                     shuf_gap.append(float(shuf["loss_recon"]) - real_l)
-        # Capture v5.4 oversmoothing canary from the last batch's last MP round.
-        # Only populated in eval (MP readout gates the K×K matmul off in train).
-        arr = out.get("graph_v5_mp_buf_cross_node_cos_per_round")
-        if arr is not None and len(arr) > 0:
-            last_mp_cos = float(arr[-1])
-        # v5 read-side eval-only diagnostics (entropies + reuse). Train-mode
-        # placeholders are zero; we just take the last-batch value at eval.
-        for k in ("graph_v5_edge_src_entropy",
-                  "graph_v5_unique_picks_frac",
-                  "graph_v5_cross_role_overlap",
-                  "graph_v5_endpoint_cos_mean"):
+        # soft_pointer_graph read-side eval-only health probes.
+        for k in ("spg_node_gate_mean_avg", "spg_edge_gate_mean_avg",
+                  "spg_fact_norm", "spg_rezero_scale_eff",
+                  "spg_state_effect", "spg_node_collapse_cos",
+                  "spg_read_src_entropy", "spg_read_dst_entropy",
+                  "spg_node_active_frac"):
             v = out.get(k)
             if v is not None:
-                last_v5_eval[k] = float(v)
-        for k in ("graph_v6_node_gate_mean_avg", "graph_v6_edge_gate_mean_avg",
-                  "graph_v6_fact_norm", "graph_v6_rezero_scale_eff",
-                  "graph_v6_state_effect", "graph_v6_node_collapse_cos",
-                  "graph_v6_read_src_entropy", "graph_v6_read_dst_entropy",
-                  "graph_v6_node_active_frac"):
-            v = out.get(k)
-            if v is not None:
-                last_v6_eval[k] = float(v)
+                last_spg_eval[k] = float(v)
         for k, v in out.items():
-            if not k.startswith(("graph_v8_", "graph_v9_")) or v is None:
+            if not k.startswith("hlvocab_") or v is None:
                 continue
             if isinstance(v, (int, float)):
-                last_v8_eval[k] = float(v)
+                last_hlvocab_eval[k] = float(v)
             elif torch.is_tensor(v) and v.numel() == 1:
-                last_v8_eval[k] = float(v.detach())
+                last_hlvocab_eval[k] = float(v.detach())
         # Per-family: use per-row loss instead of batch-wide mean (a 2-row
         # batch with rows from families X and Y was previously credited
         # the same mean to both, hiding genuine per-family differences).
@@ -198,13 +182,9 @@ def run_val(model, val_set, device, n_batches: int, window_size: int,
     if shuf_abs:
         result["val_loss_recon_shuf"] = sum(shuf_abs) / len(shuf_abs)
         result["val_shuf_minus_real"] = sum(shuf_gap) / len(shuf_gap)
-    if last_mp_cos is not None:
-        result["val_graph_v5_mp_buf_cross_node_cos_final"] = last_mp_cos
-    for k, v in last_v5_eval.items():
+    for k, v in last_spg_eval.items():
         result[f"val_{k}"] = v
-    for k, v in last_v6_eval.items():
-        result[f"val_{k}"] = v
-    for k, v in last_v8_eval.items():
+    for k, v in last_hlvocab_eval.items():
         result[f"val_{k}"] = v
     return result
 
@@ -541,31 +521,9 @@ def train_one_variant(
     # state and start consuming fresh batches at start_step.
     step = start_step
     last_completed = start_step - 1  # for the final save (= last step whose body finished)
-    _kmeans_inited = False           # graph_v7: one-shot atom k-means warmup (see below)
     for batch in train_dl:
         if step >= n_steps:
             break
-
-        # graph_v7 lazy k-means atom init: run ONCE as a dedicated no_grad
-        # warmup pass on the first real batch, BEFORE this step's gradient
-        # computation. Doing the (in-place) atom re-seed inside a grad/
-        # activation-checkpointed step corrupts checkpoint's saved-tensor set;
-        # a standalone warmup (the canonical VQ/codebook k-means-init pattern)
-        # keeps the mutation off the autograd path entirely.
-        if (not _kmeans_inited
-                and getattr(model, "variant", None) == "graph_v7_baseline"
-                and hasattr(model.encoder, "maybe_init_atoms")):
-            with torch.no_grad():
-                bb = to_device(batch, device)
-                embed = model.decoder.llama.get_input_embeddings()
-                ce = embed(bb.context_ids)
-                if getattr(model.cfg, "graph_write_context", "raw") == "contextualized":
-                    from src.repr_learning.model import contextualize_write_input
-                    ce = contextualize_write_input(model.decoder, model.cfg, ce, bb.context_mask)
-                w0 = min(window_size, ce.shape[1])
-                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    model.encoder.maybe_init_atoms(ce[:, :w0, :], bb.context_mask[:, :w0])
-            _kmeans_inited = True
 
         lr = lr_at_step(step, n_steps, cfg.learning_rate, cfg.warmup_steps)
         for g in opt.param_groups:
@@ -664,72 +622,30 @@ def train_one_variant(
         for key in _graph_scalar_keys:
             if key in out and out[key] is not None:
                 row[key] = float(out[key])
-        # Graph v5.1 telemetry (only present when variant == graph_v5_baseline).
-        # Probes the soft-pointer mechanism: are queries sharp, do edges
-        # converge on shared nodes, are roles mixing.
-        _graph_v5_scalar_keys = (
-            # Per-window write-side
-            "graph_v5_node_gate_mean", "graph_v5_edge_gate_mean",
-            "graph_v5_edge_pick_affinity", "graph_v5_edge_frac_selfpick",
-            "graph_v5_edge_pick_entropy",
-            # Chunk-end (averaged) write-side
-            "graph_v5_node_gate_mean_avg", "graph_v5_edge_gate_mean_avg",
-            "graph_v5_edge_pick_affinity_avg", "graph_v5_edge_frac_selfpick_avg",
-            "graph_v5_edge_pick_entropy_avg",
-            # Chunk-end read-side: soft pointer sharpness + reuse
-            "graph_v5_edge_src_entropy", "graph_v5_edge_dst_entropy",
-            "graph_v5_unique_picks_frac", "graph_v5_cross_role_overlap",
-            "graph_v5_endpoint_cos_mean", "graph_v5_endpoint_cos_max",
-            # v5.3+: learnable soft-pointer temperature (scalar)
-            "graph_v5_soft_pointer_temperature",
-        )
-        for key in _graph_v5_scalar_keys:
-            if key in out and out[key] is not None:
-                row[key] = float(out[key])
-        # graph_v6 telemetry (only present when variant == graph_v6_baseline).
+        # soft_pointer_graph telemetry (variant == soft_pointer_graph_baseline).
         # Write-side gate means + fact norm are emitted every step; the read-side
         # health probes (rezero/state_effect/collapse/entropy/active_frac) are
         # eval-only (computed in finalize_memory when not self.training), so on
         # train steps only the first three are present — `if key in out` handles it.
-        _graph_v6_scalar_keys = (
-            "graph_v6_node_gate_mean_avg", "graph_v6_edge_gate_mean_avg",
-            "graph_v6_fact_norm",
-            "graph_v6_rezero_scale_eff", "graph_v6_state_effect",
-            "graph_v6_node_collapse_cos",
-            "graph_v6_read_src_entropy", "graph_v6_read_dst_entropy",
-            "graph_v6_node_active_frac",
+        _spg_scalar_keys = (
+            "spg_node_gate_mean_avg", "spg_edge_gate_mean_avg",
+            "spg_fact_norm",
+            "spg_rezero_scale_eff", "spg_state_effect",
+            "spg_node_collapse_cos",
+            "spg_read_src_entropy", "spg_read_dst_entropy",
+            "spg_node_active_frac",
         )
-        for key in _graph_v6_scalar_keys:
+        for key in _spg_scalar_keys:
             if key in out and out[key] is not None:
                 row[key] = float(out[key])
-        # graph_v7 telemetry (variant == graph_v7_baseline) — emitted every step.
-        _graph_v7_scalar_keys = (
-            "graph_v7_src_entropy", "graph_v7_dst_entropy", "graph_v7_active_count",
-            "graph_v7_competition_loss", "graph_v7_decorr_loss", "graph_v7_atom_collapse_cos",
-            "graph_v7_state_effect", "graph_v7_atom_coverage_entropy",
-            "graph_v7_route_entropy_per_token",
-            "graph_v7_state_update_mag", "graph_v7_state_dir_drift",
-        )
-        for key in _graph_v7_scalar_keys:
-            if key in out and out[key] is not None:
-                row[key] = float(out[key])
+        # hlvocab telemetry (variant == hlvocab_baseline) — emitted every step.
         for key, value in out.items():
-            if not key.startswith(("graph_v8_", "graph_v9_")) or value is None:
+            if not key.startswith("hlvocab_") or value is None:
                 continue
             if isinstance(value, (int, float)):
                 row[key] = float(value)
             elif torch.is_tensor(value) and value.numel() == 1:
                 row[key] = float(value.detach())
-        # v5.4: per-round MP telemetry — log final-round value as a scalar so
-        # it shows up in jsonl plotting. Full arrays kept in aux for probes.
-        for arr_key, scalar_key in [
-            ("graph_v5_mp_buf_norm_per_round",            "graph_v5_mp_buf_norm_final"),
-            ("graph_v5_mp_agg_norm_per_round",            "graph_v5_mp_agg_norm_final"),
-            ("graph_v5_mp_buf_cross_node_cos_per_round",  "graph_v5_mp_buf_cross_node_cos_final"),
-        ]:
-            arr = out.get(arr_key)
-            if arr is not None and len(arr) > 0:
-                row[scalar_key] = float(arr[-1])
         # Per-window breakdown: graph_g_mean_w0..w3, graph_frac_*_w0..w3
         for k, v in out.items():
             if v is None: continue
@@ -759,24 +675,11 @@ def train_one_variant(
                 fs = float(out.get("graph_frac_selfpick_avg", 0.0) or 0.0)
                 extra_field = f"g={g:.3f} a/l/j={fa:.2f}/{fl:.2f}/{fj:.2f} self={fs:.2f}"
                 aux_tag, aux_display = "aux", float(out["loss_aux"])
-            elif variant == "graph_v5_baseline":
-                # v5.1: show node/edge gates + soft-pointer sharpness + reuse.
-                # Key signals:
-                #   g_n / g_e: node and edge gate means (anchor-init ≈ 0.38 / 0.27)
-                #   selfpick: fraction of edges picking their own slot's proposal
-                #   src_ent: soft-pointer entropy (low = sharp, high = spread)
-                #   uniq: fraction of unique bank entries among edge picks
-                #         (low = high reuse, which is the THESIS goal)
-                #   xrole: cross-role overlap (slots appearing as both src+dst)
-                gn = float(out.get("graph_v5_node_gate_mean_avg", 0.0) or 0.0)
-                ge = float(out.get("graph_v5_edge_gate_mean_avg", 0.0) or 0.0)
-                # v5.3+: learnable soft-pointer τ (should drift toward 0 if model
-                # finds sharper routing helpful). src_ent / uniq / mp_cos are
-                # eval-only now (gated in encoder + MP readout) — see val line.
-                tau = float(out.get("graph_v5_soft_pointer_temperature", 0.0) or 0.0)
-                extra_field = (
-                    f"g_n={gn:.2f} g_e={ge:.2f} τ={tau:.3f}"
-                )
+            elif variant == "soft_pointer_graph_baseline":
+                # show node/edge gate means (anchor-init ≈ 0.38 / 0.27).
+                g_n = float(out.get("spg_node_gate_mean_avg", 0.0) or 0.0)
+                g_e = float(out.get("spg_edge_gate_mean_avg", 0.0) or 0.0)
+                extra_field = f"g_n={g_n:.2f} g_e={g_e:.2f}"
                 aux_tag, aux_display = "aux", float(out["loss_aux"])
             elif "splat_aux" in out and out["splat_aux"] is not None:
                 aux_display = float(out["splat_aux"])
@@ -796,12 +699,6 @@ def train_one_variant(
             val_row = {"phase": "val", "step": step, "variant": variant, **vm}
             jsonl_fp.write(json.dumps(val_row) + "\n")
             extra_parts = []
-            if "val_graph_v5_mp_buf_cross_node_cos_final" in vm:
-                extra_parts.append(f"mp_cos={vm['val_graph_v5_mp_buf_cross_node_cos_final']:.3f}")
-            if "val_graph_v5_edge_src_entropy" in vm:
-                extra_parts.append(f"src_ent={vm['val_graph_v5_edge_src_entropy']:.2f}")
-            if "val_graph_v5_unique_picks_frac" in vm:
-                extra_parts.append(f"uniq={vm['val_graph_v5_unique_picks_frac']:.2f}")
             if "val_off_minus_real" in vm:
                 extra_parts.append(f"OFF-REAL={vm['val_off_minus_real']:+.3f}")
             if "val_shuf_minus_real" in vm:
@@ -1003,7 +900,7 @@ def main():
     # Retired graph/plastic/splat and older flat/continuous/MT/Mamba variants
     # remain selectable via explicit --variants if needed.
     ap.add_argument("--variants", nargs="+", default=[
-        "graph_v9_baseline",          # primary architecture (Compression-by-Vocabulary graph)
+        "hlvocab_baseline",           # primary architecture (Compression-by-Vocabulary)
         "icae_baseline",              # ICAE (ICLR'24)
         "ccm_baseline",               # CCM (ICLR'24)
         "autocompressor_baseline",    # AutoCompressor/RMT-style recurrent summary
@@ -1033,8 +930,7 @@ def main():
     ap.add_argument("--mem-tokens", type=int, default=144,
                     help="EMAT matched MEMORY budget: M memory tokens × d_llama, "
                          "matched across ICAE/CCM/AutoCompressor/Beacon "
-                         "(and graph_v6 if selected). Graph V8 has its own "
-                         "K/V read budget. Derives icae_n_slots, "
+                         "(and soft_pointer_graph if selected). Derives icae_n_slots, "
                          "ccm_n_comp, autocompressor_n_slots, and Beacon's α.")
     ap.add_argument("--passages-per-chunk", type=int, default=0,
                     help="composite_v1 passages sampled per chunk. 0 = auto: "
@@ -1098,42 +994,6 @@ def main():
     ap.add_argument("--probe-bs-list", nargs="+", type=int,
                     default=[8, 16, 24, 32, 48, 64, 96, 128, 192, 256],
                     help="BS values to try in --probe-bs (ascending; stops at first OOM).")
-    # graph_v7 READ mode (graph_v7_baseline only). "prepend" = baseline (memory
-    # prepended to the decode seq, no dedicated read). "cross_attn" = build the
-    # trainable GraphCrossAttnReader and read via gated cross-attn hooks at the
-    # chosen decoder layers. Without this plumbing cfg.graph_read_mode stays
-    # "prepend" and the reader is NEVER built → the cross_attn path is inert.
-    ap.add_argument("--graph-read-mode", choices=["prepend", "cross_attn"],
-                    default="prepend",
-                    help="graph_v7 read path: prepend (baseline) or cross_attn "
-                         "(dedicated trainable gated cross-attention READ).")
-    ap.add_argument("--graph-read-gate-init", type=float, default=0.1,
-                    help="cross_attn: NONZERO learnable scalar gate init (load-bearing — "
-                         "lets gradient reach the graph from step 0).")
-    ap.add_argument("--graph-read-layer-indices", type=str, default=None,
-                    help="cross_attn: comma-separated decoder layer indices that host a "
-                         "read (e.g. '3,7,11,15'). Default = cfg default (3,7,11,15).")
-    # graph_v7 WRITE contextualization (graph_v7_baseline only). "raw" = build
-    # memory from raw token embeds (baseline). "contextualized" = run the
-    # context through the FROZEN decoder Llama and feed its hidden states into
-    # the graph's route_enc/content_enc (the same write input the ports use).
-    # Independent of --graph-read-mode (compose freely).
-    ap.add_argument("--graph-write-context", choices=["raw", "contextualized"],
-                    default="raw",
-                    help="graph_v7 WRITE input: raw token embeds (baseline) or "
-                         "contextualized frozen-Llama hidden states (matches the ports).")
-    ap.add_argument("--graph-write-context-layers", type=int, default=0,
-                    help="graph_v7 contextualization depth: 0 = full/all decoder layers "
-                         "(last_hidden_state); N>0 = first N layers only (hidden_states[N], "
-                         "'lower attune' partial pass).")
-    # graph_v7 bind-early / unbind-late associative memory (HRR). The fix for the
-    # SHUF=REAL collapse: HRR-bind each token's value to its entity-key before it
-    # pools, unbind by the question's key at read. REQUIRES contextualized write.
-    ap.add_argument("--graph-v7-bind", action="store_true",
-                    help="graph_v7: HRR bind-early/unbind-late associative memory "
-                         "(requires --graph-write-context contextualized).")
-    ap.add_argument("--graph-v7-bind-gate-init", type=float, default=0.1,
-                    help="bind read: NONZERO learnable scalar gate init (load-bearing).")
     ap.add_argument("--out-tag", type=str, default="v1h")
     ap.add_argument("--resume", action="store_true")
     # Per-window activation checkpointing on the encoder streaming write. With the
@@ -1293,13 +1153,12 @@ def main():
             "(e.g. --mix-weights 0.35 0.15 0.15 0.15 0.2)."
         )
 
-    # Tranche-3 sizing (chunk=8192, 61× compression) — matched to graph_v6:
-    #   graph_v6 substrate: K_node=128, K_edge=196, d_node=d_state=384
-    #     → 128·384 + 196·(2·384+384) = 49,152 + 225,792 = 274,944 floats; 48.0M params
-    #   baselines: n_flat_codes=192, per_slot=1432 → 192·1432 = 274,944 floats (matched)
+    # Tranche-3 sizing (chunk=8192, 61× compression) — matched to soft_pointer_graph:
+    #   soft_pointer_graph substrate: K_node=128, K_edge=196, d_node=d_state=480
+    #     gives a 274,944-float band; baselines: n_flat_codes=192, per_slot=1432 →
+    #     192·1432 = 274,944 floats (matched).
     #     per_slot (1432) < d_llama (2048) keeps the slot the true bottleneck — every
     #     stored float can reach Llama through the prepend projection (no no-op floats).
-    #     Compression: 8192·2048 / 274,944 = 61× (matches graph_v6).
     #   MT is EXEMPT from the float match: its per-token KV bank is uncompressed /
     #     unbounded in footprint, so it is the best-case retrieval reference, not a
     #     fixed-footprint compressor. Its params are still matched (~47.8M).
@@ -1311,36 +1170,23 @@ def main():
         warmup_steps=args.warmup,
         # Bottleneck: 192 memory slots × 1432 = 274,944 state floats across all
         # fixed-footprint variants (flat / continuous / Mamba / graph), matched to
-        # graph_v6's substrate. MT exempt (see header).
+        # soft_pointer_graph's substrate. MT exempt (see header).
         d_node_state=128,
         n_edges=68,
         n_flat_codes=192,                  # was 128 (slot count = prepend tokens)
         d_continuous=1432, d_concept_baseline=1432,
         d_mt_value=1432, d_recurrent=1432,  # was 1398; 192·1432 = 274,944
-        # v5.5 graph_v5 sizing (graph_v5 arm only; graph_v6 uses ReprConfig defaults,
-        # which already give 274,944 floats / 48.0M params).
-        graph_v5_K_node=128, graph_v5_K_edge=196, graph_v5_K_proposal=196,
-        graph_v5_d_node=384,
-        graph_v5_d_state=384,
-        graph_v5_d_updater=640,
-        graph_v5_updater_layers=5,
-        graph_v5_n_message_rounds=6,
-        graph_v5_mp_d_hidden=1024,
         # Baseline encoder (SmallBiTransformer; used by flat/continuous/MT only —
-        # NOT graph or Mamba). NON-parametric sinusoidal PE (matched to graph_v6's
-        # substrate). The old learned [max_window,816] pos_embed grew to [8192,816]
-        # = 6.68M floats at chunk=8192 — a load-bearing +13% memory-param edge over
-        # graph_v6 (sinusoidal) and Mamba (no PE); removed (encoder.py SmallBiTransformer).
-        # d_enc=816 × 4L + ffn=3300 lands flat/continuous at 48.0M, matched to
-        # graph_v6 (48.02M) and Mamba (47.95M) within 0.1%. MT is ~47.2M — leaner by
-        # design (float-exempt retrieval ref, no learned codebook); NOT padded, since
-        # that would add dead params, and MT already has the largest memory footprint.
+        # NOT graph or Mamba). NON-parametric sinusoidal PE (matched to
+        # soft_pointer_graph's substrate). d_enc=816 × 4L + ffn=3300 lands
+        # flat/continuous at 48.0M, matched to soft_pointer_graph (48.02M) and
+        # Mamba (47.95M) within 0.1%. MT is ~47.2M — leaner by design (float-exempt
+        # retrieval ref, no learned codebook).
         d_enc=816,
         enc_n_layers=4,
         enc_n_heads=12,                    # 816 = 12·68
         enc_ffn_dim=3300,                  # 3264→3300: re-center flat/cont on 48.0M post-sinusoidal-PE
-        # Mamba — d_mamba=1256 × 4L ≈ 47.95M, matched to graph_v6's 48.0M.
-        # 1280 was 49.5M (matched the older graph_v5 48.6M); 1256 re-centres on 48.0.
+        # Mamba — d_mamba=1256 × 4L ≈ 47.95M, matched to soft_pointer_graph's 48.0M.
         d_mamba=1256,                      # was 1280 (49.5M)
         edge_token_packing="fused",
         # LoRA-all (fair joint training): EVERY arm — graph, the four baselines,
@@ -1381,8 +1227,8 @@ def main():
     cfg.icae_n_slots = M
     cfg.ccm_n_comp = M
     cfg.autocompressor_n_slots = M
-    cfg.graph_v6_K_edge = M          # graph prepends M fact-tokens (matched read)
-    cfg.graph_v9_m_max = M           # graph_v9 obeys the matched budget too [fix G]
+    cfg.spg_K_edge = M               # soft_pointer_graph prepends M fact-tokens (matched read)
+    cfg.hlvocab_m_max = M            # hlvocab obeys the matched budget too [fix G]
     cfg.n_flat_codes = M             # flat/continuous/MT prepend M too (was 192 -> mismatch)
     cfg.beacon_ratio = max(1, args.chunk_size // M)
     if args.beacon_param is not None:
@@ -1400,19 +1246,14 @@ def main():
                  * _ceil(args.window_size, cfg.beacon_ratio))
     print(f"[EMAT budget] mem_tokens={M} × d_llama={cfg.d_llama} = "
           f"{M * cfg.d_llama:,} prepend decoder-read floats/arm")
-    for _a, _m in (("graph_v6", M), ("icae", M), ("ccm", M),
+    for _a, _m in (("soft_pointer_graph", M), ("icae", M), ("ccm", M),
                    ("autocompressor", M), ("beacon", _beacon_M)):
-        print(f"   {_a:<16} M={_m:<4} → {_m * cfg.d_llama:,} floats")
-    if "graph_v8_baseline" in args.variants:
-        _v8_read = cfg.graph_v8_n_layers * cfg.graph_v8_n_nodes * 2 * cfg.graph_v8_d_mem
-        print(f"   graph_v8 K/V read → {_v8_read:,} floats "
-              f"({(_v8_read / max(1, M * cfg.d_llama)):.1f}× prepend budget; "
-              "not controlled by --mem-tokens)")
-    if "graph_v9_baseline" in args.variants:
-        _v9_vocab = sum(cfg.graph_v9_nodes)
-        print(f"   graph_v9 (Compression-by-Vocabulary): {_v9_vocab} nodes over "
-              f"{len(cfg.graph_v9_nodes)} layers, d_code={cfg.graph_v9_d_code}, "
-              f"top_k={cfg.graph_v9_top_k}; emits up to m_max={cfg.graph_v9_m_max} "
+        print(f"   {_a:<18} M={_m:<4} → {_m * cfg.d_llama:,} floats")
+    if "hlvocab_baseline" in args.variants:
+        _vocab = sum(cfg.hlvocab_nodes)
+        print(f"   hlvocab (Compression-by-Vocabulary): {_vocab} nodes over "
+              f"{len(cfg.hlvocab_nodes)} layers, d_code={cfg.hlvocab_d_code}, "
+              f"top_k={cfg.hlvocab_top_k}; emits up to m_max={cfg.hlvocab_m_max} "
               f"node-tokens, sliced to k. Prepend compressor (sentence_mae).")
     if abs(_beacon_M - M) > max(1, M // 10):
         raise SystemExit(
@@ -1420,10 +1261,6 @@ def main():
             f"(α={cfg.beacon_ratio}); adjust --mem-tokens / chunk / window so the "
             f"matched memory budget holds before launching.")
 
-    # ── graph_v7 cross-attention READ mode ───────────────────────────────────
-    # Plumb the read-mode knobs onto cfg so ReprLearningModel builds the
-    # GraphCrossAttnReader (graph_v7_baseline only). Without this the reader is
-    # never built and the cross_attn path stays inert (cfg default "prepend").
     # ── compression line: param-matched baselines (backbone resolved above) ───
     if args.task == "sentence_mae":
         cfg.task_mode = "sentence_mae"
@@ -1440,43 +1277,11 @@ def main():
         cfg.autocompressor_n_slots = 16
         cfg.autocompressor_lora_rank = 17; cfg.autocompressor_lora_alpha = 34
         cfg.beacon_ratio = 8; cfg.beacon_wrap_layers = (0, 10, 19, 29)
-        cfg.graph_v9_m_max = 16          # sentence_mae: emit up to 16, sliced to k [fix G]
+        cfg.hlvocab_m_max = 16           # sentence_mae: emit up to 16, sliced to k [fix G]
         if cfg.d_llama != 576:
             print(f"[WARN] param-matched ranks calibrated for d=576; d={cfg.d_llama} "
                   "→ trainable counts will differ, RECALIBRATE before claims.")
     cfg.contrastive_shuf_coef = args.contrastive_shuf_coef
-    cfg.graph_read_mode = args.graph_read_mode
-    cfg.graph_read_gate_init = args.graph_read_gate_init
-    if args.graph_read_layer_indices is not None:
-        idxs = tuple(int(x) for x in args.graph_read_layer_indices.split(",") if x.strip() != "")
-        if not idxs:
-            ap.error("--graph-read-layer-indices parsed to empty; pass e.g. '3,7,11,15'")
-        cfg.graph_read_layer_indices = idxs
-        cfg.graph_read_n_layers = len(idxs)
-    if args.graph_read_mode == "cross_attn":
-        print(f"[graph_v7] read mode = cross_attn  layers={tuple(cfg.graph_read_layer_indices)}  "
-              f"gate_init={cfg.graph_read_gate_init}")
-
-    # graph_v7 WRITE contextualization: feed frozen-Llama hidden states into the
-    # graph's route_enc/content_enc instead of raw token embeds (matches the ports'
-    # write input). Independent of read mode.
-    cfg.graph_write_context = args.graph_write_context
-    cfg.graph_write_context_layers = args.graph_write_context_layers
-    if args.graph_write_context == "contextualized":
-        _lyr = ("full/last_hidden_state" if args.graph_write_context_layers <= 0
-                else f"first {args.graph_write_context_layers} layers (hidden_states[{args.graph_write_context_layers}])")
-        print(f"[graph_v7] WRITE context = contextualized  depth={_lyr}  "
-              f"(frozen decoder Llama → route_enc/content_enc; no_grad, no second base)")
-
-    # graph_v7 bind-early / unbind-late associative memory (HRR). Plumb onto cfg
-    # so ReprLearningModel builds the GraphV7UnbindReader (graph_v7_baseline only,
-    # and only with contextualized write — the model __init__ raises otherwise).
-    cfg.graph_v7_bind = bool(args.graph_v7_bind)
-    cfg.graph_v7_bind_gate_init = args.graph_v7_bind_gate_init
-    if args.graph_v7_bind:
-        print(f"[graph_v7] BIND mode ON (HRR bind-early/unbind-late)  "
-              f"gate_init={cfg.graph_v7_bind_gate_init}  "
-              f"(⊙ fact_builder/materialize BYPASSED for recall)")
 
     # Auto-pick BABILong config to match chunk_size (audit fix #10).
     if args.babilong_config == "auto":

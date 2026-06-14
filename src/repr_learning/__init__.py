@@ -16,12 +16,12 @@ from .encoder import (
     ContinuousBaselineEncoder,
     FlatBaselineEncoder,
     FullContextEncoder,
-    GraphV6BaselineEncoder,
-    GraphV7BaselineEncoder,
+    HLVocabEncoder,
     ICAEBaselineEncoder,
     MemorizingBaselineEncoder,
     NullEncoder,
     RecurrentBaselineEncoder,
+    SoftPointerGraphEncoder,
 )
 
 __all__ = [
@@ -31,7 +31,8 @@ __all__ = [
     "ContinuousBaselineEncoder",
     "MemorizingBaselineEncoder",
     "RecurrentBaselineEncoder",
-    "GraphV6BaselineEncoder",
+    "SoftPointerGraphEncoder",
+    "HLVocabEncoder",
     "ICAEBaselineEncoder",
     "CCMBaselineEncoder",
     "BeaconBaselineEncoder",

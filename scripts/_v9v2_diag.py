@@ -1,4 +1,4 @@
-"""Detailed debug sweep for graph_v9 v2 (full graph), FRESH init (untrained).
+"""Detailed debug sweep for hlvocab v2 (full graph), FRESH init (untrained).
 Checks the NEW v2 machinery before any training:
   A. gradient flow per module — STDP τ, plasticity, edge-temp, id, role/tag,
      reader, vocab — none dead/saturated;
@@ -23,17 +23,17 @@ def matched(cfg):
     cfg.llama_model = BACKBONE; cfg.d_llama = 576; cfg.llama_vocab_size = 49152
     cfg.pad_token_id = 0; cfg.task_mode = "sentence_mae"
     cfg.use_llama_lora = True; cfg.llama_lora_rank = 16; cfg.llama_lora_alpha = 32
-    cfg.graph_v9_d_code = 256; cfg.graph_v9_nodes = (512, 256, 128)
-    cfg.graph_v9_top_k = 4; cfg.graph_v9_m_max = 16; cfg.graph_v9_tap_layer = 6
+    cfg.hlvocab_d_code = 256; cfg.hlvocab_nodes = (512, 256, 128)
+    cfg.hlvocab_top_k = 4; cfg.hlvocab_m_max = 16; cfg.hlvocab_tap_layer = 6
     return cfg
 
 
 tok = AutoTokenizer.from_pretrained(BACKBONE)
 if tok.pad_token is None: tok.pad_token = tok.eos_token
 cfg = matched(ReprConfig())
-model = ReprLearningModel(cfg, variant="graph_v9_baseline").to(dev)
+model = ReprLearningModel(cfg, variant="hlvocab_baseline").to(dev)
 sub = model.encoder.sub
-print(f"=== graph_v9 v2 FRESH (use_graph={cfg.graph_v9_use_graph}, n_edges={sub.n_edges}, "
+print(f"=== hlvocab v2 FRESH (use_graph={cfg.hlvocab_use_graph}, n_edges={sub.n_edges}, "
       f"sources={sub.edge_sources}) ===")
 
 dl = make_sentence_dataloader(tok, batch_size=16, src_tokenizer_name=SRC,
@@ -76,17 +76,17 @@ with torch.no_grad():
 
     print("\n(D) ROUTING HEALTH (phase 1) — entropy / hub / coverage")
     for l in range(sub.depth):
-        print(f"  L{l}: entropy={aux[f'graph_v9_route_entropy_L{l}']:.2f} "
-              f"hub={aux[f'graph_v9_hub_share_L{l}']:.3f} cov={aux[f'graph_v9_coverage_L{l}']:.3f}")
+        print(f"  L{l}: entropy={aux[f'hlvocab_route_entropy_L{l}']:.2f} "
+              f"hub={aux[f'hlvocab_hub_share_L{l}']:.3f} cov={aux[f'hlvocab_coverage_L{l}']:.3f}")
 
     print("\n(B) EDGE SELECTION HEALTH")
     srcL, dstL = aux["_sel_srcL"], aux["_sel_dstL"]          # [B,E]
     i_idx, j_idx = aux["_sel_i"], aux["_sel_j"]
-    print(f"  inter-layer edge fraction: {aux['graph_v9_edge_inter_frac']:.3f} "
+    print(f"  inter-layer edge fraction: {aux['hlvocab_edge_inter_frac']:.3f} "
           f"(0=all within-layer, 1=all cross-layer)")
     print(f"  src-layer dist: {[(srcL==l).float().mean().item() for l in range(sub.depth)]}")
     print(f"  dst-layer dist: {[(dstL==l).float().mean().item() for l in range(sub.depth)]}")
-    print(f"  unique endpoint nodes/example (of {2*sub.n_edges}): {aux['graph_v9_edge_uniq_nodes']:.1f}")
+    print(f"  unique endpoint nodes/example (of {2*sub.n_edges}): {aux['hlvocab_edge_uniq_nodes']:.1f}")
     # cross-example diversity: do different sentences pick different edges?
     sig = [set(zip(srcL[bi].tolist(), i_idx[bi].tolist(), dstL[bi].tolist(), j_idx[bi].tolist()))
            for bi in range(B)]
@@ -100,7 +100,7 @@ with torch.no_grad():
     ew = aux["_edge_w"]
     print(f"  edge_w: mean={ew.mean():.3f} std={ew.std():.3f} "
           f"frac>0.95={ (ew>0.95).float().mean():.2f} (high+flat = saturated gate, weak sel grad)")
-    print(f"  memory norm: {aux['graph_v9_memory_norm']:.2f} (target ~embed 3.18)")
+    print(f"  memory norm: {aux['hlvocab_memory_norm']:.2f} (target ~embed 3.18)")
     print(f"  tau_within={sub.log_tau_within.exp().tolist()}  tau_inter={sub.log_tau_inter.exp().tolist()}")
     # reader does work? compare reader output vs its input
     # (recompute tokens quickly is heavy; instead check eff rank of memory)

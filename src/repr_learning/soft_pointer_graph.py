@@ -1,6 +1,6 @@
-"""Graph substrate v6: soft-pointer graph memory with a no-op-free, per-token read.
+"""soft_pointer_graph: soft-pointer graph memory with a no-op-free, per-token read.
 
-Design: docs/graph_v6.md. Supersedes graph_substrate_v5.
+Design: docs/graph_v6.md.
 
 Governing principle — **no-op-free**: every persistent quantity (N, q_src, q_dst,
 state) is consumed by the read on the critical path, so the optimizer can't zero it.
@@ -29,7 +29,9 @@ READ:
     ReZero-scaled residual fuse. Multi-hop emerges from autoregression, not internal
     message passing.
 
-Reuses graph_substrate(.v5): AttnBlock, SoftPointer, _rmsnorm.
+Self-contained: AttnBlock (+ QKNormAttention), SoftPointer, and _rmsnorm —
+formerly imported from the retired graph_substrate / graph_substrate_v5 — are
+inlined below.
 """
 from __future__ import annotations
 
@@ -41,27 +43,177 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-from .graph_substrate import AttnBlock          # normalized cross/self attention block
-from .graph_substrate_v5 import SoftPointer, _rmsnorm
-
 # token type ids for the write transformer
 T_NODE, T_SRC, T_DST, T_STATE, T_PIN = 0, 1, 2, 3, 4
 N_TYPES = 5
 
 
 # ─────────────────────────────────────────────────────────────────────────
+# Inlined attention primitives (formerly graph_substrate.py)
+# ─────────────────────────────────────────────────────────────────────────
+class QKNormAttention(nn.Module):
+    """Multi-head attention with QK-Norm. Q, K projections are L-normalized
+    (per-head LayerNorm) BEFORE QK^T. Output goes through standard out_proj.
+
+    Forward: Q_in [B, Nq, D], KV_in [B, Nkv, D], optional kv_pad_mask [B, Nkv]
+    where True = padded (will be masked out of attention).
+    """
+    def __init__(self, d: int, n_heads: int):
+        super().__init__()
+        assert d % n_heads == 0, f"d={d} not divisible by n_heads={n_heads}"
+        self.d = d
+        self.n_heads = n_heads
+        self.d_head = d // n_heads
+        self.q_proj = nn.Linear(d, d, bias=False)
+        self.k_proj = nn.Linear(d, d, bias=False)
+        self.v_proj = nn.Linear(d, d, bias=False)
+        self.o_proj = nn.Linear(d, d, bias=False)
+        # Per-head LN on Q and K (QK-Norm). LN over the head dim.
+        self.q_norm = nn.LayerNorm(self.d_head)
+        self.k_norm = nn.LayerNorm(self.d_head)
+
+    def forward(self, q_in, kv_in, kv_pad_mask=None):
+        B, Nq, D = q_in.shape
+        Nkv = kv_in.shape[1]
+        H, Dh = self.n_heads, self.d_head
+        q = self.q_proj(q_in).view(B, Nq, H, Dh).transpose(1, 2)    # [B, H, Nq, Dh]
+        k = self.k_proj(kv_in).view(B, Nkv, H, Dh).transpose(1, 2)  # [B, H, Nkv, Dh]
+        v = self.v_proj(kv_in).view(B, Nkv, H, Dh).transpose(1, 2)  # [B, H, Nkv, Dh]
+        # QK-Norm
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+        # Build attn mask from kv_pad_mask. SDPA convention: bool mask where
+        # True = include in attention (NOT masked).
+        attn_mask = None
+        if kv_pad_mask is not None:
+            # kv_pad_mask: [B, Nkv] True=padded → invert and broadcast to [B, 1, 1, Nkv]
+            attn_mask = (~kv_pad_mask).view(B, 1, 1, Nkv).expand(B, H, Nq, Nkv)
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+        out = out.transpose(1, 2).reshape(B, Nq, D)
+        return self.o_proj(out)
+
+
+class AttnBlock(nn.Module):
+    """Pre-Q-LN + KV-LN + QK-Norm attention + post-attn-LN + residual.
+
+    Structure (per NormFormer + QK-Norm best practices):
+      q_norm    = LN(Q_in)
+      kv_norm   = LN(KV_in)
+      attn_out  = QKNormAttention(q_norm, kv_norm, kv_pad_mask)
+      attn_out  = post_norm(attn_out)            # ← caps magnitude
+      return     Q_in + attn_out                  # ← residual
+    For self-attention, pass kv=q.
+    """
+    def __init__(self, d: int, n_heads: int):
+        super().__init__()
+        self.q_in_norm = nn.LayerNorm(d)
+        self.kv_in_norm = nn.LayerNorm(d)
+        self.attn = QKNormAttention(d, n_heads)
+        self.post_norm = nn.LayerNorm(d)
+
+    def forward(self, q, kv, kv_pad_mask=None, residual=True):
+        q_n = self.q_in_norm(q)
+        kv_n = self.kv_in_norm(kv)
+        out = self.attn(q_n, kv_n, kv_pad_mask=kv_pad_mask)
+        out = self.post_norm(out)
+        # residual=False (reader): return the PURE attention output so the
+        # caller injects a fact-only signal with no q (hidden-state) leak-through.
+        return (q + out) if residual else out
+
+
+def _rmsnorm(x: Tensor, eps: float = 1e-6) -> Tensor:
+    d = x.shape[-1]
+    return x * (d ** 0.5) / (x.pow(2).sum(-1, keepdim=True).sqrt() + eps)
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# SoftPointer (formerly graph_substrate_v5.py)
+# ─────────────────────────────────────────────────────────────────────────
+class SoftPointer(nn.Module):
+    """Trained soft-pointer attention from edge queries to the node bank.
+
+    Two additions over the stateless function:
+    1) Key/value separation — N is projected through separate W_k (for
+       scoring) and W_v (for aggregation). Csordás et al. 2019 identified
+       that without K/V separation the address distribution from content-
+       based lookup is "noisy and flat, since the value influences the score
+       calculation, although only the key should." This is the standard DNC
+       pathology. W_k and W_v init to identity so the module starts equal
+       to the un-projected function.
+    2) Learnable temperature — log_tau is a trained scalar. The model
+       self-tunes sharpness (CLIP / Focal Attention style). Init from a
+       passed temperature; clamped to avoid pathological extremes.
+    """
+
+    def __init__(
+        self,
+        d_node: int,
+        init_temperature: float = 1.0,
+        log_tau_floor: float = -3.0,    # τ_min = exp(-3) ≈ 0.05 → very sharp
+        log_tau_ceiling: float = 3.0,   # τ_max = exp(3) ≈ 20 → very flat
+        kv_split: bool = True,
+    ):
+        super().__init__()
+        self.kv_split = kv_split
+        if kv_split:
+            self.W_k = nn.Linear(d_node, d_node, bias=False)
+            self.W_v = nn.Linear(d_node, d_node, bias=False)
+            nn.init.eye_(self.W_k.weight)
+            nn.init.eye_(self.W_v.weight)
+        init_log_tau = math.log(max(float(init_temperature), 1e-3))
+        self.log_tau = nn.Parameter(torch.tensor(float(init_log_tau)))
+        self.log_tau_floor = float(log_tau_floor)
+        self.log_tau_ceiling = float(log_tau_ceiling)
+
+    @property
+    def temperature(self) -> Tensor:
+        """Current τ as a tensor (for telemetry)."""
+        return self.log_tau.clamp(self.log_tau_floor, self.log_tau_ceiling).exp()
+
+    def project_kv(self, N: Tensor) -> tuple[Tensor, Tensor]:
+        """Precompute K and V projections of the node bank (cache once per N)."""
+        if self.kv_split:
+            k = self.W_k(N)
+            v = self.W_v(N)
+        else:
+            k = N
+            v = N
+        return k, v
+
+    def attend(self, q: Tensor, k: Tensor, v: Tensor) -> tuple[Tensor, Tensor]:
+        """Compute soft-pointer attention given precomputed (k, v)."""
+        d_node = q.shape[-1]
+        scores = torch.matmul(q, k.transpose(-1, -2)) * (d_node ** -0.5)
+        tau = self.log_tau.clamp(self.log_tau_floor, self.log_tau_ceiling).exp()
+        attn = (scores / tau.to(scores.dtype)).softmax(dim=-1)
+        endpoint = torch.matmul(attn, v)
+        return endpoint, attn
+
+    def forward(self, q: Tensor, N: Tensor) -> tuple[Tensor, Tensor]:
+        """
+        q : [B, K_edge, d_node] — edge queries (src or dst)
+        N : [B, K_node, d_node] — shared node bank
+        Returns:
+          endpoint : [B, K_edge, d_node]  — α @ V
+          attn     : [B, K_edge, K_node]  — soft pointer weights
+        """
+        k, v = self.project_kv(N)
+        return self.attend(q, k, v)
+
+
+# ─────────────────────────────────────────────────────────────────────────
 # Chunk-fresh state init (Slot-Attention-style stochastic init; no per-slot params)
 # ─────────────────────────────────────────────────────────────────────────
-def init_graph_v6_state(
+def init_soft_pointer_graph_state(
     B: int, K_node: int, K_edge: int, d_node: int, d_state: int,
     mu_node: Tensor, log_sigma_node: Tensor,
     mu_state: Tensor, log_sigma_state: Tensor,
     mu_q: Tensor, log_sigma_q: Tensor,
     device, dtype, generator: Optional[torch.Generator] = None,
 ) -> dict:
-    """N/q_src/q_dst/state ~ N(mu, sigma) drawn fresh per pass. Same pattern as
-    init_graph_v5_state: per-pass noise breaks symmetry, learned (mu, log_sigma) set
-    scale/center, q_src and q_dst share (mu_q, log_sigma_q) but draw independent noise."""
+    """N/q_src/q_dst/state ~ N(mu, sigma) drawn fresh per pass: per-pass noise breaks
+    symmetry, learned (mu, log_sigma) set scale/center, q_src and q_dst share
+    (mu_q, log_sigma_q) but draw independent noise."""
     def _sample(mu, log_sigma, K, d):
         eps = torch.randn(B, K, d, device=device, dtype=dtype, generator=generator)
         return mu.view(1, 1, -1) + log_sigma.exp().view(1, 1, -1) * eps
@@ -88,7 +240,7 @@ def _sinusoidal_pe(seq_len: int, d: int, offset: int, device, dtype) -> Tensor:
 # ─────────────────────────────────────────────────────────────────────────
 # WRITE: unified typed-token transformer + per-token FFN readout
 # ─────────────────────────────────────────────────────────────────────────
-class GraphV6Updater(nn.Module):
+class SoftPointerGraphUpdater(nn.Module):
     """Tokenize [nodes, edge-src, edge-dst, edge-state] with type + instance/id
     embeddings; L layers of cross-attn(pins) + self-attn(graph tokens) + FFN; cross-
     position whitening; per-token FFN heads -> new field TARGETS (gated downstream)."""
@@ -164,7 +316,7 @@ class GraphV6Updater(nn.Module):
         }
 
 
-class GraphV6Gate(nn.Module):
+class SoftPointerGraphGate(nn.Module):
     """Per-slot anchor-biased gate g in [0,1] blending old -> target.
     field_new = old + g * (target - old). init_bias makes g low by default (stability)."""
 
@@ -181,7 +333,7 @@ class GraphV6Gate(nn.Module):
 # ─────────────────────────────────────────────────────────────────────────
 # READ Stage A: directional FiLM-by-state fact-token builder
 # ─────────────────────────────────────────────────────────────────────────
-class GraphV6FactBuilder(nn.Module):
+class SoftPointerGraphFactBuilder(nn.Module):
     """fact = post-MLP( LN( (W_src·src) ⊙ (W_dst·dst) ⊙ (1 + W_rel·state) ) ).
 
     BIND (multiplicative), replacing the old ADDITIVE FiLM pool
@@ -235,7 +387,7 @@ class GraphV6FactBuilder(nn.Module):
 # ─────────────────────────────────────────────────────────────────────────
 # READ Stage B: per-decode-token multi-head soft retrieval + ReZero residual fuse
 # ─────────────────────────────────────────────────────────────────────────
-class GraphV6FactReader(nn.Module):
+class SoftPointerGraphFactReader(nn.Module):
     """At every position: project hidden -> query, MULTI-HEAD cross-attention over the
     fact-tokens (soft, full-support — no hard top-k, no dead gradients), FFN, then a
     ReZero-scaled residual into the hidden state."""

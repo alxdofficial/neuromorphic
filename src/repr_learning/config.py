@@ -344,225 +344,57 @@ class ReprConfig:
     graph_readout_n_heads: int = 4           # cross-edge message-passing attention heads
     graph_readout_d_hidden: int = 512        # d_hidden inside the directional readout
 
-    # ── Graph v5 (Exp 1 v5): shared node bank + soft-pointer edges ─────────
-    # See src/repr_learning/graph_substrate_v5.py for the design.
-    #
-    # HONEST capacity accounting (revised 2026-05-27 post-audit):
-    # Both N (bank) AND edges persist across windows. v5.4's MP readout
-    # also EMITS K_node tokens directly. Both must count toward bottleneck:
-    #     state = K_node·d_node + K_edge·(2·d_node + d_state)
-    # At K_node=32, K_edge=57, d_node=d_state=128: 4,096 + 21,888 = 25,984.
-    # Matches 26,100 baseline budget within 0.4%. Prior config (K_node=64,
-    # K_edge=68) was 34,304 floats = 31% over budget; comparisons against
-    # baselines at the old config were unfairly favorable to v5.
-    #
-    # K_proposal IS still encoder-internal (per-window scratch, discarded
-    # after slot routing — does not persist, never reaches decoder).
-    graph_v5_K_node: int = 32              # # shared node slots (counts toward bottleneck)
-    graph_v5_K_edge: int = 57              # # persistent edges (counts toward bottleneck)
-    graph_v5_K_proposal: int = 80          # # per-window candidate proposals (encoder-internal scratch)
-    graph_v5_d_node: int = 128             # node vector dim
-    graph_v5_d_state: int = 128            # edge state dim
-    graph_v5_d_updater: int = 384          # edge updater token dim
-    graph_v5_updater_layers: int = 4       # transformer-updater depth
-    graph_v5_updater_n_heads: int = 16     # heads in edge updater AttnBlocks (matches v4.2)
-    graph_v5_node_gate_init_bias: float = 0.5  # node write gate init → sigmoid(-0.5) ≈ 0.38
-    graph_v5_edge_gate_init_bias: float = 1.0  # edge update gate init → sigmoid(-1) ≈ 0.27 (anchor)
-    graph_v5_init_log_sigma: float = 0.0   # initial log σ for (μ, σ) of N/state/q init noise (σ=1.0)
-    # Init τ for the trained soft pointer. Lowered 1.0 → 0.3 (2026-05-27 post-
-    # audit): at τ=1.0, endpoint_cos_mean≈0.99 at init → MP routing degenerate
-    # in early training. Starting sharper gives v5.4's MP readout meaningful
-    # structure from step 0. Learnable τ can still drift up if model wants.
-    graph_v5_read_temperature: float = 0.3
-    # v5.3: trained soft pointer with K/V split. K_split projects N through
-    # separate W_k (for scoring) and W_v (for aggregation) — Csordás et al.
-    # 2019 fix for the DNC pathology where N playing both roles produces
-    # flat noisy address distributions. Combined with learnable τ above.
-    graph_v5_soft_pointer_kv_split: bool = True
-    graph_v5_readout_n_heads: int = 4      # [legacy v5.3 GraphReadoutV5] cross-edge MP heads
-    graph_v5_readout_d_hidden: int = 512   # [legacy v5.3 GraphReadoutV5] d_hidden
-    # v5.4: message-passing readout (replaces v5.3's cross-edge attention readout).
-    # T rounds of bipartite MP, Q/K/V split with K=N (stable address book) and
-    # V=msg_buf (evolving content). Outputs K_node memory tokens to Llama.
-    # T=4 chosen 2026-05-27: at K_node=64 with sharp pointers, 4-hop reach is
-    # plenty for the multi-hop tasks in composite_v1.
-    graph_v5_n_message_rounds: int = 4
-    graph_v5_mp_d_hidden: int = 256        # msg_mlp hidden dim (2× d_node default)
-    # Per-node mean normalization on aggregation (GAT/mean style). Without
-    # this, hub nodes touched by N edges get N× larger agg than isolated
-    # nodes → variance imbalance + hub-driven oversmoothing. Default ON
-    # (added 2026-05-27 post-audit).
-    graph_v5_mp_degree_normalize: bool = True
-    # GCNII-style anchor strength: at each MP round, blend the updated buf
-    # with the seed = W_init(N). (1-α)·updated + α·seed. Prevents msg_buf
-    # from drifting away from node identity over T rounds. α=0 disables.
-    # Default 0.1 (light touch — empirical sweet spot in GCNII literature).
-    graph_v5_mp_anchor_strength: float = 0.1
-
-    # ── Graph v6 (docs/graph_v6.md) ────────────────────────────────────────
+    # ── soft_pointer_graph (docs/graph_v6.md) ──────────────────────────────
     # Soft-pointer graph memory with a no-op-free, per-token read. Persistent
-    # state N[K_node,d_node] + per-edge (q_src,q_dst [d_node], state [d_state]) —
-    # same float accounting as graph_v5. Defaults match the v5 operative config
-    # (274,944 substrate floats); re-match baselines once the arch is frozen.
-    graph_v6_K_node: int = 128
-    graph_v6_K_edge: int = 196
-    graph_v6_d_node: int = 480    # widened 384→480 to MATCH the ports' 262,144-float memory
-    graph_v6_d_state: int = 480    # (per-example state = C + content + a_accum + q_src/q_dst/state)
-    graph_v6_d_updater: int = 640          # write-transformer token dim
-    graph_v6_updater_layers: int = 5
-    graph_v6_updater_heads: int = 16
-    graph_v6_d_read: int = 512             # fact-token / read dim
-    graph_v6_read_heads: int = 8           # multi-head cross-attention read heads
-    graph_v6_read_ffn_mult: int = 4
-    graph_v6_builder_mlp_hidden: int = 768  # post-FiLM residual MLP hidden
-    graph_v6_read_temperature: float = 0.3
-    graph_v6_node_gate_init_bias: float = 0.5
-    graph_v6_edge_gate_init_bias: float = 1.0
-    graph_v6_init_log_sigma: float = 0.0
-    graph_v6_film_hidden: int = 512
-    graph_v6_inject_layer: int = 13        # v6.1: late-layer inject (was 8 = mid-stack "conform
+    # state N[K_node,d_node] + per-edge (q_src,q_dst [d_node], state [d_state]).
+    # Defaults give 274,944 substrate floats; re-match baselines once the arch
+    # is frozen.
+    spg_K_node: int = 128
+    spg_K_edge: int = 196
+    spg_d_node: int = 480    # widened 384→480 to MATCH the ports' 262,144-float memory
+    spg_d_state: int = 480    # (per-example state = C + content + a_accum + q_src/q_dst/state)
+    spg_d_updater: int = 640          # write-transformer token dim
+    spg_updater_layers: int = 5
+    spg_updater_heads: int = 16
+    spg_d_read: int = 512             # fact-token / read dim
+    spg_read_heads: int = 8           # multi-head cross-attention read heads
+    spg_read_ffn_mult: int = 4
+    spg_builder_mlp_hidden: int = 768  # post-FiLM residual MLP hidden
+    spg_read_temperature: float = 0.3
+    spg_node_gate_init_bias: float = 0.5
+    spg_edge_gate_init_bias: float = 1.0
+    spg_init_log_sigma: float = 0.0
+    spg_film_hidden: int = 512
+    spg_inject_layer: int = 13        # v6.1: late-layer inject (was 8 = mid-stack "conform
                                            # zone" where a wrong read flips the answer; 13/16 ≈
                                            # top-third "ignore zone", Ben-Artzy — a bad read is harmless)
 
-    # ── graph_v7 READ mode (cross-attention read vs prepend) ───────────────
-    # "prepend" (default, existing behavior): the K_edge memory tokens are
-    # prepended to the decode sequence and the frozen Llama self-attention is
-    # relied on to use them. Empirically it doesn't — the memory gradient
-    # collapses (grad_norm_memory 56→0.15) and the write never learns.
-    # "cross_attn": skip the prepend (M=0) and instead install a dedicated,
-    # TRAINABLE multi-head cross-attention read at a few decoder layers. Each
-    # decode token queries the graph's memory vectors; the result is
-    # gated-added into Llama's residual stream so gradient flows back to the
-    # graph encoder from step 0 (gate init NONZERO). graph_v7 only.
-    graph_read_mode: str = "prepend"
-    graph_read_n_layers: int = 4                       # informational (len of indices)
-    graph_read_layer_indices: tuple = (3, 7, 11, 15)   # which decoder layers host a read
-    graph_read_inner_dim: int = 512                    # per-read q/k/v projection width
-    graph_read_n_heads: int = 8                        # cross-attention heads
-    graph_read_gate_init: float = 0.1                  # learnable scalar gate init (NONZERO — load-bearing)
-
-    # ── graph_v7 WRITE contextualization (encoder INPUT, not the read) ─────
-    # "raw" (default, existing behavior): the graph substrate builds its memory
-    # from RAW Llama token embeddings (context-free lookups). EVERY port
-    # (ICAE/CCM/AutoComp/Beacon) instead writes from CONTEXTUALIZED hidden
-    # states (input run through a frozen Llama → last_hidden_state). This flag
-    # gives the graph the same option: when "contextualized", run the FROZEN
-    # DECODER Llama over the context (one extra no_grad pass — no second base,
-    # avoiding the ports' OOM) and feed its hidden states into route_enc/
-    # content_enc IN PLACE of raw embeds (same [B,T,d_llama] shape, so the graph
-    # pipeline — routing, co-activation C, TokenGT edge update, ⊙ bind, the
-    # cross-attn read — is UNCHANGED). The Llama stays frozen: gradient does NOT
-    # flow into the base; the graph's own route_enc/content_enc remain the
-    # trainable write. Contextualization is WRITE-side ONLY — the decoder still
-    # decodes the ORIGINAL raw embeds. Composes independently with
-    # graph_read_mode. graph_v7 only.
-    graph_write_context: str = "raw"             # "raw" | "contextualized"
-    # 0 = full/all decoder layers → use last_hidden_state ("full contextualize").
-    # N>0 = run only the first N layers and read hidden_states[N] ("lower attune"
-    # mode — hidden_states[0] = embeds, [k] = after layer k; clamped to n_layers).
-    graph_write_context_layers: int = 0
-
-    # ── graph_v7 bind-early / unbind-late associative memory (HRR) ──────────
-    # The diagnosis: graph_v7's content accumulator MEAN-POOLS token values into
-    # shared type-atoms → per-example memory is near-constant across passages
-    # (cross-passage cosine 0.999) → SHUF=REAL (no binding). The fix: tag each
-    # token's value with its entity-KEY via an HRR (circular-convolution) bind
-    # the instant BEFORE it pools, so each atom holds a recoverable superposition
-    # (Plate 1995, Holographic Reduced Representations); UNBIND by the question's
-    # key (circular correlation) at read. When True, the WRITE pools BOUND pairs
-    # and a dedicated unbind READ replaces the cross-attn read; the structural
-    # TokenGT/edge/materialize path is left in place but RECALL goes through the
-    # unbind (the Hadamard ⊙ fact_builder is bypassed — not cleanly invertible).
-    # REQUIRES graph_write_context=="contextualized" (the entity-key needs
-    # Llama's contextualization). graph_v7_baseline only.
-    graph_v7_bind: bool = False
-    # NONZERO learnable scalar gate init for the unbind read (load-bearing — lets
-    # gradient reach key_proj/value_proj/W_recover/route_enc from step 0).
-    graph_v7_bind_gate_init: float = 0.1
-
-    # ── graph_v7 substrate hyperparameters (hoisted from getattr-buried defaults) ──
-    # Co-activation accumulator decay applied once per WINDOW (encode-once EMAT
-    # favors a long-memory accumulator; the within-scope outer-product structure
-    # is the load-bearing part regardless of cadence).
-    graph_v7_decay: float = 0.98
-    # Aux-loss weights (added directly via the graph_aux path; NOT re-scaled by
-    # load_balance_coef). Edge competition (claim distinct (src,dst) pairs) and
-    # atom decorrelation (keep the vocabulary spread). Aux-loss-as-fallback.
-    graph_v7_competition_coef: float = 0.1
-    graph_v7_decorr_coef: float = 0.1
-    # Split routing/endpoint temperatures (learnable; these set the INIT).
-    # Routing over normalized-cosine logits needs a SMALL tau to peak — a sharp
-    # per-token assignment is what lets atoms specialize (SHUF=REAL root cause).
-    # Endpoint materialization tolerates a larger tau (it pools over the active
-    # set, not a single atom). Both are learnable nn.Parameters from these inits.
-    graph_v7_route_tau_init: float = 0.1
-    graph_v7_endpoint_tau_init: float = 0.3
-    # FIXED top-k active set: the |active| atoms (by accumulated activation) that
-    # endpoints may address. Replaces the relative-fraction mask (a > frac·amax),
-    # which was budget-unstable. Used in BOTH materialize and the edge-update KV
-    # mask so the two stay consistent.
-    graph_v7_active_topk: int = 32
-    # TokenGT updater hidden width (~48M trainable at 800, matches the hand-built
-    # cluster) and the per-window scope (# tokens whose outer-product co-activation
-    # is accumulated). Hoisted from getattr-buried defaults.
-    graph_v7_d_updater: int = 800
-    graph_v7_scope_size: int = 16
-
-    # ── graph_v8 (corrected columnar V8; implementation: graph_substrate_v8.py) ──
-    # The 2026-06-09 design-correction of v8: same N nodes at EVERY layer (concept
-    # columns, positional upward writes — no write-time matching), per-token
-    # input-driven routing + co-activation at every layer (no consolidation clock;
-    # timescales = learnable per-layer decay ladder), per-NODE fusion proposals
-    # (partners' HRR self-binds weighted by the node's coact column), keys AND
-    # values delta-written, real NLL surprise, K/V-split cross-attn read
-    # (same-layer K_ℓ/V_ℓ reads via shared routers; GraphV8SymReader).
-    # Fast compressed graph_v8 anchor: final read memory is
-    # n_layers · n_nodes · 2 · d_mem = 3 · 768 · 2 · 64
-    # = 294,912 floats = 144 Llama-token-equivalent memory vectors. Including
-    # the encoder's per-example coact/traces state, the streaming graph state is
-    # ~2,068,992 floats, just below the default EMAT-bio input budget
-    # (1024 · 2048 = 2,097,152 floats), while preserving the multiple-of-32
-    # substrate contract.
-    graph_v8_d_mem: int = 64
-    graph_v8_n_nodes: int = 768
-    graph_v8_n_layers: int = 3          # persistent layers above L0 (4 incl. L0)
-    graph_v8_chunk: int = 256           # chunkwise-parallel token batch (also ckpt unit)
-    # LAYER-MATCHED splice points, one per MEMORY LAYER incl. L0 (same-layer K/V
-    # read, 2026-06-10): WRITE-side routing for source layer i consumes encoder
-    # hiddens at layers[i] (i=0..2: atoms, K1, K2); READ of memory layer ℓ hooks
-    # the decoder at layers[ℓ] and routes over K_ℓ via router ℓ (router 3 over K3
-    # is read-only — L3 never writes upward). (3, 6, 10, 14): atoms earliest
-    # (most concrete), spacing so Llama digests each read, ≥1 layer + final norm
-    # after the deepest read.
-    graph_v8_reader_layers: tuple = (3, 6, 10, 14)
-    graph_v8_reader_inner_dim: int = 224      # 7*32; v/o-only reader (routers are shared)
-
-    # ── graph_v9 (Compression-by-Vocabulary; graph_substrate_v9.py; design:
-    # docs/compression_model_design.md, 2026-06-13) ──────────────────────────────
+    # ── hierarchical_learned_vocab (Compression-by-Vocabulary;
+    # hierarchical_learned_vocab.py; design: docs/compression_model_design.md) ───
     # REPLACES the retired operator pyramid. v1 = nodes-only soft-clustering
     # compressor: a learned multi-layer node vocabulary; tokens routed against
     # node keys, re-described (residual+top-k+norm), passed up; code = the m_max
     # most-present node-clusters across layers (NPMI-anti-hub), each carrying its
     # assigned tokens' centroid. Prepend compressor for sentence_mae (sliced to
     # k=ceil(L/ratio) by the harness). v2 adds STDP edges + graph reader.
-    graph_v9_d_code: int = 256           # shared code space (vocabulary)
-    graph_v9_nodes: tuple = (512, 256, 128)  # nodes per layer (low->high)
-    graph_v9_top_k: int = 4              # perturbation sparsity (active nodes/token)
-    graph_v9_m_max: int = 16             # max emitted node-tokens (>= max k)
-    graph_v9_effective_k: float = 8.0    # target #active nodes at init -> route temp
-    graph_v9_tap_layer: int = 6          # mid-stack tap for the frozen contextualizer
+    hlvocab_d_code: int = 256           # shared code space (vocabulary)
+    hlvocab_nodes: tuple = (512, 256, 128)  # nodes per layer (low->high)
+    hlvocab_top_k: int = 4              # perturbation sparsity (active nodes/token)
+    hlvocab_m_max: int = 16             # max emitted node-tokens (>= max k)
+    hlvocab_effective_k: float = 8.0    # target #active nodes at init -> route temp
+    hlvocab_tap_layer: int = 6          # mid-stack tap for the frozen contextualizer
     # v2 FULL graph (default) vs v1 nodes-only ablation. v2 = unified STDP edges
     # (within+inter-layer) + plasticity grammar + stateless instance-tag node-tokens
     # + dedicated trainable graph reader (docs/compression_model_design.md §3-4).
-    graph_v9_use_graph: bool = True      # True = v2 full graph; False = v1 nodes-only
-    graph_v9_edge_topP: int = 32         # node prefilter: edges among top-P active nodes/layer
-    graph_v9_edge_cand: int = 48         # candidate edges after the cheap STDP-lift prefilter
-    graph_v9_d_sel: int = 192            # context-aware edge-selector transformer width
-    graph_v9_sel_layers: int = 2
-    graph_v9_sel_heads: int = 4
-    graph_v9_d_read: int = 192           # dedicated graph-reader width
-    graph_v9_reader_layers: int = 2
-    graph_v9_reader_heads: int = 4
+    hlvocab_use_graph: bool = True      # True = v2 full graph; False = v1 nodes-only
+    hlvocab_edge_topP: int = 32         # node prefilter: edges among top-P active nodes/layer
+    hlvocab_edge_cand: int = 48         # candidate edges after the cheap STDP-lift prefilter
+    hlvocab_d_sel: int = 192            # context-aware edge-selector transformer width
+    hlvocab_sel_layers: int = 2
+    hlvocab_sel_heads: int = 4
+    hlvocab_d_read: int = 192           # dedicated graph-reader width
+    hlvocab_reader_layers: int = 2
+    hlvocab_reader_heads: int = 4
 
     # ── JEPA loss coefficients (dormant path; hoisted for hygiene) ──────────
     # VicReg variance/covariance anti-collapse weights on the online memory.
@@ -621,11 +453,11 @@ class ReprConfig:
         return self.n_flat_codes * self.d_continuous
 
     @property
-    def bottleneck_floats_graph_v6(self) -> int:
-        """graph_v6 persistent substrate: node bank + per-edge (q_src, q_dst, state).
-        Same accounting as graph_v5 (the two soft-pointer queries are the 2·d_node term)."""
-        return (self.graph_v6_K_node * self.graph_v6_d_node
-                + self.graph_v6_K_edge * (2 * self.graph_v6_d_node + self.graph_v6_d_state))
+    def bottleneck_floats_spg(self) -> int:
+        """soft_pointer_graph persistent substrate: node bank + per-edge
+        (q_src, q_dst, state) — the two soft-pointer queries are the 2·d_node term."""
+        return (self.spg_K_node * self.spg_d_node
+                + self.spg_K_edge * (2 * self.spg_d_node + self.spg_d_state))
 
     @property
     def n_memory_tokens(self) -> int:
