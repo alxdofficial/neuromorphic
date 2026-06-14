@@ -664,18 +664,7 @@ def train_one_variant(
             #   is always 0, so displaying it tells you nothing)
             # - else: plain loss_aux (load_balance+orth+z)
             extra_field = ""
-            if variant == "graph_baseline":
-                # v4: show gate distribution (anchor/loadbearer/jumpedship)
-                # + self-pick rate. Tells you immediately whether g is doing
-                # anything (gate≈0.05 + no escalation = stubborn-stuck).
-                g = float(out.get("graph_gate_mean_avg", 0.0) or 0.0)
-                fa = float(out.get("graph_frac_anchor_avg", 0.0) or 0.0)
-                fl = float(out.get("graph_frac_loadbearer_avg", 0.0) or 0.0)
-                fj = float(out.get("graph_frac_jumpedship_avg", 0.0) or 0.0)
-                fs = float(out.get("graph_frac_selfpick_avg", 0.0) or 0.0)
-                extra_field = f"g={g:.3f} a/l/j={fa:.2f}/{fl:.2f}/{fj:.2f} self={fs:.2f}"
-                aux_tag, aux_display = "aux", float(out["loss_aux"])
-            elif variant == "soft_pointer_graph_baseline":
+            if variant == "soft_pointer_graph_baseline":
                 # show node/edge gate means (anchor-init ≈ 0.38 / 0.27).
                 g_n = float(out.get("spg_node_gate_mean_avg", 0.0) or 0.0)
                 g_e = float(out.get("spg_edge_gate_mean_avg", 0.0) or 0.0)

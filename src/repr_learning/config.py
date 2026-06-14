@@ -319,30 +319,6 @@ class ReprConfig:
     # Llama layer index at which to inject the per-position memory readout.
     plastic_inject_layer: int = 8
 
-    # ── Graph substrate (Exp 1 v3) ────────────────────────────────────────
-    # See docs/exp1_graph_baseline.md for design.
-    # K_max=68, d_node=d_state=128. Bottleneck convention matches splat:
-    # K_max·(2·d_node + d_state + 1) = 68·385 = 26,180 floats — the +1 is now
-    # the `u` (pick-affinity EMA) scalar, replacing the v1/v2 learned
-    # saliency_logit. Same float-count, different semantics.
-    graph_K_max: int = 68          # edge budget
-    graph_d_node: int = 128        # endpoint dim
-    graph_d_state: int = 128       # edge state dim
-    # Updater + projection scaling chosen to land at ~14-15M trainable params
-    # (matches A/B/MT/Mamba's 12.5-14.9M band).
-    graph_updater_layers: int = 4  # transformer-updater depth
-    graph_d_updater: int = 384     # updater token dim
-    # graph_d_proj_hidden was the v1/v2 projection MLP hidden dim. v3 uses
-    # graph_readout_d_hidden (below) inside GraphReadout instead. Field
-    # removed to avoid confusion — if you see it elsewhere, that code is stale.
-    # v4 graph_baseline knobs.
-    graph_u_decay: float = 0.5               # fast EMA for 4-window chunks (was 0.95; left u init-dominated)
-    graph_gate_init_bias: float = 1.0        # gate init: sigmoid(-1) ≈ 0.27 (anchor-leaning, escapes saturation)
-    graph_grace_windows: int = 4             # [unused in v4] kept for backward-compat with cfg loaders
-    graph_max_overwrites_fraction: float = 0.05  # [unused in v4] recycle was removed
-    graph_update_strength_scale: float = 4.0     # [unused in v4] alpha-from-cosine was replaced by GraphGate
-    graph_readout_n_heads: int = 4           # cross-edge message-passing attention heads
-    graph_readout_d_hidden: int = 512        # d_hidden inside the directional readout
 
     # ── soft_pointer_graph (docs/graph_v6.md) ──────────────────────────────
     # Soft-pointer graph memory with a no-op-free, per-token read. Persistent
