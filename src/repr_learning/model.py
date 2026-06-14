@@ -757,7 +757,9 @@ class ReprLearningModel(nn.Module):
         if zero_memory:
             memory = memory[:, :0]
             mem_mask = mem_mask[:, :0]
-        elif shuffle_memory and B > 1:
+        elif shuffle_memory:
+            if B == 1:   # mirror the QA path: SHUF is a no-op at B==1, fail loudly [merge #6]
+                raise ValueError("shuffle_memory requires batch size > 1 (B==1 would leave REAL memory).")
             memory = torch.roll(memory, shifts=1, dims=0)
             mem_mask = torch.roll(mem_mask, shifts=1, dims=0)
         M = memory.shape[1]

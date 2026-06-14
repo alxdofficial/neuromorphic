@@ -438,7 +438,9 @@ def train_one_variant(
     # still ramping and val noise dominates real signal at low steps.
     best_val_recon = float("inf")
     best_val_step = -1
-    BEST_MIN_STEP = max(1000, n_steps // 10)
+    # 10% of total (min 1000) to skip early-warmup flukes, but never exceed the run
+    # itself — short smokes (e.g. 600 steps) must still save a best after warmup [merge #5]
+    BEST_MIN_STEP = min(1000, max(val_every, n_steps // 10))
     # Patience-based early stopping (best.pt staleness criterion). Counts
     # eval points since the last best.pt update. Stop only when no new
     # global best has been seen for `patience` consecutive evals past
@@ -1001,7 +1003,7 @@ def main():
     # Retired graph/plastic/splat and older flat/continuous/MT/Mamba variants
     # remain selectable via explicit --variants if needed.
     ap.add_argument("--variants", nargs="+", default=[
-        "graph_v8_baseline",          # primary architecture (columnar K/V read)
+        "graph_v9_baseline",          # primary architecture (Compression-by-Vocabulary graph)
         "icae_baseline",              # ICAE (ICLR'24)
         "ccm_baseline",               # CCM (ICLR'24)
         "autocompressor_baseline",    # AutoCompressor/RMT-style recurrent summary

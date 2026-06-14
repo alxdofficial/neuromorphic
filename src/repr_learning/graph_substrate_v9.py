@@ -83,6 +83,13 @@ class GraphV9Config:
     def __post_init__(self):
         if self.d_code % 32 != 0:
             raise ValueError(f"d_code={self.d_code} must be a multiple of 32")
+        if self.use_graph:   # fail-fast on v2 shape assumptions [merge #9]
+            if self.m_max < 2:
+                raise ValueError(f"use_graph needs m_max>=2 (edges are pairs); got {self.m_max}")
+            if self.d_read % self.reader_heads != 0:
+                raise ValueError(f"d_read={self.d_read} must be divisible by reader_heads={self.reader_heads}")
+            if len(self.stdp_tau_init) < len(self.nodes):
+                raise ValueError(f"stdp_tau_init needs >= {len(self.nodes)} entries (one τ per layer)")
 
 
 class GraphV9Substrate(nn.Module):
@@ -217,7 +224,7 @@ class GraphV9Substrate(nn.Module):
                 x = self._perturb(l, x, scores) * m
             with torch.no_grad():
                 p = scores.clamp_min(1e-12)
-                aux[f"graph_v9_route_entropy_L{l}"] = ((-(p * p.log()).sum(-1)) * mask).sum() / mask.sum()
+                aux[f"graph_v9_route_entropy_L{l}"] = ((-(p * p.log()).sum(-1)) * mask).sum() / mask.sum().clamp_min(1.0)
                 ms = mean_act
                 aux[f"graph_v9_hub_share_L{l}"] = (ms / ms.sum(-1, keepdim=True).clamp_min(1e-9)).max(-1).values.mean()
                 aux[f"graph_v9_coverage_L{l}"] = torch.tensor(
@@ -237,6 +244,10 @@ class GraphV9Substrate(nn.Module):
         B, L = hiddens.shape[:2]
         device = hiddens.device
         d_llama = cfg.d_llama
+        if L > 1024:   # STDP is O(L^2) — guard until a streaming recurrence exists [merge #2]
+            raise ValueError(
+                f"graph_v9 v2 STDP builds an [L,L] kernel (L={L}); guarded at 1024. "
+                "Use sentence_mae (L<=128); long-context needs the streaming-recurrence STDP.")
         A_list, margs, aux = self._phase1(hiddens, mask)
         P = min(cfg.edge_topP, *cfg.nodes)
         E = self.n_edges
@@ -258,6 +269,7 @@ class GraphV9Substrate(nn.Module):
             src_layers = torch.tensor([s for s, _ in self.edge_sources], device=device)
             dst_layers = torch.tensor([d for _, d in self.edge_sources], device=device)
             M = self.plasticity_M.float()
+            eye = torch.eye(P, device=device, dtype=torch.bool)
             scores_per_src = []
             for (ls, ld) in self.edge_sources:
                 tau = self.log_tau_within[ls].exp() if ls == ld else self.log_tau_inter[ls].exp()
@@ -266,7 +278,10 @@ class GraphV9Substrate(nn.Module):
                 lift = C / (margP[ls].unsqueeze(2) * margP[ld].unsqueeze(1)).clamp_min(1e-9)
                 gate = torch.sigmoid(self.plasticity_scale
                                      * torch.einsum("bik,kq,bjq->bij", idP[ls], M, idP[ld]))
-                scores_per_src.append(lift.clamp_min(1e-9).log() + torch.log(gate.clamp_min(1e-6)))
+                score = lift.clamp_min(1e-9).log() + torch.log(gate.clamp_min(1e-6))
+                if ls == ld:                                   # mask self-loops i->i [merge #3]
+                    score = score.masked_fill(eye, -1e30)      # (standalone covers "node present")
+                scores_per_src.append(score)
             all_scores = torch.stack(scores_per_src, dim=1)    # [B,S,P,P]
             S = all_scores.shape[1]
 
@@ -296,19 +311,27 @@ class GraphV9Substrate(nn.Module):
             dst_tok = (_unit(dst_val) + self.role_emb[1] + self.tag_emb[tags]) * edge_w.unsqueeze(-1)
             tokens = torch.stack([src_tok, dst_tok], dim=2).reshape(B, 2 * E, d_llama)
 
-            # dedicated graph reader (groups by tag / orients by role via self-attn)
+            # dedicated graph reader — CAUSAL mask so the first-k memory tokens form a
+            # valid PREFIX code (the harness slices to k AFTER). Bidirectional mixing
+            # would let token 0 see all m_max=16 graph tokens, so the k-token budget
+            # would secretly encode the full graph = capacity LEAK vs the causal-LM
+            # baselines (whose appended slots are prefix-stable too). [merge #1 CRITICAL]
+            Mtok = tokens.shape[1]
+            causal = torch.triu(torch.full((Mtok, Mtok), float("-inf"), device=device), 1)
             h = self.read_in(tokens)
             for layer in self.reader:
-                h = layer(h)
+                h = layer(h, src_mask=causal)
             memory = self.token_norm(self.read_out(h))         # [B, 2E=m_max, d_llama]
 
         with torch.no_grad():
+            # node identity = (layer, local index) [merge #8]
             uniq = torch.tensor(
-                [torch.cat([i_idx[b], j_idx[b]]).unique().numel() for b in range(B)],
-                device=device, dtype=torch.float).mean()
+                [torch.cat([srcL[b] * 1000 + i_idx[b], dstL[b] * 1000 + j_idx[b]]).unique().numel()
+                 for b in range(B)], device=device, dtype=torch.float).mean()
             aux["graph_v9_edge_w_mean"] = edge_w.mean()
             aux["graph_v9_edge_w_spread"] = edge_w.std()
             aux["graph_v9_edge_inter_frac"] = (srcL != dstL).float().mean()
+            aux["graph_v9_self_loop_frac"] = ((srcL == dstL) & (i_idx == j_idx)).float().mean()  # [merge #3 telem]
             aux["graph_v9_edge_uniq_nodes"] = uniq
             aux["graph_v9_tau_within"] = self.log_tau_within.exp().mean()
             aux["graph_v9_memory_norm"] = memory.float().norm(dim=-1).mean()
