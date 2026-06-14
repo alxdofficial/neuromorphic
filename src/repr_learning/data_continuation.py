@@ -11,7 +11,7 @@ passage's continuation is passage-specific. EMAT is *addressed* (retrieve a spec
 key) — the thing a pool can't do. So running both on the same arms separates "keeps gist"
 (this task) from "stores addressable bindings" (EMAT). See [[project_emat_port_scale_fairness]].
 
-Data: pre-tokenized FineWeb-edu docs (`data/wave1/fineweb_edu.{train,val}.parquet`, Llama-3 ids).
+Data: pre-tokenized FineWeb-edu docs (`data/fineweb_edu/{train,val}.parquet`, Llama-3 ids).
 The predicted window sits *immediately after* the compressed cutoff, so the early continuation
 tokens genuinely depend on the compressed context.
 
@@ -32,8 +32,8 @@ from torch.utils.data import DataLoader, IterableDataset
 from .data_qa import collate_qa
 
 REPO = Path(__file__).resolve().parents[2]
-FINEWEB_TRAIN = REPO / "data/wave1/fineweb_edu.train.parquet"
-FINEWEB_VAL = REPO / "data/wave1/fineweb_edu.val.parquet"
+FINEWEB_TRAIN = REPO / "data/fineweb_edu/train.parquet"
+FINEWEB_VAL = REPO / "data/fineweb_edu/val.parquet"
 
 
 class ContinuationDataset(IterableDataset):

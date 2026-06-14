@@ -26,9 +26,9 @@ from torch.utils.data import DataLoader, IterableDataset
 from .data_qa import collate_qa
 
 REPO = Path(__file__).resolve().parents[2]
-FINEWEB_TRAIN = REPO / "data/wave1/fineweb_edu.train.parquet"
-FINEWEB_VAL = REPO / "data/wave1/fineweb_edu.val.parquet"
-TEXT_CACHE = REPO / "data/wave1/fineweb_edu_text"   # decoded-text cache dir
+FINEWEB_TRAIN = REPO / "data/fineweb_edu/train.parquet"
+FINEWEB_VAL = REPO / "data/fineweb_edu/val.parquet"
+TEXT_CACHE = REPO / "data/fineweb_edu/text_cache"   # decoded-text cache dir
 
 _SENT = re.compile(r'(?<=[.!?])\s+(?=[A-Z"\'(\d])')
 

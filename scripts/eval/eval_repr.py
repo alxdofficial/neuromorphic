@@ -37,7 +37,7 @@ from src.repr_learning.decoder import load_frozen_llama
 from src.repr_learning.model import ReprLearningModel
 
 REPO = Path(__file__).resolve().parents[2]
-FINEWEB_VAL = REPO / "data/wave1/fineweb_edu.val.parquet"
+FINEWEB_VAL = REPO / "data/fineweb_edu/val.parquet"
 COMPOSITE_VAL = REPO / "data/wave1/composite_v1/val/passages.jsonl"
 
 
