@@ -373,11 +373,6 @@ class ReprConfig:
     hlvocab_reader_layers: int = 2
     hlvocab_reader_heads: int = 4
 
-    # ── JEPA loss coefficients (dormant path; hoisted for hygiene) ──────────
-    # VicReg variance/covariance anti-collapse weights on the online memory.
-    jepa_var_coef: float = 5.0
-    jepa_cov_coef: float = 0.5
-
     # ── Gaussian Splat substrate (Exp 3) ──────────────────────────────────
     # See docs/exp3_gaussian_splat_baseline.md for full design.
     # v3 sweep: K=100, d=128 → bottleneck K·(2d+2) = 25,800 floats
