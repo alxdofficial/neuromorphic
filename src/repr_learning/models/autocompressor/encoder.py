@@ -47,6 +47,9 @@ class AutoCompressorBaselineEncoder(nn.Module):
         self.slots = nn.Parameter(slot_init)                  # M write-memory slots
         self.summary0 = nn.Parameter(slot_init.clone())       # initial read-memory (window 1)
         self.norm = _NormMatch(cfg.d_llama)
+        with torch.no_grad():   # seed norm-match scale to the backbone embed norm
+            self.norm.scale.data.fill_(   # (0.9 default is ~3x too quiet on SmolLM2; match hlvocab)
+                base.get_input_embeddings().weight.float().norm(dim=-1).mean().item())
         print(f"[AutoCompressor] encoder-LoRA wrapped {n_wrapped} layers; M={self.M} (recurrent)")
 
     def train(self, mode: bool = True):

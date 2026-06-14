@@ -98,6 +98,9 @@ class CCMBaselineEncoder(nn.Module):
         comp_init = comp_init + emb_std * torch.randn(self.n_comp, cfg.d_llama)
         self.comp_embeds = nn.Parameter(comp_init)
         self.norm = _NormMatch(cfg.d_llama)
+        with torch.no_grad():   # seed norm-match scale to the backbone embed norm
+            self.norm.scale.data.fill_(   # (0.9 default is ~3x too quiet on SmolLM2; match hlvocab)
+                base.get_input_embeddings().weight.float().norm(dim=-1).mean().item())
         print(f"[CCM] COMP-gated LoRA wrapped {n_wrapped} linears "
               f"(rank={cfg.ccm_lora_rank}); n_comp={self.n_comp}; fold={self.fold}")
 

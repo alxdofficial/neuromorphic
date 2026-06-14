@@ -63,6 +63,9 @@ class ICAEBaselineEncoder(nn.Module):
         slot_init = slot_init + emb_std * torch.randn(self.M, cfg.d_llama)
         self.slots = nn.Parameter(slot_init)
         self.norm = _NormMatch(cfg.d_llama)
+        with torch.no_grad():   # seed norm-match scale to the backbone embed norm
+            self.norm.scale.data.fill_(   # (0.9 default is ~3x too quiet on SmolLM2; match hlvocab)
+                base.get_input_embeddings().weight.float().norm(dim=-1).mean().item())
         print(f"[ICAE] encoder-LoRA wrapped {n_wrapped} layers "
               f"(rank={cfg.icae_lora_rank}); M={self.M} slots")
 

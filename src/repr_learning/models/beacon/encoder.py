@@ -99,6 +99,9 @@ class BeaconBaselineEncoder(nn.Module):
         self.beacon_embed = nn.Parameter(
             mean_vec.view(1, cfg.d_llama) + emb_std * torch.randn(1, cfg.d_llama))
         self.norm = _NormMatch(cfg.d_llama)
+        with torch.no_grad():   # seed norm-match scale to the backbone embed norm
+            self.norm.scale.data.fill_(   # (0.9 default is ~3x too quiet on SmolLM2; match hlvocab)
+                base.get_input_embeddings().weight.float().norm(dim=-1).mean().item())
         print(f"[Beacon] separate {sorted(targets)} projections on {n_wrapped} "
               f"linears; α={cfg.beacon_ratio or 32}")
 
