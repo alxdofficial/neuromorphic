@@ -2504,9 +2504,17 @@ class GraphV9PyramidEncoder(nn.Module):
             m_max=cfg.graph_v9_m_max, effective_k=cfg.graph_v9_effective_k)
         self.sub = GraphV9Substrate(v9)
         self.M = v9.m_max
+        # norm-match TARGET = the active backbone's embedding scale, NOT the
+        # Llama-era 0.9 default (SmolLM2 embeds have norm ~2.68; 0.9 left memory
+        # 3x too quiet and the learnable scalar never grew). In-distribution from
+        # step 1; learnable from there.
+        with torch.no_grad():
+            emb_norm = self.base.get_input_embeddings().weight.float().norm(dim=-1).mean()
+        self.sub.token_norm.scale.data.fill_(float(emb_norm))
         print(f"[graph_v9] compression-by-vocabulary: nodes={tuple(cfg.graph_v9_nodes)} "
               f"d_code={cfg.graph_v9_d_code} top_k={cfg.graph_v9_top_k} "
-              f"m_max={cfg.graph_v9_m_max} tap=L{cfg.graph_v9_tap_layer}")
+              f"m_max={cfg.graph_v9_m_max} tap=L{cfg.graph_v9_tap_layer} "
+              f"norm_match_target={float(emb_norm):.2f}")
 
     def train(self, mode: bool = True):
         super().train(mode)
