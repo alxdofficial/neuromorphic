@@ -241,3 +241,31 @@ For comparison: floor 6.96 (0%), ccm 5.61 (22%), …, autocomp 4.64 (38%).
   higher, centroid pooling is destroying info (build a higher-bandwidth write:
   per-token-preserving / outer-product key⊗value binding, or v2 edges+roles).
   If similar, bottleneck is elsewhere (mask/read).
+
+## RESULT — graph_v9 v1 AFTER debug-sweep fixes A-K (2026-06-14)
+Two-agent debug sweep (mine: substrate dynamics; other: harness validity) found
++ fixed 11 issues. Mechanism fixes CONFIRMED via new telemetry; norm-match target
+set to backbone embed scale (3.18, not the Llama-era 0.9).
+| version | recon ↓ | band% | SHUF−REAL | routing | mem_norm |
+|---|---|---|---|---|---|
+| old (buggy) | 6.28 | 11% | +1.55 (mask-INFLATED) | collapsed (hub .997) | 17.7 OOD |
+| fixed, norm 0.9 | 6.74 | 3% | +0.46 clean | healthy | 0.90 too quiet |
+| **fixed, norm 3.18** | **6.58** | **~6%** | **+0.85 clean** | healthy (ent 3.8, cov .32) | 3.19 in-dist |
+
+**VERDICT: v1 BINDS genuinely (clean monotone SHUF−REAL +0.85, > operator-graph &
+all EMAT) but is a WEAK compressor (~6% band, vs autocomp 38%).** The honest number
+(6.58) is slightly WORSE than the buggy 6.28 because the old result was partly
+artifact: collapse + OOD-loud memory + a mask-mismatched gate exploited a
+stronger-but-dishonest signal.
+
+**Bottleneck CONFIRMED STRUCTURAL, not mechanical.** With healthy routing (entropy
+3.8, no hubs, temp→hard-assignment), learnable keys (grad/param 3e-5→2.34),
+in-distribution scale, and a clean shared-mask gate ALL in place, the
+activation-weighted-mean centroid is simply low-bandwidth for per-token MAE
+reconstruction (pool-then-address = gist, not detail — research_memory_sidecar_binding).
+Scalar gates (perturb_gate 0.10, presence_a 1.0, token_norm.scale 3.19) under-learn
+but that's polish; the wall is the pooled write.
+
+**NEXT = v2 (richer write that preserves per-token detail):** stateless directed
+edges + roles + instance-tag node-tokens + dedicated graph reader, OR outer-product
+key⊗value binding per node. Mechanism-patching v1 is exhausted.
