@@ -36,7 +36,7 @@ _A_BEFORE = ("uni", "use", "uni", "eu", "one", "ewe", "u.")
 # name and drop any fact whose gendered language conflicts, so we never render
 # "Sverre, the daughter of …".
 try:
-    from scripts.data.wave1.tasks.biographical import pools as _pools
+    from scripts.data_gen.tasks.biographical import pools as _pools
     _FEM_NAMES = set(_pools.FIRST_NAMES_F)
     _MASC_NAMES = set(_pools.FIRST_NAMES_M)
 except Exception:                                # standalone import w/o worldspec
@@ -299,8 +299,8 @@ if __name__ == "__main__":  # smoke: print keys + values per entity type
     import sys
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    from scripts.data.wave1.tasks.biographical.state import build_scenario
-    from scripts.data.wave1.tasks.biographical.pools import year_as_words
+    from scripts.data_gen.tasks.biographical.state import build_scenario
+    from scripts.data_gen.tasks.biographical.pools import year_as_words
 
     scen = build_scenario(random.Random(11), 0, n_people=30, n_public_figures=10,
                           n_orgs=10, n_nations=8, n_places=10, n_events=10, n_works=10)

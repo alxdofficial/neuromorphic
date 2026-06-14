@@ -27,8 +27,8 @@ from src.repr_learning.data_qa import collate_qa
 from src.repr_learning.emat_bio_templates import render_key, render_value
 
 # bio world builder + lexical helper (worldspec files restored from git)
-from scripts.data.wave1.tasks.biographical.state import build_scenario
-from scripts.data.wave1.tasks.biographical.pools import year_as_words
+from scripts.data_gen.tasks.biographical.state import build_scenario
+from scripts.data_gen.tasks.biographical.pools import year_as_words
 
 # default per-type entity counts (≈410 entities → supports n_pairs up to ~32)
 _WORLD = dict(n_people=200, n_public_figures=30, n_orgs=60, n_nations=20,
