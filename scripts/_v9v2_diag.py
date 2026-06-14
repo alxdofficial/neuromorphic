@@ -79,27 +79,16 @@ with torch.no_grad():
         print(f"  L{l}: entropy={aux[f'hlvocab_route_entropy_L{l}']:.2f} "
               f"hub={aux[f'hlvocab_hub_share_L{l}']:.3f} cov={aux[f'hlvocab_coverage_L{l}']:.3f}")
 
-    print("\n(B) EDGE SELECTION HEALTH")
-    srcL, dstL = aux["_sel_srcL"], aux["_sel_dstL"]          # [B,E]
-    i_idx, j_idx = aux["_sel_i"], aux["_sel_j"]
+    print("\n(B) EDGE SELECTION HEALTH (sharp-softmax edge-query design)")
+    print(f"  sel_temp={aux['hlvocab_sel_temp']:.2f} (low=sharper); attn_entropy="
+          f"{aux['hlvocab_sel_attn_entropy']:.2f} attn_max={aux['hlvocab_sel_attn_max']:.3f} "
+          f"(high attn_max / low entropy = each slot ~picks one edge)")
+    print(f"  slot_uniq_edges={aux['hlvocab_slot_uniq_edges']:.1f}/{sub.n_edges} "
+          f"(-> n_edges = no slot collapse; << = slots grabbing the same edge)")
     print(f"  inter-layer edge fraction: {aux['hlvocab_edge_inter_frac']:.3f} "
           f"(0=all within-layer, 1=all cross-layer)")
-    print(f"  src-layer dist: {[(srcL==l).float().mean().item() for l in range(sub.depth)]}")
-    print(f"  dst-layer dist: {[(dstL==l).float().mean().item() for l in range(sub.depth)]}")
-    print(f"  unique endpoint nodes/example (of {2*sub.n_edges}): {aux['hlvocab_edge_uniq_nodes']:.1f}")
-    # cross-example diversity: do different sentences pick different edges?
-    sig = [set(zip(srcL[bi].tolist(), i_idx[bi].tolist(), dstL[bi].tolist(), j_idx[bi].tolist()))
-           for bi in range(B)]
-    import statistics as S
-    ov = [len(sig[a] & sig[c]) / sub.n_edges
-          for a in range(B) for c in range(a + 1, B)]
-    print(f"  cross-example edge overlap: mean={S.mean(ov):.2f} (0=all different, 1=identical "
-          f"-> selection ignores input)")
 
     print("\n(C) MAGNITUDES")
-    ew = aux["_edge_w"]
-    print(f"  edge_w: mean={ew.mean():.3f} std={ew.std():.3f} "
-          f"frac>0.95={ (ew>0.95).float().mean():.2f} (high+flat = saturated gate, weak sel grad)")
     print(f"  memory norm: {aux['hlvocab_memory_norm']:.2f} (target ~embed 3.18)")
     print(f"  tau_within={sub.log_tau_within.exp().tolist()}  tau_inter={sub.log_tau_inter.exp().tolist()}")
     # reader does work? compare reader output vs its input
