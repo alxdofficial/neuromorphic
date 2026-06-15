@@ -258,6 +258,22 @@ class HLVocabSubstrate(nn.Module):
         return _unit_rms(add)
 
     # ── phase 1 (shared) ─────────────────────────────────────────────────────────
+    @staticmethod
+    def _switch_lb(P: Tensor, valid: Tensor = None) -> Tensor:
+        """Switch/Mixtral load-balance on a soft assignment P[..., T] (last dim =
+        selection TARGETS, sums to 1). Returns T·Σ_t f_t·p̄_t (f detached): =1 at
+        uniform target usage, →T when one target hogs the assignment. The ONE
+        anti-collapse term, applied identically at every competitive softmax in the
+        model (routing: targets=nodes; emit: targets=candidates)."""
+        T = P.shape[-1]
+        Pf = P.reshape(-1, T).float()
+        if valid is not None:
+            v = valid.reshape(-1).bool()
+            Pf = Pf[v]
+        pbar = Pf.mean(0)                                       # mean soft usage per target
+        f = F.one_hot(Pf.argmax(-1), T).float().mean(0)        # argmax fraction per target
+        return T * (f.detach() * pbar).sum()
+
     def _phase1(self, hiddens: Tensor, mask: Tensor):
         cfg = self.config
         m = mask.float().unsqueeze(-1)
@@ -390,6 +406,15 @@ class HLVocabSubstrate(nn.Module):
             for layer in self.reader:
                 h = layer(h, src_mask=causal)
             memory = self.token_norm(self.read_out(h))         # [B,M,d_llama]
+
+            # ── unified anti-collapse: the SAME Switch load-balance at every
+            # competitive softmax — routing (targets=nodes, per layer) and emit
+            # (targets=candidates). Weighted by cfg.load_balance_coef in the loss.
+            lb = w.new_zeros(())
+            for Al in A_list:
+                lb = lb + self._switch_lb(Al, mask)
+            lb = lb / max(len(A_list), 1) + self._switch_lb(w)
+            aux["load_balance_loss"] = lb
 
         with torch.no_grad():
             picked = w.argmax(-1)                              # [B,E] which candidate each slot favors

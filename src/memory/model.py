@@ -318,10 +318,16 @@ class ReprLearningModel(nn.Module):
 
         # keep mask_embed in-graph even when no positions select it
         loss = loss_recon + 0.0 * self.decoder.mask_embed.float().sum()
+        # anti-collapse: load-balance on every competitive softmax (emitted by the
+        # encoder as load_balance_loss; e.g. hlvocab routing+emit). Weighted by the
+        # (previously inert) load_balance_coef — the one uniform mechanism.
+        loss_aux = mem_aux.get("load_balance_loss") if mem_aux else None
+        if loss_aux is not None:
+            loss = loss + self.cfg.load_balance_coef * loss_aux
         out = {
             "loss": loss, "loss_recon": loss_recon.detach(),
             "top1_acc": top1, "per_example_loss": per_ex,
-            "loss_aux": torch.zeros((), device=device),
+            "loss_aux": loss_aux.detach() if torch.is_tensor(loss_aux) else torch.zeros((), device=device),
             "n_content_positions": int(loss_mask.sum()),   # masked positions = the CE targets
             "memory_shape": (B, M),                        # (batch, code size) for the logger
             "mae_n_masked": float(loss_mask.sum()), "mae_M": float(M),
