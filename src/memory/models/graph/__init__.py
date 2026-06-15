@@ -7,5 +7,6 @@ reader cross-attends the graph + causal-self-attends decode positions and inject
 (RMS-matched, gated) into the frozen LLM. Design: docs/graph_model.md.
 """
 from .substrate import GraphConfig, GraphWriter, GraphReader
+from .encoder import GraphEncoder
 
-__all__ = ["GraphConfig", "GraphWriter", "GraphReader"]
+__all__ = ["GraphConfig", "GraphWriter", "GraphReader", "GraphEncoder"]

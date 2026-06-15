@@ -22,10 +22,10 @@ N_LAYERS = 30  # SmolLM2-135M
 # The masked_reconstruction override block from scripts/train/train.py, mirrored
 # here so this probe measures exactly what the trainer builds. Edit to preview.
 MAE_RANKS = dict(
-    icae_lora_rank=60, icae_lora_alpha=120,
-    ccm_lora_rank=30, ccm_lora_alpha=60,
-    autocompressor_lora_rank=30, autocompressor_lora_alpha=60,
-    beacon_ratio=8, beacon_wrap_layers=beacon_wrap_layers(N_LAYERS),
+    icae_lora_rank=80, icae_lora_alpha=160,
+    ccm_lora_rank=40, ccm_lora_alpha=80,
+    autocompressor_lora_rank=40, autocompressor_lora_alpha=80,
+    beacon_ratio=8, beacon_wrap_layers=beacon_wrap_layers(N_LAYERS, 8),
     # soft_pointer_graph capacity-matched to hlvocab (~3.30M memory)
     spg_K_edge=16, spg_K_node=64, spg_d_node=176, spg_d_state=176, spg_d_read=176,
     spg_d_updater=240, spg_updater_layers=2, spg_updater_heads=8,
@@ -53,7 +53,7 @@ def n_trainable(variant):
     return sum(p.numel() for p in m.parameters() if p.requires_grad)
 
 
-VARIANTS = ["vanilla_llama", "hlvocab_baseline", "soft_pointer_graph_baseline",
+VARIANTS = ["vanilla_llama", "graph_baseline", "hlvocab_baseline", "soft_pointer_graph_baseline",
             "icae_baseline", "ccm_baseline", "autocompressor_baseline", "beacon_baseline"]
 
 print(f"backbone={BACKBONE} d=576; ranks={MAE_RANKS}\n")

@@ -30,12 +30,12 @@ def matched(cfg):
     cfg.pad_token_id = 0; cfg.task_mode = "masked_reconstruction"
     cfg.use_llama_lora = True; cfg.llama_lora_rank = 16; cfg.llama_lora_alpha = 32
     cfg.n_flat_codes = 16
-    # capacity-matched to hlvocab ~4.45M (see scripts/diagnostics/param_count.py)
-    cfg.icae_n_slots = 16; cfg.icae_lora_rank = 60; cfg.icae_lora_alpha = 120
-    cfg.ccm_n_comp = 16; cfg.ccm_lora_rank = 30; cfg.ccm_lora_alpha = 60
+    # capacity-matched to the graph anchor ~4.60M memory (see param_count.py)
+    cfg.icae_n_slots = 16; cfg.icae_lora_rank = 80; cfg.icae_lora_alpha = 160
+    cfg.ccm_n_comp = 16; cfg.ccm_lora_rank = 40; cfg.ccm_lora_alpha = 80
     cfg.autocompressor_n_slots = 16
-    cfg.autocompressor_lora_rank = 30; cfg.autocompressor_lora_alpha = 60
-    cfg.beacon_ratio = 8; cfg.beacon_wrap_layers = (0, 6, 12, 17, 23, 29)
+    cfg.autocompressor_lora_rank = 40; cfg.autocompressor_lora_alpha = 80
+    cfg.beacon_ratio = 8; cfg.beacon_wrap_layers = (0, 4, 8, 12, 17, 21, 25, 29)
     # hlvocab (compression-by-vocabulary): smaller vocab for the 135M smoke
     cfg.hlvocab_d_code = 256; cfg.hlvocab_nodes = (512, 256, 128)
     cfg.hlvocab_top_k = 4; cfg.hlvocab_m_max = 16; cfg.hlvocab_tap_layer = 6
@@ -45,6 +45,11 @@ def matched(cfg):
     cfg.spg_d_updater = 240; cfg.spg_updater_layers = 2; cfg.spg_updater_heads = 8
     cfg.spg_read_ffn_mult = 2
     cfg.spg_builder_mlp_hidden = 224; cfg.spg_film_hidden = 176
+    # graph (VQ-codebook + TokenGT controller + inject reader) — defaults match
+    # config.py (~4.5M); explicit here so the smoke documents the matched config.
+    cfg.graph_d_graph = 256; cfg.graph_n_codes = 1024; cfg.graph_n_edges = 8
+    cfg.graph_write_layers = 3; cfg.graph_read_layers = 2; cfg.graph_heads = 4
+    cfg.graph_ffn_mult = 2; cfg.graph_obs_tap_layer = 6; cfg.graph_inject_layer = 18
     return cfg
 
 
@@ -74,7 +79,9 @@ print(f"batch: context {tuple(batch.context_ids.shape)}, k_slots={batch.k_slots}
 extra_batches = [to_dev(next(it)) for _ in range(3)]
 
 # hlvocab + soft_pointer_graph ABANDONED (2026-06-15) — dropped from the active gate.
-VARIANTS = ["icae_baseline", "ccm_baseline",
+# graph = the current line (inject reader, M=0 prepend).
+VARIANTS = ["graph_baseline",
+            "icae_baseline", "ccm_baseline",
             "autocompressor_baseline", "beacon_baseline",
             "vanilla_llama", "vanilla_full_context"]
 for variant in VARIANTS:
@@ -97,7 +104,9 @@ for variant in VARIANTS:
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             out = model.compute_masked_reconstruction_loss(batch)
         M = out["mae_M"]; nmask = out["mae_n_masked"]
-        exp_M = {"vanilla_llama": 0.0, "vanilla_full_context": float(batch.context_ids.shape[1])}
+        # graph reads by inject (M=0 prepend), like the vanilla floor's layout.
+        exp_M = {"vanilla_llama": 0.0, "graph_baseline": 0.0,
+                 "vanilla_full_context": float(batch.context_ids.shape[1])}
         expect = exp_M.get(variant, float(batch.k_slots))
         ok_M = abs(M - expect) < 0.5
         if not ok_M:

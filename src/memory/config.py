@@ -172,5 +172,23 @@ class ReprConfig:
     hlvocab_emit: str = "edge_query"
     hlvocab_slot_iters: int = 3         # Slot-Attention refinement iterations (slotattn)
 
+    # ── graph (VQ-codebook graph + TokenGT controller; the current line) ─────
+    # models/graph/; design: docs/graph_model.md. Edge endpoints are discrete VQ
+    # codes (distinct addresses — the fix for the v6/v8/v9 rank-1 read collapse);
+    # a TokenGT writer cross-attends the observation + self-attends the graph; a
+    # custom reader cross-attends the graph + causal-self-attends decode positions
+    # and INJECTS (RMS-matched, gated) into the frozen LLM at a mid-late layer.
+    graph_d_graph: int = 256            # graph/codebook space width (decoupled from d_llama)
+    graph_n_codes: int = 1024           # codebook size (shared src+dst vocabulary)
+    graph_n_edges: int = 8              # K — edge budget
+    graph_write_layers: int = 3         # N — TokenGT write stack depth
+    graph_read_layers: int = 2          # M — reader stack depth
+    graph_heads: int = 4
+    graph_ffn_mult: int = 2             # FFN expansion (2 capacity-matches ~4.5M to the baselines)
+    graph_vq_decay: float = 0.99        # EMA codebook decay
+    graph_vq_commit: float = 0.25       # VQ commitment-loss weight
+    graph_obs_tap_layer: int = 6        # frozen-backbone layer tapped for the observation
+    graph_inject_layer: int = 18        # frozen-backbone layer the reader injects into (mid-late)
+
     # ── Misc ───────────────────────────────────────────────────────────────
     seed: int = 42                  # wired in the trainer (torch/np/random) for reproducibility

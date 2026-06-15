@@ -619,10 +619,11 @@ def train_one_variant(
             if key in out and out[key] is not None:
                 row[key] = float(out[key])
         # Graph-variant telemetry (only present when variant == graph_baseline).
-        # v4 has no aux loss; logged keys are gate-distribution + endpoint
-        # clustering diagnostics.
-        # Whitelisted scalars + a glob for per-window breakdown keys.
+        # The current graph emits the VQ commitment loss + collapse canaries
+        # (distinct codes used, read-gate amplitude). Older graph_v3/v4 keys are
+        # kept in the whitelist for back-compat reproduction (skipped if absent).
         _graph_scalar_keys = (
+            "graph_vq_loss", "graph_codes_active", "graph_read_gate",
             "graph_aux", "graph_endpoint_reuse",
             "graph_u_mean", "graph_age_mean", "graph_src_norm",
             "graph_pick_affinity_avg", "graph_gate_mean_avg",
@@ -903,8 +904,8 @@ def main():
     # remain selectable via explicit --variants if needed.
     # hlvocab_baseline + soft_pointer_graph_baseline are ABANDONED (2026-06-15) —
     # still selectable via explicit --variants for reproduction, out of the default.
-    # The new `graph` model (VQ-VAE → graph + TokenGT) joins here once built.
     ap.add_argument("--variants", nargs="+", default=[
+        "graph_baseline",             # the current line: VQ-codebook graph + TokenGT + inject reader
         "icae_baseline",              # ICAE (ICLR'24)
         "ccm_baseline",               # CCM (ICLR'24)
         "autocompressor_baseline",    # AutoCompressor/RMT-style recurrent summary
@@ -1271,21 +1272,22 @@ def main():
         cfg.use_llama_lora = True
         cfg.llama_lora_rank = 16; cfg.llama_lora_alpha = 32
         # M_max = 16 (k in [3,16]). Memory-mechanism trainable params matched to
-        # hlvocab (graph_v9 ≈ 4.45M total / 3.52M memory) on 135M, d=576:
-        #   icae r60 → 4.39M, ccm r30 → 4.39M, autocompressor r30 → 4.40M,
-        #   beacon 6 wrap layers → 4.24M. (See scripts/diagnostics/param_count.py.)
+        # the `graph` anchor (VQ-codebook graph + TokenGT ≈ 5.52M total / 4.60M
+        # memory) on 135M, d=576:
+        #   icae r80 → 4.62M, ccm r40 → 4.62M, autocompressor r40 → 4.63M,
+        #   beacon 8 wrap layers → 4.43M. (See scripts/diagnostics/param_count.py.)
         cfg.n_flat_codes = 16
-        cfg.icae_n_slots = 16; cfg.icae_lora_rank = 60; cfg.icae_lora_alpha = 120
-        cfg.ccm_n_comp = 16; cfg.ccm_lora_rank = 30; cfg.ccm_lora_alpha = 60
+        cfg.icae_n_slots = 16; cfg.icae_lora_rank = 80; cfg.icae_lora_alpha = 160
+        cfg.ccm_n_comp = 16; cfg.ccm_lora_rank = 40; cfg.ccm_lora_alpha = 80
         cfg.autocompressor_n_slots = 16
-        cfg.autocompressor_lora_rank = 30; cfg.autocompressor_lora_alpha = 60
+        cfg.autocompressor_lora_rank = 40; cfg.autocompressor_lora_alpha = 80
         cfg.beacon_ratio = 8
-        # Beacon wraps 6 evenly-spaced layers (≈4.24M on SmolLM2-135M, matched to
-        # the cohort). Shared helper derives indices from the backbone depth.
+        # Beacon wraps 8 evenly-spaced layers (≈4.43M on SmolLM2-135M, matched to
+        # the graph anchor). Shared helper derives indices from the backbone depth.
         from transformers import AutoConfig as _ACL
         from src.memory.common import beacon_wrap_layers as _bwl
         _nlayers = _ACL.from_pretrained(cfg.llama_model).num_hidden_layers
-        cfg.beacon_wrap_layers = _bwl(_nlayers)
+        cfg.beacon_wrap_layers = _bwl(_nlayers, 8)
         cfg.hlvocab_m_max = 16           # masked_reconstruction: emit up to 16, sliced to k [fix G]
         cfg.hlvocab_edge_cand = 48       # calibrated for the 16-token MAE regime (overrides budget-scaled)
         cfg.hlvocab_emit = args.hlvocab_emit   # edge_query (default) | slotattn (competition)

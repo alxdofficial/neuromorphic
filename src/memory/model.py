@@ -17,6 +17,7 @@ from .config import ReprConfig
 from .models.autocompressor import AutoCompressorBaselineEncoder
 from .models.beacon import BeaconBaselineEncoder
 from .models.ccm import CCMBaselineEncoder
+from .models.graph import GraphEncoder
 from .models.hierarchical_learned_vocab import HLVocabEncoder
 from .models.icae import ICAEBaselineEncoder
 from .models.soft_pointer_graph import SoftPointerGraphEncoder
@@ -40,6 +41,8 @@ class ReprLearningModel(nn.Module):
         # line moved to the VQ-VAE→graph+TokenGT model. See project_mae_4k_collapse_result.
         "soft_pointer_graph_baseline": SoftPointerGraphEncoder,   # ABANDONED (was graph_v6, free-endpoint)
         "hlvocab_baseline": HLVocabEncoder,                       # ABANDONED (was graph_v9, compression-by-vocab)
+        # the current line: VQ-codebook graph + TokenGT controller + inject reader
+        "graph_baseline": GraphEncoder,
         "icae_baseline": ICAEBaselineEncoder,  # ICAE (ICLR'24) compressor, EMAT-retrained
         "ccm_baseline": CCMBaselineEncoder,    # CCM (ICLR'24) recurrent compressor, EMAT-retrained
         "beacon_baseline": BeaconBaselineEncoder,  # Activation Beacon (BAAI) per-layer beacon attn
@@ -249,6 +252,11 @@ class ReprLearningModel(nn.Module):
         batch.k_slots for the compressor variants; vanilla_llama → M=0 (floor),
         vanilla_full_context → M=T (ceiling).
         """
+        # graph reads by INJECT (forward hook), not prepend — its own path.
+        if self.variant == "graph_baseline":
+            return self._graph_masked_reconstruction_loss(
+                batch, zero_memory=zero_memory, shuffle_memory=shuffle_memory,
+                mask_ratio=mask_ratio)
         device = batch.context_ids.device
         B, T = batch.context_ids.shape
         embed = self.decoder.llama.get_input_embeddings()
@@ -339,6 +347,120 @@ class ReprLearningModel(nn.Module):
                 out[_k] = _v.detach()
             elif isinstance(_v, (int, float)):
                 out[_k] = _v
+        return out
+
+    def _graph_masked_reconstruction_loss(
+        self,
+        batch,
+        zero_memory: bool = False,
+        shuffle_memory: bool = False,
+        mask_ratio: float = 0.85,
+    ) -> dict:
+        """MAE loss for the graph model — read by INJECT, not prepend.
+
+        Write: tap the frozen backbone for the observation → TokenGT writer →
+        graph (VQ-code endpoints + edge-states). Read: a forward hook on the
+        mid-late decoder layer cross-attends the graph and adds the reader's
+        (RMS-matched, gated) output to the residual stream — there is NO prepend,
+        so the decode sequence is just the masked span (M=0). REAL/OFF/SHUF:
+        graph present / hook absent / graph rolled along the batch.
+        """
+        device = batch.context_ids.device
+        B, T = batch.context_ids.shape
+        enc = self.encoder
+        embed = self.decoder.llama.get_input_embeddings()
+        with torch.no_grad():
+            ctx_embeds = embed(batch.context_ids)                       # [B,T,d]
+
+        # ---- 1. write the graph from the observation ----
+        state = enc.init_streaming_state(B, device, ctx_embeds.dtype)
+        state, _ = enc.streaming_write(state, ctx_embeds, batch.context_mask)
+        _, mem_aux = enc.finalize_memory(state)
+        graph = mem_aux["graph"]
+        vq_loss = mem_aux["vq_loss"]
+
+        # ---- 2. REAL / OFF / SHUF ----
+        inject = True
+        if zero_memory:                                                # OFF: no hook
+            inject = False
+        elif shuffle_memory:                                           # SHUF: roll graph along batch
+            if B == 1:
+                raise ValueError("shuffle_memory requires batch size > 1 (B==1 leaves REAL memory).")
+            graph = {k: (torch.roll(v, shifts=1, dims=0) if torch.is_tensor(v) and v.dim() >= 1 else v)
+                     for k, v in graph.items()}
+
+        # ---- 3. masked decoder input (no prepend; M=0) ----
+        mask_vec = self.decoder.mask_embed.to(ctx_embeds.dtype)
+        rnd = torch.rand(B, T, device=device)                          # eval: seeded in run_val
+        masked = (rnd < mask_ratio) & batch.context_mask
+        dec_in = torch.where(masked.unsqueeze(-1), mask_vec.view(1, 1, -1), ctx_embeds)
+        attn = batch.context_mask.long()
+
+        # ---- 4. inject hook on the mid-late decoder layer ----
+        handle = None
+        if inject:
+            reader = enc.reader
+            layer = self.decoder.llama.model.layers[enc.inject_layer]
+
+            def _inject_hook(module, args, output):
+                hidden = output[0] if isinstance(output, tuple) else output
+                inj = reader(hidden, graph).to(hidden.dtype)
+                hidden = hidden + inj
+                if isinstance(output, tuple):
+                    return (hidden,) + tuple(output[1:])
+                return hidden
+
+            handle = layer.register_forward_hook(_inject_hook)
+        try:
+            base_out = self.decoder.llama.model(
+                inputs_embeds=dec_in, attention_mask=attn, use_cache=False)
+            span_hidden = base_out.last_hidden_state                    # [B,T,d] (M=0)
+        finally:
+            if handle is not None:
+                handle.remove()
+
+        # ---- 5. CE on masked positions (predict t_p from hidden p-1) ----
+        pred_hidden = span_hidden[:, :-1]
+        targets = batch.context_ids[:, 1:]
+        loss_mask = masked[:, 1:] & batch.context_mask[:, 1:]
+        if loss_mask.sum() == 0:                                        # degenerate batch
+            loss_mask[:, 0] = batch.context_mask[:, 1]
+        sel_hidden = pred_hidden[loss_mask]
+        sel_targets = targets[loss_mask]
+        logits = self.decoder.llama.lm_head(sel_hidden).float()
+        per_tok = F.cross_entropy(logits, sel_targets, reduction="none")
+        loss_recon = per_tok.mean()
+
+        with torch.no_grad():
+            top1 = (logits.argmax(-1) == sel_targets).float().mean()
+            rows = loss_mask.nonzero(as_tuple=False)[:, 0]
+            per_ex = torch.zeros(B, device=device)
+            cnt = torch.zeros(B, device=device)
+            per_ex.scatter_add_(0, rows, per_tok.detach())
+            cnt.scatter_add_(0, rows, torch.ones_like(per_tok))
+            per_ex = per_ex / cnt.clamp_min(1.0)
+
+        # VQ commitment loss is part of the quantizer (a principled architectural
+        # term of every VQ-VAE, not an anti-collapse aux); keep mask_embed in-graph.
+        loss = loss_recon + vq_loss.to(loss_recon.dtype) + 0.0 * self.decoder.mask_embed.float().sum()
+        with torch.no_grad():
+            # collapse canaries: distinct codes used across all edge endpoints,
+            # and the learned read amplitude (tanh-gate). A healthy run keeps
+            # codes_active well above 1 and a nonzero, growing read gate.
+            codes_active = torch.cat([graph["src_idx"].reshape(-1),
+                                      graph["dst_idx"].reshape(-1)]).unique().numel()
+            read_gate = float(torch.tanh(enc.reader.gate).abs().item())
+        out = {
+            "loss": loss, "loss_recon": loss_recon.detach(),
+            "top1_acc": top1, "per_example_loss": per_ex,
+            "loss_aux": vq_loss.detach() if torch.is_tensor(vq_loss) else torch.zeros((), device=device),
+            "n_content_positions": int(loss_mask.sum()),
+            "memory_shape": (B, enc.gcfg.n_edges),          # K edges (the "code size") for the logger
+            "mae_n_masked": float(loss_mask.sum()), "mae_M": 0.0,
+            "graph_vq_loss": vq_loss.detach() if torch.is_tensor(vq_loss) else 0.0,
+            "graph_codes_active": float(codes_active),
+            "graph_read_gate": read_gate,
+        }
         return out
 
     def compute_loss(

@@ -39,7 +39,7 @@ def test_config_dead_fields_removed():
 def test_variant_registry_and_mae_compressor_subset():
     from src.memory.model import ReprLearningModel
     variants = set(ReprLearningModel.VARIANTS)
-    for v in ("hlvocab_baseline", "icae_baseline", "ccm_baseline",
+    for v in ("graph_baseline", "hlvocab_baseline", "icae_baseline", "ccm_baseline",
               "autocompressor_baseline", "beacon_baseline",
               "soft_pointer_graph_baseline", "vanilla_llama", "vanilla_full_context"):
         assert v in variants, f"variant missing from registry: {v}"
