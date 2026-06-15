@@ -14,8 +14,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 import torch
 from src.memory.config import ReprConfig
 from src.memory.model import ReprLearningModel
+from src.memory.common import beacon_wrap_layers
 
 BACKBONE = "HuggingFaceTB/SmolLM2-135M"
+N_LAYERS = 30  # SmolLM2-135M
 
 # The masked_reconstruction override block from scripts/train/train.py, mirrored
 # here so this probe measures exactly what the trainer builds. Edit to preview.
@@ -23,7 +25,7 @@ MAE_RANKS = dict(
     icae_lora_rank=60, icae_lora_alpha=120,
     ccm_lora_rank=30, ccm_lora_alpha=60,
     autocompressor_lora_rank=30, autocompressor_lora_alpha=60,
-    beacon_ratio=8, beacon_wrap_layers=(0, 6, 12, 17, 23, 29),
+    beacon_ratio=8, beacon_wrap_layers=beacon_wrap_layers(N_LAYERS),
 )
 
 

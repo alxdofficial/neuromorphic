@@ -62,6 +62,10 @@ def to_dev(b):
 
 batch = to_dev(batch)
 print(f"batch: context {tuple(batch.context_ids.shape)}, k_slots={batch.k_slots}")
+# a few MORE distinct batches: the dead-grad check accumulates grad-alive across
+# them so selection-conditional params (e.g. inter-layer τ) that don't fire on one
+# fixed batch still get a chance over data diversity.
+extra_batches = [to_dev(next(it)) for _ in range(3)]
 
 VARIANTS = ["hlvocab_baseline", "icae_baseline", "ccm_baseline",
             "autocompressor_baseline", "beacon_baseline",
@@ -128,6 +132,15 @@ for variant in VARIANTS:
         print(f"  8-step loss: {losses[0]:.3f} → {losses[-1]:.3f} (min {min(losses):.3f}, Δ {drop:+.3f})")
         if drop <= 0:
             fails.append(f"{variant}: loss never improved in 8 steps")
+        # expand grad-alive over a few distinct batches (data diversity) so the
+        # dead-grad check below doesn't false-flag selection-conditional params.
+        for _b in extra_batches:
+            model.zero_grad(set_to_none=True)
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                model.compute_masked_reconstruction_loss(_b)["loss"].backward()
+            for n, p in trainable:
+                if p.grad is not None and p.grad.norm() > 0:
+                    alive.add(n)
         # dead-grad check AFTER steps (B has moved, so true-dead modules show now)
         # exempt clamped scalars: at a clamp boundary their grad is legitimately
         # 0 (mask_embed = no-positions-selected; log_route_temp = temp hit its

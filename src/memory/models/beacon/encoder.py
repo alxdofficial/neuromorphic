@@ -144,10 +144,16 @@ class BeaconBaselineEncoder(nn.Module):
         if prefix is not None:
             B = prefix.shape[0]
             pm = torch.ones(B, prefix.shape[1], device=prefix.device, dtype=torch.bool)
+            # is_beacon does double duty: it selects the beacon q/k/v projections AND
+            # marks which positions are EXTRACTED as new beacons (`pos` below). Carried
+            # prefix beacons are intentionally marked NOT-beacon: they are read as
+            # condensed CONTEXT by this window (base projections) and must be excluded
+            # from extraction so new_mem grows by only the fresh beacons (marking them
+            # beacon would re-route AND re-extract them, double-counting memory).
             pb = torch.zeros(B, prefix.shape[1], device=prefix.device, dtype=torch.bool)
             seq = torch.cat([prefix.to(seq.dtype), seq], dim=1)
             msk = torch.cat([pm, msk], dim=1)
-            is_beacon = torch.cat([pb, is_beacon], dim=1)   # prefix routed through base
+            is_beacon = torch.cat([pb, is_beacon], dim=1)
         self._mask[0] = is_beacon.unsqueeze(-1).to(seq.dtype)
         try:
             h = self.base.model(inputs_embeds=seq, attention_mask=msk.long()).last_hidden_state

@@ -90,6 +90,10 @@ class HLVocabConfig:
         if self.use_graph:
             if self.m_max < 2:
                 raise ValueError(f"use_graph needs m_max>=2 (edges are pairs); got {self.m_max}")
+            if self.m_max % 2 != 0:
+                # v2 emits 2 tokens per edge (src+dst) → 2*(m_max//2); an odd m_max
+                # would silently emit m_max-1 tokens. Require even to avoid the surprise.
+                raise ValueError(f"use_graph needs an EVEN m_max (emits 2 per edge); got {self.m_max}")
             if self.d_sel % self.sel_heads != 0:
                 raise ValueError(f"d_sel={self.d_sel} % sel_heads={self.sel_heads} != 0")
             if self.d_read % self.reader_heads != 0:
@@ -346,6 +350,10 @@ class HLVocabSubstrate(nn.Module):
     # ── v1 forward (nodes-only ablation) ────────────────────────────────────────
     def _forward_v1(self, hiddens: Tensor, mask: Tensor) -> tuple[Tensor, dict]:
         cfg = self.config
+        # v1 nodes-only path: seed_proj only exists when use_graph=False (built
+        # conditionally in __init__). Guard so a mis-dispatch fails loudly here
+        # rather than with an opaque AttributeError on self.seed_proj.
+        assert not cfg.use_graph, "_forward_v1 is the v1 nodes-only path; use_graph=True must dispatch to _forward_v2"
         B, L = hiddens.shape[:2]
         m = mask.float().unsqueeze(-1)
         n_tok = mask.float().sum(1, keepdim=True).clamp_min(1.0)

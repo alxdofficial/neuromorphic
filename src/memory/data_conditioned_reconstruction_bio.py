@@ -121,6 +121,7 @@ class ConditionedReconstructionBioDataset(IterableDataset):
         names: List[str] = []
         givens: List[str] = []
         cum = 0
+        line_lens: List[int] = []
         budget = self.context_len - 8                          # margin for BPE line-join effects
         for e in pool:
             k, v, nm, gv = self._render_pair(e, rng)
@@ -132,14 +133,28 @@ class ConditionedReconstructionBioDataset(IterableDataset):
             if cum + line_len > budget and len(keys) >= max(self.n_query, 1):
                 break                                          # budget full → stop packing
             keys.append(k); values.append(v); names.append(nm); givens.append(gv)
-            cum += line_len
+            line_lens.append(line_len); cum += line_len
 
         context_str = "".join(f"{k} = {v}\n" for k, v in zip(keys, values))
         ctx = self._ids(context_str)[: self.context_len]       # clamp (margin makes this a no-op)
         valid = len(ctx)
         ctx = ctx + [self.pad_token_id] * (self.context_len - valid)
 
-        qi = rng.sample(range(len(keys)), self.n_query)
+        # Only query keys whose full "k = v" line is entirely inside the clamped
+        # context. To guarantee n_query the loop may over-pack past budget when few
+        # keys exist; those trailing lines can be truncated by the clamp, and
+        # querying a truncated value would ask the decoder for absent tokens.
+        cum_end, queryable = 0, []
+        for i, ll in enumerate(line_lens):
+            cum_end += ll
+            if cum_end <= valid:
+                queryable.append(i)
+        if len(queryable) < self.n_query:
+            raise ValueError(
+                f"context_len={self.context_len} too small: only {len(queryable)} of "
+                f"{len(keys)} packed facts fully fit the context; need n_query={self.n_query}. "
+                f"Raise --cond-recon-bio context length or lower n_query.")
+        qi = rng.sample(queryable, self.n_query)
         question_ids = self._ids(keys[qi[0]])
 
         answer_ids: List[int] = []

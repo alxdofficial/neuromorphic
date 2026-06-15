@@ -31,7 +31,6 @@ class SoftPointerGraphEncoder(nn.Module):
         self.d_node = cfg.spg_d_node
         self.d_state = cfg.spg_d_state
         d_read = cfg.spg_d_read
-        self.inject_layer_idx = getattr(cfg, "spg_inject_layer", 8)
 
         from .substrate import (
             SoftPointer,
@@ -240,15 +239,10 @@ class SoftPointerGraphEncoder(nn.Module):
                 aux["spg_node_active_frac"] = active.float().mean().to(torch.float32)
         return memory, aux
 
-    def inject(self, hidden_states, facts):
-        """READ Stage B: per-position soft retrieval over fact-tokens (installed as a
-        forward pre-hook on Llama layer `inject_layer_idx` by compute_loss)."""
-        return self.fact_reader(hidden_states, facts["value"])
-
     def forward(self, token_embeds, attention_mask=None, mask_positions=None):
-        """Non-streaming fallback (recon/HSM paths). The QA path uses streaming_write +
-        finalize_memory + the per-position inject hook. Here we return a prepend
-        projection of the fact-tokens so non-QA callers get usable memory."""
+        """Non-streaming fallback. soft_pointer_graph reads via the PREPEND path only
+        (streaming_write + finalize_memory); the retired per-position inject hook was
+        removed. Here we return a prepend projection of the fact-tokens."""
         del mask_positions
         B, device, dtype = token_embeds.shape[0], token_embeds.device, token_embeds.dtype
         state = self.init_streaming_state(B, device, dtype)

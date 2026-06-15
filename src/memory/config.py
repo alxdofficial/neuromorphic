@@ -37,13 +37,23 @@ class ReprConfig:
     # sets this to --mem-tokens (and to 16 for the masked_reconstruction line).
     n_flat_codes: int = 96
 
-    # ── Routing aux losses ─────────────────────────────────────────────────
+    # ── Routing aux losses (inert extension hooks) ─────────────────────────
     # load_balance: anti-collapse on classification routing. z_loss: Mixtral-style
     # penalty on logsumexp(scores)² to bound logit magnitude. codebook_orth: soft
-    # orthogonality coefficient (only applied when an encoder emits the loss).
+    # orthogonality. NOTE: no ACTIVE encoder currently emits any of these losses
+    # (the design avoids aux losses — anti-collapse is architectural), so all three
+    # multiply zero today. Kept as wired hooks: an encoder that emits the matching
+    # aux key (load_balance_loss / z_loss / codebook_orth_loss) gets it weighted.
     load_balance_coef: float = 0.01
     z_loss_coef: float = 1e-3
     codebook_orth_coef: float = 0.01
+
+    # ── Objective / dispatch ───────────────────────────────────────────────
+    # task_mode routes compute_loss (set by the trainer). contrastive_shuf_coef
+    # adds a SHUF-contrastive binding term. Real fields (not dynamic attrs) so
+    # dataclasses.asdict(cfg) captures them in checkpoint metadata for drift checks.
+    task_mode: str = "qa"
+    contrastive_shuf_coef: float = 0.0
 
     # ── Decoder LoRA (shared by every variant so the MAE protocol is learnable)
     # Manual LoRA (no `peft`): W + (B @ A)·(alpha/rank); A small-init, B zero-init
@@ -133,7 +143,6 @@ class ReprConfig:
     spg_edge_gate_init_bias: float = 1.0
     spg_init_log_sigma: float = 0.0
     spg_film_hidden: int = 512
-    spg_inject_layer: int = 13        # late-layer inject ("ignore zone", Ben-Artzy)
 
     # ── hierarchical_learned_vocab (Compression-by-Vocabulary; hlvocab) ─────
     # models/hierarchical_learned_vocab/; design: docs/compression_model_design.md.
@@ -157,6 +166,4 @@ class ReprConfig:
     hlvocab_reader_heads: int = 4
 
     # ── Misc ───────────────────────────────────────────────────────────────
-    seed: int = 42
-    device: str = "cuda"
-    dtype: str = "bfloat16"
+    seed: int = 42                  # wired in the trainer (torch/np/random) for reproducibility

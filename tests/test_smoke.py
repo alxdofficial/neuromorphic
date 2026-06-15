@@ -16,7 +16,8 @@ def test_config_constructs_and_has_live_fields():
     c = ReprConfig()
     for f in ("n_flat_codes", "load_balance_coef", "z_loss_coef",
               "mae_mask_ratio", "hlvocab_use_graph", "hlvocab_edge_cand",
-              "spg_inject_layer", "use_llama_lora", "icae_lora_rank"):
+              "spg_K_node", "use_llama_lora", "icae_lora_rank",
+              "task_mode", "contrastive_shuf_coef", "seed"):
         assert hasattr(c, f), f"live field missing: {f}"
 
 
@@ -28,7 +29,8 @@ def test_config_dead_fields_removed():
             "enc_n_layers", "edge_token_packing", "selection_temperature",
             "slot_iters", "mt_layer", "use_role_embeddings", "use_qformer_adapter",
             "plastic_depth", "splat_K", "b_diversity_scale", "mt_diversity_scale",
-            "fixed_window_size", "max_window_size", "mask_ratio_min", "eval_every"}
+            "fixed_window_size", "max_window_size", "mask_ratio_min", "eval_every",
+            "device", "dtype"}
     leaked = dead & fields
     assert not leaked, f"dead config fields still present: {sorted(leaked)}"
 
@@ -56,15 +58,18 @@ def test_hlvocab_edge_cand_constraint():
     for M in (16, 32, 144, 256):
         ec = max(48, (M + 1) // 2)
         HLVocabConfig(use_graph=True, m_max=M, edge_cand=ec)  # should not raise
+    # odd m_max would silently emit m_max-1 tokens (2 per edge) → must be rejected
+    with pytest.raises(ValueError):
+        HLVocabConfig(use_graph=True, m_max=5, edge_cand=48)
 
 
-# ── beacon wrap-layer derivation (bug #4) ───────────────────────────────────
-def test_beacon_wrap_layer_quantiles():
-    def wrap(n):
-        return tuple(sorted({int(round(q * (n - 1))) for q in (0.0, 1 / 3, 2 / 3, 1.0)}))
-    assert wrap(30) == (0, 10, 19, 29)   # SmolLM2-135M (preserves the old hard-coded set)
-    assert wrap(16) == (0, 5, 10, 15)    # Llama-3.2-1B (no longer degenerates to 2 layers)
-    assert len(wrap(16)) == 4
+# ── beacon wrap-layer derivation (shared helper used by trainer/param_count) ─
+def test_beacon_wrap_layer_helper():
+    from src.memory.common import beacon_wrap_layers
+    # the actual helper the trainer + param_count use (6 evenly-spaced layers)
+    assert beacon_wrap_layers(30) == (0, 6, 12, 17, 23, 29)   # SmolLM2-135M (capacity calibration)
+    assert beacon_wrap_layers(16) == (0, 3, 6, 9, 12, 15)     # 16-layer backbone, all distinct
+    assert len(beacon_wrap_layers(16)) == 6
 
 
 # ── masked_reconstruction mask-ratio dispatch (bug #2) ──────────────────────

@@ -43,11 +43,14 @@ class ContinuationDataset(IterableDataset):
     context = the compress span (→ memory, then dropped), answer = the next predict_len tokens.
     """
 
-    def __init__(self, parquet_path, tokenizer, compress_len: int = 4096,
+    def __init__(self, parquet_path, tokenizer, *,
+                 src_tokenizer_name: str = "meta-llama/Llama-3.2-1B",
+                 split: str = "train", compress_len: int = 4096,
                  predict_len: int = 512, seed: int = 0, n_items: int = 1_000_000,
                  pad_token_id: int = 128_001, trigger: str = None,
                  objective: str = "continuation"):
-        import pyarrow.parquet as pq
+        import json
+        from .data_masked_reconstruction import _decode_cache
         assert objective == "continuation"
         self.tok = tokenizer
         self.compress_len = compress_len
@@ -61,18 +64,26 @@ class ContinuationDataset(IterableDataset):
         if trigger is None:
             trigger = "Continue the passage."
 
-        tbl = pq.read_table(str(parquet_path), columns=["input_ids", "num_tokens"])
-        nt = tbl.column("num_tokens").to_numpy()
-        keep = np.nonzero(nt >= need)[0]
-        ids = tbl.column("input_ids").to_pylist()
-        self.docs = [np.asarray(ids[i], dtype=np.int64) for i in keep]
+        # The parquet stores SOURCE-tokenizer (Llama-3) ids. Feeding them raw to a
+        # different backbone (e.g. SmolLM2) would be a token-identity mismatch, so
+        # decode → text (cached) → re-tokenize with the BACKBONE tokenizer — the
+        # same firewall data_masked_reconstruction uses.
+        cache = _decode_cache(Path(parquet_path), split, src_tokenizer_name)
+        self.docs = []
+        n_total = 0
+        for line in open(cache):
+            n_total += 1
+            arr = np.asarray(tokenizer(json.loads(line)["text"],
+                                       add_special_tokens=False).input_ids, dtype=np.int64)
+            if arr.shape[0] >= need:
+                self.docs.append(arr)
         if not self.docs:
             raise ValueError(
                 f"No FineWeb-edu doc has ≥ {need} tokens (compress_len+predict_len) in "
-                f"{parquet_path}. Lower --compress-len/--predict-len.")
+                f"{parquet_path} after re-tokenization. Lower --compress-len/--predict-len.")
         # continuation cue (the chat-template user turn); the value to predict is raw document text.
         self.trigger_ids = tokenizer(trigger, add_special_tokens=False).input_ids
-        print(f"[{objective}] {len(self.docs)}/{len(nt)} docs ≥ {need} tok from "
+        print(f"[{objective}] {len(self.docs)}/{n_total} docs ≥ {need} tok from "
               f"{Path(parquet_path).name}; compress={compress_len} predict={self.predict_len} "
               f"(ratio {compress_len}/M memory tokens)", flush=True)
 
@@ -103,9 +114,11 @@ class ContinuationDataset(IterableDataset):
 def make_continuation_dataloader(tokenizer, batch_size: int, compress_len: int = 4096,
                                  predict_len: int = 512, split: str = "train", seed: int = 0,
                                  pad_token_id: int = 128_001, num_workers: int = 2,
-                                 objective: str = "continuation") -> DataLoader:
+                                 objective: str = "continuation",
+                                 src_tokenizer_name: str = "meta-llama/Llama-3.2-1B") -> DataLoader:
     path = FINEWEB_TRAIN if split == "train" else FINEWEB_VAL
-    ds = ContinuationDataset(path, tokenizer, compress_len=compress_len, predict_len=predict_len,
+    ds = ContinuationDataset(path, tokenizer, src_tokenizer_name=src_tokenizer_name, split=split,
+                             compress_len=compress_len, predict_len=predict_len,
                              seed=seed, pad_token_id=pad_token_id, objective=objective)
     return DataLoader(ds, batch_size=batch_size, num_workers=num_workers,
                       collate_fn=lambda s: collate_qa(s, pad_token_id))

@@ -479,6 +479,18 @@ def train_one_variant(
     start_step = 0
     if resume and ckpt_path.exists():
         sd = torch.load(ckpt_path, map_location=device, weights_only=False)
+        # objective/backbone drift check — a resume that silently switches task or
+        # backbone would corrupt the run (the metadata's whole reason for existing).
+        _meta = sd.get("metadata", {}) or {}
+        _ck_cfg = _meta.get("cfg_dict", {}) or {}
+        for _field, _now in (("backbone_model", model.cfg.llama_model),
+                             ("task_mode", getattr(model.cfg, "task_mode", None))):
+            _was = _meta.get(_field, _ck_cfg.get(_field))
+            if _was is not None and _was != _now:
+                raise RuntimeError(
+                    f"[resume] {_field} drift: checkpoint has {_was!r} but this run "
+                    f"is {_now!r}. Resuming would mix objectives/backbones — refusing. "
+                    f"Start a fresh --out-tag or match the original setting.")
         _res = model.load_state_dict(sd["model_state_dict"], strict=False)
         _bad = [k for k in (_res.missing_keys + _res.unexpected_keys)
                 if "llama" not in k.lower()
@@ -1052,7 +1064,30 @@ def main():
                          "3000 after tranche 1 v2: flat_baseline was still "
                          "improving past step 5000 when patience fired at 5k. "
                          "Slow learners need more runway before plateau check.")
+    ap.add_argument("--seed", type=int, default=42,
+                    help="Global RNG seed (torch/numpy/random). Wired for reproducibility.")
+    ap.add_argument("--allow-unmatched-backbone", action="store_true",
+                    help="Permit masked_reconstruction on a non-d=576 backbone "
+                         "(param-matched ranks are calibrated for SmolLM2-135M).")
     args = ap.parse_args()
+
+    # ── reproducibility: wire the seed (was an unused cfg field) ─────────────
+    import random as _random
+    import numpy as _np
+    _random.seed(args.seed); _np.random.seed(args.seed)
+    torch.manual_seed(args.seed); torch.cuda.manual_seed_all(args.seed)
+
+    # ── fail-fast guards (cheap, before any model/data construction) ─────────
+    if "hlvocab_baseline" in args.variants and args.task != "masked_reconstruction" \
+            and args.chunk_size > 1024:
+        raise SystemExit(
+            f"hlvocab_baseline builds an [L,L] STDP kernel guarded at L<=1024, but "
+            f"--task {args.task} --chunk-size {args.chunk_size} yields L>1024. Use "
+            f"--task masked_reconstruction, or --chunk-size <=1024 (single window).")
+    if args.contrastive_shuf_coef > 0 and args.batch_size < 2:
+        raise SystemExit(
+            f"--contrastive-shuf-coef {args.contrastive_shuf_coef} needs batch_size>=2 "
+            f"(SHUF rolls memory along the batch dim; B==1 would leave REAL memory).")
 
     # Conditioned-reconstruction context (N small key=value lines) is far shorter than the QA
     # default 8192. If the user left chunk-size at the QA default, tighten it so the encoder
@@ -1209,7 +1244,13 @@ def main():
               f"{len(cfg.hlvocab_nodes)} layers, d_code={cfg.hlvocab_d_code}, "
               f"top_k={cfg.hlvocab_top_k}; emits up to m_max={cfg.hlvocab_m_max} "
               f"node-tokens, sliced to k. Prepend compressor (masked_reconstruction).")
-    if abs(_beacon_M - M) > max(1, M // 10):
+    if args.task == "masked_reconstruction":
+        # MAE ignores --mem-tokens: the override below sets M_max=16, sliced to
+        # batch.k_slots per example. The QA-shaped budget figures above (M, _beacon_M)
+        # do NOT describe what MAE emits — skip the multi-window beacon assertion.
+        print("   [masked_reconstruction] the above --mem-tokens budget is IGNORED; "
+              "every arm emits M_max=16 node/slot tokens sliced to per-example k_slots.")
+    elif abs(_beacon_M - M) > max(1, M // 10):
         raise SystemExit(
             f"[memory budget] beacon M={_beacon_M} is >10% off mem_tokens={M} "
             f"(α={cfg.beacon_ratio}); adjust --mem-tokens / chunk / window so the "
@@ -1234,21 +1275,24 @@ def main():
         cfg.autocompressor_n_slots = 16
         cfg.autocompressor_lora_rank = 30; cfg.autocompressor_lora_alpha = 60
         cfg.beacon_ratio = 8
-        # Beacon's capacity knob is the NUMBER of wrapped layers (each adds full
-        # q/k/v copies). 6 evenly-spaced layers ≈ 4.24M on SmolLM2-135M, matched
-        # to the cohort. Derived from the backbone depth (was hard-coded
-        # (0,10,19,29), which degenerated to 2 layers on a 16-layer backbone).
+        # Beacon wraps 6 evenly-spaced layers (≈4.24M on SmolLM2-135M, matched to
+        # the cohort). Shared helper derives indices from the backbone depth.
         from transformers import AutoConfig as _ACL
+        from src.memory.common import beacon_wrap_layers as _bwl
         _nlayers = _ACL.from_pretrained(cfg.llama_model).num_hidden_layers
-        cfg.beacon_wrap_layers = tuple(sorted({
-            int(round(q * (_nlayers - 1))) for q in (0.0, .2, .4, .6, .8, 1.0)}))
+        cfg.beacon_wrap_layers = _bwl(_nlayers)
         cfg.hlvocab_m_max = 16           # masked_reconstruction: emit up to 16, sliced to k [fix G]
         cfg.hlvocab_edge_cand = 48       # calibrated for the 16-token MAE regime (overrides budget-scaled)
         cfg.spg_K_edge = 16              # soft_pointer_graph: cap fact-tokens to k (capacity-fair if selected)
-        if cfg.d_llama != 576:
-            print(f"[WARN] param-matched ranks calibrated for d=576; d={cfg.d_llama} "
-                  "→ trainable counts will differ, RECALIBRATE before claims.")
+        if cfg.d_llama != 576 and not args.allow_unmatched_backbone:
+            raise SystemExit(
+                f"masked_reconstruction param-matched ranks are calibrated for "
+                f"SmolLM2-135M (d=576); got d_llama={cfg.d_llama} "
+                f"(backbone={cfg.llama_model}). Pass --backbone HuggingFaceTB/SmolLM2-135M, "
+                f"or --allow-unmatched-backbone to override (capacity match will be off).")
     cfg.contrastive_shuf_coef = args.contrastive_shuf_coef
+    cfg.task_mode = args.task        # accurate ckpt metadata (dispatch still keys on this)
+    cfg.seed = args.seed             # record the actual seed in ckpt metadata
 
     # Auto-pick BABILong config to match chunk_size (audit fix #10).
     if args.babilong_config == "auto":
