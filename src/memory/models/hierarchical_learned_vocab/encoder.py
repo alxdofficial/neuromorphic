@@ -41,7 +41,8 @@ class HLVocabEncoder(nn.Module):
             sel_layers=cfg.hlvocab_sel_layers, sel_heads=cfg.hlvocab_sel_heads,
             d_read=cfg.hlvocab_d_read, reader_layers=cfg.hlvocab_reader_layers,
             reader_heads=cfg.hlvocab_reader_heads,
-            emit=cfg.hlvocab_emit, slot_iters=cfg.hlvocab_slot_iters)
+            emit=cfg.hlvocab_emit, slot_iters=cfg.hlvocab_slot_iters,
+            tap_layers=tuple(cfg.hlvocab_tap_layers))
         self.sub = HLVocabSubstrate(hlv)
         self.M = hlv.m_max
         # norm-match TARGET = the active backbone's embedding scale, NOT the
@@ -53,7 +54,7 @@ class HLVocabEncoder(nn.Module):
         self.sub.token_norm.scale.data.fill_(float(emb_norm))
         print(f"[hlvocab] compression-by-vocabulary: nodes={tuple(cfg.hlvocab_nodes)} "
               f"d_code={cfg.hlvocab_d_code} top_k={cfg.hlvocab_top_k} "
-              f"m_max={cfg.hlvocab_m_max} tap=L{cfg.hlvocab_tap_layer} "
+              f"m_max={cfg.hlvocab_m_max} taps=L{tuple(cfg.hlvocab_tap_layers)} "
               f"norm_match_target={float(emb_norm):.2f}")
 
     def train(self, mode: bool = True):
@@ -75,7 +76,9 @@ class HLVocabEncoder(nn.Module):
             out = self.base.model(inputs_embeds=token_embeds,
                                   attention_mask=attention_mask.long(),
                                   output_hidden_states=True, use_cache=False)
-            h = out.hidden_states[self.cfg.hlvocab_tap_layer + 1]   # [B,W,d_llama]
+            # K contextualized taps (one per vocab scale) → [B, W, K, d_llama]
+            taps = [out.hidden_states[t + 1] for t in self.cfg.hlvocab_tap_layers]
+            h = torch.stack(taps, dim=2)                    # [B,W,K,d_llama]
         if state["hiddens"] is None:
             state["hiddens"] = h.float()
             state["mask"] = attention_mask.bool()

@@ -153,7 +153,11 @@ class ReprConfig:
     hlvocab_top_k: int = 4              # perturbation sparsity (active nodes/token)
     hlvocab_m_max: int = 16             # max emitted node-tokens (>= max k)
     hlvocab_effective_k: float = 8.0    # target #active nodes at init -> route temp
-    hlvocab_tap_layer: int = 6          # mid-stack tap for the frozen contextualizer
+    hlvocab_tap_layer: int = 6          # v1 single-tap (nodes-only ablation)
+    # v2: one frozen-backbone hidden-layer tap per vocab scale (low→high). Each vocab
+    # layer routes its OWN contextualized Llama tap (mixing+position), replacing the
+    # per-token perturbation chain. len must == len(hlvocab_nodes).
+    hlvocab_tap_layers: tuple = (6, 15, 24)
     hlvocab_use_graph: bool = True      # True = v2 full graph; False = v1 nodes-only
     hlvocab_edge_topP: int = 32         # node prefilter: edges among top-P active nodes/layer
     hlvocab_edge_cand: int = 48         # candidate edges after the cheap STDP-lift prefilter

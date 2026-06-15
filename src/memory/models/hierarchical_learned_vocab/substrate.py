@@ -67,6 +67,10 @@ class HLVocabConfig:
     d_llama: int = 2048
     d_code: int = 256
     nodes: tuple = (512, 256, 128)
+    # v2: one frozen-backbone hidden-layer tap per vocab scale (low→high). Each
+    # vocab layer routes its OWN contextualized Llama tap (mixing + position from
+    # Llama's attention), replacing the per-token perturbation chain.
+    tap_layers: tuple = (6, 15, 24)
     top_k: int = 4
     m_max: int = 16
     effective_k: float = 8.0
@@ -92,6 +96,10 @@ class HLVocabConfig:
         if self.d_code % 32 != 0:
             raise ValueError(f"d_code={self.d_code} must be a multiple of 32")
         if self.use_graph:
+            if len(self.tap_layers) != len(self.nodes):
+                raise ValueError(
+                    f"use_graph needs one tap_layer per vocab scale: "
+                    f"len(tap_layers)={len(self.tap_layers)} != len(nodes)={len(self.nodes)}")
             if self.m_max < 2:
                 raise ValueError(f"use_graph needs m_max>=2 (edges are pairs); got {self.m_max}")
             if self.m_max % 2 != 0:
@@ -161,9 +169,16 @@ class HLVocabSubstrate(nn.Module):
             nn.Parameter(torch.randn(n, cfg.d_code) / math.sqrt(cfg.d_code)) for n in cfg.nodes)
         self.node_values = nn.ParameterList(
             nn.Parameter(torch.randn(n, cfg.d_code) / math.sqrt(cfg.d_code)) for n in cfg.nodes)
-        self.route_projs = nn.ModuleList(
-            [nn.Linear(cfg.d_model, cfg.d_code, bias=False)]
-            + [nn.Linear(cfg.d_code, cfg.d_code, bias=False) for _ in range(L - 1)])
+        # v2 (multi-tap): EVERY layer routes its own Llama-layer tap (d_model space),
+        # so all route_projs are d_model→d_code. v1 (nodes-only ablation) keeps the
+        # old chain shape (layer 0 from d_model, layers 1+ from the d_code perturb).
+        if cfg.use_graph:
+            self.route_projs = nn.ModuleList(
+                nn.Linear(cfg.d_model, cfg.d_code, bias=False) for _ in range(L))
+        else:
+            self.route_projs = nn.ModuleList(
+                [nn.Linear(cfg.d_model, cfg.d_code, bias=False)]
+                + [nn.Linear(cfg.d_code, cfg.d_code, bias=False) for _ in range(L - 1)])
         for lin in self.route_projs:
             nn.init.normal_(lin.weight, std=1.0 / math.sqrt(lin.in_features))
         if not cfg.use_graph:    # v1-only: the no-residual v2 stream comes from nodes, not a seed
@@ -275,17 +290,20 @@ class HLVocabSubstrate(nn.Module):
         return T * (f.detach() * pbar).sum()
 
     def _phase1(self, hiddens: Tensor, mask: Tensor):
+        """v2 routing: hiddens is [B, L, K, d] — K contextualized Llama-layer taps,
+        one per vocab scale. Layer l routes its OWN tap (Llama already mixed + RoPE-
+        positioned it); no cross-layer perturbation chain."""
         cfg = self.config
         m = mask.float().unsqueeze(-1)
         n_tok = mask.float().sum(1, keepdim=True).clamp_min(1.0)
-        x = None   # v2 stream is regenerated each layer from node values (no seed/residual)
         if self.training:
             self.marg_count += 1
         bias_corr = (1.0 - cfg.ema_decay ** self.marg_count.clamp_min(1.0)).clamp_min(1e-6)
 
         A_list, margs, aux = [], [], {}
         for l in range(self.depth):
-            scores = self.route(l, hiddens.float() if l == 0 else x) * m
+            tap_l = hiddens[:, :, l, :].float()                 # this layer's Llama tap
+            scores = self.route(l, tap_l) * m
             mean_act = scores.sum(dim=1) / n_tok
             marg_buf = getattr(self, f"act_marginal_L{l}")
             if self.training:
@@ -293,8 +311,6 @@ class HLVocabSubstrate(nn.Module):
                     marg_buf.mul_(cfg.ema_decay).add_(mean_act.mean(0), alpha=1 - cfg.ema_decay)
             A_list.append(scores)
             margs.append((marg_buf / bias_corr).clamp_min(1e-9))
-            if l < self.depth - 1:
-                x = self._perturb(l, x, scores) * m
             with torch.no_grad():
                 p = scores.clamp_min(1e-12)
                 aux[f"hlvocab_route_entropy_L{l}"] = ((-(p * p.log()).sum(-1)) * mask).sum() / mask.sum().clamp_min(1.0)
@@ -472,6 +488,8 @@ class HLVocabSubstrate(nn.Module):
         return memory, aux
 
     def forward(self, hiddens: Tensor, mask: Tensor) -> tuple[Tensor, dict]:
+        # hiddens: [B, L, K, d] — K Llama-layer taps (one per vocab scale).
         if self.config.use_graph:
             return self._forward_v2(hiddens, mask)
-        return self._forward_v1(hiddens, mask)
+        # v1 ablation routes a single tap chain → use the first tap.
+        return self._forward_v1(hiddens[:, :, 0, :] if hiddens.dim() == 4 else hiddens, mask)
