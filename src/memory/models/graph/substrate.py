@@ -15,6 +15,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+from vector_quantize_pytorch import VectorQuantize
 
 
 def _rmsnorm(x: Tensor, eps: float = 1e-6) -> Tensor:
@@ -35,38 +36,9 @@ class GraphConfig:
     vq_commit: float = 0.25          # commitment loss weight
 
 
-# ── VQ (van den Oord 2017 + EMA codebook; straight-through) ──────────────────
-class VQ(nn.Module):
-    """Snap z[...,d] to the nearest of n_codes codebook vectors. Returns the
-    STE-quantized vector, the code indices, and the commitment loss. Codebook is
-    updated by EMA (not gradient); a buffer, so it lives in state_dict."""
-
-    def __init__(self, n_codes: int, d: int, decay: float = 0.99,
-                 commit: float = 0.25, eps: float = 1e-5):
-        super().__init__()
-        self.n_codes, self.d, self.decay, self.commit, self.eps = n_codes, d, decay, commit, eps
-        cb = torch.randn(n_codes, d) / math.sqrt(d)
-        self.register_buffer("codebook", cb)
-        self.register_buffer("cluster_size", torch.zeros(n_codes))
-        self.register_buffer("ema_codebook", cb.clone())
-
-    def forward(self, z: Tensor) -> tuple[Tensor, Tensor, Tensor]:
-        flat = z.reshape(-1, self.d).float()
-        cb = self.codebook.float()
-        d2 = (flat.pow(2).sum(1, keepdim=True) - 2 * flat @ cb.t() + cb.pow(2).sum(1))
-        idx = d2.argmin(1)
-        q = self.codebook[idx].view_as(z)
-        if self.training:
-            with torch.no_grad():
-                onehot = F.one_hot(idx, self.n_codes).type_as(flat)
-                self.cluster_size.mul_(self.decay).add_(onehot.sum(0), alpha=1 - self.decay)
-                self.ema_codebook.mul_(self.decay).add_(onehot.t() @ flat, alpha=1 - self.decay)
-                n = self.cluster_size.sum()
-                cs = (self.cluster_size + self.eps) / (n + self.n_codes * self.eps) * n
-                self.codebook.copy_(self.ema_codebook / cs.unsqueeze(1))
-        commit_loss = self.commit * F.mse_loss(q.detach(), z)
-        q = z + (q - z).detach()                                   # straight-through
-        return q, idx.view(z.shape[:-1]), commit_loss
+# VQ = vector-quantize-pytorch's VectorQuantize (EMA codebook + kmeans init + dead-
+# code revival — the mature off-the-shelf quantizer; codebook-collapse mitigation
+# matters given our history). Built in GraphWriter; returns (quantized, indices, loss).
 
 
 # ── attention with QK-RMSNorm + learnable temp (the read cold-start fix) ──────
@@ -128,7 +100,11 @@ class GraphWriter(nn.Module):
         self.obs_proj = nn.Linear(cfg.d_llama, d)                           # LLM obs → d_graph (cross-attn KV)
         self.blocks = nn.ModuleList(_Block(d, cfg.heads, cfg.ffn_mult) for _ in range(cfg.write_layers))
         self.src_head = nn.Linear(d, d); self.dst_head = nn.Linear(d, d); self.edge_head = nn.Linear(d, d)
-        self.vq = VQ(cfg.n_codes, d, cfg.vq_decay, cfg.vq_commit)
+        # shared codebook for src+dst endpoints (one vocabulary). kmeans init +
+        # dead-code revival (threshold_ema_dead_code) fight codebook collapse.
+        self.vq = VectorQuantize(
+            dim=d, codebook_size=cfg.n_codes, decay=cfg.vq_decay,
+            commitment_weight=cfg.vq_commit, kmeans_init=True, threshold_ema_dead_code=2)
 
     def forward(self, obs_hiddens: Tensor, obs_mask: Tensor) -> dict:
         B, K, d = obs_hiddens.shape[0], self.cfg.n_edges, self.cfg.d_graph
