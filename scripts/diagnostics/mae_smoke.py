@@ -30,11 +30,12 @@ def matched(cfg):
     cfg.pad_token_id = 0; cfg.task_mode = "masked_reconstruction"
     cfg.use_llama_lora = True; cfg.llama_lora_rank = 16; cfg.llama_lora_alpha = 32
     cfg.n_flat_codes = 16
-    cfg.icae_n_slots = 16; cfg.icae_lora_rank = 34; cfg.icae_lora_alpha = 68
-    cfg.ccm_n_comp = 16; cfg.ccm_lora_rank = 17; cfg.ccm_lora_alpha = 34
+    # capacity-matched to hlvocab ~4.45M (see scripts/diagnostics/param_count.py)
+    cfg.icae_n_slots = 16; cfg.icae_lora_rank = 60; cfg.icae_lora_alpha = 120
+    cfg.ccm_n_comp = 16; cfg.ccm_lora_rank = 30; cfg.ccm_lora_alpha = 60
     cfg.autocompressor_n_slots = 16
-    cfg.autocompressor_lora_rank = 17; cfg.autocompressor_lora_alpha = 34
-    cfg.beacon_ratio = 8; cfg.beacon_wrap_layers = (0, 10, 19, 29)
+    cfg.autocompressor_lora_rank = 30; cfg.autocompressor_lora_alpha = 60
+    cfg.beacon_ratio = 8; cfg.beacon_wrap_layers = (0, 6, 12, 17, 23, 29)
     # hlvocab (compression-by-vocabulary): smaller vocab for the 135M smoke
     cfg.hlvocab_d_code = 256; cfg.hlvocab_nodes = (512, 256, 128)
     cfg.hlvocab_top_k = 4; cfg.hlvocab_m_max = 16; cfg.hlvocab_tap_layer = 6

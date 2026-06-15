@@ -1224,20 +1224,24 @@ def main():
         # PROTOCOL is learnable; competitors ADD their ~2M compression encoder.
         cfg.use_llama_lora = True
         cfg.llama_lora_rank = 16; cfg.llama_lora_alpha = 32
-        # M_max = 16 (k in [3,16]); param-matched ranks (~2M on 135M, d=576).
+        # M_max = 16 (k in [3,16]). Memory-mechanism trainable params matched to
+        # hlvocab (graph_v9 ≈ 4.45M total / 3.52M memory) on 135M, d=576:
+        #   icae r60 → 4.39M, ccm r30 → 4.39M, autocompressor r30 → 4.40M,
+        #   beacon 6 wrap layers → 4.24M. (See scripts/diagnostics/param_count.py.)
         cfg.n_flat_codes = 16
-        cfg.icae_n_slots = 16; cfg.icae_lora_rank = 34; cfg.icae_lora_alpha = 68
-        cfg.ccm_n_comp = 16; cfg.ccm_lora_rank = 17; cfg.ccm_lora_alpha = 34
+        cfg.icae_n_slots = 16; cfg.icae_lora_rank = 60; cfg.icae_lora_alpha = 120
+        cfg.ccm_n_comp = 16; cfg.ccm_lora_rank = 30; cfg.ccm_lora_alpha = 60
         cfg.autocompressor_n_slots = 16
-        cfg.autocompressor_lora_rank = 17; cfg.autocompressor_lora_alpha = 34
+        cfg.autocompressor_lora_rank = 30; cfg.autocompressor_lora_alpha = 60
         cfg.beacon_ratio = 8
-        # Beacon wraps 4 evenly-spaced decoder layers. Derive from the backbone's
-        # actual depth (was hard-coded (0,10,19,29) for SmolLM2-135M's 30 layers,
-        # which silently degenerated to 2 layers on a 16-layer backbone).
+        # Beacon's capacity knob is the NUMBER of wrapped layers (each adds full
+        # q/k/v copies). 6 evenly-spaced layers ≈ 4.24M on SmolLM2-135M, matched
+        # to the cohort. Derived from the backbone depth (was hard-coded
+        # (0,10,19,29), which degenerated to 2 layers on a 16-layer backbone).
         from transformers import AutoConfig as _ACL
         _nlayers = _ACL.from_pretrained(cfg.llama_model).num_hidden_layers
         cfg.beacon_wrap_layers = tuple(sorted({
-            int(round(q * (_nlayers - 1))) for q in (0.0, 1 / 3, 2 / 3, 1.0)}))
+            int(round(q * (_nlayers - 1))) for q in (0.0, .2, .4, .6, .8, 1.0)}))
         cfg.hlvocab_m_max = 16           # masked_reconstruction: emit up to 16, sliced to k [fix G]
         cfg.hlvocab_edge_cand = 48       # calibrated for the 16-token MAE regime (overrides budget-scaled)
         cfg.spg_K_edge = 16              # soft_pointer_graph: cap fact-tokens to k (capacity-fair if selected)
