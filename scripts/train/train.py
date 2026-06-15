@@ -901,9 +901,10 @@ def main():
     # Active suite: latest graph + published closed-book compressor baselines.
     # Retired graph/plastic/splat and older flat/continuous/MT/Mamba variants
     # remain selectable via explicit --variants if needed.
+    # hlvocab_baseline + soft_pointer_graph_baseline are ABANDONED (2026-06-15) —
+    # still selectable via explicit --variants for reproduction, out of the default.
+    # The new `graph` model (VQ-VAE → graph + TokenGT) joins here once built.
     ap.add_argument("--variants", nargs="+", default=[
-        "hlvocab_baseline",           # primary architecture A (Compression-by-Vocabulary)
-        "soft_pointer_graph_baseline",  # primary architecture B (free-endpoint soft-pointer graph)
         "icae_baseline",              # ICAE (ICLR'24)
         "ccm_baseline",               # CCM (ICLR'24)
         "autocompressor_baseline",    # AutoCompressor/RMT-style recurrent summary

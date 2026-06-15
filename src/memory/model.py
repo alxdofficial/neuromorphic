@@ -35,11 +35,11 @@ class ReprLearningModel(nn.Module):
     """
 
     VARIANTS = {
-        # soft-pointer graph memory (models/soft_pointer_graph/; docs/graph_v6.md).
-        "soft_pointer_graph_baseline": SoftPointerGraphEncoder,
-        # Compression-by-Vocabulary (models/hierarchical_learned_vocab/;
-        # docs/compression_model_design.md) — the active model.
-        "hlvocab_baseline": HLVocabEncoder,
+        # ── ABANDONED (2026-06-15) — kept loadable for reproducing prior results,
+        # NOT in the active suite. Both hit the rank-1 read/membership wall; the
+        # line moved to the VQ-VAE→graph+TokenGT model. See project_mae_4k_collapse_result.
+        "soft_pointer_graph_baseline": SoftPointerGraphEncoder,   # ABANDONED (was graph_v6, free-endpoint)
+        "hlvocab_baseline": HLVocabEncoder,                       # ABANDONED (was graph_v9, compression-by-vocab)
         "icae_baseline": ICAEBaselineEncoder,  # ICAE (ICLR'24) compressor, EMAT-retrained
         "ccm_baseline": CCMBaselineEncoder,    # CCM (ICLR'24) recurrent compressor, EMAT-retrained
         "beacon_baseline": BeaconBaselineEncoder,  # Activation Beacon (BAAI) per-layer beacon attn

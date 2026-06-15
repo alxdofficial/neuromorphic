@@ -73,8 +73,8 @@ print(f"batch: context {tuple(batch.context_ids.shape)}, k_slots={batch.k_slots}
 # fixed batch still get a chance over data diversity.
 extra_batches = [to_dev(next(it)) for _ in range(3)]
 
-VARIANTS = ["hlvocab_baseline", "soft_pointer_graph_baseline",
-            "icae_baseline", "ccm_baseline",
+# hlvocab + soft_pointer_graph ABANDONED (2026-06-15) — dropped from the active gate.
+VARIANTS = ["icae_baseline", "ccm_baseline",
             "autocompressor_baseline", "beacon_baseline",
             "vanilla_llama", "vanilla_full_context"]
 for variant in VARIANTS:
