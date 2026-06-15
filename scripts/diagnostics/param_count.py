@@ -26,6 +26,10 @@ MAE_RANKS = dict(
     ccm_lora_rank=30, ccm_lora_alpha=60,
     autocompressor_lora_rank=30, autocompressor_lora_alpha=60,
     beacon_ratio=8, beacon_wrap_layers=beacon_wrap_layers(N_LAYERS),
+    # soft_pointer_graph capacity-matched to hlvocab (~3.30M memory)
+    spg_K_edge=16, spg_K_node=64, spg_d_node=176, spg_d_state=176, spg_d_read=176,
+    spg_d_updater=240, spg_updater_layers=2, spg_updater_heads=8,
+    spg_read_ffn_mult=2, spg_builder_mlp_hidden=224, spg_film_hidden=176,
 )
 
 
@@ -49,8 +53,8 @@ def n_trainable(variant):
     return sum(p.numel() for p in m.parameters() if p.requires_grad)
 
 
-VARIANTS = ["vanilla_llama", "hlvocab_baseline", "icae_baseline", "ccm_baseline",
-            "autocompressor_baseline", "beacon_baseline"]
+VARIANTS = ["vanilla_llama", "hlvocab_baseline", "soft_pointer_graph_baseline",
+            "icae_baseline", "ccm_baseline", "autocompressor_baseline", "beacon_baseline"]
 
 print(f"backbone={BACKBONE} d=576; ranks={MAE_RANKS}\n")
 floor = n_trainable("vanilla_llama")

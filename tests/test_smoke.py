@@ -30,7 +30,7 @@ def test_config_dead_fields_removed():
             "slot_iters", "mt_layer", "use_role_embeddings", "use_qformer_adapter",
             "plastic_depth", "splat_K", "b_diversity_scale", "mt_diversity_scale",
             "fixed_window_size", "max_window_size", "mask_ratio_min", "eval_every",
-            "device", "dtype"}
+            "device", "dtype", "spg_read_heads", "spg_inject_layer"}
     leaked = dead & fields
     assert not leaked, f"dead config fields still present: {sorted(leaked)}"
 

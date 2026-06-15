@@ -5,7 +5,6 @@ from .substrate import (
     SoftPointerGraphUpdater,
     SoftPointerGraphGate,
     SoftPointerGraphFactBuilder,
-    SoftPointerGraphFactReader,
     init_soft_pointer_graph_state,
 )
 
@@ -15,6 +14,5 @@ __all__ = [
     "SoftPointerGraphUpdater",
     "SoftPointerGraphGate",
     "SoftPointerGraphFactBuilder",
-    "SoftPointerGraphFactReader",
     "init_soft_pointer_graph_state",
 ]

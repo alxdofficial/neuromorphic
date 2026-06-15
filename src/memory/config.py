@@ -135,8 +135,7 @@ class ReprConfig:
     spg_updater_layers: int = 5
     spg_updater_heads: int = 16
     spg_d_read: int = 512             # fact-token / read dim
-    spg_read_heads: int = 8           # multi-head cross-attention read heads
-    spg_read_ffn_mult: int = 4
+    spg_read_ffn_mult: int = 4        # prepend-read projection MLP expansion (d_read → mult·d_read → d_llama)
     spg_builder_mlp_hidden: int = 768  # post-FiLM residual MLP hidden
     spg_read_temperature: float = 0.3
     spg_node_gate_init_bias: float = 0.5

@@ -35,7 +35,7 @@ class SoftPointerGraphEncoder(nn.Module):
         from .substrate import (
             SoftPointer,
             SoftPointerGraphUpdater, SoftPointerGraphGate,
-            SoftPointerGraphFactBuilder, SoftPointerGraphFactReader,
+            SoftPointerGraphFactBuilder,
         )
 
         d_up = cfg.spg_d_updater
@@ -71,10 +71,13 @@ class SoftPointerGraphEncoder(nn.Module):
             d_node=self.d_node, d_state=self.d_state, d_read=d_read,
             film_hidden=cfg.spg_film_hidden, mlp_hidden=cfg.spg_builder_mlp_hidden,
         )
-        self.fact_reader = SoftPointerGraphFactReader(
-            d_llama=cfg.d_llama, d_read=d_read,
-            n_heads=cfg.spg_read_heads, ffn_mult=cfg.spg_read_ffn_mult,
-        )
+        # PREPEND read (parity with every other arm): project the d_read fact tokens
+        # to d_llama and prepend; the frozen decoder's own attention does the reading.
+        # (The retired per-position cross-attention reader lived here — it left most
+        # of its params gradient-dead in the prepend regime.)
+        _rm = cfg.spg_read_ffn_mult * d_read
+        self.prepend_proj = nn.Sequential(
+            nn.Linear(d_read, _rm), nn.GELU(), nn.Linear(_rm, cfg.d_llama))
         # EMAT prepend read: norm-match the projected fact-tokens to Llama's token
         # scale (same as the baselines) so the graph reads through the IDENTICAL
         # prepend interface — no privileged per-position inject hook.
@@ -182,7 +185,7 @@ class SoftPointerGraphEncoder(nn.Module):
     def finalize_memory(self, state):
         N = state["N"]
         B, device = N.shape[0], N.device
-        dtype = next(self.fact_reader.parameters()).dtype
+        dtype = next(self.prepend_proj.parameters()).dtype
         zero_state = bool(state.get("zero_state", False))   # finer ablation than zero_memory
         fact_value = self._build_facts(state, zero_state=zero_state)
         # PREPEND read (EMAT-matched, identical to the baselines): the K_edge
@@ -190,7 +193,7 @@ class SoftPointerGraphEncoder(nn.Module):
         # [B, K_edge, d_llama] prepend memory. The old per-position inject hook
         # is retired (model.py) so the graph reads like every other arm and
         # REAL/SHUF/OFF apply to it too. spg_facts stays in aux for telemetry.
-        memory = self.prepend_norm(self.fact_reader.W_out(fact_value).float())
+        memory = self.prepend_norm(self.prepend_proj(fact_value).float())
         n_w = max(state["n_windows"], 1)
         aux = {
             "load_balance_loss": torch.zeros((), device=device, dtype=dtype),
@@ -209,13 +212,6 @@ class SoftPointerGraphEncoder(nn.Module):
         # or →log K diffuse; active_frac→0 = hub collapse).
         if not self.training:
             with torch.no_grad():
-                fr = self.fact_reader
-                eff = (fr.scale_max * torch.tanh(fr.scale_raw)).abs().mean()
-                aux["spg_rezero_scale_eff"] = eff.float().to(torch.float32)
-                # v6.1: per-position read gate mean (from the last decode pass) — should
-                # drop below 1 if the model learns to suppress the read where unhelpful.
-                if getattr(fr, "_last_gate_mean", None) is not None:
-                    aux["spg_read_gate_mean"] = fr._last_gate_mean.to(torch.float32)
                 fact_zero = self._build_facts(state, zero_state=True)
                 aux["spg_state_effect"] = (
                     (fact_value - fact_zero).float().norm(dim=-1).mean().to(torch.float32))
@@ -248,6 +244,6 @@ class SoftPointerGraphEncoder(nn.Module):
         state = self.init_streaming_state(B, device, dtype)
         state, _ = self.streaming_write(state, token_embeds, attention_mask)
         fact_value = self._build_facts(state)
-        memory = self.fact_reader.W_out(fact_value).to(dtype)     # [B, K_edge, d_llama] (query-agnostic fallback)
+        memory = self.prepend_proj(fact_value).to(dtype)          # [B, K_edge, d_llama] prepend read
         aux = {"load_balance_loss": torch.zeros((), device=device, dtype=memory.dtype)}
         return memory, aux

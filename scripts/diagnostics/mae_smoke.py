@@ -39,6 +39,12 @@ def matched(cfg):
     # hlvocab (compression-by-vocabulary): smaller vocab for the 135M smoke
     cfg.hlvocab_d_code = 256; cfg.hlvocab_nodes = (512, 256, 128)
     cfg.hlvocab_top_k = 4; cfg.hlvocab_m_max = 16; cfg.hlvocab_tap_layer = 6
+    # soft_pointer_graph capacity-matched to hlvocab (~3.30M memory)
+    cfg.spg_K_edge = 16; cfg.spg_K_node = 64
+    cfg.spg_d_node = 176; cfg.spg_d_state = 176; cfg.spg_d_read = 176
+    cfg.spg_d_updater = 240; cfg.spg_updater_layers = 2; cfg.spg_updater_heads = 8
+    cfg.spg_read_ffn_mult = 2
+    cfg.spg_builder_mlp_hidden = 224; cfg.spg_film_hidden = 176
     return cfg
 
 
@@ -67,7 +73,8 @@ print(f"batch: context {tuple(batch.context_ids.shape)}, k_slots={batch.k_slots}
 # fixed batch still get a chance over data diversity.
 extra_batches = [to_dev(next(it)) for _ in range(3)]
 
-VARIANTS = ["hlvocab_baseline", "icae_baseline", "ccm_baseline",
+VARIANTS = ["hlvocab_baseline", "soft_pointer_graph_baseline",
+            "icae_baseline", "ccm_baseline",
             "autocompressor_baseline", "beacon_baseline",
             "vanilla_llama", "vanilla_full_context"]
 for variant in VARIANTS:

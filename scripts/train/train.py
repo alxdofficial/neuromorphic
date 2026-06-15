@@ -902,7 +902,8 @@ def main():
     # Retired graph/plastic/splat and older flat/continuous/MT/Mamba variants
     # remain selectable via explicit --variants if needed.
     ap.add_argument("--variants", nargs="+", default=[
-        "hlvocab_baseline",           # primary architecture (Compression-by-Vocabulary)
+        "hlvocab_baseline",           # primary architecture A (Compression-by-Vocabulary)
+        "soft_pointer_graph_baseline",  # primary architecture B (free-endpoint soft-pointer graph)
         "icae_baseline",              # ICAE (ICLR'24)
         "ccm_baseline",               # CCM (ICLR'24)
         "autocompressor_baseline",    # AutoCompressor/RMT-style recurrent summary
@@ -1283,7 +1284,15 @@ def main():
         cfg.beacon_wrap_layers = _bwl(_nlayers)
         cfg.hlvocab_m_max = 16           # masked_reconstruction: emit up to 16, sliced to k [fix G]
         cfg.hlvocab_edge_cand = 48       # calibrated for the 16-token MAE regime (overrides budget-scaled)
-        cfg.spg_K_edge = 16              # soft_pointer_graph: cap fact-tokens to k (capacity-fair if selected)
+        # soft_pointer_graph (our other primary graph; "free endpoint selection")
+        # capacity-matched to hlvocab on d=576: ≈3.30M memory / 4.22M total. Defaults
+        # are sized for the retired ~48M QA regime, so shrink for the MAE cohort.
+        cfg.spg_K_edge = 16              # cap fact-tokens to k (sliced to per-example k_slots)
+        cfg.spg_K_node = 64
+        cfg.spg_d_node = 176; cfg.spg_d_state = 176; cfg.spg_d_read = 176
+        cfg.spg_d_updater = 240; cfg.spg_updater_layers = 2; cfg.spg_updater_heads = 8
+        cfg.spg_read_ffn_mult = 2
+        cfg.spg_builder_mlp_hidden = 224; cfg.spg_film_hidden = 176
         if cfg.d_llama != 576 and not args.allow_unmatched_backbone:
             raise SystemExit(
                 f"masked_reconstruction param-matched ranks are calibrated for "
