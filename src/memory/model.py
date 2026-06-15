@@ -25,6 +25,22 @@ from .models.vanilla import FullContextEncoder, NullEncoder
 from .decoder import FrozenLlamaDecoder
 
 
+def _participation_ratio(x: Tensor) -> float:
+    """Effective rank (participation ratio of squared singular values) of the rows
+    of x — `(Σσ²)² / Σσ⁴`. Computed via the covariance-trace identity (no SVD):
+    `(tr C)² / ‖C‖_F²` on the mean-centered gram `C = Xcᵀ Xc`. Cheap (a d×d gram),
+    exact. PR≈1 ⇒ rank-1 collapse; PR≈d ⇒ isotropic. The collapse canary for the
+    graph's write routing / node values / endpoint codes / injected read."""
+    x = x.detach().float()
+    if x.shape[0] < 2:
+        return 0.0
+    xc = x - x.mean(0, keepdim=True)
+    C = xc.t() @ xc                                   # [d,d]
+    tr = torch.diagonal(C).sum()
+    fro2 = (C * C).sum()
+    return float((tr * tr / fro2.clamp_min(1e-12)).item())
+
+
 class ReprLearningModel(nn.Module):
     """Encoder + frozen Llama decoder, end-to-end.
 
@@ -398,6 +414,7 @@ class ReprLearningModel(nn.Module):
 
         # ---- 4. inject hook on the mid-late decoder layer ----
         handle = None
+        cap = {}                                        # stashes the injected vector for read-eff-rank
         if inject:
             reader = enc.reader
             layer = self.decoder.llama.model.layers[enc.inject_layer]
@@ -405,6 +422,7 @@ class ReprLearningModel(nn.Module):
             def _inject_hook(module, args, output):
                 hidden = output[0] if isinstance(output, tuple) else output
                 inj = reader(hidden, graph).to(hidden.dtype)
+                cap["inj"] = inj
                 hidden = hidden + inj
                 if isinstance(output, tuple):
                     return (hidden,) + tuple(output[1:])
@@ -443,13 +461,6 @@ class ReprLearningModel(nn.Module):
         # VQ commitment loss is part of the quantizer (a principled architectural
         # term of every VQ-VAE, not an anti-collapse aux); keep mask_embed in-graph.
         loss = loss_recon + vq_loss.to(loss_recon.dtype) + 0.0 * self.decoder.mask_embed.float().sum()
-        with torch.no_grad():
-            # collapse canaries: distinct codes used across all edge endpoints,
-            # and the learned read amplitude (tanh-gate). A healthy run keeps
-            # codes_active well above 1 and a nonzero, growing read gate.
-            codes_active = torch.cat([graph["src_idx"].reshape(-1),
-                                      graph["dst_idx"].reshape(-1)]).unique().numel()
-            read_gate = float(torch.tanh(enc.reader.gate).abs().item())
         out = {
             "loss": loss, "loss_recon": loss_recon.detach(),
             "top1_acc": top1, "per_example_loss": per_ex,
@@ -458,9 +469,31 @@ class ReprLearningModel(nn.Module):
             "memory_shape": (B, enc.gcfg.n_edges),          # K edges (the "code size") for the logger
             "mae_n_masked": float(loss_mask.sum()), "mae_M": 0.0,
             "graph_vq_loss": vq_loss.detach() if torch.is_tensor(vq_loss) else 0.0,
-            "graph_codes_active": float(codes_active),
-            "graph_read_gate": read_gate,
+            "graph_read_gate": float(torch.tanh(enc.reader.gate).abs().mean().item()),
         }
+        # ---- 6. holistic anti-collapse telemetry (every step; cheap) ----
+        # The collapse canaries the sweep needs, at every stage of the pipeline:
+        #   WRITE routing  → codebook usage (distinct codes + perplexity = effective
+        #                    #codes); codebook collapse is the #1 VQ failure.
+        #   node KEYS      → eff_rank of the snapped endpoint vectors (src_q,dst_q).
+        #   node VALUES    → eff_rank of the continuous edge_states across edges.
+        #   READ           → eff_rank of the injected signal across decode positions
+        #                    (prior models collapsed this to ~1 = membership-not-binding).
+        with torch.no_grad():
+            idx = torch.cat([graph["src_idx"].reshape(-1), graph["dst_idx"].reshape(-1)])
+            counts = torch.bincount(idx, minlength=enc.gcfg.n_codes).float()
+            p = counts / counts.sum().clamp_min(1.0)
+            ppl = torch.exp(-(p * p.clamp_min(1e-12).log()).sum())     # effective #codes
+            d_g = enc.gcfg.d_graph
+            out["graph_codes_active"] = float(idx.unique().numel())
+            out["graph_codebook_ppl"] = float(ppl.item())
+            out["graph_key_effrank"] = _participation_ratio(
+                torch.cat([graph["src_q"], graph["dst_q"]], dim=1).reshape(-1, d_g))
+            out["graph_value_effrank"] = _participation_ratio(
+                graph["edge_state"].reshape(-1, d_g))
+            if "inj" in cap:                                            # REAL path only
+                out["graph_read_effrank"] = _participation_ratio(
+                    cap["inj"][batch.context_mask.bool()])
         return out
 
     def compute_loss(

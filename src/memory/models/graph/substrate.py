@@ -132,10 +132,11 @@ class GraphReader(nn.Module):
         self.q_in = nn.Linear(dl, d)                                       # decode hidden → query
         self.blocks = nn.ModuleList(_Block(d, cfg.heads, cfg.ffn_mult) for _ in range(cfg.read_layers))
         self.out = nn.Linear(d, dl)
-        # gate init small-but-NONZERO (tanh(0.1)≈0.1): a 0-init ReZero gate zeros the
-        # read output → the reader gets no gradient (the v8c cold-start). ~10% amplitude
-        # at init gives the read signal from step 0 (RMS-match keeps it stream-scaled).
-        self.gate = nn.Parameter(torch.tensor([0.1]))
+        # learnable gate, init DIMENSION-SCALED (1/√d_llama) instead of a bare 0.1
+        # magic constant: small-but-NONZERO so the reader gets gradient from step 0
+        # (a 0-init ReZero gate zeros the read output → the v8c cold-start), while the
+        # init scales with model width. tanh-bounded so the inject can't exceed stream RMS.
+        self.gate = nn.Parameter(torch.tensor([dl ** -0.5]))
 
     def graph_tokens(self, graph: dict) -> Tensor:
         K = self.cfg.n_edges

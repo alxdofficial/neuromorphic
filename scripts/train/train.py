@@ -576,6 +576,29 @@ def train_one_variant(
         _gn_lora = _grad_group_norm(
             p for n, p in model.named_parameters()
             if p.requires_grad and n.startswith("decoder.llama."))
+        # Per-MECHANISM gradient flow (graph variant): is any sub-module being
+        # gradient-starved / ignored (the model learning to route around it)?
+        # Splits write (obs/blocks/endpoint-heads/edge-head/slots) and read
+        # (q_in/blocks/out/gate/tag-role) so the sweep can see WHICH path carries
+        # the learning signal. (VQ codebook is EMA — no grad — intentionally absent.)
+        graph_gn = {}
+        if variant == "graph_baseline":
+            _gmech = {
+                "w_obs": ("encoder.writer.obs_proj",),
+                "w_blocks": ("encoder.writer.blocks",),
+                "w_endpt": ("encoder.writer.src_head", "encoder.writer.dst_head"),
+                "w_edge": ("encoder.writer.edge_head",),
+                "w_slots": ("encoder.writer.init_tok", "encoder.writer.role", "encoder.writer.tag"),
+                "r_qin": ("encoder.reader.q_in",),
+                "r_blocks": ("encoder.reader.blocks",),
+                "r_out": ("encoder.reader.out",),
+                "r_gate": ("encoder.reader.gate",),
+                "r_tagrole": ("encoder.reader.role", "encoder.reader.tag"),
+            }
+            for _lab, _prefs in _gmech.items():
+                graph_gn[f"graph_gn_{_lab}"] = _grad_group_norm(
+                    p for n, p in model.named_parameters()
+                    if p.requires_grad and any(n.startswith(x) for x in _prefs))
         # PER-GROUP clipping (audit fix): a single global clip is dominated by the
         # LoRA group (>99% of the norm), silently shrinking the memory side's step
         # whenever LoRA spikes. Clip memory and LoRA separately at the same bound.
@@ -624,6 +647,9 @@ def train_one_variant(
         # kept in the whitelist for back-compat reproduction (skipped if absent).
         _graph_scalar_keys = (
             "graph_vq_loss", "graph_codes_active", "graph_read_gate",
+            # holistic anti-collapse canaries (write routing → key → value → read)
+            "graph_codebook_ppl", "graph_key_effrank", "graph_value_effrank",
+            "graph_read_effrank",
             "graph_aux", "graph_endpoint_reuse",
             "graph_u_mean", "graph_age_mean", "graph_src_norm",
             "graph_pick_affinity_avg", "graph_gate_mean_avg",
@@ -636,6 +662,7 @@ def train_one_variant(
         for key in _graph_scalar_keys:
             if key in out and out[key] is not None:
                 row[key] = float(out[key])
+        row.update(graph_gn)         # per-mechanism gradient flow (graph variant)
         # soft_pointer_graph telemetry (variant == soft_pointer_graph_baseline).
         # Write-side gate means + fact norm are emitted every step; the read-side
         # health probes (rezero/state_effect/collapse/entropy/active_frac) are
@@ -684,6 +711,15 @@ def train_one_variant(
                 g_e = float(out.get("spg_edge_gate_mean_avg", 0.0) or 0.0)
                 extra_field = f"g_n={g_n:.2f} g_e={g_e:.2f}"
                 aux_tag, aux_display = "aux", float(out["loss_aux"])
+            elif variant == "graph_baseline":
+                # live collapse canaries: effective #codes (perplexity), value/read
+                # eff-rank, read-gate. Watch ppl→1 (codebook collapse), read_er→1
+                # (membership-not-binding), gate→0 (read being ignored).
+                extra_field = (f"ppl={float(out.get('graph_codebook_ppl',0)):.0f} "
+                               f"val_er={float(out.get('graph_value_effrank',0)):.1f} "
+                               f"rd_er={float(out.get('graph_read_effrank',0)):.1f} "
+                               f"gate={float(out.get('graph_read_gate',0)):.3f}")
+                aux_tag, aux_display = "vq", float(out.get("graph_vq_loss", 0.0))
             elif "splat_aux" in out and out["splat_aux"] is not None:
                 aux_display = float(out["splat_aux"])
                 aux_tag = "s_aux"
