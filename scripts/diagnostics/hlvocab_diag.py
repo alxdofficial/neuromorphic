@@ -1,6 +1,9 @@
-"""hlvocab debug sweep — load the trained 4k checkpoint and measure the things
-static review can't: gradient flow per module, routing collapse, node/centroid
-collapse, presence saturation, multi-resolution selection, memory-norm OOD."""
+"""hlvocab V1 (nodes-only) debug sweep — load a trained checkpoint and measure
+the things static review can't: gradient flow per module, routing collapse,
+node/centroid collapse, presence saturation, multi-resolution selection,
+memory-norm OOD. This analyses the V1 nodes-only path (seed_proj + centroid
+pooling); for the V2 full graph use hlvocab_graph_diag.py.
+Override the checkpoint with CKPT=<path> (or FRESH=1 for untrained mechanics)."""
 import sys, os, math
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 import torch, torch.nn.functional as F
@@ -12,13 +15,15 @@ from src.memory.models.hierarchical_learned_vocab.substrate import _unit_rms, _u
 
 dev = "cuda"
 BACKBONE = "HuggingFaceTB/SmolLM2-135M"; SRC = "meta-llama/Llama-3.2-1B"
-CKPT = "outputs/memory/mae_135m_4k_v9_graph_v9_baseline/ckpts/graph_v9_baseline.best.pt"
+CKPT = os.environ.get(
+    "CKPT", "outputs/memory/mae_v1_hlvocab_baseline/ckpts/hlvocab_baseline.best.pt")
 
 
 def matched(cfg):
     cfg.llama_model = BACKBONE; cfg.d_llama = 576; cfg.llama_vocab_size = 49152
     cfg.pad_token_id = 0; cfg.task_mode = "masked_reconstruction"
     cfg.use_llama_lora = True; cfg.llama_lora_rank = 16; cfg.llama_lora_alpha = 32
+    cfg.hlvocab_use_graph = False        # this tool analyses the V1 nodes-only path
     cfg.hlvocab_d_code = 256; cfg.hlvocab_nodes = (512, 256, 128)
     cfg.hlvocab_top_k = 4; cfg.hlvocab_m_max = 16; cfg.hlvocab_tap_layer = 6
     return cfg

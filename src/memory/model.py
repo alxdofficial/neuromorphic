@@ -217,7 +217,8 @@ class ReprLearningModel(nn.Module):
     # compressor variants whose memory is a [B, M, d] prepend (capacity-relative
     # slicing applies to these; vanillas pass through at M=0 / M=T).
     _MASKED_RECON_COMPRESSORS = ("icae_baseline", "ccm_baseline", "hlvocab_baseline",
-                        "autocompressor_baseline", "beacon_baseline")
+                        "autocompressor_baseline", "beacon_baseline",
+                        "soft_pointer_graph_baseline")  # slice to k too if selected (capacity-fair)
 
     def compute_masked_reconstruction_loss(
         self,
@@ -363,7 +364,8 @@ class ReprLearningModel(nn.Module):
         """
         if getattr(self, "task_mode", None) == "masked_reconstruction":
             return self.compute_masked_reconstruction_loss(
-                batch, zero_memory=zero_memory, shuffle_memory=shuffle_memory)
+                batch, zero_memory=zero_memory, shuffle_memory=shuffle_memory,
+                mask_ratio=self.cfg.mae_mask_ratio)
         device = batch.context_ids.device
         B, T_ctx = batch.context_ids.shape
         T_q = batch.question_ids.shape[1]
@@ -423,9 +425,9 @@ class ReprLearningModel(nn.Module):
             finalize_aux.update(mt_aux)
             M = K_retrieve
 
-        # ---- 2b. Faithful MT branch: install the kNN datastore into the
-        # decoder-layer wrapper. M STAYS 0 (NO prepend) — the read happens
-        # inside attention at cfg.mt_layer, not by prepending memory tokens.
+        # ---- 2b. Faithful MT branch (retired baseline; inert — no current
+        # encoder produces mt_faithful_bank). M STAYS 0 (NO prepend) — the read
+        # happens inside attention at a fixed decoder layer, not by prepending.
         #   OFF  (zero_memory)               : leave datastore None → vanilla Llama.
         #   SHUF (shuffle_memory, not zero)  : roll keys/values/ctx_mask by 1 on
         #                                       dim 0 so each row reads another

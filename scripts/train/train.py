@@ -926,11 +926,6 @@ def main():
                     help="composite_v1 passages sampled per chunk. 0 = auto: "
                          "scales with chunk_size (~75 per 1024 tokens). "
                          "Manual override accepted as positive int.")
-    # Default 0: B (canonical Slot Attention) and MT (per-position retrieval)
-    # prevent collapse by mechanism, not by a non-canonical diversity loss.
-    # Pass a small positive value only if a retrain shows collapse.
-    ap.add_argument("--b-diversity-scale", type=float, default=0.0)
-    ap.add_argument("--mt-diversity-scale", type=float, default=0.0)
     ap.add_argument("--task", type=str, default="masked_reconstruction",
                     choices=["masked_reconstruction", "qa", "conditioned_reconstruction",
                              "conditioned_reconstruction_bio", "continuation"],
@@ -1143,51 +1138,16 @@ def main():
             "(e.g. --mix-weights 0.35 0.15 0.15 0.15 0.2)."
         )
 
-    # Tranche-3 sizing (chunk=8192, 61× compression) — matched to soft_pointer_graph:
-    #   soft_pointer_graph substrate: K_node=128, K_edge=196, d_node=d_state=480
-    #     gives a 274,944-float band; baselines: n_flat_codes=192, per_slot=1432 →
-    #     192·1432 = 274,944 floats (matched).
-    #     per_slot (1432) < d_llama (2048) keeps the slot the true bottleneck — every
-    #     stored float can reach Llama through the prepend projection (no no-op floats).
-    #   MT is EXEMPT from the float match: its per-token KV bank is uncompressed /
-    #     unbounded in footprint, so it is the best-case retrieval reference, not a
-    #     fixed-footprint compressor. Its params are still matched (~47.8M).
+    # Base config. Memory-token count + per-variant LoRA ranks/slots are set
+    # below (matched-budget block + masked_reconstruction override). LoRA-all:
+    # every arm gets the SAME decoder LoRA on the frozen backbone, so the decoder
+    # budget is identical and only the memory mechanism differs.
     cfg = ReprConfig(
         batch_size=args.batch_size,
-        fixed_window_size=args.window_size,
-        max_window_size=args.chunk_size,
         max_steps=args.steps,
         warmup_steps=args.warmup,
-        # Bottleneck: 192 memory slots × 1432 = 274,944 state floats across all
-        # fixed-footprint variants (flat / continuous / Mamba / graph), matched to
-        # soft_pointer_graph's substrate. MT exempt (see header).
-        d_node_state=128,
-        n_edges=68,
-        n_flat_codes=192,                  # was 128 (slot count = prepend tokens)
-        d_continuous=1432, d_concept_baseline=1432,
-        d_mt_value=1432, d_recurrent=1432,  # was 1398; 192·1432 = 274,944
-        # Baseline encoder (SmallBiTransformer; used by flat/continuous/MT only —
-        # NOT graph or Mamba). NON-parametric sinusoidal PE (matched to
-        # soft_pointer_graph's substrate). d_enc=816 × 4L + ffn=3300 lands
-        # flat/continuous at 48.0M, matched to soft_pointer_graph (48.02M) and
-        # Mamba (47.95M) within 0.1%. MT is ~47.2M — leaner by design (float-exempt
-        # retrieval ref, no learned codebook).
-        d_enc=816,
-        enc_n_layers=4,
-        enc_n_heads=12,                    # 816 = 12·68
-        enc_ffn_dim=3300,                  # 3264→3300: re-center flat/cont on 48.0M post-sinusoidal-PE
-        # Mamba — d_mamba=1256 × 4L ≈ 47.95M, matched to soft_pointer_graph's 48.0M.
-        d_mamba=1256,                      # was 1280 (49.5M)
-        edge_token_packing="fused",
-        # LoRA-all (fair joint training): EVERY arm — graph, the four baselines,
-        # and BOTH vanilla references — gets the SAME rank-16 q/v LoRA on the frozen
-        # Llama-1B (~1.70M params: q 65,536 + v 40,960 per layer × 16). The decoder
-        # budget is identical across arms; only the memory mechanism differs.
-        # vanilla_llama+LoRA = floor, vanilla_full_context+LoRA = ceiling.
         use_llama_lora=True,
         grad_checkpoint_stream=args.grad_ckpt_stream,
-        b_diversity_scale=args.b_diversity_scale,
-        mt_diversity_scale=args.mt_diversity_scale,
         **({"learning_rate": args.lr} if args.lr is not None else {}),
     )
 
@@ -1219,6 +1179,10 @@ def main():
     cfg.autocompressor_n_slots = M
     cfg.spg_K_edge = M               # soft_pointer_graph prepends M fact-tokens (matched read)
     cfg.hlvocab_m_max = M            # hlvocab obeys the matched budget too [fix G]
+    # edge_cand must stay >= n_edges (= m_max//2) or HLVocabConfig.__post_init__
+    # rejects the build. Scale it with the budget instead of leaving the default 48
+    # (which crashed non-MAE tasks at the default mem_tokens=144 → n_edges=72).
+    cfg.hlvocab_edge_cand = max(cfg.hlvocab_edge_cand, (M + 1) // 2)
     cfg.n_flat_codes = M             # flat/continuous/MT prepend M too (was 192 -> mismatch)
     cfg.beacon_ratio = max(1, args.chunk_size // M)
     if args.beacon_param is not None:
@@ -1266,8 +1230,17 @@ def main():
         cfg.ccm_n_comp = 16; cfg.ccm_lora_rank = 17; cfg.ccm_lora_alpha = 34
         cfg.autocompressor_n_slots = 16
         cfg.autocompressor_lora_rank = 17; cfg.autocompressor_lora_alpha = 34
-        cfg.beacon_ratio = 8; cfg.beacon_wrap_layers = (0, 10, 19, 29)
+        cfg.beacon_ratio = 8
+        # Beacon wraps 4 evenly-spaced decoder layers. Derive from the backbone's
+        # actual depth (was hard-coded (0,10,19,29) for SmolLM2-135M's 30 layers,
+        # which silently degenerated to 2 layers on a 16-layer backbone).
+        from transformers import AutoConfig as _ACL
+        _nlayers = _ACL.from_pretrained(cfg.llama_model).num_hidden_layers
+        cfg.beacon_wrap_layers = tuple(sorted({
+            int(round(q * (_nlayers - 1))) for q in (0.0, 1 / 3, 2 / 3, 1.0)}))
         cfg.hlvocab_m_max = 16           # masked_reconstruction: emit up to 16, sliced to k [fix G]
+        cfg.hlvocab_edge_cand = 48       # calibrated for the 16-token MAE regime (overrides budget-scaled)
+        cfg.spg_K_edge = 16              # soft_pointer_graph: cap fact-tokens to k (capacity-fair if selected)
         if cfg.d_llama != 576:
             print(f"[WARN] param-matched ranks calibrated for d=576; d={cfg.d_llama} "
                   "→ trainable counts will differ, RECALIBRATE before claims.")
@@ -1302,10 +1275,8 @@ def main():
         print(f"[auto] composite passages_per_chunk = {args.passages_per_chunk} "
               f"(scaled for chunk_size={args.chunk_size})")
 
-    print(f"v1h config: chunk={args.chunk_size}, window={args.window_size}, "
+    print(f"config: chunk={args.chunk_size}, window={args.window_size}, "
           f"passages_per_chunk={args.passages_per_chunk}")
-    print(f"Bottleneck (baselines): {cfg.n_flat_codes} × {cfg.d_continuous} "
-          f"= {cfg.n_flat_codes * cfg.d_continuous} floats")
     print(f"Steps: {args.steps}, batch={cfg.batch_size}")
 
     print(f"\nLoading tokenizer {cfg.llama_model}...")
