@@ -51,7 +51,7 @@ and likely the better corpus — swap and re-measure.
 ## Objective
 1. **MAE, high mask ratio** (≥85%): ingest sentence(pair) → code → drop input →
    fill masked positions in parallel (NOT teacher-forced NTP — NTP's local prior is
-   why the floor was ⅔-guessable). Reuse data_continuation `mae` at sentence scale.
+   why the floor was ⅔-guessable). The masked_reconstruction objective applies this at sentence scale.
    REPORT the no-memory MAE floor (same mask, memory off) every run.
 2. **Contrastive on the CODE** (in-batch InfoNCE, mean-pooled cosine, temperature):
    a sentence's code closer to itself than to other sentences' — the principled form
@@ -77,7 +77,7 @@ steps.
 - start flat (no pyramid) when our model returns.
 
 ## Build order
-1. **DONE: sentence-pair dataloader** (`src/repr_learning/data_sentence.py`).
+1. **DONE: sentence-pair dataloader** (`src/memory/data_masked_reconstruction.py`).
    FineWeb-EDU local parquet → decode (Llama tok, cached) → segment → SmolLM2
    re-tokenize → filter 24-128 → length-bucket by k=ceil(len/8) (uniform-k
    batches, M=k per batch). Emits QABatch + `k_slots`/`n_tokens`. Smoke: clean
@@ -128,9 +128,9 @@ budget) OR param count reported as a first-class axis. DECISION NEEDED.
 
 ## Honest status (2026-06-12 end) — SUPERSEDED (all "NOT YET BUILT" items below are now built; see RESULTS)
 DONE+VALIDATED: sentence-pair dataloader; true-MAE mechanic; SmolLM2 drop-in;
-baseline instantiation + param counts. NOT YET BUILT: compute_mae_loss decode
+baseline instantiation + param counts. NOT YET BUILT: compute_masked_reconstruction_loss decode
 path (the new forward), capacity-relative per-batch-k wiring (use first k slots),
-trainer task="sentence_mae", the trained floor/ceiling band scan. Our compressor:
+trainer task="masked_reconstruction", the trained floor/ceiling band scan. Our compressor:
 deferred (redesign).
 
 
@@ -164,7 +164,7 @@ deliberately unmatched (floor M=0, ceiling M=full).
 MAE training path complete + trainer-smoke validated end-to-end (train+eval+
 save+summary; peak VRAM 1.8GB at bs16). Pre-flight bugs caught & fixed:
 pad-token/vocab mismatch (SmolLM2), frozen-decoder-can't-learn-MAE (→ decoder
-LoRA on all variants), argparse choices missing sentence_mae, logger keys
+LoRA on all variants), argparse choices missing masked_reconstruction, logger keys
 (n_content_positions/memory_shape). Decoder LoRA (rank16, ~0.9M) is shared
 infra so the protocol is learnable; competitors = ~2M encoder + shared decoder
 LoRA (icae total 2.89M). RUN LAUNCHED: 6 variants × 800 steps, SmolLM2-135M,

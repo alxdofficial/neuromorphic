@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
-"""v1h training: composite-QA with teacher-forced CE on answer-content tokens.
+"""Memory training harness: every memory variant × objective, with teacher-forced CE.
+
+Default objective = masked_reconstruction (sentence-pair MAE); other objectives
+(qa, conditioned_reconstruction[_bio], continuation) select via --task.
 
 For each variant:
- - Encoder ingests a 4096-token context (packed composite_v1 passages) via
-   4 × 1024 streaming writes → memory tokens.
+ - Encoder ingests a context via streaming writes → memory tokens.
  - Decoder forward on [memory, question, answer]. The original context
    tokens are NOT visible to the decoder — only memory carries that info.
  - TF-CE on the answer's content-mask positions (load-bearing tokens; the
    rest of the answer span is filler).
 
-Per-variant outputs in outputs/repr_learning/<out_tag>_<variant>/:
+Per-variant outputs in outputs/memory/<out_tag>_<variant>/:
   jsonl/<variant>.jsonl   — per-step training metrics
   ckpts/<variant>.last.pt — encoder + decoder.mask_embed weights
 """
@@ -26,13 +28,14 @@ from transformers import AutoTokenizer
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from src.repr_learning.config import ReprConfig
-from src.repr_learning.data_qa import make_qa_dataloader, make_mixed_qa_dataloader, collate_qa
-from src.repr_learning.data_emat import make_emat_dataloader, EMATDataset
-from src.repr_learning.data_continuation import make_continuation_dataloader
-from src.repr_learning.data_emat_bio import make_emat_bio_dataloader
-from src.repr_learning.decoder import load_frozen_llama
-from src.repr_learning.model import ReprLearningModel
+from src.memory.config import ReprConfig
+from src.memory.data_qa import make_qa_dataloader, make_mixed_qa_dataloader, collate_qa
+from src.memory.data_conditioned_reconstruction import (
+    make_conditioned_reconstruction_dataloader, ConditionedReconstructionDataset)
+from src.memory.data_continuation import make_continuation_dataloader
+from src.memory.data_conditioned_reconstruction_bio import make_conditioned_reconstruction_bio_dataloader
+from src.memory.decoder import load_frozen_llama
+from src.memory.model import ReprLearningModel
 
 
 REPO = Path(__file__).resolve().parents[2]
@@ -111,7 +114,7 @@ def run_val(model, val_set, device, n_batches: int, window_size: int,
         # no_grad: huge memory win (~18→4 GiB at B=12). Val never backprops,
         # so the autograd graph was being built for nothing under autocast.
         with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            out = model.compute_qa_loss(batch, window_size=window_size)
+            out = model.compute_loss(batch, window_size=window_size)
         losses.append(float(out["loss_recon"]))
         accs.append(float(out["top1_acc"]))
         # REAL/SHUF/OFF binding gate on the first gate_batches (3× cost → capped).
@@ -120,17 +123,17 @@ def run_val(model, val_set, device, n_batches: int, window_size: int,
             real_l = float(out["loss_recon"])
             # REAL/OFF/SHUF must differ ONLY in memory, NOT in the random MAE
             # mask. The eval path's sole RNG draw is the mask (torch.rand in
-            # compute_mae_loss); re-seeding to the SAME value before each control
+            # compute_masked_reconstruction_loss); re-seeding to the SAME value before each control
             # makes all three predict the IDENTICAL masked positions [fix B].
             with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
                 torch.manual_seed(20260527 + i)
-                off = model.compute_qa_loss(batch, window_size=window_size,
+                off = model.compute_loss(batch, window_size=window_size,
                                             zero_memory=True)
                 off_abs.append(float(off["loss_recon"]))
                 off_gap.append(float(off["loss_recon"]) - real_l)
                 if batch.context_ids.shape[0] > 1:
                     torch.manual_seed(20260527 + i)
-                    shuf = model.compute_qa_loss(batch, window_size=window_size,
+                    shuf = model.compute_loss(batch, window_size=window_size,
                                                  shuffle_memory=True)
                     shuf_abs.append(float(shuf["loss_recon"]))
                     shuf_gap.append(float(shuf["loss_recon"]) - real_l)
@@ -289,9 +292,9 @@ def train_one_variant(
     patience: int = 5,                       # eval-points without improvement → stop
     min_step_for_stop: int = 2000,           # don't stop during warmup-noise era
     min_delta: float = 0.01,                 # min val_recon drop to count as a real improvement
-    task: str = "qa",                        # "qa" = composite-QA mix; "emat" = key→value; "continuation" = gist-LM
-    emat_n_pairs: int = 64, emat_n_query: int = 1, emat_value_len: int = 1,
-    emat_bio_n_facts: int = 3, emat_bio_world_seed: int = 0,
+    task: str = "masked_reconstruction",     # "masked_reconstruction" = sentence-pair MAE (active); "qa" = composite-QA mix; "conditioned_reconstruction" = key→value; "continuation" = gist-LM
+    cond_recon_n_pairs: int = 64, cond_recon_n_query: int = 1, cond_recon_value_len: int = 1,
+    cond_recon_bio_n_facts: int = 3, cond_recon_bio_world_seed: int = 0,
     compress_len: int = 2048, predict_len: int = 512,
     mae_src_tok: str = "meta-llama/Llama-3.2-1B",
 ) -> dict:
@@ -303,8 +306,8 @@ def train_one_variant(
     # LoRA off → keep sharing the single read-only frozen Llama (fast).
     llama_arg = None if cfg.use_llama_lora else llama
     model = ReprLearningModel(cfg, variant=variant, llama_model=llama_arg).to(device)
-    if getattr(cfg, "task_mode", None) == "sentence_mae":
-        model.task_mode = "sentence_mae"   # route compute_qa_loss → compute_mae_loss
+    if getattr(cfg, "task_mode", None) == "masked_reconstruction":
+        model.task_mode = "masked_reconstruction"   # route compute_loss → compute_masked_reconstruction_loss
     n_trainable = model.n_trainable_params()
     # A variant is eval-only iff it has no trainable params. With LoRA-all on, the
     # two vanilla references DO train (their ~1.7M LoRA) — they become the LoRA'd
@@ -315,7 +318,7 @@ def train_one_variant(
     # full-context Llama is already a valid upper bound. Its zero-init LoRA, if
     # built, is an identity no-op. vanilla_llama (the floor) still LoRA-trains.
     is_eval_only = (n_trainable == 0) or (
-        variant == "vanilla_full_context" and task != "sentence_mae")
+        variant == "vanilla_full_context" and task != "masked_reconstruction")
     print(f"\n{'='*78}")
     print(f"Variant: {variant}  ({n_trainable:,} trainable, {n_steps} steps)")
     print(f"{'='*78}")
@@ -336,38 +339,36 @@ def train_one_variant(
     else:
         opt = None
 
-    if task == "emat":
-        # Strict EMAT: context = N (key=value) pairs, condition on a verbatim key, reproduce
-        # its value (closed-book). Same encoder→memory→prepend→CE path; only the DATA differs.
-        # Train/val share the word pools but use different RNG seeds (every example is a fresh
-        # random pairing, so there is no binding overlap to leak).
-        _emat = dict(context_len=chunk_size, batch_size=cfg.batch_size,
-                     n_pairs=emat_n_pairs, n_query=emat_n_query, value_len=emat_value_len)
-        train_dl = None if is_eval_only else make_emat_dataloader(
-            tokenizer, split="train", seed=42, **_emat)
-        val_dl = make_emat_dataloader(tokenizer, split="validation", seed=7, **_emat)
-    elif task == "emat_bio":
-        # Biographical key→value EMAT: context = N (key-phrase = fact-dense sentence) pairs,
-        # condition on a verbatim key phrase, reproduce its value sentence (closed-book).
+    if task == "conditioned_reconstruction":
+        # Conditioned reconstruction (random-word MQAR): context = N (key=value) pairs, condition
+        # on a verbatim key, reproduce its value (closed-book). Same encoder→memory→prepend→CE
+        # path; only the DATA differs. Train/val share the word pools but use different RNG seeds
+        # (every example is a fresh random pairing, so there is no binding overlap to leak).
+        _cr = dict(context_len=chunk_size, batch_size=cfg.batch_size,
+                     n_pairs=cond_recon_n_pairs, n_query=cond_recon_n_query, value_len=cond_recon_value_len)
+        train_dl = None if is_eval_only else make_conditioned_reconstruction_dataloader(
+            tokenizer, split="train", seed=42, **_cr)
+        val_dl = make_conditioned_reconstruction_dataloader(tokenizer, split="validation", seed=7, **_cr)
+    elif task == "conditioned_reconstruction_bio":
+        # Biographical conditioned reconstruction: context = N (key-phrase = fact-dense sentence)
+        # pairs, condition on a verbatim key phrase, reproduce its value sentence (closed-book).
         # Train/val build DISJOINT worlds (different world_seed → different entities).
-        _eb = dict(context_len=chunk_size, batch_size=cfg.batch_size, n_pairs=emat_n_pairs,
-                   n_query=emat_n_query, n_facts=emat_bio_n_facts, world_seed=emat_bio_world_seed)
-        train_dl = None if is_eval_only else make_emat_bio_dataloader(
+        _eb = dict(context_len=chunk_size, batch_size=cfg.batch_size, n_pairs=cond_recon_n_pairs,
+                   n_query=cond_recon_n_query, n_facts=cond_recon_bio_n_facts, world_seed=cond_recon_bio_world_seed)
+        train_dl = None if is_eval_only else make_conditioned_reconstruction_bio_dataloader(
             tokenizer, split="train", stream_seed=42, **_eb)
-        val_dl = make_emat_bio_dataloader(tokenizer, split="validation", stream_seed=7, **_eb)
-    elif task in ("continuation", "ae", "mae"):
+        val_dl = make_conditioned_reconstruction_bio_dataloader(tokenizer, split="validation", stream_seed=7, **_eb)
+    elif task == "continuation":
         # continuation: compress N → predict the NEXT tokens (gist/LM).
-        # ae: compress N → reconstruct the SAME N (ICAE autoencoding, teacher-forced).
-        # mae: compress N → fill ~85% masked tokens of the SAME N (denoising; masked in fwd).
         _cont = dict(batch_size=cfg.batch_size, compress_len=compress_len, predict_len=predict_len,
                      objective=task)
         train_dl = None if is_eval_only else make_continuation_dataloader(
             tokenizer, split="train", seed=42, **_cont)
         val_dl = make_continuation_dataloader(tokenizer, split="validation", seed=7, **_cont)
-    elif task == "sentence_mae":
-        # sentence-pair compression (FineWeb-EDU, MAE). Variable code size k per
+    elif task == "masked_reconstruction":
+        # sentence-pair masked reconstruction (FineWeb-EDU, MAE). Variable code size k per
         # bucket; the loader yields fully-collated uniform-k batches.
-        from src.repr_learning.data_sentence import make_sentence_dataloader
+        from src.memory.data_masked_reconstruction import make_sentence_dataloader
         _pad = cfg.pad_token_id if cfg.pad_token_id is not None else 0
         train_dl = None if is_eval_only else make_sentence_dataloader(
             tokenizer, batch_size=cfg.batch_size, src_tokenizer_name=mae_src_tok,
@@ -537,7 +538,7 @@ def train_one_variant(
         # (entropy, normalization) so those remain fp32 even under the outer
         # autocast — the codebase was designed for this pattern.
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            out = model.compute_qa_loss(batch, window_size=window_size)
+            out = model.compute_loss(batch, window_size=window_size)
         loss = out["loss"]
         if getattr(cfg, "contrastive_shuf_coef", 0.0) > 0:
             # contrastive binding pressure: gradient flows through BOTH branches
@@ -545,7 +546,7 @@ def train_one_variant(
             # the state to be expressed by the read). Primary CE on REAL keeps
             # the help-on-match direction anchored against poison-on-mismatch.
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                out_shuf = model.compute_qa_loss(batch, window_size=window_size,
+                out_shuf = model.compute_loss(batch, window_size=window_size,
                                                  shuffle_memory=True)
             contrast = torch.nn.functional.softplus(out["loss"] - out_shuf["loss"])
             loss = loss + cfg.contrastive_shuf_coef * contrast
@@ -812,15 +813,15 @@ def train_one_variant(
 
 
 def probe_bs(variants, llama, tokenizer, cfg, args):
-    """Per-arm max-batch-size VRAM probe on the EMAT path (no training, no checkpoints).
+    """Per-arm max-batch-size VRAM probe on the conditioned-reconstruction path (no training, no checkpoints).
     For each arm: push BS up the --probe-bs-list until OOM; report the largest fitting BS,
     its peak VRAM, and throughput. Builds each arm with the SAME production cfg as a real
     run, so the reported max-BS is directly usable as that arm's --batch-size."""
     import time
     from dataclasses import replace as _dc_replace
     device = "cuda"
-    ds = EMATDataset(tokenizer, context_len=args.chunk_size, n_pairs=args.emat_n_pairs,
-                     n_query=args.emat_n_query, value_len=args.emat_value_len, seed=0)
+    ds = ConditionedReconstructionDataset(tokenizer, context_len=args.chunk_size, n_pairs=args.cond_recon_n_pairs,
+                     n_query=args.cond_recon_n_query, value_len=args.cond_recon_value_len, seed=0)
     pool, it = [], iter(ds)
     for _ in range(max(args.probe_bs_list)):
         pool.append(next(it))
@@ -853,13 +854,13 @@ def probe_bs(variants, llama, tokenizer, cfg, args):
                 for _ in range(2):                                   # warmup (compile/alloc)
                     opt.zero_grad(set_to_none=True)
                     with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                        out = model.compute_qa_loss(batch, window_size=args.window_size)
+                        out = model.compute_loss(batch, window_size=args.window_size)
                     out["loss"].backward(); opt.step()
                 torch.cuda.synchronize(); t0 = time.time()
                 for _ in range(5):
                     opt.zero_grad(set_to_none=True)
                     with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                        out = model.compute_qa_loss(batch, window_size=args.window_size)
+                        out = model.compute_loss(batch, window_size=args.window_size)
                     out["loss"].backward(); opt.step()
                 torch.cuda.synchronize()
                 dt = (time.time() - t0) / 5
@@ -874,7 +875,7 @@ def probe_bs(variants, llama, tokenizer, cfg, args):
         del model, opt; torch.cuda.empty_cache()
 
     total = torch.cuda.get_device_properties(0).total_memory / 2**30
-    print(f"\n==== EMAT max-BS per arm (N={args.emat_n_pairs}, {total:.0f}GB GPU) ====", flush=True)
+    print(f"\n==== conditioned-reconstruction max-BS per arm (N={args.cond_recon_n_pairs}, {total:.0f}GB GPU) ====", flush=True)
     print(f"  {'arm':<24}{'maxBS':>7}{'peakGB':>8}{'headGB':>8}{'samp/s':>9}")
     for v, bs, pk, sps in rows:
         print(f"  {v:<24}{bs:>7}{pk:>8.1f}{total-pk:>8.1f}{sps:>9.1f}")
@@ -883,7 +884,7 @@ def probe_bs(variants, llama, tokenizer, cfg, args):
 def main():
     # allow_abbrev=False: stop `--out <path>` from prefix-matching `--out-tag`,
     # which silently baked a full relative path into the tag and re-nested every
-    # run under outputs/repr_learning/outputs/repr_learning/.
+    # run under outputs/memory/outputs/memory/.
     ap = argparse.ArgumentParser(allow_abbrev=False)
     # Active suite: latest graph + published closed-book compressor baselines.
     # Retired graph/plastic/splat and older flat/continuous/MT/Mamba variants
@@ -917,7 +918,7 @@ def main():
     ap.add_argument("--chunk-size", type=int, default=8192)
     ap.add_argument("--window-size", type=int, default=1024)
     ap.add_argument("--mem-tokens", type=int, default=144,
-                    help="EMAT matched MEMORY budget: M memory tokens × d_llama, "
+                    help="Matched MEMORY budget: M memory tokens × d_llama, "
                          "matched across ICAE/CCM/AutoCompressor/Beacon "
                          "(and soft_pointer_graph if selected). Derives icae_n_slots, "
                          "ccm_n_comp, autocompressor_n_slots, and Beacon's α.")
@@ -930,24 +931,24 @@ def main():
     # Pass a small positive value only if a retrain shows collapse.
     ap.add_argument("--b-diversity-scale", type=float, default=0.0)
     ap.add_argument("--mt-diversity-scale", type=float, default=0.0)
-    ap.add_argument("--task", type=str, default="qa",
-                    choices=["qa", "emat", "emat_bio", "continuation", "ae", "mae",
-                             "sentence_mae"],
-                    help="qa = composite-QA mix (default); emat = random-word key→value (MQAR); "
-                         "emat_bio = biographical key-phrase→fact-dense-sentence (binding); "
-                         "continuation = compress N → predict next (AutoComp/Beacon gist/LM); "
-                         "ae = compress N → reconstruct same N (ICAE autoencoding); "
-                         "mae = compress N → fill ~85%%-masked N (denoising, leak-free).")
+    ap.add_argument("--task", type=str, default="masked_reconstruction",
+                    choices=["masked_reconstruction", "qa", "conditioned_reconstruction",
+                             "conditioned_reconstruction_bio", "continuation"],
+                    help="masked_reconstruction = sentence-pair MAE compression (default, active); "
+                         "qa = composite-QA mix; "
+                         "conditioned_reconstruction = random-word key→value (MQAR); "
+                         "conditioned_reconstruction_bio = biographical key-phrase→fact-dense-sentence (binding); "
+                         "continuation = compress N → predict next (AutoComp/Beacon gist/LM).")
     ap.add_argument("--mae-mask-ratio", type=float, default=0.85,
                     help="mae: fraction of answer tokens replaced by <mask> in the forward.")
-    ap.add_argument("--emat-n-pairs", type=int, default=64,
-                    help="EMAT: number of key→value pairs packed into the context (capacity).")
-    ap.add_argument("--emat-n-query", type=int, default=1,
-                    help="EMAT: keys recalled per example. 1 = single-EMAT; >1 = multi-EMAT.")
-    ap.add_argument("--emat-value-len", type=int, default=1,
-                    help="EMAT: words per value (1 = single-token value).")
-    ap.add_argument("--emat-bio-n-facts", type=int, default=3,
-                    help="emat_bio: random facts packed per value sentence (2-4).")
+    ap.add_argument("--cond-recon-n-pairs", type=int, default=64,
+                    help="conditioned_reconstruction: number of key→value pairs packed into the context (capacity).")
+    ap.add_argument("--cond-recon-n-query", type=int, default=1,
+                    help="conditioned_reconstruction: keys recalled per example. 1 = single; >1 = multi.")
+    ap.add_argument("--cond-recon-value-len", type=int, default=1,
+                    help="conditioned_reconstruction: words per value (1 = single-token value).")
+    ap.add_argument("--cond-recon-bio-n-facts", type=int, default=3,
+                    help="conditioned_reconstruction_bio: random facts packed per value sentence (2-4).")
     ap.add_argument("--backbone", type=str, default=None,
                     help="override cfg.llama_model (e.g. HuggingFaceTB/SmolLM2-135M for "
                          "the compression line). Auto-sets d_llama from the config.")
@@ -959,8 +960,8 @@ def main():
                          "binding gate ITSELF a training objective (2x step cost; "
                          "the sanctioned aux-loss fallback after the architectural "
                          "ladder, 2026-06-12). Needs batch>1 for the roll.")
-    ap.add_argument("--emat-bio-world-seed", type=int, default=0,
-                    help="emat_bio: world-build seed (train uses this; val uses +10000 → disjoint).")
+    ap.add_argument("--cond-recon-bio-world-seed", type=int, default=0,
+                    help="conditioned_reconstruction_bio: world-build seed (train uses this; val uses +10000 → disjoint).")
     ap.add_argument("--compress-len", type=int, default=1024,
                     help="continuation/ae/mae: # natural-text tokens compressed into the 128-token "
                          "memory (then dropped). 1024 = 8x compression (the aligned default).")
@@ -975,11 +976,11 @@ def main():
     ap.add_argument("--port-lora-rank", type=int, default=None,
                     help="Capacity knob for ICAE/CCM/AutoCompressor: override their LoRA rank "
                          "(defaults 32/8/32 ≈ 4–6M). e.g. 256 pushes them to ~27–55M (above "
-                         "Beacon's ~10M binding floor) to test capacity-vs-mechanism on EMAT.")
+                         "Beacon's ~10M binding floor) to test capacity-vs-mechanism on conditioned-reconstruction.")
     ap.add_argument("--probe-bs", action="store_true",
                     help="Per-arm max-batch-size VRAM probe (no training). For each --variants "
                          "arm: push BS up until OOM, report max-fitting BS + peak VRAM + samp/s, "
-                         "then exit. Uses the production cfg + the EMAT data path.")
+                         "then exit. Uses the production cfg + the conditioned-reconstruction data path.")
     ap.add_argument("--probe-bs-list", nargs="+", type=int,
                     default=[8, 16, 24, 32, 48, 64, 96, 128, 192, 256],
                     help="BS values to try in --probe-bs (ascending; stops at first OOM).")
@@ -1058,21 +1059,21 @@ def main():
                          "Slow learners need more runway before plateau check.")
     args = ap.parse_args()
 
-    # EMAT context (N small key=value lines) is far shorter than the QA default 8192.
-    # If the user left chunk-size at the QA default, tighten it so the encoder isn't
-    # padding/processing thousands of pad positions (≈300 tok for N=64). window=chunk
+    # Conditioned-reconstruction context (N small key=value lines) is far shorter than the QA
+    # default 8192. If the user left chunk-size at the QA default, tighten it so the encoder
+    # isn't padding/processing thousands of pad positions (≈300 tok for N=64). window=chunk
     # → one window. Override only the untouched default; an explicit --chunk-size wins.
-    if args.task == "emat" and args.chunk_size == 8192:
+    if args.task == "conditioned_reconstruction" and args.chunk_size == 8192:
         args.chunk_size = 1024
         args.window_size = min(args.window_size, args.chunk_size)
-        print(f"[auto] EMAT: chunk_size={args.chunk_size}, window_size={args.window_size}")
-    if args.task == "emat_bio" and args.chunk_size == 8192:
+        print(f"[auto] conditioned_reconstruction: chunk_size={args.chunk_size}, window_size={args.window_size}")
+    if args.task == "conditioned_reconstruction_bio" and args.chunk_size == 8192:
         # 8x compression vs the 128-token memory → input 1024. Fill-to-budget packs
         # as many key→value pairs as fit (~22-24); never overflows.
         args.chunk_size = 1024
         args.window_size = min(args.window_size, args.chunk_size)
-        print(f"[auto] emat_bio: chunk_size={args.chunk_size}, window_size={args.window_size}")
-    if args.task in ("continuation", "ae", "mae"):
+        print(f"[auto] conditioned_reconstruction_bio: chunk_size={args.chunk_size}, window_size={args.window_size}")
+    if args.task == "continuation":
         # the encoder must ingest exactly compress_len tokens → chunk_size = compress_len
         args.chunk_size = args.compress_len
         args.window_size = min(args.window_size, args.chunk_size)
@@ -1082,7 +1083,7 @@ def main():
     if "/" in args.out_tag:
         ap.error(
             f"--out-tag must be a bare tag, not a path (got {args.out_tag!r}). "
-            f"Outputs go to outputs/repr_learning/<out_tag>_<variant>/ automatically; "
+            f"Outputs go to outputs/memory/<out_tag>_<variant>/ automatically; "
             f"pass e.g. --out-tag tranche5_mamba_canonical"
         )
 
@@ -1206,8 +1207,8 @@ def main():
         print(f"[backbone] {args.backbone}  d_llama={cfg.d_llama}  "
               f"vocab={cfg.llama_vocab_size}  pad={cfg.pad_token_id}")
 
-    # ── EMAT matched MEMORY budget (decoder-read M × d_llama) ────────────────
-    # mem_tokens is the single knob; the prepend EMAT arms all emit ~M tokens at
+    # ── Matched MEMORY budget (decoder-read M × d_llama) ────────────────
+    # mem_tokens is the single knob; the prepend conditioned-reconstruction arms all emit ~M tokens at
     # d_llama, so the decoder reads the SAME float budget from each — only the
     # memory MECHANISM differs. Beacon (concat) derives α = chunk//M so its total
     # ≈ M. Trainable params are NOT matched (LoRA ports vs the graph substrate
@@ -1233,7 +1234,7 @@ def main():
     _ceil = lambda a, b: -(-a // b)
     _beacon_M = (_ceil(args.chunk_size, args.window_size)
                  * _ceil(args.window_size, cfg.beacon_ratio))
-    print(f"[EMAT budget] mem_tokens={M} × d_llama={cfg.d_llama} = "
+    print(f"[memory budget] mem_tokens={M} × d_llama={cfg.d_llama} = "
           f"{M * cfg.d_llama:,} prepend decoder-read floats/arm")
     for _a, _m in (("soft_pointer_graph", M), ("icae", M), ("ccm", M),
                    ("autocompressor", M), ("beacon", _beacon_M)):
@@ -1243,16 +1244,16 @@ def main():
         print(f"   hlvocab (Compression-by-Vocabulary): {_vocab} nodes over "
               f"{len(cfg.hlvocab_nodes)} layers, d_code={cfg.hlvocab_d_code}, "
               f"top_k={cfg.hlvocab_top_k}; emits up to m_max={cfg.hlvocab_m_max} "
-              f"node-tokens, sliced to k. Prepend compressor (sentence_mae).")
+              f"node-tokens, sliced to k. Prepend compressor (masked_reconstruction).")
     if abs(_beacon_M - M) > max(1, M // 10):
         raise SystemExit(
-            f"[EMAT budget] beacon M={_beacon_M} is >10% off mem_tokens={M} "
+            f"[memory budget] beacon M={_beacon_M} is >10% off mem_tokens={M} "
             f"(α={cfg.beacon_ratio}); adjust --mem-tokens / chunk / window so the "
             f"matched memory budget holds before launching.")
 
     # ── compression line: param-matched baselines (backbone resolved above) ───
-    if args.task == "sentence_mae":
-        cfg.task_mode = "sentence_mae"
+    if args.task == "masked_reconstruction":
+        cfg.task_mode = "masked_reconstruction"
         # decoder LoRA: a frozen decoder can't learn the MAE protocol (mask
         # handling + memory-use) — the band-needs-training finding. Every variant
         # (incl. the vanilla floor/ceiling) gets a shared-size decoder LoRA so the
@@ -1266,7 +1267,7 @@ def main():
         cfg.autocompressor_n_slots = 16
         cfg.autocompressor_lora_rank = 17; cfg.autocompressor_lora_alpha = 34
         cfg.beacon_ratio = 8; cfg.beacon_wrap_layers = (0, 10, 19, 29)
-        cfg.hlvocab_m_max = 16           # sentence_mae: emit up to 16, sliced to k [fix G]
+        cfg.hlvocab_m_max = 16           # masked_reconstruction: emit up to 16, sliced to k [fix G]
         if cfg.d_llama != 576:
             print(f"[WARN] param-matched ranks calibrated for d=576; d={cfg.d_llama} "
                   "→ trainable counts will differ, RECALIBRATE before claims.")
@@ -1315,14 +1316,14 @@ def main():
     llama, _ = load_frozen_llama(cfg.llama_model, dtype=torch.bfloat16)
 
     if args.probe_bs:
-        print(f"\n[probe-bs] per-arm max batch size, EMAT N={args.emat_n_pairs}, "
+        print(f"\n[probe-bs] per-arm max batch size, conditioned-reconstruction N={args.cond_recon_n_pairs}, "
               f"chunk={args.chunk_size}, mem_tokens={M}")
         probe_bs(args.variants, llama, tokenizer, cfg, args)
         return
 
     summaries = []
     for variant in args.variants:
-        out_dir = REPO / f"outputs/repr_learning/{args.out_tag}_{variant}"
+        out_dir = REPO / f"outputs/memory/{args.out_tag}_{variant}"
         out_dir.mkdir(parents=True, exist_ok=True)
         s = train_one_variant(
             variant=variant, llama=llama, tokenizer=tokenizer, cfg=cfg,
@@ -1343,9 +1344,9 @@ def main():
             min_step_for_stop=args.min_step_for_stop,
             min_delta=args.early_stop_min_delta,
             task=args.task,
-            emat_n_pairs=args.emat_n_pairs, emat_n_query=args.emat_n_query,
-            emat_value_len=args.emat_value_len,
-            emat_bio_n_facts=args.emat_bio_n_facts, emat_bio_world_seed=args.emat_bio_world_seed,
+            cond_recon_n_pairs=args.cond_recon_n_pairs, cond_recon_n_query=args.cond_recon_n_query,
+            cond_recon_value_len=args.cond_recon_value_len,
+            cond_recon_bio_n_facts=args.cond_recon_bio_n_facts, cond_recon_bio_world_seed=args.cond_recon_bio_world_seed,
             compress_len=args.compress_len, predict_len=args.predict_len,
             mae_src_tok=args.src_tokenizer,
         )
@@ -1362,7 +1363,7 @@ def main():
               f"{s['final_val_top1_acc']*100:>7.1f}%"
               f"{s['elapsed_s']/60:>12.1f}")
 
-    summary_path = REPO / f"outputs/repr_learning/{args.out_tag}_summary.json"
+    summary_path = REPO / f"outputs/memory/{args.out_tag}_summary.json"
     with open(summary_path, "w") as f:
         json.dump(summaries, f, indent=2)
     print(f"\nWrote {summary_path}")

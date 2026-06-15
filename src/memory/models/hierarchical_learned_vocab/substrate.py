@@ -255,7 +255,7 @@ class HLVocabSubstrate(nn.Module):
         if L > 1024:
             raise ValueError(
                 f"hlvocab v2 STDP builds an [L,L] kernel (L={L}); guarded at 1024. "
-                "Use sentence_mae (L<=128); long-context needs a streaming-recurrence STDP.")
+                "Use masked_reconstruction (L<=128); long-context needs a streaming-recurrence STDP.")
         A_list, margs, aux = self._phase1(hiddens, mask)
         P = min(cfg.edge_topP, *cfg.nodes)
         K = self.n_scales

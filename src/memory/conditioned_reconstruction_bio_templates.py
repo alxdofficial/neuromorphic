@@ -1,4 +1,4 @@
-"""Templates for biographical key→value EMAT (``emat_bio``).
+"""Templates for biographical conditioned reconstruction (``conditioned_reconstruction_bio``).
 
 A **KEY** is a short identifying phrase for a world entity: its name plus *at
 most one* identity disambiguator (e.g. ``"Hanne Rudh, born 1971"``). A
@@ -7,7 +7,7 @@ most one* identity disambiguator (e.g. ``"Hanne Rudh, born 1971"``). A
 (e.g. ``"Hanne Rudh, an ornithologist, recognized for the survey of inland
 heron populations, and a graduate of Bergvik Conservation Association."``).
 
-Strict-EMAT discipline (so SHUF is a hard control):
+Strict conditioned-reconstruction discipline (so SHUF is a hard control):
 - The key's disambiguator attribute is **excluded** from the value, so the key
   never co-encodes a value fact. A wrong-entity (shuffled) memory therefore
   cannot reconstruct the sentence.

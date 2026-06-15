@@ -1,8 +1,8 @@
 """Pre-flight bug sweep for the MAE training path, BEFORE the 800-step runs.
 
 Checks (the things that silently break a run):
-  1. each variant constructs on SmolLM2 + task_mode=sentence_mae;
-  2. compute_mae_loss runs fwd+bwd: finite loss, finite grads;
+  1. each variant constructs on SmolLM2 + task_mode=masked_reconstruction;
+  2. compute_masked_reconstruction_loss runs fwd+bwd: finite loss, finite grads;
   3. EVERY trainable param receives gradient (no dead module);
   4. capacity-relative slice: memory M == k_slots for compressors; M==0 vanilla_llama
      (floor), M==T vanilla_full_context (ceiling);
@@ -15,9 +15,9 @@ import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 import torch
 from transformers import AutoTokenizer
-from src.repr_learning.config import ReprConfig
-from src.repr_learning.model import ReprLearningModel
-from src.repr_learning.data_sentence import make_sentence_dataloader
+from src.memory.config import ReprConfig
+from src.memory.model import ReprLearningModel
+from src.memory.data_masked_reconstruction import make_sentence_dataloader
 
 device = "cuda"
 BACKBONE = "HuggingFaceTB/SmolLM2-135M"
@@ -27,7 +27,7 @@ fails = []
 
 def matched(cfg):
     cfg.llama_model = BACKBONE; cfg.d_llama = 576; cfg.llama_vocab_size = 49152
-    cfg.pad_token_id = 0; cfg.task_mode = "sentence_mae"
+    cfg.pad_token_id = 0; cfg.task_mode = "masked_reconstruction"
     cfg.use_llama_lora = True; cfg.llama_lora_rank = 16; cfg.llama_lora_alpha = 32
     cfg.n_flat_codes = 16
     cfg.icae_n_slots = 16; cfg.icae_lora_rank = 34; cfg.icae_lora_alpha = 68
@@ -70,7 +70,7 @@ for variant in VARIANTS:
     cfg = matched(ReprConfig())
     try:
         model = ReprLearningModel(cfg, variant=variant).to(device)
-        model.task_mode = "sentence_mae"
+        model.task_mode = "masked_reconstruction"
         model.train()
     except Exception as e:
         import traceback; traceback.print_exc()
@@ -83,7 +83,7 @@ for variant in VARIANTS:
     # capacity / shapes / finite, fwd+bwd
     try:
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            out = model.compute_mae_loss(batch)
+            out = model.compute_masked_reconstruction_loss(batch)
         M = out["mae_M"]; nmask = out["mae_n_masked"]
         exp_M = {"vanilla_llama": 0.0, "vanilla_full_context": float(batch.context_ids.shape[1])}
         expect = exp_M.get(variant, float(batch.k_slots))
@@ -105,8 +105,8 @@ for variant in VARIANTS:
 
     # REAL vs OFF executes
     with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
-        real = model.compute_mae_loss(batch)["loss_recon"].item()
-        off = model.compute_mae_loss(batch, zero_memory=True)["loss_recon"].item()
+        real = model.compute_masked_reconstruction_loss(batch)["loss_recon"].item()
+        off = model.compute_masked_reconstruction_loss(batch, zero_memory=True)["loss_recon"].item()
     print(f"  REAL={real:.3f}  OFF={off:.3f}  (untrained; OFF≈REAL expected pre-training)")
 
     # a few optimizer steps reduce the loss
@@ -117,7 +117,7 @@ for variant in VARIANTS:
         for _ in range(8):
             model.zero_grad(set_to_none=True)
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                o = model.compute_mae_loss(batch)
+                o = model.compute_masked_reconstruction_loss(batch)
             o["loss"].backward()
             for n, p in trainable:
                 if p.grad is not None and p.grad.norm() > 0:

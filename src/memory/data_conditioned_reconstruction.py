@@ -16,11 +16,11 @@ the random `barn = ocean` binding has no semantic reason to exist → it can onl
 memory). Keys and values are drawn from DISJOINT word pools.
 
 Emits the exact per-sample dict that `data_qa.collate_qa` consumes, so the whole
-`ReprLearningModel.compute_qa_loss` path (encoder → memory → prepend → frozen-LM CE on
+`ReprLearningModel.compute_loss` path (encoder → memory → prepend → frozen-LM CE on
 `answer_content_mask`) and the REAL/SHUF/OFF binding gate are reused unchanged — only the
 *data* differs from the composite-QA pipeline.
 
-  python -m src.repr_learning.data_emat        # smoke: print a few rendered EMAT examples
+  python -m src.memory.data_conditioned_reconstruction        # smoke: print a few rendered EMAT examples
 """
 from __future__ import annotations
 
@@ -76,7 +76,7 @@ def _word_to_id(tokenizer, word: str) -> Optional[int]:
     return ids[0] if len(ids) == 1 else None
 
 
-class EMATDataset(IterableDataset):
+class ConditionedReconstructionDataset(IterableDataset):
     """Infinite stream of strict EMAT examples at a fixed (n_pairs, n_query, value_len).
 
     Per example: sample ``n_pairs`` distinct keys and (random, with replacement) values
@@ -156,7 +156,7 @@ class EMATDataset(IterableDataset):
             "question_ids": torch.tensor(question_ids, dtype=torch.long),
             "answer_ids": torch.tensor(answer_ids, dtype=torch.long),
             "answer_content_mask_list": content,
-            "task_family": "emat",
+            "task_family": "conditioned_reconstruction",
             "question_type": "single" if self.n_query == 1 else f"multi{self.n_query}",
             "answer_refs": [values[qi[0]]],
         }
@@ -168,11 +168,11 @@ class EMATDataset(IterableDataset):
             yield self._gen(rng)
 
 
-def make_emat_dataloader(tokenizer, context_len: int, batch_size: int,
+def make_conditioned_reconstruction_dataloader(tokenizer, context_len: int, batch_size: int,
                          n_pairs: int = 64, n_query: int = 1, value_len: int = 1,
                          split: str = "train", seed: int = 0,
                          pad_token_id: int = 128_001, num_workers: int = 2) -> DataLoader:
-    ds = EMATDataset(tokenizer, context_len=context_len, n_pairs=n_pairs, n_query=n_query,
+    ds = ConditionedReconstructionDataset(tokenizer, context_len=context_len, n_pairs=n_pairs, n_query=n_query,
                      value_len=value_len, seed=seed, pad_token_id=pad_token_id)
     return DataLoader(ds, batch_size=batch_size, num_workers=num_workers,
                       collate_fn=lambda s: collate_qa(s, pad_token_id))
@@ -183,11 +183,11 @@ if __name__ == "__main__":  # smoke: render a few EMAT examples
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from transformers import AutoTokenizer
-    from src.repr_learning.config import ReprConfig
+    from src.memory.config import ReprConfig
 
     tok = AutoTokenizer.from_pretrained(ReprConfig().llama_model)
     for nq, vl in [(1, 1), (1, 2), (3, 1)]:
-        ds = EMATDataset(tok, context_len=1024, n_pairs=8, n_query=nq, value_len=vl, seed=1)
+        ds = ConditionedReconstructionDataset(tok, context_len=1024, n_pairs=8, n_query=nq, value_len=vl, seed=1)
         print(f"\n===== single={nq==1} n_query={nq} value_len={vl} | "
               f"|key_pool|={len(ds.key_words)} |val_pool|={len(ds.val_words)} =====")
         s = next(iter(ds))

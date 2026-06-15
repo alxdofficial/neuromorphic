@@ -16,9 +16,9 @@ The predicted window sits *immediately after* the compressed cutoff, so the earl
 tokens genuinely depend on the compressed context.
 
 Emits the per-sample dict that `data_qa.collate_qa` consumes → reuses the whole
-`compute_qa_loss` path + REAL/SHUF/OFF gate unchanged; only the data differs.
+`compute_loss` path + REAL/SHUF/OFF gate unchanged; only the data differs.
 
-  python -m src.repr_learning.data_continuation     # smoke: print a rendered example
+  python -m src.memory.data_continuation     # smoke: print a rendered example
 """
 from __future__ import annotations
 
@@ -48,22 +48,18 @@ class ContinuationDataset(IterableDataset):
                  pad_token_id: int = 128_001, trigger: str = None,
                  objective: str = "continuation"):
         import pyarrow.parquet as pq
-        assert objective in ("continuation", "ae", "mae")
+        assert objective == "continuation"
         self.tok = tokenizer
         self.compress_len = compress_len
-        # ae/mae operate on the SAME compressed span (mae masks it in the forward);
-        # continuation predicts the NEXT span.
+        # continuation predicts the NEXT span after the compressed prefix.
         self.objective = objective
-        self.predict_len = compress_len if objective in ("ae", "mae") else predict_len
+        self.predict_len = predict_len
         self.seed = seed
         self.n_items = n_items
         self.pad_token_id = pad_token_id
-        # ae/mae compress & target the same span → need = compress_len only.
-        need = compress_len if objective in ("ae", "mae") else compress_len + predict_len
+        need = compress_len + predict_len
         if trigger is None:
-            trigger = {"ae": "Reconstruct the passage above.",
-                       "mae": "Fill in the masked passage above.",
-                       "continuation": "Continue the passage."}[objective]
+            trigger = "Continue the passage."
 
         tbl = pq.read_table(str(parquet_path), columns=["input_ids", "num_tokens"])
         nt = tbl.column("num_tokens").to_numpy()
@@ -82,17 +78,10 @@ class ContinuationDataset(IterableDataset):
 
     def _gen(self, rng: np.random.Generator) -> dict:
         d = self.docs[rng.integers(len(self.docs))]
-        # ae/mae compress & target the SAME span → span need = compress_len only
-        # (must match the filter's `need`, else docs of len==compress_len crash
-        # with high<=0 because predict_len==compress_len here) [fix H].
-        span_need = (self.compress_len if self.objective in ("ae", "mae")
-                     else self.compress_len + self.predict_len)
+        span_need = self.compress_len + self.predict_len
         s = int(rng.integers(0, len(d) - span_need + 1))
         compress = d[s: s + self.compress_len]
-        if self.objective in ("ae", "mae"):
-            predict = compress                                    # target the same span (mae masks in fwd)
-        else:
-            predict = d[s + self.compress_len: s + self.compress_len + self.predict_len]
+        predict = d[s + self.compress_len: s + self.compress_len + self.predict_len]
         return {
             "context_ids": torch.tensor(compress, dtype=torch.long),
             "context_mask": torch.ones(self.compress_len, dtype=torch.bool),   # full span, no pad
@@ -126,7 +115,7 @@ if __name__ == "__main__":  # smoke
     import sys
     sys.path.insert(0, str(REPO))
     from transformers import AutoTokenizer
-    from src.repr_learning.config import ReprConfig
+    from src.memory.config import ReprConfig
     tok = AutoTokenizer.from_pretrained(ReprConfig().llama_model)
     ds = ContinuationDataset(FINEWEB_TRAIN, tok, compress_len=2048, predict_len=512, seed=1)
     s = next(iter(ds))

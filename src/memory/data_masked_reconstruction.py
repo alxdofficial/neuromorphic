@@ -55,7 +55,7 @@ def _decode_cache(parquet_path: Path, split: str, src_tokenizer_name: str) -> Pa
         for doc in ids:
             text = src_tok.decode(doc, skip_special_tokens=True)
             fp.write(json.dumps({"text": text}) + "\n")
-    print(f"[data_sentence] decoded {len(ids)} docs → {out.name}", flush=True)
+    print(f"[data_masked_reconstruction] decoded {len(ids)} docs → {out.name}", flush=True)
     return out
 
 
@@ -75,7 +75,7 @@ class SentencePairDataset(IterableDataset):
         cache = _decode_cache(Path(parquet_path), split, src_tokenizer_name)
         self.texts = [json.loads(l)["text"] for l in open(cache)]
         self.trigger_ids = tokenizer(trigger, add_special_tokens=False).input_ids
-        print(f"[data_sentence] {split}: {len(self.texts)} docs; pair, ratio {ratio}, "
+        print(f"[data_masked_reconstruction] {split}: {len(self.texts)} docs; pair, ratio {ratio}, "
               f"{min_len}-{max_len} tok", flush=True)
 
     def k_slots(self, length: int) -> int:
@@ -99,7 +99,7 @@ class SentencePairDataset(IterableDataset):
             "question_ids": torch.tensor(self.trigger_ids, dtype=torch.long),
             "answer_ids": span.clone(),
             "answer_content_mask_list": [True] * n,
-            "task_family": "sentence_mae", "question_type": "sentence_mae",
+            "task_family": "masked_reconstruction", "question_type": "masked_reconstruction",
             "answer_refs": [], "k_slots": k, "n_tokens": n,
         }
 

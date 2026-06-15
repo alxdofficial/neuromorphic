@@ -1,15 +1,16 @@
-"""Biographical key→value EMAT (``emat_bio``) — natural-sentence strict EMAT.
+"""Biographical conditioned reconstruction — natural-sentence key→value reconstruction.
 
-The natural-language sibling of ``data_emat.py`` (which is random-word MQAR).
-Here a **key** is a short identifying phrase for a world entity and a **value**
-is a fact-dense natural sentence packing several of that entity's *other*
-random attributes (see ``emat_bio_templates.py``). The encoder ingests N
+The natural-language sibling of ``data_conditioned_reconstruction.py`` (which is
+random-word MQAR). Here a **key** is a short identifying phrase for a world entity
+and a **value** is a fact-dense natural sentence packing several of that entity's
+*other* random attributes (see ``conditioned_reconstruction_bio_templates.py``).
+The encoder ingests N
 ``key = value`` lines → memory; the decoder reproduces a queried key's value
 sentence verbatim, conditioned on the key. Loss only on the value span.
 
 Emits the exact per-sample dict ``data_qa.collate_qa`` consumes, so the whole
-``compute_qa_loss`` path + REAL/SHUF/OFF gate are reused unchanged — only the
-key/value *content* differs from ``data_emat.py``.
+``compute_loss`` path + REAL/SHUF/OFF gate are reused unchanged — only the
+key/value *content* differs from ``data_conditioned_reconstruction.py``.
 
 Train/val disjointness: train and val build worlds from different ``world_seed``
 values → entirely different entity names/attrs (entity-level firewall).
@@ -23,8 +24,8 @@ from typing import List
 import torch
 from torch.utils.data import IterableDataset, DataLoader
 
-from src.repr_learning.data_qa import collate_qa
-from src.repr_learning.emat_bio_templates import render_key, render_value
+from src.memory.data_qa import collate_qa
+from src.memory.conditioned_reconstruction_bio_templates import render_key, render_value
 
 # bio world builder + lexical helper (worldspec files restored from git)
 from scripts.data_gen.tasks.biographical.state import build_scenario
@@ -45,8 +46,8 @@ def _train_names(world_seed: int) -> set:
     return {_canon(e) for e in scen.world.entities.values()}
 
 
-class EMATBioDataset(IterableDataset):
-    """Infinite stream of biographical key→value EMAT examples from one world."""
+class ConditionedReconstructionBioDataset(IterableDataset):
+    """Infinite stream of biographical conditioned-reconstruction examples from one world."""
 
     def __init__(self, tokenizer, context_len: int, n_pairs: int = 16,
                  n_query: int = 1, n_facts: int = 3, world_seed: int = 0,
@@ -75,7 +76,7 @@ class EMATBioDataset(IterableDataset):
         if len(self.entities) < n_pairs:
             raise ValueError(f"world has {len(self.entities)} entities < n_pairs={n_pairs} "
                              f"(after firewall drop of {len(exclude_names or ())} train names)")
-        print(f"[emat_bio] world_seed={world_seed}: {len(self.entities)} entities "
+        print(f"[conditioned_reconstruction_bio] world_seed={world_seed}: {len(self.entities)} entities "
               f"(firewall dropped {len(scen.world.entities) - len(self.entities)}); "
               f"n_pairs={n_pairs} n_query={n_query} n_facts={n_facts} "
               f"context_len={context_len}", flush=True)
@@ -161,7 +162,7 @@ class EMATBioDataset(IterableDataset):
             "question_ids": torch.tensor(question_ids, dtype=torch.long),
             "answer_ids": torch.tensor(answer_ids, dtype=torch.long),
             "answer_content_mask_list": content,
-            "task_family": "emat_bio",
+            "task_family": "conditioned_reconstruction_bio",
             "question_type": "single" if self.n_query == 1 else f"multi{self.n_query}",
             "answer_refs": [values[qi[0]]],
         }
@@ -173,7 +174,7 @@ class EMATBioDataset(IterableDataset):
             yield self._gen(rng)
 
 
-def make_emat_bio_dataloader(tokenizer, context_len: int, batch_size: int,
+def make_conditioned_reconstruction_bio_dataloader(tokenizer, context_len: int, batch_size: int,
                              n_pairs: int = 16, n_query: int = 1, n_facts: int = 3,
                              split: str = "train", world_seed: int = 0,
                              stream_seed: int = 0, pad_token_id: int = 128_001,
@@ -183,7 +184,7 @@ def make_emat_bio_dataloader(tokenizer, context_len: int, batch_size: int,
     # disjoint; both worlds draw from the same finite pools). sweep bug #1.
     ws = world_seed if split == "train" else world_seed + 10_000
     exclude = None if split == "train" else _train_names(world_seed)
-    ds = EMATBioDataset(tokenizer, context_len=context_len, n_pairs=n_pairs,
+    ds = ConditionedReconstructionBioDataset(tokenizer, context_len=context_len, n_pairs=n_pairs,
                         n_query=n_query, n_facts=n_facts, world_seed=ws,
                         stream_seed=stream_seed, pad_token_id=pad_token_id,
                         relational=relational, exclude_names=exclude)
@@ -191,15 +192,15 @@ def make_emat_bio_dataloader(tokenizer, context_len: int, batch_size: int,
                       collate_fn=lambda s: collate_qa(s, pad_token_id))
 
 
-if __name__ == "__main__":  # smoke: render a few emat_bio examples end-to-end
+if __name__ == "__main__":  # smoke: render a few conditioned_reconstruction_bio examples end-to-end
     import sys
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from transformers import AutoTokenizer
-    from src.repr_learning.config import ReprConfig
+    from src.memory.config import ReprConfig
 
     tok = AutoTokenizer.from_pretrained(ReprConfig().llama_model)
     for nq in (1, 3):
-        ds = EMATBioDataset(tok, context_len=2048, n_pairs=12, n_query=nq, n_facts=3,
+        ds = ConditionedReconstructionBioDataset(tok, context_len=2048, n_pairs=12, n_query=nq, n_facts=3,
                             world_seed=0, stream_seed=1)
         s = next(iter(ds))
         ctx = tok.decode([t for t in s["context_ids"].tolist() if t != ds.pad_token_id])

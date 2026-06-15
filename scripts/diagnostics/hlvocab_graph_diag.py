@@ -12,16 +12,16 @@ import sys, os, math
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 import torch, torch.nn.functional as F
 from transformers import AutoTokenizer
-from src.repr_learning.config import ReprConfig
-from src.repr_learning.model import ReprLearningModel
-from src.repr_learning.data_sentence import make_sentence_dataloader
+from src.memory.config import ReprConfig
+from src.memory.model import ReprLearningModel
+from src.memory.data_masked_reconstruction import make_sentence_dataloader
 
 dev = "cuda"; BACKBONE = "HuggingFaceTB/SmolLM2-135M"; SRC = "meta-llama/Llama-3.2-1B"
 
 
 def matched(cfg):
     cfg.llama_model = BACKBONE; cfg.d_llama = 576; cfg.llama_vocab_size = 49152
-    cfg.pad_token_id = 0; cfg.task_mode = "sentence_mae"
+    cfg.pad_token_id = 0; cfg.task_mode = "masked_reconstruction"
     cfg.use_llama_lora = True; cfg.llama_lora_rank = 16; cfg.llama_lora_alpha = 32
     cfg.hlvocab_d_code = 256; cfg.hlvocab_nodes = (512, 256, 128)
     cfg.hlvocab_top_k = 4; cfg.hlvocab_m_max = 16; cfg.hlvocab_tap_layer = 6
@@ -48,7 +48,7 @@ for a in ("context_ids","context_mask","question_ids","question_mask",
 print("\n(A) GRADIENT FLOW (one MAE step) — grad/param per module")
 model.train(); model.zero_grad(set_to_none=True)
 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-    out = model.compute_mae_loss(b)
+    out = model.compute_masked_reconstruction_loss(b)
 out["loss"].backward()
 from collections import defaultdict
 g = defaultdict(lambda: [0.0, 0.0])
@@ -101,7 +101,7 @@ with torch.no_grad():
 
     print("\n(E) MEMORY IS USED")
     with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-        real = model.compute_mae_loss(b)["loss_recon"].item()
-        off = model.compute_mae_loss(b, zero_memory=True)["loss_recon"].item()
+        real = model.compute_masked_reconstruction_loss(b)["loss_recon"].item()
+        off = model.compute_masked_reconstruction_loss(b, zero_memory=True)["loss_recon"].item()
     print(f"  REAL={real:.3f}  OFF={off:.3f}  OFF-REAL={off-real:+.3f} (untrained; sign noisy)")
 print("\nDONE.")

@@ -9,18 +9,18 @@ import sys, os, math
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 import torch, torch.nn.functional as F
 from transformers import AutoTokenizer
-from src.repr_learning.config import ReprConfig
-from src.repr_learning.model import ReprLearningModel
-from src.repr_learning.data_sentence import make_sentence_dataloader
+from src.memory.config import ReprConfig
+from src.memory.model import ReprLearningModel
+from src.memory.data_masked_reconstruction import make_sentence_dataloader
 
 dev = "cuda"
 BACKBONE = "HuggingFaceTB/SmolLM2-135M"; SRC = "meta-llama/Llama-3.2-1B"
-CKPT = "outputs/repr_learning/mae_135m_4k_v9fix2_graph_v9_baseline/ckpts/graph_v9_baseline.best.pt"
+CKPT = "outputs/memory/mae_135m_4k_v9fix2_graph_v9_baseline/ckpts/graph_v9_baseline.best.pt"
 
 
 def matched(cfg):
     cfg.llama_model = BACKBONE; cfg.d_llama = 576; cfg.llama_vocab_size = 49152
-    cfg.pad_token_id = 0; cfg.task_mode = "sentence_mae"
+    cfg.pad_token_id = 0; cfg.task_mode = "masked_reconstruction"
     cfg.use_llama_lora = True; cfg.llama_lora_rank = 16; cfg.llama_lora_alpha = 32
     cfg.hlvocab_d_code = 256; cfg.hlvocab_nodes = (512, 256, 128)
     cfg.hlvocab_top_k = 4; cfg.hlvocab_m_max = 16; cfg.hlvocab_tap_layer = 6
@@ -80,7 +80,7 @@ with torch.no_grad():
             M = c.shape[0]; mem_cos.append(((c.sum() - M) / (M * (M - 1))).item())
         # node usage = argmax routing per layer
         m = mask.unsqueeze(-1); x = sub._unit_rms_in(emb) if hasattr(sub, "_unit_rms_in") else None
-        from src.repr_learning.models.hierarchical_learned_vocab.substrate import _unit_rms
+        from src.memory.models.hierarchical_learned_vocab.substrate import _unit_rms
         x = _unit_rms(sub.seed_proj(hiddens.float())) * m
         for l in range(sub.depth):
             sc = sub.route(l, (hiddens.float() if l == 0 else x)) * m

@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 import torch
 import torch.nn.functional as F
 from transformers import AutoTokenizer, AutoModelForCausalLM
-from src.repr_learning.data_sentence import make_sentence_dataloader
+from src.memory.data_masked_reconstruction import make_sentence_dataloader
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--backbone", default="HuggingFaceTB/SmolLM2-135M")

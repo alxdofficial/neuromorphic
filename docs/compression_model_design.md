@@ -3,7 +3,7 @@
 **Single source of truth for the active model.** Supersedes the retired operator/
 Householder graph_v9 (`docs/archive/graph_v9_operator_householder_design.md`) and the
 earlier v2.1 / graph_v5–v8 lineages (all in `docs/archive/`). Implemented in
-`src/repr_learning/hierarchical_learned_vocab.py` (+ `encoder.py` `HLVocabEncoder`).
+`src/memory/hierarchical_learned_vocab.py` (+ `encoder.py` `HLVocabEncoder`).
 
 ## 0. Thesis & objective
 - **Goal:** compress a passage into its OWN learned vocabulary — a directed graph of

@@ -6,15 +6,15 @@ from typing import Literal
 
 @dataclass
 class ReprConfig:
-    """All hyperparameters for V2.1 representation learning.
+    """All hyperparameters for the memory module (compression + binding).
 
-    Default values match docs/v2.1_repr_learning.md.
+    Default values match docs/compression_model_design.md.
     """
 
     # ── Backbone (LM the encoder injects memory into) ──────────────────────
     # Field is "llama_model" historically — any HF chat model works. Set this
     # to an Instruct/chat-tuned model to enable chat-template scaffolding
-    # (see src/repr_learning/chat_template.py). The model loader detects
+    # (see src/memory/chat_template.py). The model loader detects
     # whether the tokenizer has a chat template and routes accordingly.
     llama_model: str = "meta-llama/Llama-3.2-1B-Instruct"
     d_llama: int = 2048  # Llama-3.2-1B hidden size
@@ -221,7 +221,7 @@ class ReprConfig:
     beacon_ratio: int = 0                   # condensing ratio α (beacons/window=W/α); 0 ⇒ auto from n_flat_codes
     beacon_window: int = 0                  # 0 ⇒ use trainer window_size
     beacon_wrap_layers: tuple = ()          # layer indices to wrap; () ⇒ ALL layers (capacity knob)
-    mae_mask_ratio: float = 0.85            # mae task: fraction of answer tokens masked in the forward
+    mae_mask_ratio: float = 0.85            # masked_reconstruction: fraction of tokens masked in the forward
 
     # ── Activation efficiency ───────────────────────────────────────────────
     # Activation-checkpoint each streaming-write window so we don't retain all
@@ -352,7 +352,7 @@ class ReprConfig:
     # compressor: a learned multi-layer node vocabulary; tokens routed against
     # node keys, re-described (residual+top-k+norm), passed up; code = the m_max
     # most-present node-clusters across layers (NPMI-anti-hub), each carrying its
-    # assigned tokens' centroid. Prepend compressor for sentence_mae (sliced to
+    # assigned tokens' centroid. Prepend compressor for masked_reconstruction (sliced to
     # k=ceil(L/ratio) by the harness). v2 adds STDP edges + graph reader.
     hlvocab_d_code: int = 256           # shared code space (vocabulary)
     hlvocab_nodes: tuple = (512, 256, 128)  # nodes per layer (low->high)

@@ -14,7 +14,7 @@ from ...config import ReprConfig
 class SoftPointerGraphEncoder(nn.Module):
     """soft_pointer_graph: soft-pointer graph memory with a no-op-free, per-token read.
 
-    See docs/graph_v6.md + src/repr_learning/models/soft_pointer_graph/substrate.py.
+    See docs/graph_v6.md + src/memory/models/soft_pointer_graph/substrate.py.
 
     WRITE: chunk-fresh (mu,sigma) node bank + soft-pointer edges, updated per window
       by a unified typed-token transformer (SoftPointerGraphUpdater) with a per-token
@@ -195,7 +195,7 @@ class SoftPointerGraphEncoder(nn.Module):
         n_w = max(state["n_windows"], 1)
         aux = {
             "load_balance_loss": torch.zeros((), device=device, dtype=dtype),
-            # graph_aux=0 (no aux loss) — also flips compute_qa_loss's `graph_aux is not
+            # graph_aux=0 (no aux loss) — also flips compute_loss's `graph_aux is not
             # None` guard True so the spg_* telemetry pass-through actually fires.
             "graph_aux": torch.zeros((), device=device, dtype=dtype),
             "spg_facts": {"value": fact_value},
@@ -242,7 +242,7 @@ class SoftPointerGraphEncoder(nn.Module):
 
     def inject(self, hidden_states, facts):
         """READ Stage B: per-position soft retrieval over fact-tokens (installed as a
-        forward pre-hook on Llama layer `inject_layer_idx` by compute_qa_loss)."""
+        forward pre-hook on Llama layer `inject_layer_idx` by compute_loss)."""
         return self.fact_reader(hidden_states, facts["value"])
 
     def forward(self, token_embeds, attention_mask=None, mask_positions=None):

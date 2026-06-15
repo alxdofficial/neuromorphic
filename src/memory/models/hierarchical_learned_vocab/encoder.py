@@ -19,7 +19,7 @@ class HLVocabEncoder(nn.Module):
     A FROZEN base contextualizes the full span (the ICAE/CCM separate-frozen-copy
     pattern); the substrate compresses the contextualized hiddens into m_max
     presence-ranked node-tokens. finalize_memory returns [B, m_max, d_llama]; the
-    sentence_mae harness slices to k = ceil(L/ratio) and prepends. v1 = nodes-only
+    masked_reconstruction harness slices to k = ceil(L/ratio) and prepends. v1 = nodes-only
     (prepend compressor, same decode path as the baselines).
     """
 
