@@ -83,6 +83,10 @@ class HLVocabConfig:
     d_read: int = 192               # causal graph-reader width
     reader_layers: int = 2
     reader_heads: int = 4
+    # emit read-out: "edge_query" = E independent sharp-softmax slots (collapse-prone);
+    # "slotattn" = Slot-Attention competitive slots (softmax OVER slots → partition).
+    emit: str = "edge_query"
+    slot_iters: int = 3             # Slot-Attention refinement iterations (emit="slotattn")
 
     def __post_init__(self):
         if self.d_code % 32 != 0:
@@ -102,6 +106,46 @@ class HLVocabConfig:
                 raise ValueError(f"stdp_tau_init needs >= {len(self.nodes)} entries")
             if self.edge_cand < self.m_max // 2:
                 raise ValueError(f"edge_cand={self.edge_cand} must be >= n_edges={self.m_max // 2}")
+
+
+class _SlotAttentionEmit(nn.Module):
+    """Slot-Attention competitive read-out (Locatello 2020). K slots compete for the
+    candidate inputs via softmax-OVER-SLOTS, so they PARTITION the candidates instead
+    of all collapsing onto the same one (the edge-query failure). Stochastic shared-
+    Gaussian slot init (symmetry breaking) + GRU refinement. Returns the refined slot
+    vectors and the per-slot assignment weights over inputs (rows ~sum-to-1 over N)."""
+
+    def __init__(self, n_slots: int, d: int, iters: int = 3):
+        super().__init__()
+        self.n_slots, self.d, self.iters = n_slots, d, iters
+        self.mu = nn.Parameter(torch.zeros(1, 1, d))
+        self.log_sigma = nn.Parameter(torch.zeros(1, 1, d))     # σ=1 at init
+        self.norm_in = nn.LayerNorm(d)
+        self.norm_slots = nn.LayerNorm(d)
+        self.norm_mlp = nn.LayerNorm(d)
+        self.to_q = nn.Linear(d, d, bias=False)
+        self.to_k = nn.Linear(d, d, bias=False)
+        self.gru = nn.GRUCell(d, d)
+        self.mlp = nn.Sequential(nn.Linear(d, 4 * d), nn.GELU(), nn.Linear(4 * d, d))
+        self.scale = d ** -0.5
+
+    def forward(self, inputs: Tensor) -> tuple[Tensor, Tensor]:
+        B, N, _ = inputs.shape
+        k = self.to_k(self.norm_in(inputs))                                  # [B,N,d]
+        slots = self.mu + self.log_sigma.exp() * torch.randn(
+            B, self.n_slots, self.d, device=inputs.device, dtype=inputs.dtype)
+        attn = None
+        for _ in range(self.iters):
+            q = self.to_q(self.norm_slots(slots)) * self.scale               # [B,K,d]
+            logits = torch.einsum("bkd,bnd->bkn", q, k)                      # [B,K,N]
+            attn = logits.softmax(dim=1) + 1e-8                              # over SLOTS → competition
+            w = attn / attn.sum(dim=-1, keepdim=True)                        # weighted-mean norm over N
+            updates = torch.einsum("bkn,bnd->bkd", w, inputs)               # [B,K,d]
+            slots = self.gru(updates.reshape(-1, self.d),
+                             slots.reshape(-1, self.d)).reshape(B, self.n_slots, self.d)
+            slots = slots + self.mlp(self.norm_mlp(slots))
+        w = attn / attn.sum(dim=-1, keepdim=True)
+        return slots, w
 
 
 class HLVocabSubstrate(nn.Module):
@@ -158,9 +202,13 @@ class HLVocabSubstrate(nn.Module):
                     cfg.d_sel, cfg.sel_heads, dim_feedforward=4 * cfg.d_sel,
                     dropout=0.0, batch_first=True, norm_first=True, activation="gelu")
                 for _ in range(cfg.sel_layers))
-            # E edge-query slots: each a SHARP softmax over candidates (soft ≈ pick-1).
-            self.edge_query = nn.Parameter(torch.randn(self.n_edges, cfg.d_sel) / math.sqrt(cfg.d_sel))
-            self.sel_log_temp = nn.Parameter(torch.tensor(0.0))     # selection sharpness (learnable)
+            # emit read-out: edge_query (independent sharp-softmax, collapse-prone) OR
+            # slotattn (Slot-Attention competition: slots PARTITION candidates).
+            if cfg.emit == "slotattn":
+                self.slot_emit = _SlotAttentionEmit(self.n_edges, cfg.d_sel, iters=cfg.slot_iters)
+            else:
+                self.edge_query = nn.Parameter(torch.randn(self.n_edges, cfg.d_sel) / math.sqrt(cfg.d_sel))
+                self.sel_log_temp = nn.Parameter(torch.tensor(0.0))   # selection sharpness (learnable)
             # stateless TokenGT pieces: role(src/dst/standalone), instance-tags, edge-ctx
             self.role_emb = nn.Parameter(torch.randn(3, cfg.d_llama) / math.sqrt(cfg.d_llama))
             self.tag_emb = nn.Parameter(torch.randn(self.n_edges, cfg.d_llama) / math.sqrt(cfg.d_llama))
@@ -311,13 +359,23 @@ class HLVocabSubstrate(nn.Module):
             for layer in self.selector:
                 R = layer(R)                                   # [B,Cand,d_sel]
 
-            # E edge-query slots, each a SHARP softmax over candidates (soft ≈ pick-1)
-            temp = self.sel_log_temp.exp().clamp(0.05, 5.0)
-            logits = torch.einsum("ed,bcd->bec", self.edge_query, R) / math.sqrt(cfg.d_sel)
-            w = torch.softmax(logits / temp, dim=-1)           # [B,E,Cand] sharp
-            src_e = torch.einsum("bec,bcd->bed", w, src_val)   # soft-blended edge endpoints
+            # emit read-out → per-slot assignment w [B,E,Cand] + edge context ctx_e
+            if cfg.emit == "slotattn":
+                slots, w = self.slot_emit(R)                   # competition: softmax OVER slots
+                # slots are permutation-symmetric → mass-order so the prefix k-slice
+                # takes the highest-claim edges first (prefix-valid causal read).
+                order = w.sum(-1).argsort(dim=-1, descending=True)            # [B,E]
+                w = torch.gather(w, 1, order.unsqueeze(-1).expand(-1, -1, w.shape[-1]))
+                slots = torch.gather(slots, 1, order.unsqueeze(-1).expand(-1, -1, slots.shape[-1]))
+                ctx_e = self.sel_to_tok(slots)
+                temp = torch.tensor(0.0, device=device)        # n/a (telemetry placeholder)
+            else:
+                temp = self.sel_log_temp.exp().clamp(0.05, 5.0)
+                logits = torch.einsum("ed,bcd->bec", self.edge_query, R) / math.sqrt(cfg.d_sel)
+                w = torch.softmax(logits / temp, dim=-1)       # [B,E,Cand] sharp (per-slot, independent)
+                ctx_e = self.sel_to_tok(torch.einsum("bec,bcd->bed", w, R))
+            src_e = torch.einsum("bec,bcd->bed", w, src_val)   # blended edge endpoints
             dst_e = torch.einsum("bec,bcd->bed", w, dst_val)
-            ctx_e = self.sel_to_tok(torch.einsum("bec,bcd->bed", w, R))   # edge context
 
             # stateless TokenGT node-tokens [role, value, tag, edge-ctx], src-then-dst
             tags = torch.arange(E, device=device)

@@ -163,6 +163,10 @@ class ReprConfig:
     hlvocab_d_read: int = 192           # dedicated graph-reader width
     hlvocab_reader_layers: int = 2
     hlvocab_reader_heads: int = 4
+    # emit read-out: "edge_query" (independent sharp-softmax slots, collapse-prone)
+    # | "slotattn" (Slot-Attention competition — slots PARTITION candidates).
+    hlvocab_emit: str = "edge_query"
+    hlvocab_slot_iters: int = 3         # Slot-Attention refinement iterations (slotattn)
 
     # ── Misc ───────────────────────────────────────────────────────────────
     seed: int = 42                  # wired in the trainer (torch/np/random) for reproducibility

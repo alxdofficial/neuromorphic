@@ -949,6 +949,9 @@ def main():
                          "continuation = compress N → predict next (AutoComp/Beacon gist/LM).")
     ap.add_argument("--mae-mask-ratio", type=float, default=0.85,
                     help="mae: fraction of answer tokens replaced by <mask> in the forward.")
+    ap.add_argument("--hlvocab-emit", choices=["edge_query", "slotattn"], default="edge_query",
+                    help="hlvocab emit read-out: edge_query (independent sharp-softmax) "
+                         "| slotattn (Slot-Attention competition — slots partition candidates).")
     ap.add_argument("--cond-recon-n-pairs", type=int, default=64,
                     help="conditioned_reconstruction: number of key→value pairs packed into the context (capacity).")
     ap.add_argument("--cond-recon-n-query", type=int, default=1,
@@ -1284,6 +1287,7 @@ def main():
         cfg.beacon_wrap_layers = _bwl(_nlayers)
         cfg.hlvocab_m_max = 16           # masked_reconstruction: emit up to 16, sliced to k [fix G]
         cfg.hlvocab_edge_cand = 48       # calibrated for the 16-token MAE regime (overrides budget-scaled)
+        cfg.hlvocab_emit = args.hlvocab_emit   # edge_query (default) | slotattn (competition)
         # soft_pointer_graph (our other primary graph; "free endpoint selection")
         # capacity-matched to hlvocab on d=576: ≈3.30M memory / 4.22M total. Defaults
         # are sized for the retired ~48M QA regime, so shrink for the MAE cohort.

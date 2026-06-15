@@ -40,7 +40,8 @@ class HLVocabEncoder(nn.Module):
             edge_cand=cfg.hlvocab_edge_cand, d_sel=cfg.hlvocab_d_sel,
             sel_layers=cfg.hlvocab_sel_layers, sel_heads=cfg.hlvocab_sel_heads,
             d_read=cfg.hlvocab_d_read, reader_layers=cfg.hlvocab_reader_layers,
-            reader_heads=cfg.hlvocab_reader_heads)
+            reader_heads=cfg.hlvocab_reader_heads,
+            emit=cfg.hlvocab_emit, slot_iters=cfg.hlvocab_slot_iters)
         self.sub = HLVocabSubstrate(hlv)
         self.M = hlv.m_max
         # norm-match TARGET = the active backbone's embedding scale, NOT the
