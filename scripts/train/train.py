@@ -645,9 +645,8 @@ def train_one_variant(
             if key in out and out[key] is not None:
                 row[key] = float(out[key])
         # Graph-variant telemetry (only present when variant == graph_baseline).
-        # The current graph emits the VQ commitment loss + collapse canaries
-        # (distinct codes used, read-gate amplitude). Older graph_v3/v4 keys are
-        # kept in the whitelist for back-compat reproduction (skipped if absent).
+        # The relational parser emits the selection/vocabulary/relation/read canaries
+        # (pointer entropy, distinct nodes used, eff-ranks, read-gate amplitude).
         _graph_scalar_keys = (
             # relational-parser canaries (selection → vocabulary → relation → read)
             "graph_ptr_entropy", "graph_nodes_used", "graph_bank_effrank",
@@ -935,7 +934,7 @@ def main():
     # hlvocab_baseline + soft_pointer_graph_baseline are ABANDONED (2026-06-15) —
     # still selectable via explicit --variants for reproduction, out of the default.
     ap.add_argument("--variants", nargs="+", default=[
-        "graph_baseline",             # the current line: VQ-codebook graph + TokenGT + inject reader
+        "graph_baseline",             # the current line: relational parser over a learnable node bank
         "icae_baseline",              # ICAE (ICLR'24)
         "ccm_baseline",               # CCM (ICLR'24)
         "autocompressor_baseline",    # AutoCompressor/RMT-style recurrent summary

@@ -412,8 +412,8 @@ class ReprLearningModel(nn.Module):
         elif shuffle_memory:                                           # SHUF: roll graph along batch
             if B == 1:
                 raise ValueError("shuffle_memory requires batch size > 1 (B==1 leaves REAL memory).")
-            graph = {k: (torch.roll(v, shifts=1, dims=0) if torch.is_tensor(v) and v.dim() >= 1 else v)
-                     for k, v in graph.items()}
+            graph = {key: (torch.roll(v, shifts=1, dims=0) if torch.is_tensor(v) and v.dim() >= 1 else v)
+                     for key, v in graph.items()}
 
         # ---- 3. masked decoder input (no prepend; M=0) ----
         mask_vec = self.decoder.mask_embed.to(ctx_embeds.dtype)
