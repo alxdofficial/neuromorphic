@@ -88,9 +88,20 @@ class GraphEncoder(nn.Module):
         graph = None
         for s in range(0, T, W):
             e = min(s + W, T)
-            if not mask[:, s:e].any():                           # all-padding tail window → skip
+            win_mask = mask[:, s:e]
+            if not win_mask.any():                               # whole-batch padding → skip
                 continue
-            graph = self.parser(hiddens[:, s:e], mask[:, s:e], state=graph)
+            new = self.parser(hiddens[:, s:e], win_mask, state=graph)
+            if graph is None:
+                graph = new
+            else:
+                # PER-EXAMPLE carry: a row with no real token in THIS window keeps its
+                # previous graph unchanged (don't update it from padding). The batch-wide
+                # skip above only covers all-padding windows; this handles mixed-length
+                # batches where some rows have ended. (MAE = one window → never taken.)
+                row_has = win_mask.any(dim=-1)                   # [B] bool
+                graph = {k: torch.where(row_has[:, None, None], new[k], graph[k])
+                         for k in new}
         if graph is None:                                        # fully-padded batch (degenerate) → one parse
             graph = self.parser(hiddens, mask, state=None)       # avoids a None-deref downstream
         B = hiddens.shape[0]
