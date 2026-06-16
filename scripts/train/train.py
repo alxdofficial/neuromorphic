@@ -344,7 +344,7 @@ def train_one_variant(
         # on a verbatim key, reproduce its value (closed-book). Same encoder→memory→prepend→CE
         # path; only the DATA differs. Train/val share the word pools but use different RNG seeds
         # (every example is a fresh random pairing, so there is no binding overlap to leak).
-        _cr = dict(context_len=chunk_size, batch_size=cfg.batch_size,
+        _cr = dict(context_len=chunk_size, batch_size=cfg.batch_size, pad_token_id=cfg.pad_token_id,
                      n_pairs=cond_recon_n_pairs, n_query=cond_recon_n_query, value_len=cond_recon_value_len)
         train_dl = None if is_eval_only else make_conditioned_reconstruction_dataloader(
             tokenizer, split="train", seed=42, **_cr)
@@ -353,15 +353,16 @@ def train_one_variant(
         # Biographical conditioned reconstruction: context = N (key-phrase = fact-dense sentence)
         # pairs, condition on a verbatim key phrase, reproduce its value sentence (closed-book).
         # Train/val build DISJOINT worlds (different world_seed → different entities).
-        _eb = dict(context_len=chunk_size, batch_size=cfg.batch_size, n_pairs=cond_recon_n_pairs,
-                   n_query=cond_recon_n_query, n_facts=cond_recon_bio_n_facts, world_seed=cond_recon_bio_world_seed)
+        _eb = dict(context_len=chunk_size, batch_size=cfg.batch_size, pad_token_id=cfg.pad_token_id,
+                   n_pairs=cond_recon_n_pairs, n_query=cond_recon_n_query,
+                   n_facts=cond_recon_bio_n_facts, world_seed=cond_recon_bio_world_seed)
         train_dl = None if is_eval_only else make_conditioned_reconstruction_bio_dataloader(
             tokenizer, split="train", stream_seed=42, **_eb)
         val_dl = make_conditioned_reconstruction_bio_dataloader(tokenizer, split="validation", stream_seed=7, **_eb)
     elif task == "continuation":
         # continuation: compress N → predict the NEXT tokens (gist/LM).
         _cont = dict(batch_size=cfg.batch_size, compress_len=compress_len, predict_len=predict_len,
-                     objective=task)
+                     pad_token_id=cfg.pad_token_id, objective=task)
         train_dl = None if is_eval_only else make_continuation_dataloader(
             tokenizer, split="train", seed=42, **_cont)
         val_dl = make_continuation_dataloader(tokenizer, split="validation", seed=7, **_cont)
@@ -1242,10 +1243,12 @@ def main():
         cfg.d_llama = _bc.hidden_size
         cfg.llama_vocab_size = _bc.vocab_size
         _bt = _AT.from_pretrained(args.backbone)
-        # SmolLM2 has no pad token → use eos (masked out of attention/loss anyway)
-        cfg.pad_token_id = _bt.pad_token_id if _bt.pad_token_id is not None else _bt.eos_token_id
+        # LLM-AGNOSTIC pad + sep derived from the active backbone tokenizer (the old
+        # 128001/198 defaults are Llama-only → out of range on SmolLM2 etc.).
+        from src.memory.common import resolve_special_ids as _rsi
+        cfg.pad_token_id, cfg.sep_token_id = _rsi(_bt)
         print(f"[backbone] {args.backbone}  d_llama={cfg.d_llama}  "
-              f"vocab={cfg.llama_vocab_size}  pad={cfg.pad_token_id}")
+              f"vocab={cfg.llama_vocab_size}  pad={cfg.pad_token_id}  sep={cfg.sep_token_id}")
 
     # ── Matched MEMORY budget (decoder-read M × d_llama) ────────────────
     # mem_tokens is the single knob; the prepend conditioned-reconstruction arms all emit ~M tokens at

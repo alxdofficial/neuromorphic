@@ -171,7 +171,9 @@ class ConditionedReconstructionDataset(IterableDataset):
 def make_conditioned_reconstruction_dataloader(tokenizer, context_len: int, batch_size: int,
                          n_pairs: int = 64, n_query: int = 1, value_len: int = 1,
                          split: str = "train", seed: int = 0,
-                         pad_token_id: int = 128_001, num_workers: int = 2) -> DataLoader:
+                         pad_token_id: int = None, num_workers: int = 2) -> DataLoader:
+    if pad_token_id is None:                                  # LLM-agnostic default
+        pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
     ds = ConditionedReconstructionDataset(tokenizer, context_len=context_len, n_pairs=n_pairs, n_query=n_query,
                      value_len=value_len, seed=seed, pad_token_id=pad_token_id)
     return DataLoader(ds, batch_size=batch_size, num_workers=num_workers,

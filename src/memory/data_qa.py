@@ -80,6 +80,7 @@ class QADataset(IterableDataset):
         self,
         passages_path: Path,
         questions_path: Path,
+        tokenizer,                         # LLM-agnostic: re-tokenize the TEXT fields
         chunk_size: int = 4096,
         passages_per_chunk: int = 80,
         sep_token_id: int = 198,           # newline (matches sentence-pack default)
@@ -90,6 +91,7 @@ class QADataset(IterableDataset):
         super().__init__()
         self.passages_path = Path(passages_path)
         self.questions_path = Path(questions_path)
+        self.tokenizer = tokenizer
         self.chunk_size = chunk_size
         self.passages_per_chunk = passages_per_chunk
         self.sep_token_id = sep_token_id
@@ -106,6 +108,30 @@ class QADataset(IterableDataset):
         n_questions = sum(len(v) for v in self.sampler.questions_by_family.values())
         print(f"[data v1h]   {n_passages:,} passages, {n_questions:,} questions "
               f"across {len(self.sampler._families)} task families")
+
+    def _tok(self, text: str) -> list[int]:
+        return self.tokenizer(text or "", add_special_tokens=False,
+                              return_attention_mask=False)["input_ids"]
+
+    def _tok_answer(self, answer_text: str, target_value: str) -> tuple[list[int], list[bool]]:
+        """Tokenize the answer (LLM-agnostically) and mark the load-bearing content
+        tokens = those overlapping the `target_value` char span (via offset mapping).
+        Falls back to whole-answer-is-content when target_value is absent / not found /
+        the tokenizer is slow (no offsets)."""
+        answer_text = answer_text or ""
+        if target_value and getattr(self.tokenizer, "is_fast", False):
+            enc = self.tokenizer(answer_text, add_special_tokens=False,
+                                 return_attention_mask=False, return_offsets_mapping=True)
+            ids, offs = enc["input_ids"], enc["offset_mapping"]
+            lo = answer_text.find(target_value)
+            if lo >= 0:
+                hi = lo + len(target_value)
+                content = [(e > lo and s < hi) for (s, e) in offs]
+                if any(content):
+                    return ids, content
+            return ids, [True] * len(ids)
+        ids = self._tok(answer_text)
+        return ids, [True] * len(ids)
 
     def __iter__(self) -> Iterator[dict]:
         # Worker-aware RNG for evidence/distractor interleaving
@@ -133,7 +159,9 @@ class QADataset(IterableDataset):
             distractors = [passages[i] for i, _ in enumerate(passages) if i not in evidence_idxs]
 
             # Pack evidence first; if it can't fit alone, skip this example.
-            ev_tokens = [p["passage_token_ids"] for p in evidence]
+            # LLM-agnostic: re-tokenize the passage TEXT with the active tokenizer
+            # (NOT the baked-in Llama `passage_token_ids`).
+            ev_tokens = [self._tok(p["passage"]) for p in evidence]
             ev_total = sum(len(t) for t in ev_tokens) + max(0, len(ev_tokens) - 1)
             if ev_total > self.chunk_size:
                 continue  # evidence-too-big; resample
@@ -143,7 +171,7 @@ class QADataset(IterableDataset):
             packed = list(ev_tokens)
             cur_total = ev_total
             for d in distractors:
-                d_tokens = d["passage_token_ids"]
+                d_tokens = self._tok(d["passage"])
                 add_cost = len(d_tokens) + 1  # plus separator
                 if cur_total + add_cost > self.chunk_size:
                     continue  # this distractor too big; try next (might be smaller)
@@ -161,24 +189,13 @@ class QADataset(IterableDataset):
                 pad_token_id=self.pad_token_id,
             )
 
-            q_ids = list(target_q["question_token_ids"])
-            a_ids = list(target_q["answer_token_ids"])
-            content_positions = list(
-                target_q.get("answer_content_token_positions") or []
-            )
-            if not content_positions:
-                content_positions = list(range(len(a_ids)))
-
-            content_mask = [False] * len(a_ids)
-            for pos in content_positions:
-                if 0 <= pos < len(a_ids):
-                    content_mask[pos] = True
-
-            # For composite_v1, refs = [target_value] (load-bearing content
-            # only) so EM/F1 isn't fooled by templated prefixes. Fall back
-            # to the full answer string when target_value is absent.
+            # LLM-agnostic: re-tokenize question/answer TEXT with the active tokenizer;
+            # content mask = the target_value span (via offsets), re-derived (the stored
+            # answer_content_token_positions index the OLD Llama tokenization).
             answer_full = target_q.get("answer") or ""
             target_val = target_q.get("target_value") or ""
+            q_ids = self._tok(target_q["question"])
+            a_ids, content_mask = self._tok_answer(answer_full, target_val)
             # Span-only when target_value exists (drop the echoing sentence —
             # else F1 pays out for parroting the question prefix). Fall back to
             # the full answer only when target_value is absent.
@@ -241,6 +258,7 @@ def collate_qa(samples: list[dict], pad_token_id: int = 128_001) -> QABatch:
 
 def make_qa_dataloader(
     cfg: ReprConfig,
+    tokenizer,
     passages_path: Path | str,
     questions_path: Path | str,
     chunk_size: int = 4096,
@@ -251,6 +269,7 @@ def make_qa_dataloader(
 ) -> DataLoader:
     ds = QADataset(
         Path(passages_path), Path(questions_path),
+        tokenizer=tokenizer,
         chunk_size=chunk_size,
         passages_per_chunk=passages_per_chunk,
         sep_token_id=cfg.sep_token_id,
@@ -1248,6 +1267,7 @@ def make_mixed_qa_dataloader(
             and weights[0] > 0):
         sources.append(QADataset(
             Path(composite_passages_path), Path(composite_questions_path),
+            tokenizer=tokenizer,
             chunk_size=chunk_size, passages_per_chunk=passages_per_chunk,
             sep_token_id=cfg.sep_token_id, pad_token_id=cfg.pad_token_id,
             task_weights=composite_task_weights,

@@ -12,6 +12,19 @@ import torch.nn.functional as F
 from torch import Tensor
 
 
+def resolve_special_ids(tokenizer) -> tuple[int, int]:
+    """LLM-AGNOSTIC (pad, sep) ids derived from the ACTIVE tokenizer, so the data
+    layer never bakes in a specific model's vocab (the old hard-coded 128001/198 are
+    Llama-only → out of range on SmolLM2, etc.). pad = the tokenizer's pad (else eos);
+    sep = the tokenizer's newline token. Swap the backbone → these follow it."""
+    pad = tokenizer.pad_token_id
+    if pad is None:
+        pad = tokenizer.eos_token_id
+    nl = tokenizer("\n", add_special_tokens=False)["input_ids"]
+    sep = nl[-1] if nl else pad
+    return int(pad), int(sep)
+
+
 class _NormMatch(nn.Module):
     """Put projected memory tokens in Llama's token-embedding magnitude region.
 

@@ -113,9 +113,11 @@ class ContinuationDataset(IterableDataset):
 
 def make_continuation_dataloader(tokenizer, batch_size: int, compress_len: int = 4096,
                                  predict_len: int = 512, split: str = "train", seed: int = 0,
-                                 pad_token_id: int = 128_001, num_workers: int = 2,
+                                 pad_token_id: int = None, num_workers: int = 2,
                                  objective: str = "continuation",
                                  src_tokenizer_name: str = "meta-llama/Llama-3.2-1B") -> DataLoader:
+    if pad_token_id is None:                                  # LLM-agnostic default
+        pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
     path = FINEWEB_TRAIN if split == "train" else FINEWEB_VAL
     ds = ContinuationDataset(path, tokenizer, src_tokenizer_name=src_tokenizer_name, split=split,
                              compress_len=compress_len, predict_len=predict_len,

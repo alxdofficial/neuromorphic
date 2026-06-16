@@ -192,8 +192,10 @@ class ConditionedReconstructionBioDataset(IterableDataset):
 def make_conditioned_reconstruction_bio_dataloader(tokenizer, context_len: int, batch_size: int,
                              n_pairs: int = 16, n_query: int = 1, n_facts: int = 3,
                              split: str = "train", world_seed: int = 0,
-                             stream_seed: int = 0, pad_token_id: int = 128_001,
+                             stream_seed: int = 0, pad_token_id: int = None,
                              num_workers: int = 2, relational: bool = False) -> DataLoader:
+    if pad_token_id is None:                                  # LLM-agnostic default
+        pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
     # val builds a DIFFERENT world AND drops any entity whose canonical name also exists
     # in the train world — a REAL name-disjoint firewall (the seed offset alone is NOT
     # disjoint; both worlds draw from the same finite pools). sweep bug #1.
