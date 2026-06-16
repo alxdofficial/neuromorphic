@@ -170,20 +170,26 @@ by-`(src,dst)` framing; slot-carry is the model that fits fixed-`E` instance-tag
 
 ---
 
-## 6. Capacity (MAE-matched to the baseline cohort)
-Param cost is dominated by the transformer blocks (`≈12·d²` each); `N` and `E` are cheap.
-At `d_graph=512` a real parser is ~8M (3× over budget); at `d_graph=256` it fits.
+## 6. Capacity (matched to the baseline cohort on BOTH axes)
+**Param axis (the mechanism cost):** matched to **~5.98M memory params**. Cohort:
+`graph 5.98M · icae r104 6.00M · ccm r52 6.00M · autocompressor r52 6.01M · beacon 11
+wrap-layers 6.08M` (all within 1.7%). Verified by `scripts/diagnostics/param_count.py`.
 
-**v1 MAE config (matched to the cohort ~4.6M memory params, ~8k read-surface floats):**
-`d_graph=256, n_nodes=1024, n_edges=16, write_layers=2, read_layers=2, heads=4, ffn_mult=2,
-obs_tap_layer=6, inject_layer=18`. Exact count verified by `scripts/diagnostics/param_count.py`;
-tune `write_layers`/`read_layers` to land on the anchor.
+**v1 MAE config:** `d_graph=256, n_nodes=1024, n_edges=16 (E_max), write_layers=3,
+read_layers=2, heads=4, ffn_mult=2, obs_tap_layer=6, inject_layer=18`.
 
-**"Full" / streaming config (later, needs its own larger baseline tier):**
-`n_nodes=1024, d_graph=512, n_edges=128` — the user's design target; ~8M, not MAE-matched.
+**Read-surface axis (capacity-relative — same bins as the baselines):** the parser predicts
+`E_max=16` edges, but the read **slices to the first `k = ceil(L/8) ∈ [3,16]` edges** (the same
+Matryoshka-prefix bins the baselines slice their slots to). So the graph obeys the cohort's
+**8:1 compression ratio and k-bins** on the sentence task. Read surface = `k×d_graph = k×256`
+floats (vs baselines `k×d_llama = k×576`): same `k` units / same ratio; fewer floats per unit
+only because `d_graph(256) < d_llama(576)` (the graph's internal width). On non-MAE tasks
+(no `k_slots`) the full `E_max` edge budget is used. *(All `E_max` edge slots still receive
+gradient even when sliced — the 6E working-set self-attention couples kept and dropped slots.)*
 
-Read-surface fairness: decoder cross-attends `E×d_graph` edge vectors ≈ `16×256 ≈ 4k`
-(vs baselines `k≤16 × 576 ≈ 9k`) — comparable order; primary match is on **params**.
+**"Full" / longer-task config (later — conditioned-reconstruction etc., own larger tier):**
+bump `n_edges`/`d_graph` (design target `n_nodes=1024, d_graph=512, n_edges=128`) and drop the
+`k`-slice (use the full budget); re-match a larger baseline tier then.
 
 ---
 

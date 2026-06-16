@@ -395,6 +395,16 @@ class ReprLearningModel(nn.Module):
         _, mem_aux = enc.finalize_memory(state)
         graph = mem_aux["graph"]
 
+        # capacity-relative read: slice to the same k=ceil(L/8) bins the baselines use
+        # (the parser predicts E_max edges; the read uses the first k — the Matryoshka
+        # prefix protocol). Obeys the cohort's compression ratio on the sentence task;
+        # non-MAE tasks (no k_slots) use the full edge budget.
+        k = getattr(batch, "k_slots", None)
+        if k is not None:
+            k = int(k)
+            graph = {kk: (v[:, :k] if torch.is_tensor(v) and v.dim() >= 2 else v)
+                     for kk, v in graph.items()}
+
         # ---- 2. REAL / OFF / SHUF ----
         inject = True
         if zero_memory:                                                # OFF: no hook
@@ -466,7 +476,7 @@ class ReprLearningModel(nn.Module):
             "top1_acc": top1, "per_example_loss": per_ex,
             "loss_aux": torch.zeros((), device=device),
             "n_content_positions": int(loss_mask.sum()),
-            "memory_shape": (B, enc.gcfg.n_edges),          # E edges for the logger
+            "memory_shape": (B, graph["edge_state"].shape[1]),   # k edges (capacity-relative)
             "mae_n_masked": float(loss_mask.sum()), "mae_M": 0.0,
             "graph_read_gate": float(torch.tanh(enc.reader.gate).abs().mean().item()),
         }
