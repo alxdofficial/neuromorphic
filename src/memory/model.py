@@ -4,6 +4,7 @@ The model takes one of the encoder variants (see VARIANTS) and the frozen
 Llama decoder, and produces the reconstruction loss for training.
 """
 from __future__ import annotations
+from contextlib import contextmanager
 from typing import Optional
 
 import torch
@@ -365,6 +366,34 @@ class ReprLearningModel(nn.Module):
                 out[_k] = _v
         return out
 
+    @contextmanager
+    def _graph_inject(self, graph, cap=None):
+        """Install the graph reader as a forward hook on the inject layer (adds the
+        RMS-matched, gated read into the residual at that layer); remove on exit. No-op
+        when graph is None (the OFF control) or the variant isn't graph_baseline.
+        Shared by the MAE and the generic (QA/conditioned/continuation) loss paths so
+        the graph injects identically across objectives. `cap` (optional dict) stashes
+        the injected vector for read-eff-rank telemetry."""
+        if graph is None or self.variant != "graph_baseline":
+            yield
+            return
+        reader = self.encoder.reader
+        layer = self.decoder.llama.model.layers[self.encoder.inject_layer]
+
+        def _hook(module, args, output):
+            hidden = output[0] if isinstance(output, tuple) else output
+            inj = reader(hidden, graph).to(hidden.dtype)
+            if cap is not None:
+                cap["inj"] = inj
+            hidden = hidden + inj
+            return (hidden,) + tuple(output[1:]) if isinstance(output, tuple) else hidden
+
+        handle = layer.register_forward_hook(_hook)
+        try:
+            yield
+        finally:
+            handle.remove()
+
     def _graph_masked_reconstruction_loss(
         self,
         batch,
@@ -422,30 +451,12 @@ class ReprLearningModel(nn.Module):
         dec_in = torch.where(masked.unsqueeze(-1), mask_vec.view(1, 1, -1), ctx_embeds)
         attn = batch.context_mask.long()
 
-        # ---- 4. inject hook on the mid-late decoder layer ----
-        handle = None
+        # ---- 4. inject hook on the mid-late decoder layer (no-op for OFF) ----
         cap = {}                                        # stashes the injected vector for read-eff-rank
-        if inject:
-            reader = enc.reader
-            layer = self.decoder.llama.model.layers[enc.inject_layer]
-
-            def _inject_hook(module, args, output):
-                hidden = output[0] if isinstance(output, tuple) else output
-                inj = reader(hidden, graph).to(hidden.dtype)
-                cap["inj"] = inj
-                hidden = hidden + inj
-                if isinstance(output, tuple):
-                    return (hidden,) + tuple(output[1:])
-                return hidden
-
-            handle = layer.register_forward_hook(_inject_hook)
-        try:
+        with self._graph_inject(graph if inject else None, cap=cap):
             base_out = self.decoder.llama.model(
                 inputs_embeds=dec_in, attention_mask=attn, use_cache=False)
             span_hidden = base_out.last_hidden_state                    # [B,T,d] (M=0)
-        finally:
-            if handle is not None:
-                handle.remove()
 
         # ---- 5. CE on masked positions (predict t_p from hidden p-1) ----
         pred_hidden = span_hidden[:, :-1]
@@ -545,16 +556,6 @@ class ReprLearningModel(nn.Module):
             return self.compute_masked_reconstruction_loss(
                 batch, zero_memory=zero_memory, shuffle_memory=shuffle_memory,
                 mask_ratio=self.cfg.mae_mask_ratio)
-        # graph_baseline injects its graph via a forward hook ONLY in the
-        # masked_reconstruction path; this generic path would prepend an EMPTY memory
-        # and silently ignore the graph (dead memory — parser/reader get no gradient).
-        # Fail fast rather than train a dead arm. Wire the inject into compute_loss
-        # before running graph_baseline on QA / conditioned_reconstruction / streaming.
-        if self.variant == "graph_baseline":
-            raise NotImplementedError(
-                "graph_baseline only supports --task masked_reconstruction (its memory "
-                "is injected via a decoder hook); the generic compute_loss path ignores "
-                "the graph. Add a graph inject path to compute_loss for non-MAE tasks.")
         device = batch.context_ids.device
         B, T_ctx = batch.context_ids.shape
         T_q = batch.question_ids.shape[1]
@@ -598,8 +599,21 @@ class ReprLearningModel(nn.Module):
             state["question_embeds"] = embed(batch.question_ids)
             state["question_mask"] = batch.question_mask
         memory, finalize_aux = self.encoder.finalize_memory(state)
-        # memory: [B, M, d_llama] or [B, 0, d_llama] for MT/Vanilla
+        # memory: [B, M, d_llama] or [B, 0, d_llama] for MT/Vanilla/graph
         M = memory.shape[1]
+
+        # graph_baseline: memory is empty (M=0); the graph injects via a decoder hook
+        # (installed around the forward below). REAL = graph as-is; OFF (zero_memory) =
+        # no inject; SHUF = roll the graph along the batch. Same controls as the prepend
+        # arms, applied to the graph state. (Non-graph variants: graph_state stays None.)
+        graph_state = finalize_aux.get("graph")
+        if graph_state is not None:
+            if zero_memory:
+                graph_state = None                                   # OFF: no inject
+            elif shuffle_memory:
+                if B <= 1:
+                    raise ValueError("shuffle_memory (SHUF) needs batch size > 1.")
+                graph_state = {k: torch.roll(v, shifts=1, dims=0) for k, v in graph_state.items()}
 
         # ---- 2. MT branch: retrieve per-chunk using question as query ----
         mt_bank = finalize_aux.get("mt_bank")
@@ -831,11 +845,13 @@ class ReprLearningModel(nn.Module):
             # there is no autoregressive decode that reuses KV. Building the
             # cache adds a noticeable per-step cost (esp. for vanilla_full_ctx
             # where T_ctx ~= 8K).
-            base_out = self.decoder.llama.model(
-                inputs_embeds=full_embeds,
-                attention_mask=attn_mask_full.to(torch.long),
-                use_cache=False,
-            )
+            # graph_baseline injects its read here via the hook (M=0 prepend).
+            with self._graph_inject(graph_state):
+                base_out = self.decoder.llama.model(
+                    inputs_embeds=full_embeds,
+                    attention_mask=attn_mask_full.to(torch.long),
+                    use_cache=False,
+                )
             hidden = base_out.last_hidden_state            # [B, T_total, d_llama]
         finally:
             if hook_handle is not None:
