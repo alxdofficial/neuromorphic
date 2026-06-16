@@ -247,10 +247,11 @@ Canaries at every stage:
 - Selection: **pure pointer** (chosen) vs shortlist + keep-gate; locality bias **off** (chosen) to start.
 - Read endpoints: **single vector per node** (chosen) vs separate key/value.
 - `obs_tap_layer=6` (chosen, mid). Read is prepend — no inject layer.
-- **Node competition** (`graph_node_competition`, default **off**): slot-attention edge
-  competition in `_point` (softmax over edges per node → renormalize per edge) so edges
-  spread instead of hub-collapsing (6/1024 nodes observed). Default off so prepend-alone vs
-  prepend+competition is a clean A/B; flip on if `nodes_used`/`edge_effrank` stay low.
+- Node anti-collapse: NOT slot-attention softmax-over-slots — that spreads a bank-mean
+  background across all edges in our N≫E regime (the SA paper's documented "background
+  spread across slots" artifact) and would worsen collapse. If needed, the literature-correct
+  tool is Sinkhorn/OT partial assignment (SwAV / Gumbel-Sinkhorn). Deferred — prepend alone
+  already recovered selection rank on MAE (nodes 6→36, edge_effrank 3.7→14).
 
 ---
 

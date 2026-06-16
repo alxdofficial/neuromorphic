@@ -38,8 +38,7 @@ class GraphEncoder(nn.Module):
             d_llama=cfg.d_llama, d_graph=cfg.graph_d_graph, n_nodes=cfg.graph_n_nodes,
             n_edges=cfg.graph_n_edges, write_layers=cfg.graph_write_layers,
             read_layers=cfg.graph_read_layers, heads=cfg.graph_heads,
-            ffn_mult=cfg.graph_ffn_mult, ptr_logit_temp_init=cfg.graph_ptr_logit_temp_init,
-            node_competition=cfg.graph_node_competition)
+            ffn_mult=cfg.graph_ffn_mult, ptr_logit_temp_init=cfg.graph_ptr_logit_temp_init)
         self.gcfg = gcfg
         self.parser = GraphParser(gcfg)
         self.reader = GraphReader(gcfg)                     # forms PREPEND memory tokens (not inject)
@@ -55,7 +54,7 @@ class GraphEncoder(nn.Module):
         self.obs_tap_layer = obs_tap                       # observation tap
         print(f"[graph] relational parser: N={gcfg.n_nodes} bank, E={gcfg.n_edges} edges, "
               f"d_graph={gcfg.d_graph}, write×{gcfg.write_layers}/read×{gcfg.read_layers}, "
-              f"obs_tap=L{self.obs_tap_layer}, prepend read, competition={gcfg.node_competition}")
+              f"obs_tap=L{self.obs_tap_layer}, prepend read")
 
     def train(self, mode: bool = True):
         super().train(mode)
