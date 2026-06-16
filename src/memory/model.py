@@ -545,6 +545,16 @@ class ReprLearningModel(nn.Module):
             return self.compute_masked_reconstruction_loss(
                 batch, zero_memory=zero_memory, shuffle_memory=shuffle_memory,
                 mask_ratio=self.cfg.mae_mask_ratio)
+        # graph_baseline injects its graph via a forward hook ONLY in the
+        # masked_reconstruction path; this generic path would prepend an EMPTY memory
+        # and silently ignore the graph (dead memory — parser/reader get no gradient).
+        # Fail fast rather than train a dead arm. Wire the inject into compute_loss
+        # before running graph_baseline on QA / conditioned_reconstruction / streaming.
+        if self.variant == "graph_baseline":
+            raise NotImplementedError(
+                "graph_baseline only supports --task masked_reconstruction (its memory "
+                "is injected via a decoder hook); the generic compute_loss path ignores "
+                "the graph. Add a graph inject path to compute_loss for non-MAE tasks.")
         device = batch.context_ids.device
         B, T_ctx = batch.context_ids.shape
         T_q = batch.question_ids.shape[1]

@@ -549,14 +549,22 @@ def train_one_variant(
         # Encoders have `enabled=False` blocks around numerically-sensitive ops
         # (entropy, normalization) so those remain fp32 even under the outer
         # autocast — the codebase was designed for this pattern.
+        _do_contrast = getattr(cfg, "contrastive_shuf_coef", 0.0) > 0
+        # REAL and SHUF must see the SAME random mask, else the contrastive term
+        # absorbs mask-difficulty noise (the masking is drawn fresh each compute_loss
+        # call). Capture the RNG before REAL and restore it before SHUF so SHUF redraws
+        # the identical mask — REAL/SHUF then differ only in memory identity. [R1-M3]
+        if _do_contrast:
+            _rng = torch.cuda.get_rng_state()
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             out = model.compute_loss(batch, window_size=window_size)
         loss = out["loss"]
-        if getattr(cfg, "contrastive_shuf_coef", 0.0) > 0:
+        if _do_contrast:
             # contrastive binding pressure: gradient flows through BOTH branches
             # (lower REAL loss AND raise SHUF loss — both require doc-identity in
             # the state to be expressed by the read). Primary CE on REAL keeps
             # the help-on-match direction anchored against poison-on-mismatch.
+            torch.cuda.set_rng_state(_rng)            # SHUF redraws the SAME mask as REAL
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                 out_shuf = model.compute_loss(batch, window_size=window_size,
                                                  shuffle_memory=True)
@@ -939,6 +947,8 @@ def main():
         "ccm_baseline",               # CCM (ICLR'24)
         "autocompressor_baseline",    # AutoCompressor/RMT-style recurrent summary
         "beacon_baseline",            # Activation Beacon
+        "vanilla_llama",              # MAE loss FLOOR (band lower bound)
+        "vanilla_full_context",       # MAE loss CEILING (band upper bound)
     ])
     ap.add_argument("--steps", type=int, default=8_000)
     ap.add_argument("--batch-size", type=int, default=8)

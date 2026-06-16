@@ -186,6 +186,12 @@ class GraphReader(nn.Module):
         # binding installed BEFORE attention (the side-car lesson) — not pooling raw tokens.
         self.w_sd = nn.Linear(2 * d, d)
         self.w_gamma = nn.Linear(d, d); self.w_beta = nn.Linear(d, d)
+        # FiLM near-identity init: γ.bias=1, β.bias=0 anchors the bind (edge_vec≈sd at
+        # start, so a random relation can't drown the endpoint binding — R1-L5), while
+        # the (default-init, nonzero) weights keep edge_state effective AND gradient-
+        # flowing. NB: zeroing the γ/β *weights* would give edge_state zero path to the
+        # output → starve edge_head (the relation channel) of gradient — don't.
+        nn.init.ones_(self.w_gamma.bias); nn.init.zeros_(self.w_beta.bias)
         self.q_in = nn.Linear(dl, d)
         self.blocks = nn.ModuleList(_Block(d, cfg.heads, cfg.ffn_mult) for _ in range(cfg.read_layers))
         self.out = nn.Linear(d, dl)

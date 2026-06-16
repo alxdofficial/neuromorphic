@@ -26,10 +26,6 @@ MAE_RANKS = dict(
     ccm_lora_rank=52, ccm_lora_alpha=104,
     autocompressor_lora_rank=52, autocompressor_lora_alpha=104,
     beacon_ratio=8, beacon_wrap_layers=beacon_wrap_layers(N_LAYERS, 11),
-    # soft_pointer_graph capacity-matched to hlvocab (~3.30M memory)
-    spg_K_edge=16, spg_K_node=64, spg_d_node=176, spg_d_state=176, spg_d_read=176,
-    spg_d_updater=240, spg_updater_layers=2, spg_updater_heads=8,
-    spg_read_ffn_mult=2, spg_builder_mlp_hidden=224, spg_film_hidden=176,
 )
 
 
@@ -40,9 +36,6 @@ def mae_cfg():
     c.use_llama_lora = True; c.llama_lora_rank = 16; c.llama_lora_alpha = 32
     c.n_flat_codes = 16
     c.icae_n_slots = 16; c.ccm_n_comp = 16; c.autocompressor_n_slots = 16
-    c.hlvocab_d_code = 256; c.hlvocab_nodes = (512, 256, 128)
-    c.hlvocab_top_k = 4; c.hlvocab_m_max = 16; c.hlvocab_tap_layer = 6
-    c.hlvocab_use_graph = True
     for k, v in MAE_RANKS.items():
         setattr(c, k, v)
     return c
@@ -53,7 +46,9 @@ def n_trainable(variant):
     return sum(p.numel() for p in m.parameters() if p.requires_grad)
 
 
-VARIANTS = ["vanilla_llama", "graph_baseline", "hlvocab_baseline", "soft_pointer_graph_baseline",
+# active cohort (graph + the four published baselines + vanilla floor). hlvocab /
+# soft_pointer_graph are ABANDONED — dropped here to match the active suite.
+VARIANTS = ["vanilla_llama", "graph_baseline",
             "icae_baseline", "ccm_baseline", "autocompressor_baseline", "beacon_baseline"]
 
 print(f"backbone={BACKBONE} d=576; ranks={MAE_RANKS}\n")
