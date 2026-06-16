@@ -1,17 +1,23 @@
 """graph model substrate — relational-parser graph memory over a learnable node bank.
 
-Design (2026-06-16 dialogue, supersedes the VQ-codebook version): the model is a
-learned RELATIONAL PARSER, not synaptic plasticity. A fixed **learnable node bank**
-is the vocabulary (replaces the VQ-VAE — no encode-snap/EMA/commitment collapse).
-The **write** is a TokenGT-style parser: E edge-query slots self-attend + cross-attend
-the observation, and each slot SELECTS its src/dst by *pointing* into the bank (sharp
-softmax — never regresses an endpoint) and regresses an edge state. The **read** binds
-each edge `op(src,dst,edge)` into one vector and cross-attends those into the frozen LLM.
+Design: docs/graph_model.md (SOURCE OF TRUTH). The model is a learned RELATIONAL
+PARSER over a fixed learnable node bank (the vocabulary; replaces the VQ-VAE).
 
-Why this is a graph and not a transformer-in-disguise: endpoints are constrained to
-the discrete vocabulary (pointer-select, reuse via shared nodes); per-edge instance
-tags make slots specialize (DETR-style anti-collapse); the read binds before pooling.
-See docs/graph_model.md.
+WRITE (GraphParser) — the working set is TWO copies of the E edges:
+  • Part 1 = the CURRENT graph WITH values: per edge `[src_val, edge_state, dst_val]`
+    + role + instance tag (+ a "current" part-marker). Window 1 → a learnable initial
+    graph; window t+1 → the carried previous graph (persistence).
+  • Part 2 = PREDICTION slots, NO values: per edge `[role_src, role_edge, role_dst]`
+    + instance tag (+ a "prediction" part-marker).
+Per layer (×write_layers, ≥3): the working set self-attends → cross-attends the
+AVAILABLE NODES (all N, role="available") → cross-attends the OBSERVATION → FFN.
+We then read the NEW graph off Part 2 only: a head per slot → src/dst SNAP to a bank
+node (pointer-select, never regressed), edge_state from the edge slot itself. Reading
+off fresh value-less slots (not in-place on Part 1) teaches active re-arrangement, not
+copy-the-current-graph.
+
+READ (GraphReader) — per edge bind op(src,dst,edge)→one vector, cross-attn inject
+(RMS-matched, gated) into the frozen LLM at a mid-late layer.
 """
 from __future__ import annotations
 
@@ -33,7 +39,7 @@ class GraphConfig:
     d_graph: int = 256               # graph/vocabulary space (decoupled from d_llama)
     n_nodes: int = 1024              # N — node bank size (the learnable vocabulary)
     n_edges: int = 16                # E — edge budget
-    write_layers: int = 2            # parser depth (self-attend edges + cross-attend obs)
+    write_layers: int = 3            # parser depth (self → cross-nodes → cross-obs); ≥3
     read_layers: int = 2             # reader depth (cross-attend edges + causal self)
     heads: int = 4
     ffn_mult: int = 2
@@ -64,19 +70,34 @@ class _Attn(nn.Module):
             scores = scores.masked_fill(cm, float("-inf"))
         if kv_mask is not None:                                    # [B,Tk] True=valid
             scores = scores.masked_fill(~kv_mask[:, None, None, :], float("-inf"))
-            # guard: a query whose kv is ALL masked (e.g. an all-padding window for
-            # one example in the persistent carry) → all -inf → NaN softmax. Make it
-            # uniform instead (the caller treats such a window as a no-op update).
             allmask = ~kv_mask.any(-1)                            # [B] True = no valid kv
-            if allmask.any():
+            if allmask.any():                                    # avoid NaN softmax (all-padding window)
                 scores = scores.masked_fill(allmask[:, None, None, None], 0.0)
         a = scores.softmax(-1)
         out = (a @ v).transpose(1, 2).reshape(B, Tq, self.h * self.dh)
         return self.o(out)
 
 
+class _ParserBlock(nn.Module):
+    """self-attend(working set) → cross-attend(available nodes) → cross-attend(obs) → FFN."""
+    def __init__(self, d: int, heads: int, ffn_mult: int):
+        super().__init__()
+        self.sn = nn.LayerNorm(d); self.slf = _Attn(d, heads)
+        self.nn_norm = nn.LayerNorm(d); self.cross_nodes = _Attn(d, heads)
+        self.on = nn.LayerNorm(d); self.cross_obs = _Attn(d, heads)
+        self.fn = nn.LayerNorm(d)
+        self.ff = nn.Sequential(nn.Linear(d, ffn_mult * d), nn.GELU(), nn.Linear(ffn_mult * d, d))
+
+    def forward(self, x: Tensor, nodes: Tensor, obs: Tensor, obs_mask: Tensor) -> Tensor:
+        xn = self.sn(x); x = x + self.slf(xn, xn)                 # self-attend the working set
+        x = x + self.cross_nodes(self.nn_norm(x), nodes)         # cross-attend available nodes (all valid)
+        x = x + self.cross_obs(self.on(x), obs, kv_mask=obs_mask.bool())   # cross-attend observation
+        x = x + self.ff(self.fn(x))
+        return x
+
+
 class _Block(nn.Module):
-    """cross-attend(kv) → self-attend(x, optional causal) → FFN, pre-LN residual."""
+    """cross-attend(kv) → self-attend(x, optional causal) → FFN, pre-LN residual. (reader)"""
     def __init__(self, d: int, heads: int, ffn_mult: int):
         super().__init__()
         self.cn = nn.LayerNorm(d); self.cross = _Attn(d, heads)
@@ -99,56 +120,55 @@ class GraphParser(nn.Module):
         super().__init__()
         self.cfg = cfg
         N, E, d = cfg.n_nodes, cfg.n_edges, cfg.d_graph
-        # the vocabulary: N learnable node vectors. Gradient-trained (not VQ-EMA),
-        # static within a forward → selection keys cache for free.
+        # the vocabulary: N learnable node vectors. Gradient-trained (not VQ-EMA).
         self.node_bank = nn.Parameter(torch.randn(N, d) / math.sqrt(d))
-        self.bank_key = nn.Linear(d, d, bias=False)                # match-key projection of the bank
-        self.obs_proj = nn.Linear(cfg.d_llama, d)                  # LLM obs → d_graph (cross-attn KV)
-        # E edge-query slots, 3 tokens each (src/dst/edge) + role + per-edge instance
-        # tag (the "signature" → DETR-style specialization = anti-collapse).
-        self.init_tok = nn.Parameter(torch.randn(3, E, d) / math.sqrt(d))
-        self.role = nn.Parameter(torch.randn(3, d) / math.sqrt(d))
-        self.tag = nn.Parameter(torch.randn(E, d) / math.sqrt(d))
-        self.blocks = nn.ModuleList(_Block(d, cfg.heads, cfg.ffn_mult) for _ in range(cfg.write_layers))
-        self.q_src = nn.Linear(d, d, bias=False)                   # src/dst pointer queries
+        self.bank_key = nn.Linear(d, d, bias=False)                # pointer match-keys (raw bank)
+        self.node_role_avail = nn.Parameter(torch.randn(d) / math.sqrt(d))   # "available" role (cross-attn)
+        self.obs_proj = nn.Linear(cfg.d_llama, d)                  # obs → d_graph (cross-attn)
+        self.role = nn.Parameter(torch.randn(3, d) / math.sqrt(d))    # src / edge / dst role
+        self.tag = nn.Parameter(torch.randn(E, d) / math.sqrt(d))     # per-edge instance tag
+        self.part = nn.Parameter(torch.randn(2, d) / math.sqrt(d))    # current-graph vs prediction-slot
+        self.init_graph = nn.Parameter(torch.randn(3, E, d) / math.sqrt(d))  # window-1 "initial graph" values
+        self.blocks = nn.ModuleList(_ParserBlock(d, cfg.heads, cfg.ffn_mult) for _ in range(cfg.write_layers))
+        self.q_src = nn.Linear(d, d, bias=False)                   # head: src/dst slot → pointer query
         self.q_dst = nn.Linear(d, d, bias=False)
-        # learnable src/dst pointer sharpness; init from cfg (0 ⇒ temp=1, consistent
-        # with the attention blocks; negative ⇒ sharper-from-step-0, a sweep knob).
+        # learnable src/dst pointer sharpness; init from cfg (0 ⇒ temp=1; negative ⇒ sharper).
         self.log_temp = nn.Parameter(torch.full((2,), float(cfg.ptr_logit_temp_init)))
-        self.edge_head = nn.Linear(d, d)                          # regress the relation state
+        self.edge_head = nn.Linear(d, d)                          # head: edge slot → edge_state
 
     def _point(self, q: Tensor, which: int) -> tuple[Tensor, Tensor]:
-        """Select a node by pointing: QK-RMSNorm + learnable-temp softmax over the
-        bank → gather the bank value. Never regresses an endpoint (sharpens to a
-        near-hard pick; gathered value stays on the vocabulary). Returns (value, ptr)."""
+        """Snap: QK-RMSNorm + learnable-temp softmax over the bank → gather the RAW bank
+        value (stable identity). Never regresses an endpoint. Returns (value, ptr)."""
         d = q.shape[-1]
         qn = _rmsnorm(q)                                           # [B,E,d]
-        kn = _rmsnorm(self.bank_key(self.node_bank))              # [N,d]
+        kn = _rmsnorm(self.bank_key(self.node_bank))             # [N,d]
         temp = self.log_temp[which].clamp(-3.0, 3.0).exp()
         scores = (qn @ kn.t()) * (d ** -0.5) / temp               # [B,E,N]
         ptr = scores.softmax(-1)
-        val = ptr @ self.node_bank                                # [B,E,d] gather (sharp → near-exact)
-        return val, ptr
+        return ptr @ self.node_bank, ptr                          # gather raw bank (sharp → near-exact)
 
     def forward(self, obs: Tensor, obs_mask: Tensor, state: dict = None) -> dict:
-        """Parse/UPDATE the graph from one observation window. `state` = the current
-        graph (carried across windows) or None (first window → fresh init_tok slots).
-        Ingesting the prior state lets the parser REFINE — re-point endpoints, re-state
-        edges relative to what's there — instead of regenerating from scratch and
-        scrambling slot identities. The per-edge instance tag is the persistent slot id."""
+        """Parse/UPDATE the graph. Working set = [Part 1: current graph WITH values ;
+        Part 2: prediction slots, no values]; self-attend, cross-attend available nodes,
+        cross-attend obs (×write_layers); predict the new graph off Part 2 (snap src/dst,
+        regress edge_state). `state` = carried graph (None on window 1 → init_graph)."""
         B, E, d = obs.shape[0], self.cfg.n_edges, self.cfg.d_graph
-        kv = self.obs_proj(obs.float())                           # [B,T,d]
-        if state is None:                                         # window 1: fresh slots
-            base = self.init_tok + self.role[:, None, :] + self.tag[None, :, :]   # [3,E,d]
-            x = base.reshape(3 * E, d).unsqueeze(0).expand(B, 3 * E, d).contiguous()
-        else:                                                     # window t+1: ingest carried state
-            src_in = state["src_value"] + self.role[0] + self.tag    # [B,E,d]
-            dst_in = state["dst_value"] + self.role[1] + self.tag
-            edge_in = state["edge_state"] + self.role[2] + self.tag
-            x = torch.stack([src_in, dst_in, edge_in], dim=1).reshape(B, 3 * E, d)
+        obs_kv = self.obs_proj(obs.float())                       # [B,T,d]
+        nodes_kv = (self.node_bank + self.node_role_avail).unsqueeze(0).expand(B, -1, -1)  # [B,N,d]
+        rt = self.role[:, None, :] + self.tag[None, :, :]        # [3,E,d] role+tag
+        # Part 1 — current graph WITH values (window 1: learnable init; else carried)
+        if state is None:
+            p1 = (self.init_graph + rt + self.part[0]).reshape(3 * E, d).unsqueeze(0).expand(B, 3 * E, d).contiguous()
+        else:
+            vals = torch.stack([state["src_value"], state["edge_state"], state["dst_value"]], dim=1)  # [B,3,E,d]
+            p1 = (vals + rt[None] + self.part[0]).reshape(B, 3 * E, d)
+        # Part 2 — prediction slots, NO values
+        p2 = (rt + self.part[1]).reshape(3 * E, d).unsqueeze(0).expand(B, 3 * E, d).contiguous()
+        x = torch.cat([p1, p2], dim=1)                           # [B,6E,d]
         for blk in self.blocks:
-            x = blk(x, kv, kv_mask=obs_mask.bool())               # self-attend edges + cross-attend obs
-        src_t, dst_t, edge_t = x.view(B, 3, E, d).unbind(1)
+            x = blk(x, nodes_kv, obs_kv, obs_mask)
+        # predict the new graph off Part 2 (the value-less prediction slots)
+        src_t, edge_t, dst_t = x[:, 3 * E:].view(B, 3, E, d).unbind(1)
         src_v, src_ptr = self._point(self.q_src(src_t), 0)
         dst_v, dst_ptr = self._point(self.q_dst(dst_t), 1)
         edge_state = self.edge_head(edge_t)

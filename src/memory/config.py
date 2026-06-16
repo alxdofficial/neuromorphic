@@ -186,7 +186,7 @@ class ReprConfig:
     graph_window: int = 256             # obs window for the PERSISTENT carry-forward: the
                                         # parser ingests the prior graph + each window → updates
                                         # it. Inputs ≤ one window (every MAE sentence) = one parse.
-    graph_write_layers: int = 2         # parser depth (self-attend edges + cross-attend obs)
+    graph_write_layers: int = 3         # parser depth (self → cross-nodes → cross-obs); ≥3
     graph_read_layers: int = 2          # reader depth (cross-attend edges + causal self)
     graph_heads: int = 4
     graph_ffn_mult: int = 2             # FFN expansion (capacity-matches ~4.6M to the baselines)

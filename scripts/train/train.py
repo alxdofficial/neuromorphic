@@ -589,8 +589,9 @@ def train_one_variant(
                 "p_ptr": ("encoder.parser.q_src", "encoder.parser.q_dst", "encoder.parser.bank_key",
                           "encoder.parser.log_temp"),   # incl. the pointer sharpness param
                 "p_edge": ("encoder.parser.edge_head",),
-                "p_bank": ("encoder.parser.node_bank",),
-                "p_slots": ("encoder.parser.init_tok", "encoder.parser.role", "encoder.parser.tag"),
+                "p_bank": ("encoder.parser.node_bank", "encoder.parser.node_role_avail"),
+                "p_slots": ("encoder.parser.init_graph", "encoder.parser.role",
+                            "encoder.parser.tag", "encoder.parser.part"),
                 "r_op": ("encoder.reader.w_sd", "encoder.reader.w_gamma", "encoder.reader.w_beta"),
                 "r_qin": ("encoder.reader.q_in",),
                 "r_blocks": ("encoder.reader.blocks",),

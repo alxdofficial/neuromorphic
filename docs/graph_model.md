@@ -57,20 +57,35 @@ exactly the endpoints the `E` edges point to (≤ `2E` distinct, fewer with reus
 full bank is the *selection space*; the `E` edges are the *state*.
 
 ### 2.3 Write — the relational parser (`GraphParser`)
-Input: the frozen LLM's hidden states of the passage at one mid tap (the *observation*),
-projected to `d_graph` (`obs_proj`). The parser is `E` edge-query slots, each **3 tokens**
-(`src` / `dst` / `edge`) = `init_tok + role + instance_tag`, so `3E` tokens total. Per
-layer, ×`write_layers`:
-1. **cross-attend** the edge tokens → the observation,
-2. **self-attend** the edge tokens over each other (slots coordinate / specialize),
-3. FFN. (pre-LN residual; QK-RMSNorm + learnable temp on every attention.)
+Inputs: the frozen LLM's hidden states of the passage at one mid tap (the *observation*),
+projected to `d_graph` (`obs_proj`); and the node bank.
 
-After the stack, split into `src`/`dst`/`edge` tokens and produce, **per edge**:
-1. **src pointer** → select a bank node → gather `src_value`,
-2. **dst pointer** → select a bank node → gather `dst_value`,
-3. **edge_state** = `edge_head(edge_token)` (regressed).
+**Working set (self-attended) = `6E` tokens, two parts** (each token = role + instance tag):
+- **Part 1 — current graph, WITH values** (`3E` tokens): per edge `e`,
+  `[src_val + role_src + tag_e , edge_state + role_edge + tag_e , dst_val + role_dst + tag_e]`
+  + a "current" part-marker. **Window 1** (every MAE sentence): a **learnable initial graph**
+  (`init_graph`); **window t+1**: the **carried** previous graph (persistence).
+- **Part 2 — prediction slots, NO values** (`3E` tokens): per edge `e`,
+  `[role_src + tag_e , role_edge + tag_e , role_dst + tag_e]` + a "prediction" part-marker.
 
-This is **set/graph prediction** (DETR-style), not per-token self-prediction.
+**Cross-attention targets:** the **available nodes** (all `N`, `node_bank + role_available`)
+and the **observation** (passage hiddens). The bank's K/V are fixed → cacheable; cross-
+attending the bank (not self-attending it) gives node-availability awareness at `O(6E·N)`,
+not `O(N²)`.
+
+**Per layer, ×`write_layers` (≥3):** self-attend the `6E` working set → **cross-attend the
+available nodes** → **cross-attend the observation** → FFN. (pre-LN; QK-RMSNorm + learnable
+temp on every attention.)
+
+**Predict the new graph off Part 2 only** (the value-less slots — reading off fresh slots,
+not in-place on Part 1, teaches *active re-arrangement* not copy-the-current-graph). A head
+per slot:
+1. **src slot → pointer → SNAP to a bank node** → `src_value`,
+2. **dst slot → pointer → SNAP to a bank node** → `dst_value`,
+3. **edge slot → `edge_head` → `edge_state`** (from itself, regressed).
+
+This is **set/graph prediction** (DETR-style): Part 2 attends Part 1 (current state) + the
+bank + the observation, and *chooses* the new graph.
 
 #### Pointer selection (how endpoints are chosen — never regressed)
 For each `src`/`dst` query token: **QK-RMSNorm + learnable-temperature softmax** over the

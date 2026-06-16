@@ -45,10 +45,9 @@ def matched(cfg):
     cfg.spg_d_updater = 240; cfg.spg_updater_layers = 2; cfg.spg_updater_heads = 8
     cfg.spg_read_ffn_mult = 2
     cfg.spg_builder_mlp_hidden = 224; cfg.spg_film_hidden = 176
-    # graph (relational parser over a learnable node bank) — defaults match
-    # config.py (~4.6M); explicit here so the smoke documents the matched config.
+    # graph (relational parser over a learnable node bank) — defaults from config.py.
     cfg.graph_d_graph = 256; cfg.graph_n_nodes = 1024; cfg.graph_n_edges = 16
-    cfg.graph_write_layers = 2; cfg.graph_read_layers = 2; cfg.graph_heads = 4
+    cfg.graph_write_layers = 3; cfg.graph_read_layers = 2; cfg.graph_heads = 4
     cfg.graph_ffn_mult = 2; cfg.graph_obs_tap_layer = 6; cfg.graph_inject_layer = 18
     return cfg
 
