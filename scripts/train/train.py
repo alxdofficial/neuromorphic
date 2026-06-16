@@ -584,16 +584,17 @@ def train_one_variant(
         graph_gn = {}
         if variant == "graph_baseline":
             _gmech = {
-                "w_obs": ("encoder.writer.obs_proj",),
-                "w_blocks": ("encoder.writer.blocks",),
-                "w_endpt": ("encoder.writer.src_head", "encoder.writer.dst_head"),
-                "w_edge": ("encoder.writer.edge_head",),
-                "w_slots": ("encoder.writer.init_tok", "encoder.writer.role", "encoder.writer.tag"),
+                "p_obs": ("encoder.parser.obs_proj",),
+                "p_blocks": ("encoder.parser.blocks",),
+                "p_ptr": ("encoder.parser.q_src", "encoder.parser.q_dst", "encoder.parser.bank_key"),
+                "p_edge": ("encoder.parser.edge_head",),
+                "p_bank": ("encoder.parser.node_bank",),
+                "p_slots": ("encoder.parser.init_tok", "encoder.parser.role", "encoder.parser.tag"),
+                "r_op": ("encoder.reader.w_sd", "encoder.reader.w_gamma", "encoder.reader.w_beta"),
                 "r_qin": ("encoder.reader.q_in",),
                 "r_blocks": ("encoder.reader.blocks",),
                 "r_out": ("encoder.reader.out",),
                 "r_gate": ("encoder.reader.gate",),
-                "r_tagrole": ("encoder.reader.role", "encoder.reader.tag"),
             }
             for _lab, _prefs in _gmech.items():
                 graph_gn[f"graph_gn_{_lab}"] = _grad_group_norm(
@@ -646,18 +647,9 @@ def train_one_variant(
         # (distinct codes used, read-gate amplitude). Older graph_v3/v4 keys are
         # kept in the whitelist for back-compat reproduction (skipped if absent).
         _graph_scalar_keys = (
-            "graph_vq_loss", "graph_codes_active", "graph_read_gate",
-            # holistic anti-collapse canaries (write routing → key → value → read)
-            "graph_codebook_ppl", "graph_key_effrank", "graph_value_effrank",
-            "graph_read_effrank",
-            "graph_aux", "graph_endpoint_reuse",
-            "graph_u_mean", "graph_age_mean", "graph_src_norm",
-            "graph_pick_affinity_avg", "graph_gate_mean_avg",
-            "graph_frac_anchor_avg", "graph_frac_loadbearer_avg",
-            "graph_frac_jumpedship_avg", "graph_frac_selfpick_avg",
-            # Specialization + endpoint clustering (audit-2 additions)
-            "graph_g_slot_std", "graph_g_slot_range",
-            "graph_endpoint_eff_rank", "graph_endpoint_cos_max",
+            # relational-parser canaries (selection → vocabulary → relation → read)
+            "graph_ptr_entropy", "graph_nodes_used", "graph_bank_effrank",
+            "graph_edge_effrank", "graph_read_effrank", "graph_read_gate",
         )
         for key in _graph_scalar_keys:
             if key in out and out[key] is not None:
@@ -712,14 +704,14 @@ def train_one_variant(
                 extra_field = f"g_n={g_n:.2f} g_e={g_e:.2f}"
                 aux_tag, aux_display = "aux", float(out["loss_aux"])
             elif variant == "graph_baseline":
-                # live collapse canaries: effective #codes (perplexity), value/read
-                # eff-rank, read-gate. Watch ppl→1 (codebook collapse), read_er→1
-                # (membership-not-binding), gate→0 (read being ignored).
-                extra_field = (f"ppl={float(out.get('graph_codebook_ppl',0)):.0f} "
-                               f"val_er={float(out.get('graph_value_effrank',0)):.1f} "
+                # live collapse canaries: nodes used, pointer entropy, read eff-rank,
+                # read gate. Watch nodes→1 (vocabulary collapse), ent high (pointer not
+                # sharpening), rd_er→1 (membership-not-binding), gate→0 (read ignored).
+                extra_field = (f"nodes={float(out.get('graph_nodes_used',0)):.0f} "
+                               f"ent={float(out.get('graph_ptr_entropy',0)):.2f} "
                                f"rd_er={float(out.get('graph_read_effrank',0)):.1f} "
                                f"gate={float(out.get('graph_read_gate',0)):.3f}")
-                aux_tag, aux_display = "vq", float(out.get("graph_vq_loss", 0.0))
+                aux_tag, aux_display = "ent", float(out.get("graph_ptr_entropy", 0.0))
             elif "splat_aux" in out and out["splat_aux"] is not None:
                 aux_display = float(out["splat_aux"])
                 aux_tag = "s_aux"
@@ -1308,15 +1300,15 @@ def main():
         cfg.use_llama_lora = True
         cfg.llama_lora_rank = 16; cfg.llama_lora_alpha = 32
         # M_max = 16 (k in [3,16]). Memory-mechanism trainable params matched to
-        # the `graph` anchor (VQ-codebook graph + TokenGT ≈ 5.52M total / 4.60M
-        # memory) on 135M, d=576:
-        #   icae r80 → 4.62M, ccm r40 → 4.62M, autocompressor r40 → 4.63M,
+        # the `graph` anchor (relational parser over a learnable node bank, write=2/
+        # read=2 ≈ 5.33M total / 4.40M memory) on 135M, d=576:
+        #   icae r76 → 4.39M, ccm r38 → 4.39M, autocompressor r38 → 4.40M,
         #   beacon 8 wrap layers → 4.43M. (See scripts/diagnostics/param_count.py.)
         cfg.n_flat_codes = 16
-        cfg.icae_n_slots = 16; cfg.icae_lora_rank = 80; cfg.icae_lora_alpha = 160
-        cfg.ccm_n_comp = 16; cfg.ccm_lora_rank = 40; cfg.ccm_lora_alpha = 80
+        cfg.icae_n_slots = 16; cfg.icae_lora_rank = 76; cfg.icae_lora_alpha = 152
+        cfg.ccm_n_comp = 16; cfg.ccm_lora_rank = 38; cfg.ccm_lora_alpha = 76
         cfg.autocompressor_n_slots = 16
-        cfg.autocompressor_lora_rank = 40; cfg.autocompressor_lora_alpha = 80
+        cfg.autocompressor_lora_rank = 38; cfg.autocompressor_lora_alpha = 76
         cfg.beacon_ratio = 8
         # Beacon wraps 8 evenly-spaced layers (≈4.43M on SmolLM2-135M, matched to
         # the graph anchor). Shared helper derives indices from the backbone depth.

@@ -1,10 +1,17 @@
-"""graph model substrate — VQ quantizer, TokenGT writer, custom inject reader.
+"""graph model substrate — relational-parser graph memory over a learnable node bank.
 
-Design: docs/graph_model.md. The graph's edge ENDPOINTS are discrete VQ codes
-(distinct addresses — the fix for the v6/v8/v9 rank-1 read collapse). The TokenGT
-writer cross-attends the LLM observation + self-attends the graph (×N) and snaps
-node endpoints to codes; the reader cross-attends the graph + causal-self-attends
-the decode positions (×M) and injects (RMS-matched, gated) into the frozen LLM.
+Design (2026-06-16 dialogue, supersedes the VQ-codebook version): the model is a
+learned RELATIONAL PARSER, not synaptic plasticity. A fixed **learnable node bank**
+is the vocabulary (replaces the VQ-VAE — no encode-snap/EMA/commitment collapse).
+The **write** is a TokenGT-style parser: E edge-query slots self-attend + cross-attend
+the observation, and each slot SELECTS its src/dst by *pointing* into the bank (sharp
+softmax — never regresses an endpoint) and regresses an edge state. The **read** binds
+each edge `op(src,dst,edge)` into one vector and cross-attends those into the frozen LLM.
+
+Why this is a graph and not a transformer-in-disguise: endpoints are constrained to
+the discrete vocabulary (pointer-select, reuse via shared nodes); per-edge instance
+tags make slots specialize (DETR-style anti-collapse); the read binds before pooling.
+See docs/graph_model.md.
 """
 from __future__ import annotations
 
@@ -13,9 +20,7 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch import Tensor
-from vector_quantize_pytorch import VectorQuantize
 
 
 def _rmsnorm(x: Tensor, eps: float = 1e-6) -> Tensor:
@@ -25,23 +30,16 @@ def _rmsnorm(x: Tensor, eps: float = 1e-6) -> Tensor:
 @dataclass
 class GraphConfig:
     d_llama: int = 576
-    d_graph: int = 256
-    n_codes: int = 1024
-    n_edges: int = 8                 # K — edge budget
-    write_layers: int = 3            # N
-    read_layers: int = 2             # M
+    d_graph: int = 256               # graph/vocabulary space (decoupled from d_llama)
+    n_nodes: int = 1024              # N — node bank size (the learnable vocabulary)
+    n_edges: int = 16                # E — edge budget
+    write_layers: int = 2            # parser depth (self-attend edges + cross-attend obs)
+    read_layers: int = 2             # reader depth (cross-attend edges + causal self)
     heads: int = 4
-    ffn_mult: int = 4
-    vq_decay: float = 0.99           # EMA codebook
-    vq_commit: float = 0.25          # commitment loss weight
+    ffn_mult: int = 2
 
 
-# VQ = vector-quantize-pytorch's VectorQuantize (EMA codebook + kmeans init + dead-
-# code revival — the mature off-the-shelf quantizer; codebook-collapse mitigation
-# matters given our history). Built in GraphWriter; returns (quantized, indices, loss).
-
-
-# ── attention with QK-RMSNorm + learnable temp (the read cold-start fix) ──────
+# ── attention with QK-RMSNorm + learnable temp (the read/select cold-start fix) ──
 class _Attn(nn.Module):
     def __init__(self, d: int, heads: int):
         super().__init__()
@@ -88,71 +86,84 @@ class _Block(nn.Module):
         return x
 
 
-# ── TokenGT writer: builds/updates the graph from the observation ────────────
-class GraphWriter(nn.Module):
+# ── WRITE: learned relational parser over a learnable node bank ──────────────
+class GraphParser(nn.Module):
     def __init__(self, cfg: GraphConfig):
         super().__init__()
         self.cfg = cfg
-        K, d = cfg.n_edges, cfg.d_graph
-        self.init_tok = nn.Parameter(torch.randn(3, K, d) / math.sqrt(d))   # src/dst/edge slots
-        self.role = nn.Parameter(torch.randn(3, d) / math.sqrt(d))          # src/dst/edge role
-        self.tag = nn.Parameter(torch.randn(K, d) / math.sqrt(d))           # per-edge instance tag
-        self.obs_proj = nn.Linear(cfg.d_llama, d)                           # LLM obs → d_graph (cross-attn KV)
+        N, E, d = cfg.n_nodes, cfg.n_edges, cfg.d_graph
+        # the vocabulary: N learnable node vectors. Gradient-trained (not VQ-EMA),
+        # static within a forward → selection keys cache for free.
+        self.node_bank = nn.Parameter(torch.randn(N, d) / math.sqrt(d))
+        self.bank_key = nn.Linear(d, d, bias=False)                # match-key projection of the bank
+        self.obs_proj = nn.Linear(cfg.d_llama, d)                  # LLM obs → d_graph (cross-attn KV)
+        # E edge-query slots, 3 tokens each (src/dst/edge) + role + per-edge instance
+        # tag (the "signature" → DETR-style specialization = anti-collapse).
+        self.init_tok = nn.Parameter(torch.randn(3, E, d) / math.sqrt(d))
+        self.role = nn.Parameter(torch.randn(3, d) / math.sqrt(d))
+        self.tag = nn.Parameter(torch.randn(E, d) / math.sqrt(d))
         self.blocks = nn.ModuleList(_Block(d, cfg.heads, cfg.ffn_mult) for _ in range(cfg.write_layers))
-        self.src_head = nn.Linear(d, d); self.dst_head = nn.Linear(d, d); self.edge_head = nn.Linear(d, d)
-        # shared codebook for src+dst endpoints (one vocabulary). kmeans init +
-        # dead-code revival (threshold_ema_dead_code) fight codebook collapse.
-        self.vq = VectorQuantize(
-            dim=d, codebook_size=cfg.n_codes, decay=cfg.vq_decay,
-            commitment_weight=cfg.vq_commit, kmeans_init=True, threshold_ema_dead_code=2)
+        self.q_src = nn.Linear(d, d, bias=False)                   # src/dst pointer queries
+        self.q_dst = nn.Linear(d, d, bias=False)
+        self.log_temp = nn.Parameter(torch.zeros(2))              # learnable src/dst pointer sharpness
+        self.edge_head = nn.Linear(d, d)                          # regress the relation state
 
-    def forward(self, obs_hiddens: Tensor, obs_mask: Tensor) -> dict:
-        B, K, d = obs_hiddens.shape[0], self.cfg.n_edges, self.cfg.d_graph
-        kv = self.obs_proj(obs_hiddens.float())                            # [B,L,d]
-        base = self.init_tok + self.role[:, None, :] + self.tag[None, :, :]   # [3,K,d]
-        x = base.reshape(3 * K, d).unsqueeze(0).expand(B, 3 * K, d).contiguous()
+    def _point(self, q: Tensor, which: int) -> tuple[Tensor, Tensor]:
+        """Select a node by pointing: QK-RMSNorm + learnable-temp softmax over the
+        bank → gather the bank value. Never regresses an endpoint (sharpens to a
+        near-hard pick; gathered value stays on the vocabulary). Returns (value, ptr)."""
+        d = q.shape[-1]
+        qn = _rmsnorm(q)                                           # [B,E,d]
+        kn = _rmsnorm(self.bank_key(self.node_bank))              # [N,d]
+        temp = self.log_temp[which].clamp(-3.0, 3.0).exp()
+        scores = (qn @ kn.t()) * (d ** -0.5) / temp               # [B,E,N]
+        ptr = scores.softmax(-1)
+        val = ptr @ self.node_bank                                # [B,E,d] gather (sharp → near-exact)
+        return val, ptr
+
+    def forward(self, obs: Tensor, obs_mask: Tensor) -> dict:
+        B, E, d = obs.shape[0], self.cfg.n_edges, self.cfg.d_graph
+        kv = self.obs_proj(obs.float())                           # [B,T,d]
+        base = self.init_tok + self.role[:, None, :] + self.tag[None, :, :]   # [3,E,d]
+        x = base.reshape(3 * E, d).unsqueeze(0).expand(B, 3 * E, d).contiguous()
         for blk in self.blocks:
-            x = blk(x, kv, kv_mask=obs_mask.bool())
-        src_o, dst_o, edge_o = x.view(B, 3, K, d).unbind(1)
-        q_src, src_idx, l_s = self.vq(self.src_head(src_o))
-        q_dst, dst_idx, l_d = self.vq(self.dst_head(dst_o))
-        edge_state = self.edge_head(edge_o)
-        return {"src_q": q_src, "dst_q": q_dst, "edge_state": edge_state,
-                "src_idx": src_idx, "dst_idx": dst_idx, "vq_loss": l_s + l_d}
+            x = blk(x, kv, kv_mask=obs_mask.bool())               # self-attend edges + cross-attend obs
+        src_t, dst_t, edge_t = x.view(B, 3, E, d).unbind(1)
+        src_v, src_ptr = self._point(self.q_src(src_t), 0)
+        dst_v, dst_ptr = self._point(self.q_dst(dst_t), 1)
+        edge_state = self.edge_head(edge_t)
+        return {"src_value": src_v, "dst_value": dst_v, "edge_state": edge_state,
+                "src_ptr": src_ptr, "dst_ptr": dst_ptr}
 
 
-# ── custom reader: graph → injected vector for the frozen LLM ─────────────────
+# ── READ: per-edge bound vector → cross-attention inject ─────────────────────
 class GraphReader(nn.Module):
     def __init__(self, cfg: GraphConfig):
         super().__init__()
         self.cfg = cfg
         d, dl = cfg.d_graph, cfg.d_llama
-        self.role = nn.Parameter(torch.randn(3, d) / math.sqrt(d))
-        self.tag = nn.Parameter(torch.randn(cfg.n_edges, d) / math.sqrt(d))
-        self.q_in = nn.Linear(dl, d)                                       # decode hidden → query
+        # per-edge bind op: bind the two endpoints, modulate by the relation (FiLM).
+        # binding installed BEFORE attention (the side-car lesson) — not pooling raw tokens.
+        self.w_sd = nn.Linear(2 * d, d)
+        self.w_gamma = nn.Linear(d, d); self.w_beta = nn.Linear(d, d)
+        self.q_in = nn.Linear(dl, d)
         self.blocks = nn.ModuleList(_Block(d, cfg.heads, cfg.ffn_mult) for _ in range(cfg.read_layers))
         self.out = nn.Linear(d, dl)
-        # learnable gate, init DIMENSION-SCALED (1/√d_llama) instead of a bare 0.1
-        # magic constant: small-but-NONZERO so the reader gets gradient from step 0
-        # (a 0-init ReZero gate zeros the read output → the v8c cold-start), while the
-        # init scales with model width. tanh-bounded so the inject can't exceed stream RMS.
+        # learnable gate, dim-scaled init (1/√d_llama) — small-but-NONZERO so the reader
+        # gets gradient from step 0; tanh-bounded so the inject can't exceed stream RMS.
         self.gate = nn.Parameter(torch.tensor([dl ** -0.5]))
 
-    def graph_tokens(self, graph: dict) -> Tensor:
-        K = self.cfg.n_edges
-        tags = self.tag[None]
-        src = graph["src_q"] + self.role[0] + tags
-        dst = graph["dst_q"] + self.role[1] + tags
-        edg = graph["edge_state"] + self.role[2] + tags
-        return torch.stack([src, dst, edg], dim=2).reshape(graph["src_q"].shape[0], 3 * K, self.cfg.d_graph)
+    def edge_tokens(self, graph: dict) -> Tensor:
+        sd = self.w_sd(torch.cat([graph["src_value"], graph["dst_value"]], dim=-1))  # bind endpoints
+        g = self.w_gamma(graph["edge_state"]); b = self.w_beta(graph["edge_state"])
+        return g * sd + b                                          # [B,E,d] — relation FiLM-modulates the pair
 
     def forward(self, dec_hidden: Tensor, graph: dict) -> Tensor:
-        gtok = self.graph_tokens(graph)                                    # [B,3K,d]
-        x = self.q_in(dec_hidden.float())                                  # [B,T,d]
+        mem = self.edge_tokens(graph)                             # [B,E,d]
+        x = self.q_in(dec_hidden.float())
         for blk in self.blocks:
-            x = blk(x, gtok, self_causal=True)                            # cross graph + causal self
+            x = blk(x, mem, self_causal=True)                    # cross-attend edges + causal self
         inj = self.out(x)
-        # RMS-match the injection to the residual-stream scale, then gate.
         stream_rms = dec_hidden.float().pow(2).mean(-1, keepdim=True).sqrt()
-        inj = _rmsnorm(inj) * stream_rms
+        inj = _rmsnorm(inj) * stream_rms                          # RMS-match to the stream
         return torch.tanh(self.gate) * inj.to(dec_hidden.dtype)

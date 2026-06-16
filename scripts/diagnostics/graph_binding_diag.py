@@ -79,8 +79,9 @@ for bi in range(N_BATCHES):
         st, _ = enc.streaming_write(st, ctx, batch.context_mask)
         _, aux = enc.finalize_memory(st)
         g = aux["graph"]
-        codes_used.append(torch.cat([g["src_idx"].reshape(-1), g["dst_idx"].reshape(-1)]).unique().numel())
-        # edge-state diversity across the K edges (flatten batch×K → K-dir rank)
+        sel = torch.cat([g["src_ptr"].argmax(-1).reshape(-1), g["dst_ptr"].argmax(-1).reshape(-1)])
+        codes_used.append(sel.unique().numel())                  # distinct nodes pointed to
+        # edge-state diversity across the E edges (flatten batch×E → eff rank)
         es = g["edge_state"].reshape(-1, g["edge_state"].shape[-1])
         edge_ranks.append(eff_rank(es))
         # injected read signal across decode positions (capture inj from the hook)
@@ -107,8 +108,8 @@ print(f"  OFF  recon = {O:.4f}   (OFF-REAL = {O-R:+.4f}  → memory helps)")
 print(f"  SHUF recon = {S:.4f}   (SHUF-REAL = {S-R:+.4f} → content-specific binding)")
 print(f"  SHUF-OFF   = {S-O:+.4f}   (>0 ⇒ wrong memory worse than none = strong binding)")
 print(f"\n=== graph geometry ===")
-print(f"  codes_active (distinct VQ codes / batch): {sum(codes_used)/len(codes_used):.1f}  "
-      f"(of n_codes={enc.gcfg.n_codes}, K={enc.gcfg.n_edges} edges → {2*enc.gcfg.n_edges} endpoints)")
+print(f"  nodes_used (distinct nodes pointed to / batch): {sum(codes_used)/len(codes_used):.1f}  "
+      f"(of N={enc.gcfg.n_nodes} bank, E={enc.gcfg.n_edges} edges → {2*enc.gcfg.n_edges} endpoints)")
 print(f"  edge_state eff_rank (across edges):       {sum(edge_ranks)/len(edge_ranks):.2f}  (of d_graph={enc.gcfg.d_graph})")
 print(f"  INJECTED read eff_rank (across positions): {sum(inj_ranks)/len(inj_ranks):.2f}  "
       f"(of d_llama={enc.cfg.d_llama}; prior models collapsed this to ~1)")

@@ -374,12 +374,13 @@ class ReprLearningModel(nn.Module):
     ) -> dict:
         """MAE loss for the graph model — read by INJECT, not prepend.
 
-        Write: tap the frozen backbone for the observation → TokenGT writer →
-        graph (VQ-code endpoints + edge-states). Read: a forward hook on the
-        mid-late decoder layer cross-attends the graph and adds the reader's
-        (RMS-matched, gated) output to the residual stream — there is NO prepend,
-        so the decode sequence is just the masked span (M=0). REAL/OFF/SHUF:
-        graph present / hook absent / graph rolled along the batch.
+        Write: tap the frozen backbone for the observation → relational PARSER →
+        graph (E edges; endpoints POINTER-SELECTED from the learnable node bank +
+        regressed edge states). Read: a forward hook on the mid-late decoder layer
+        binds each edge op(src,dst,edge) and adds the reader's (RMS-matched, gated)
+        output to the residual stream — NO prepend, so the decode sequence is just
+        the masked span (M=0). REAL/OFF/SHUF: graph present / hook absent / rolled.
+        See docs/graph_model.md (source of truth).
         """
         device = batch.context_ids.device
         B, T = batch.context_ids.shape
@@ -388,12 +389,11 @@ class ReprLearningModel(nn.Module):
         with torch.no_grad():
             ctx_embeds = embed(batch.context_ids)                       # [B,T,d]
 
-        # ---- 1. write the graph from the observation ----
+        # ---- 1. parse the observation into the graph ----
         state = enc.init_streaming_state(B, device, ctx_embeds.dtype)
         state, _ = enc.streaming_write(state, ctx_embeds, batch.context_mask)
         _, mem_aux = enc.finalize_memory(state)
         graph = mem_aux["graph"]
-        vq_loss = mem_aux["vq_loss"]
 
         # ---- 2. REAL / OFF / SHUF ----
         inject = True
@@ -458,38 +458,36 @@ class ReprLearningModel(nn.Module):
             cnt.scatter_add_(0, rows, torch.ones_like(per_tok))
             per_ex = per_ex / cnt.clamp_min(1.0)
 
-        # VQ commitment loss is part of the quantizer (a principled architectural
-        # term of every VQ-VAE, not an anti-collapse aux); keep mask_embed in-graph.
-        loss = loss_recon + vq_loss.to(loss_recon.dtype) + 0.0 * self.decoder.mask_embed.float().sum()
+        # No aux loss — anti-collapse is architectural (pointer-select + tags + fixed
+        # bank). Holistic recon only; keep mask_embed in-graph.
+        loss = loss_recon + 0.0 * self.decoder.mask_embed.float().sum()
         out = {
             "loss": loss, "loss_recon": loss_recon.detach(),
             "top1_acc": top1, "per_example_loss": per_ex,
-            "loss_aux": vq_loss.detach() if torch.is_tensor(vq_loss) else torch.zeros((), device=device),
+            "loss_aux": torch.zeros((), device=device),
             "n_content_positions": int(loss_mask.sum()),
-            "memory_shape": (B, enc.gcfg.n_edges),          # K edges (the "code size") for the logger
+            "memory_shape": (B, enc.gcfg.n_edges),          # E edges for the logger
             "mae_n_masked": float(loss_mask.sum()), "mae_M": 0.0,
-            "graph_vq_loss": vq_loss.detach() if torch.is_tensor(vq_loss) else 0.0,
             "graph_read_gate": float(torch.tanh(enc.reader.gate).abs().mean().item()),
         }
-        # ---- 6. holistic anti-collapse telemetry (every step; cheap) ----
-        # The collapse canaries the sweep needs, at every stage of the pipeline:
-        #   WRITE routing  → codebook usage (distinct codes + perplexity = effective
-        #                    #codes); codebook collapse is the #1 VQ failure.
-        #   node KEYS      → eff_rank of the snapped endpoint vectors (src_q,dst_q).
-        #   node VALUES    → eff_rank of the continuous edge_states across edges.
-        #   READ           → eff_rank of the injected signal across decode positions
-        #                    (prior models collapsed this to ~1 = membership-not-binding).
+        # ---- 6. holistic anti-collapse telemetry (every step; cheap — PR via cov) ----
+        # Canaries at every stage of the pipeline (docs/graph_model.md §7):
+        #   SELECTION → ptr_entropy (sharp→near-one-hot good; high→blending bad) +
+        #               nodes_used (distinct nodes pointed to = reuse / coverage).
+        #   VOCABULARY→ bank_effrank (node-bank collapse).
+        #   RELATION  → edge_effrank (edge-state rank across edges).
+        #   READ      → read_effrank (injected signal across positions; prior models
+        #               collapsed this to ~1 = membership-not-binding).
         with torch.no_grad():
-            idx = torch.cat([graph["src_idx"].reshape(-1), graph["dst_idx"].reshape(-1)])
-            counts = torch.bincount(idx, minlength=enc.gcfg.n_codes).float()
-            p = counts / counts.sum().clamp_min(1.0)
-            ppl = torch.exp(-(p * p.clamp_min(1e-12).log()).sum())     # effective #codes
             d_g = enc.gcfg.d_graph
-            out["graph_codes_active"] = float(idx.unique().numel())
-            out["graph_codebook_ppl"] = float(ppl.item())
-            out["graph_key_effrank"] = _participation_ratio(
-                torch.cat([graph["src_q"], graph["dst_q"]], dim=1).reshape(-1, d_g))
-            out["graph_value_effrank"] = _participation_ratio(
+            src_ptr, dst_ptr = graph["src_ptr"], graph["dst_ptr"]       # [B,E,N]
+            ent = -(src_ptr * src_ptr.clamp_min(1e-12).log()).sum(-1).mean() \
+                  - (dst_ptr * dst_ptr.clamp_min(1e-12).log()).sum(-1).mean()
+            sel = torch.cat([src_ptr.argmax(-1).reshape(-1), dst_ptr.argmax(-1).reshape(-1)])
+            out["graph_ptr_entropy"] = float((ent / 2).item())
+            out["graph_nodes_used"] = float(sel.unique().numel())
+            out["graph_bank_effrank"] = _participation_ratio(enc.parser.node_bank)
+            out["graph_edge_effrank"] = _participation_ratio(
                 graph["edge_state"].reshape(-1, d_g))
             if "inj" in cap:                                            # REAL path only
                 out["graph_read_effrank"] = _participation_ratio(

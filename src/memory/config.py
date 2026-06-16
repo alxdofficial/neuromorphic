@@ -172,21 +172,21 @@ class ReprConfig:
     hlvocab_emit: str = "edge_query"
     hlvocab_slot_iters: int = 3         # Slot-Attention refinement iterations (slotattn)
 
-    # ── graph (VQ-codebook graph + TokenGT controller; the current line) ─────
-    # models/graph/; design: docs/graph_model.md. Edge endpoints are discrete VQ
-    # codes (distinct addresses — the fix for the v6/v8/v9 rank-1 read collapse);
-    # a TokenGT writer cross-attends the observation + self-attends the graph; a
-    # custom reader cross-attends the graph + causal-self-attends decode positions
-    # and INJECTS (RMS-matched, gated) into the frozen LLM at a mid-late layer.
-    graph_d_graph: int = 256            # graph/codebook space width (decoupled from d_llama)
-    graph_n_codes: int = 1024           # codebook size (shared src+dst vocabulary)
-    graph_n_edges: int = 8              # K — edge budget
-    graph_write_layers: int = 3         # N — TokenGT write stack depth
-    graph_read_layers: int = 2          # M — reader stack depth
+    # ── graph (relational-parser graph memory over a learnable node bank) ────
+    # models/graph/; design: docs/graph_model.md (SOURCE OF TRUTH). A learnable
+    # NODE BANK is the vocabulary (replaces the VQ-VAE — no encode-snap/EMA/commit
+    # collapse). The WRITE is a TokenGT parser: E edge-query slots self-attend +
+    # cross-attend the observation, and each POINTS into the bank to select src/dst
+    # (sharp learnable-temp softmax, never regresses) + regresses an edge state.
+    # The READ binds each edge op(src,dst,edge)→one vector and cross-attends those
+    # into the frozen LLM (RMS-matched, gated) at a mid-late layer.
+    graph_d_graph: int = 256            # graph/vocabulary space width (decoupled from d_llama)
+    graph_n_nodes: int = 1024           # N — node bank size (the learnable vocabulary)
+    graph_n_edges: int = 16             # E — edge budget
+    graph_write_layers: int = 2         # parser depth (self-attend edges + cross-attend obs)
+    graph_read_layers: int = 2          # reader depth (cross-attend edges + causal self)
     graph_heads: int = 4
-    graph_ffn_mult: int = 2             # FFN expansion (2 capacity-matches ~4.5M to the baselines)
-    graph_vq_decay: float = 0.99        # EMA codebook decay
-    graph_vq_commit: float = 0.25       # VQ commitment-loss weight
+    graph_ffn_mult: int = 2             # FFN expansion (capacity-matches ~4.6M to the baselines)
     graph_obs_tap_layer: int = 6        # frozen-backbone layer tapped for the observation
     graph_inject_layer: int = 18        # frozen-backbone layer the reader injects into (mid-late)
 
