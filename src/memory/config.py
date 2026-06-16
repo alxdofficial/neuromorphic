@@ -2,9 +2,9 @@
 
 Only fields consumed by the LIVE code path are kept here. The active line is
 masked_reconstruction (MAE) on a frozen backbone; the models that read this
-config are: hierarchical_learned_vocab (hlvocab), soft_pointer_graph, and the
-four faithful baseline ports (icae / ccm / autocompressor / beacon) plus the
-vanilla floor/ceiling. Defaults match docs/compression_model_design.md.
+config are: the `graph` relational parser (the current model; docs/graph_model.md),
+the abandoned hlvocab / soft_pointer_graph, and the four faithful baseline ports
+(icae / ccm / autocompressor / beacon) plus the vanilla floor/ceiling.
 """
 from __future__ import annotations
 from dataclasses import dataclass
@@ -190,6 +190,12 @@ class ReprConfig:
     graph_read_layers: int = 2          # reader depth (cross-attend edges + causal self)
     graph_heads: int = 4
     graph_ffn_mult: int = 2             # FFN expansion (capacity-matches ~4.6M to the baselines)
+    # pointer-softmax sharpness at init (log-temp; 0 ⇒ temp=1, consistent with every
+    # attention block). Over QK-RMSNorm'd cosine-scale logits this starts SOFT/near-
+    # uniform (the gradient-rich cold-start) and the learnable temp sharpens it (watch
+    # graph_ptr_entropy). A negative init (e.g. -1 ⇒ temp≈0.37) biases toward selection
+    # from step 0 — the prime sweep knob if the pointer fails to sharpen.
+    graph_ptr_logit_temp_init: float = 0.0
     graph_obs_tap_layer: int = 6        # frozen-backbone layer tapped for the observation
     graph_inject_layer: int = 18        # frozen-backbone layer the reader injects into (mid-late)
 

@@ -57,7 +57,7 @@ class ReprLearningModel(nn.Module):
         # line moved to the VQ-VAE→graph+TokenGT model. See project_mae_4k_collapse_result.
         "soft_pointer_graph_baseline": SoftPointerGraphEncoder,   # ABANDONED (was graph_v6, free-endpoint)
         "hlvocab_baseline": HLVocabEncoder,                       # ABANDONED (was graph_v9, compression-by-vocab)
-        # the current line: VQ-codebook graph + TokenGT controller + inject reader
+        # the current line: relational-parser graph memory over a learnable node bank
         "graph_baseline": GraphEncoder,
         "icae_baseline": ICAEBaselineEncoder,  # ICAE (ICLR'24) compressor, EMAT-retrained
         "ccm_baseline": CCMBaselineEncoder,    # CCM (ICLR'24) recurrent compressor, EMAT-retrained

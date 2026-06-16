@@ -3,9 +3,9 @@
 The wall every prior model (v6/v8/v9) failed: the read collapses to ~rank-1
 (membership, not binding). This measures, on the trained `graph` ckpt:
   1. REAL / OFF / SHUF recon — the binding gate (want REAL << SHUF, SHUF ~>= OFF).
-  2. codes_active — how many distinct VQ codes the endpoints actually use
-     (the codebook-collapse canary; training logs showed early collapse to ~2).
-  3. eff_rank of the edge-states across the K edges (is the continuous relation
+  2. nodes_used — how many distinct bank nodes the edge endpoints actually point to
+     (the vocabulary-collapse canary).
+  3. eff_rank of the edge-states across the E edges (is the continuous relation
      channel carrying distinct per-edge content, or pooled to one direction?).
   4. eff_rank of the INJECTED read signal across decode positions (the binding-
      relevant rank — prior models collapsed this to ~1).

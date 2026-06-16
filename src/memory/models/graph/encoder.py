@@ -38,7 +38,7 @@ class GraphEncoder(nn.Module):
             d_llama=cfg.d_llama, d_graph=cfg.graph_d_graph, n_nodes=cfg.graph_n_nodes,
             n_edges=cfg.graph_n_edges, write_layers=cfg.graph_write_layers,
             read_layers=cfg.graph_read_layers, heads=cfg.graph_heads,
-            ffn_mult=cfg.graph_ffn_mult)
+            ffn_mult=cfg.graph_ffn_mult, ptr_logit_temp_init=cfg.graph_ptr_logit_temp_init)
         self.gcfg = gcfg
         self.parser = GraphParser(gcfg)
         self.reader = GraphReader(gcfg)
@@ -91,6 +91,8 @@ class GraphEncoder(nn.Module):
             if not mask[:, s:e].any():                           # all-padding tail window → skip
                 continue
             graph = self.parser(hiddens[:, s:e], mask[:, s:e], state=graph)
+        if graph is None:                                        # fully-padded batch (degenerate) → one parse
+            graph = self.parser(hiddens, mask, state=None)       # avoids a None-deref downstream
         B = hiddens.shape[0]
         empty = torch.zeros(B, 0, self.cfg.d_llama, device=hiddens.device)
         return empty, {"graph": graph}

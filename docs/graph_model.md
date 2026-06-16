@@ -75,13 +75,19 @@ This is **set/graph prediction** (DETR-style), not per-token self-prediction.
 #### Pointer selection (how endpoints are chosen — never regressed)
 For each `src`/`dst` query token: **QK-RMSNorm + learnable-temperature softmax** over the
 `N` bank match-keys → gather `ptr @ node_bank`. Same mechanism as every other attention
-in the model (uniform). It **starts moderately sharp and learns to sharpen** toward
-near-hard — *not* a fixed harsh temperature (which would saturate → no gradient → the
-cold-start failure). No Gumbel, no STE. Caveats to monitor: a softmax still technically
-blends (watch `ptr_entropy`); over a large bank the tail can blend (cheap fallback:
+in the model (uniform). **Init:** the pointer temp inits at `graph_ptr_logit_temp_init`
+(default `0` ⇒ temp=1, consistent with every attention block). Because the logits are
+QK-RMSNorm'd cosine-scale *and untrained*, this default starts **soft / near-uniform**
+(entropy ≈ ln N) — the **gradient-rich** regime (the cold-start failure the design avoids
+is the *too-sharp* one, where the softmax saturates → no sharpening gradient; soft is the
+safe side). The **learnable temp then sharpens** toward near-hard as selection lowers the
+loss — **watch `graph_ptr_entropy`**: if it does *not* fall, the pointer is stuck hedging
+(de-facto mean-blend = the collapse attractor) and the **prime sweep knob** is a negative
+`graph_ptr_logit_temp_init` (e.g. `-1` ⇒ temp≈0.37) to bias toward selection from step 0.
+No Gumbel, no STE. Other caveat: over a large bank the tail can blend (cheap fallback:
 top-k mask before the softmax, only if the entropy canary shows it). Selection precedes
-filling: there is no chicken-and-egg, because the query *points*; src/dst are **outputs**,
-never pre-filled inputs, and the cost is `O(E·N)`, never `N²`.
+filling: no chicken-and-egg — the query *points*; src/dst are **outputs**, never pre-filled
+inputs, and the cost is `O(E·N)`, never `N²`.
 
 ### 2.4 Read — per-edge bound vector → cross-attention inject (`GraphReader`)
 Per edge, bind into **one vector** (binding *before* attention):

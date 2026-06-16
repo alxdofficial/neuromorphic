@@ -37,6 +37,7 @@ class GraphConfig:
     read_layers: int = 2             # reader depth (cross-attend edges + causal self)
     heads: int = 4
     ffn_mult: int = 2
+    ptr_logit_temp_init: float = 0.0  # pointer log-temp init (0 ⇒ temp=1; negative ⇒ sharper)
 
 
 # ── attention with QK-RMSNorm + learnable temp (the read/select cold-start fix) ──
@@ -111,7 +112,9 @@ class GraphParser(nn.Module):
         self.blocks = nn.ModuleList(_Block(d, cfg.heads, cfg.ffn_mult) for _ in range(cfg.write_layers))
         self.q_src = nn.Linear(d, d, bias=False)                   # src/dst pointer queries
         self.q_dst = nn.Linear(d, d, bias=False)
-        self.log_temp = nn.Parameter(torch.zeros(2))              # learnable src/dst pointer sharpness
+        # learnable src/dst pointer sharpness; init from cfg (0 ⇒ temp=1, consistent
+        # with the attention blocks; negative ⇒ sharper-from-step-0, a sweep knob).
+        self.log_temp = nn.Parameter(torch.full((2,), float(cfg.ptr_logit_temp_init)))
         self.edge_head = nn.Linear(d, d)                          # regress the relation state
 
     def _point(self, q: Tensor, which: int) -> tuple[Tensor, Tensor]:

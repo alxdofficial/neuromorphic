@@ -586,7 +586,8 @@ def train_one_variant(
             _gmech = {
                 "p_obs": ("encoder.parser.obs_proj",),
                 "p_blocks": ("encoder.parser.blocks",),
-                "p_ptr": ("encoder.parser.q_src", "encoder.parser.q_dst", "encoder.parser.bank_key"),
+                "p_ptr": ("encoder.parser.q_src", "encoder.parser.q_dst", "encoder.parser.bank_key",
+                          "encoder.parser.log_temp"),   # incl. the pointer sharpness param
                 "p_edge": ("encoder.parser.edge_head",),
                 "p_bank": ("encoder.parser.node_bank",),
                 "p_slots": ("encoder.parser.init_tok", "encoder.parser.role", "encoder.parser.tag"),
