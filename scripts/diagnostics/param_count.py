@@ -22,10 +22,10 @@ N_LAYERS = 30  # SmolLM2-135M
 # The masked_reconstruction override block from scripts/train/train.py, mirrored
 # here so this probe measures exactly what the trainer builds. Edit to preview.
 MAE_RANKS = dict(
-    icae_lora_rank=76, icae_lora_alpha=152,
-    ccm_lora_rank=38, ccm_lora_alpha=76,
-    autocompressor_lora_rank=38, autocompressor_lora_alpha=76,
-    beacon_ratio=8, beacon_wrap_layers=beacon_wrap_layers(N_LAYERS, 8),
+    icae_lora_rank=104, icae_lora_alpha=208,
+    ccm_lora_rank=52, ccm_lora_alpha=104,
+    autocompressor_lora_rank=52, autocompressor_lora_alpha=104,
+    beacon_ratio=8, beacon_wrap_layers=beacon_wrap_layers(N_LAYERS, 11),
     # soft_pointer_graph capacity-matched to hlvocab (~3.30M memory)
     spg_K_edge=16, spg_K_node=64, spg_d_node=176, spg_d_state=176, spg_d_read=176,
     spg_d_updater=240, spg_updater_layers=2, spg_updater_heads=8,

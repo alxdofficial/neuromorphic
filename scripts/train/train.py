@@ -1302,22 +1302,22 @@ def main():
         cfg.use_llama_lora = True
         cfg.llama_lora_rank = 16; cfg.llama_lora_alpha = 32
         # M_max = 16 (k in [3,16]). Memory-mechanism trainable params matched to
-        # the `graph` anchor (relational parser over a learnable node bank, write=2/
-        # read=2 ≈ 5.33M total / 4.40M memory) on 135M, d=576:
-        #   icae r76 → 4.39M, ccm r38 → 4.39M, autocompressor r38 → 4.40M,
-        #   beacon 8 wrap layers → 4.43M. (See scripts/diagnostics/param_count.py.)
+        # the `graph` anchor (relational parser over a node bank, write=3/read=2,
+        # 2-part working set + dual cross-attn ≈ 6.90M total / 5.98M memory) on 135M:
+        #   icae r104 → 6.00M, ccm r52 → 6.00M, autocompressor r52 → 6.01M,
+        #   beacon 11 wrap layers → 6.08M. (See scripts/diagnostics/param_count.py.)
         cfg.n_flat_codes = 16
-        cfg.icae_n_slots = 16; cfg.icae_lora_rank = 76; cfg.icae_lora_alpha = 152
-        cfg.ccm_n_comp = 16; cfg.ccm_lora_rank = 38; cfg.ccm_lora_alpha = 76
+        cfg.icae_n_slots = 16; cfg.icae_lora_rank = 104; cfg.icae_lora_alpha = 208
+        cfg.ccm_n_comp = 16; cfg.ccm_lora_rank = 52; cfg.ccm_lora_alpha = 104
         cfg.autocompressor_n_slots = 16
-        cfg.autocompressor_lora_rank = 38; cfg.autocompressor_lora_alpha = 76
+        cfg.autocompressor_lora_rank = 52; cfg.autocompressor_lora_alpha = 104
         cfg.beacon_ratio = 8
-        # Beacon wraps 8 evenly-spaced layers (≈4.43M on SmolLM2-135M, matched to
+        # Beacon wraps 11 evenly-spaced layers (≈6.08M on SmolLM2-135M, matched to
         # the graph anchor). Shared helper derives indices from the backbone depth.
         from transformers import AutoConfig as _ACL
         from src.memory.common import beacon_wrap_layers as _bwl
         _nlayers = _ACL.from_pretrained(cfg.llama_model).num_hidden_layers
-        cfg.beacon_wrap_layers = _bwl(_nlayers, 8)
+        cfg.beacon_wrap_layers = _bwl(_nlayers, 11)
         cfg.hlvocab_m_max = 16           # masked_reconstruction: emit up to 16, sliced to k [fix G]
         cfg.hlvocab_edge_cand = 48       # calibrated for the 16-token MAE regime (overrides budget-scaled)
         cfg.hlvocab_emit = args.hlvocab_emit   # edge_query (default) | slotattn (competition)
