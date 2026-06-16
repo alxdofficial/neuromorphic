@@ -1348,6 +1348,34 @@ def main():
                 f"SmolLM2-135M (d=576); got d_llama={cfg.d_llama} "
                 f"(backbone={cfg.llama_model}). Pass --backbone HuggingFaceTB/SmolLM2-135M, "
                 f"or --allow-unmatched-backbone to override (capacity match will be off).")
+    elif args.task in ("qa", "conditioned_reconstruction",
+                       "conditioned_reconstruction_bio", "continuation"):
+        # The longer-context objectives: 30:1 COMPRESSION + ~13M memory params (the
+        # "fully using" config; MAE keeps its 8:1 / ~6M de-risk). Memory budget
+        # M = ceil(context / 30); params matched to the graph anchor (d_graph=384,
+        # write=3/read=2, N=1024 ≈ 13.0M) on SmolLM2-135M (d=576). Ranks calibrated
+        # for d=576 — capacity match is approximate on other backbones.
+        # (See scripts/diagnostics/param_count.py.)
+        cfg.use_llama_lora = True
+        cfg.llama_lora_rank = 16; cfg.llama_lora_alpha = 32
+        _ctx = args.compress_len if args.task == "continuation" else args.chunk_size
+        _M = max(1, -(-_ctx // 30))                      # ceil(ctx/30) — the 30:1 budget
+        cfg.n_flat_codes = _M
+        cfg.icae_n_slots = _M; cfg.icae_lora_rank = 223; cfg.icae_lora_alpha = 446
+        cfg.ccm_n_comp = _M; cfg.ccm_lora_rank = 111; cfg.ccm_lora_alpha = 222
+        cfg.autocompressor_n_slots = _M
+        cfg.autocompressor_lora_rank = 110; cfg.autocompressor_lora_alpha = 220
+        cfg.beacon_ratio = 30                            # condensing ratio = the 30:1 compression
+        from transformers import AutoConfig as _ACL2
+        from src.memory.common import beacon_wrap_layers as _bwl2
+        _nlayers2 = _ACL2.from_pretrained(cfg.llama_model).num_hidden_layers
+        cfg.beacon_wrap_layers = _bwl2(_nlayers2, 23)
+        # graph: ~13M via WIDER node/edge vectors (d_graph 256→384); E = M (same 30:1 budget)
+        cfg.graph_d_graph = 384; cfg.graph_write_layers = 3; cfg.graph_read_layers = 2
+        cfg.graph_n_nodes = 1024; cfg.graph_n_edges = _M
+        print(f"[capacity] {args.task}: 30:1 compression → M={_M} (ctx {_ctx}); "
+              f"~13M memory params (graph d_graph=384, E={_M}, baselines icae r223 / "
+              f"ccm r111 / ac r110 / beacon 23L).")
     cfg.contrastive_shuf_coef = args.contrastive_shuf_coef
     cfg.task_mode = args.task        # accurate ckpt metadata (dispatch still keys on this)
     cfg.seed = args.seed             # record the actual seed in ckpt metadata
