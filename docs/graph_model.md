@@ -17,21 +17,25 @@ construction loss (translating a sentence ≠ transcoding word-by-word; that pre
 killed HLV).
 
 - **Write = a learned relational parser** (not synaptic plasticity, not "STDP").
-- **Read = bind each edge into a vector and inject** into the frozen LLM.
+- **Read = bind each edge into a vector and PREPEND** the E memory tokens; the frozen
+  LLM reads them via its own attention (was a custom cross-attn *inject* — that collapsed
+  the read to ≈rank-1, the same additive nudge at every position; see
+  `scripts/diagnostics/why_graph_collapses_mae.py`). Binding stays in the write (the FiLM
+  `op(src,dst,edge)` forms each token); only the read mechanism changed.
 
 ### Why this is a graph, not a transformer-in-disguise (the load-bearing constraints)
 1. **Endpoints are constrained to the discrete vocabulary** — the parser *selects* a
    node by **pointing** into the bank; it never regresses a free endpoint vector.
 2. **Reuse** — two edges pointing at the same bank node *share* that node (coreference /
    dedup); the dynamic content lives in the edges, the identities are fixed.
-3. **Per-edge bound read** — binding is installed in `op(src,dst,edge)` *before*
-   attention; the read is not pooling over raw node/edge tokens.
+3. **Per-edge bound memory token** — binding is installed in `op(src,dst,edge)` when each
+   memory token is *formed*; the prepended token is a bound edge, not a raw node/edge pooled.
 4. **Specialized edge slots** — each edge-query carries a unique instance tag, so slots
    specialize (DETR-style) instead of collapsing onto one pair.
 
 Litmus test the design must pass: **rewire the edges (keep the same token multiset) and
-the read output must change.** A transformer-over-a-bag fails this; this design passes
-because the read routes through `op(src,dst,edge)`.
+the memory must change.** A transformer-over-a-bag fails this; this design passes because
+each memory token is `op(src,dst,edge)` of a *specific* edge.
 
 ---
 
@@ -104,28 +108,35 @@ top-k mask before the softmax, only if the entropy canary shows it). Selection p
 filling: no chicken-and-egg — the query *points*; src/dst are **outputs**, never pre-filled
 inputs, and the cost is `O(E·N)`, never `N²`.
 
-### 2.4 Read — per-edge bound vector → cross-attention inject (`GraphReader`)
-Per edge, bind into **one vector** (binding *before* attention):
+### 2.4 Read — per-edge bound token → PREPEND (`GraphReader`)
+Per edge, bind into **one vector** (binding when the token is formed):
 ```
 sd        = w_sd( concat(src_value, dst_value) )      # bind the two endpoints
 edge_vec  = w_gamma(edge_state) ⊙ sd + w_beta(edge_state)   # relation FiLM-modulates the pair
 ```
-At a mid-late LLM layer (`inject_layer`), the per-position residual hidden *is* the query
-(taken via a forward hook). Project `d_llama→d_graph` (`q_in`); per layer, ×`read_layers`:
-1. **cross-attend** decode positions → the `E` edge vectors,
-2. **self-attend** decode positions — **CAUSAL** (frozen causal LLM),
-3. FFN.
-Then project `d_graph→d_llama` **once** (after pooling — never per-edge), **RMS-match** to
-the residual stream, **learnable dim-scaled gate** (`tanh(gate)`, init `1/√d_llama`), and
-**add** into the residual at `inject_layer`. `M=0` prepend (inject, not prepend).
+The `E` edge vectors **self-attend among themselves** (`×read_layers`, no causal mask — a
+set, no decoder cross-attn), then `LayerNorm` + project `d_graph→d_llama`. The result is
+`memory ∈ ℝ^{B×E×d_llama}`, which the loss path **PREPENDS** (`M=E`) exactly like the
+baseline compressors — the frozen decoder reads it through its **own** attention,
+**per-position**. No forward hook, no gate, no RMS-match.
+
+**Why prepend, not inject:** the old cross-attn inject produced one additive vector per
+position that was ≈identical across positions (`read_effrank≈1`) — a constant nudge that
+can reconstruct *one* addressed value (conditioned_reconstruction) but not the many
+distinct per-position tokens MAE/continuation need. Prepending hands the read to the
+decoder's native attention, which reads a different mixture per position (rank ≤ E). This
+also makes the comparison clean: graph vs baselines now differ **only in the write**
+(structured parser vs flat compressor), same read. (Diagnostic:
+`scripts/diagnostics/why_graph_collapses_mae.py`.)
 
 ---
 
 ## 3. Non-negotiables (or the read collapses like every prior version)
 1. **Pointer-select, never regress** an endpoint (else: v6 free-endpoint collapse + no reuse).
 2. **QK-RMSNorm + learnable temperature** on the pointer and every attention (read cold-start).
-3. **RMS-match the inject to the stream + nonzero gate** (v8c: inject ~2e4× too quiet → SHUF=REAL).
-4. **Bind in `op(src,dst,edge)` before the read attention** (never pool raw tokens = membership wall).
+3. **Read = PREPEND the bound edge tokens** (the decoder reads them per-position via its own
+   attention). The custom cross-attn *inject* collapsed the read to ≈rank-1 — do not bring it back.
+4. **Bind in `op(src,dst,edge)` when forming each memory token** (never pool raw tokens = membership wall).
 5. **Per-edge instance tags** so slots specialize (anti-collapse HLV/the VQ-graph lacked).
 6. **No aux losses** — anti-collapse is architectural (pointer-select + tags + fixed bank). Holistic
    recon only; no per-token/per-node construction loss.
@@ -133,9 +144,11 @@ the residual stream, **learnable dim-scaled gate** (`tanh(gate)`, init `1/√d_l
 ---
 
 ## 4. Trained vs frozen
-- **Frozen:** the Llama backbone (observation source at `obs_tap_layer` + the decoder injected into).
-- **Trained:** the node bank, the parser (write), the reader (read incl. the bind `op` + gate),
-  and a shared decoder LoRA (q/v, rank 16 — identical across all arms, the learnable read protocol).
+- **Frozen:** the Llama backbone (observation source at `obs_tap_layer` + the decoder that
+  reads the prepended memory).
+- **Trained:** the node bank, the parser (write), the reader (the bind `op` + self-attn
+  memory-former + `d_graph→d_llama` projection), and a shared decoder LoRA (q/v, rank 16 —
+  identical across all arms, the learnable read protocol).
 - The graph is **state**, not parameters.
 
 ---
@@ -176,16 +189,17 @@ by-`(src,dst)` framing; slot-carry is the model that fits fixed-`E` instance-tag
 wrap-layers 6.08M` (all within 1.7%). Verified by `scripts/diagnostics/param_count.py`.
 
 **v1 MAE config:** `d_graph=256, n_nodes=1024, n_edges=16 (E_max), write_layers=3,
-read_layers=2, heads=4, ffn_mult=2, obs_tap_layer=6, inject_layer=18`.
+read_layers=2, heads=4, ffn_mult=2, obs_tap_layer=6` (prepend read — no inject layer).
 
 **Read-surface axis (capacity-relative — same bins as the baselines):** the parser predicts
-`E_max=16` edges, but the read **slices to the first `k = ceil(L/8) ∈ [3,16]` edges** (the same
-Matryoshka-prefix bins the baselines slice their slots to). So the graph obeys the cohort's
-**8:1 compression ratio and k-bins** on the sentence task. Read surface = `k×d_graph = k×256`
-floats (vs baselines `k×d_llama = k×576`): same `k` units / same ratio; fewer floats per unit
-only because `d_graph(256) < d_llama(576)` (the graph's internal width). On non-MAE tasks
-(no `k_slots`) the full `E_max` edge budget is used. *(All `E_max` edge slots still receive
-gradient even when sliced — the 6E working-set self-attention couples kept and dropped slots.)*
+`E_max=16` edges, formed into `E` memory tokens, but the prepend **slices to the first
+`k = ceil(L/8) ∈ [3,16]` tokens** (the same Matryoshka-prefix bins the baselines slice to).
+So the graph obeys the cohort's **8:1 compression ratio and k-bins**, and — because the
+memory tokens are projected to `d_llama` and prepended — the read surface is now
+**`k×d_llama = k×576`, identical to the baselines** (the old inject read at `d_graph` is
+gone). On non-MAE tasks (no `k_slots`) the full `E_max` budget is prepended. *(All `E_max`
+edge slots still receive gradient even when sliced — the 6E working-set self-attention
+couples kept and dropped slots.)*
 
 **"Full" / longer-task config (later — conditioned-reconstruction etc., own larger tier):**
 bump `n_edges`/`d_graph` (design target `n_nodes=1024, d_graph=512, n_edges=128`) and drop the
@@ -199,10 +213,10 @@ Canaries at every stage:
   (distinct nodes pointed to → reuse / vocabulary coverage).
 - **vocabulary:** `bank_effrank` (node-bank effective rank — vocabulary collapse).
 - **relation:** `edge_effrank` (edge-state effective rank across edges).
-- **read:** `read_effrank` (injected signal across decode positions — the rank prior models
-  collapsed to ~1), `read_gate`.
+- **read:** `mem_effrank` (effective rank of the PREPENDED memory tokens across edges×batch —
+  the content rank the decoder can read; the old inject read collapsed this to ~1).
 - **gradient flow (per mechanism):** parser `obs_proj / blocks / pointer(q_src,q_dst,bank_key) /
-  edge_head / bank / slots`; reader `op(w_sd,w_gamma,w_beta) / q_in / blocks / out / gate` — shows
+  edge_head / bank / slots`; reader `op(w_sd,w_gamma,w_beta) / blocks(memory-former) / out` — shows
   which path carries the signal / is starved.
 - **binding gate:** REAL / OFF / SHUF (SHUF = graph rolled along batch). Want REAL ≪ SHUF ≲ OFF.
 - **topology sensitivity** (post-hoc): rewire edges → Δ output (≈0 ⇒ still a transformer).
@@ -219,7 +233,11 @@ Canaries at every stage:
 - **Fully-connected `K²` rejected** (unsustainable as N grows; edges must stay expressive
   vectors, not scalar attention biases). Fixed **edge budget E** instead.
 - **Pointer = sharp *learnable-temp* softmax**, not Gumbel/STE and not a fixed harsh temp.
-- **Read = per-edge bound vector + cross-attn**, not 3 separate tokens pooled.
+- **Read = per-edge bound token, PREPENDED** (decoder reads via its own attention), NOT a custom
+  cross-attn inject. The inject collapsed to ≈rank-1 (one additive nudge for all positions) — fine
+  for one addressed value, fatal for the many distinct per-position tokens MAE/continuation need.
+  Prepend also isolates the experiment to the WRITE (same read as the baselines). *(Superseded the
+  v1 inject design 2026-06-16; see `scripts/diagnostics/why_graph_collapses_mae.py`.)*
 - **Nodes fixed/stateless** in v1 (reuse via shared identities; content in edges); stateful nodes deferred.
 
 ---
@@ -228,7 +246,11 @@ Canaries at every stage:
 - `op(src,dst,edge)`: **FiLM** (chosen) vs concat-MLP vs binding product.
 - Selection: **pure pointer** (chosen) vs shortlist + keep-gate; locality bias **off** (chosen) to start.
 - Read endpoints: **single vector per node** (chosen) vs separate key/value.
-- `inject_layer=18`, `obs_tap_layer=6` (chosen, mid / mid-late).
+- `obs_tap_layer=6` (chosen, mid). Read is prepend — no inject layer.
+- **Node competition** (`graph_node_competition`, default **off**): slot-attention edge
+  competition in `_point` (softmax over edges per node → renormalize per edge) so edges
+  spread instead of hub-collapsing (6/1024 nodes observed). Default off so prepend-alone vs
+  prepend+competition is a clean A/B; flip on if `nodes_used`/`edge_effrank` stay low.
 
 ---
 

@@ -38,28 +38,24 @@ class GraphEncoder(nn.Module):
             d_llama=cfg.d_llama, d_graph=cfg.graph_d_graph, n_nodes=cfg.graph_n_nodes,
             n_edges=cfg.graph_n_edges, write_layers=cfg.graph_write_layers,
             read_layers=cfg.graph_read_layers, heads=cfg.graph_heads,
-            ffn_mult=cfg.graph_ffn_mult, ptr_logit_temp_init=cfg.graph_ptr_logit_temp_init)
+            ffn_mult=cfg.graph_ffn_mult, ptr_logit_temp_init=cfg.graph_ptr_logit_temp_init,
+            node_competition=cfg.graph_node_competition)
         self.gcfg = gcfg
         self.parser = GraphParser(gcfg)
-        self.reader = GraphReader(gcfg)
-        # Depth guard: the absolute defaults (obs=6, inject=18) are tuned for SmolLM2-135M's
-        # 30 layers (0.20 / 0.60 of depth). On a shallower backbone (e.g. Llama-3.2-1B = 16
-        # layers, the config default), inject=18 would index past the stack. Keep the
-        # configured taps when they fit; otherwise re-derive depth-relative at the same
-        # fractions. Invariant: 0 ≤ obs < inject < n_layers (the read needs ≥1 layer after
-        # the inject to consume it; the obs tap reads hidden_states[obs+1] ≤ n_layers).
+        self.reader = GraphReader(gcfg)                     # forms PREPEND memory tokens (not inject)
+        # Depth guard for the observation tap: the default (obs=6) is tuned for SmolLM2-135M's
+        # 30 layers (0.20 of depth). On a shallower backbone, re-derive depth-relative so the
+        # tap can't index past the stack. (The read is now a prepend — no inject layer.)
         n_layers = base.config.num_hidden_layers
-        obs_tap, inject = cfg.graph_obs_tap_layer, cfg.graph_inject_layer
-        if not (0 <= obs_tap < inject < n_layers):
+        obs_tap = cfg.graph_obs_tap_layer
+        if not (0 <= obs_tap < n_layers):
             obs_tap = max(1, round(0.20 * n_layers))
-            inject = min(n_layers - 1, max(obs_tap + 1, round(0.60 * n_layers)))
-            print(f"[graph] tap/inject ({cfg.graph_obs_tap_layer}/{cfg.graph_inject_layer}) "
-                  f"out of range for {n_layers}-layer backbone → depth-relative {obs_tap}/{inject}")
+            print(f"[graph] obs_tap ({cfg.graph_obs_tap_layer}) out of range for "
+                  f"{n_layers}-layer backbone → depth-relative {obs_tap}")
         self.obs_tap_layer = obs_tap                       # observation tap
-        self.inject_layer = inject                         # reader inject point
         print(f"[graph] relational parser: N={gcfg.n_nodes} bank, E={gcfg.n_edges} edges, "
               f"d_graph={gcfg.d_graph}, write×{gcfg.write_layers}/read×{gcfg.read_layers}, "
-              f"obs_tap=L{self.obs_tap_layer} inject=L{self.inject_layer}")
+              f"obs_tap=L{self.obs_tap_layer}, prepend read, competition={gcfg.node_competition}")
 
     def train(self, mode: bool = True):
         super().train(mode)
@@ -94,7 +90,8 @@ class GraphEncoder(nn.Module):
         accumulated hiddens in graph_window-token windows, carrying (and updating) the
         graph across them (the parser ingests the prior graph each window). A short
         input (≤ one window — every MAE sentence) runs once from the fresh init slots
-        = a single parse. The reader injects via a decoder hook (loss path), no prepend."""
+        = a single parse. The reader forms E memory tokens (FiLM-bound edges) that the
+        loss path PREPENDS — the decoder reads them via its own attention (no inject)."""
         hiddens, mask = state["hiddens"], state["mask"]          # [B,T,d_llama], [B,T]
         W = self.cfg.graph_window
         T = hiddens.shape[1]
@@ -117,9 +114,8 @@ class GraphEncoder(nn.Module):
                          for k in new}
         if graph is None:                                        # fully-padded batch (degenerate) → one parse
             graph = self.parser(hiddens, mask, state=None)       # avoids a None-deref downstream
-        B = hiddens.shape[0]
-        empty = torch.zeros(B, 0, self.cfg.d_llama, device=hiddens.device)
-        return empty, {"graph": graph}
+        memory = self.reader(graph)                              # [B, E, d_llama] — FiLM-bound edge tokens
+        return memory, {"graph": graph}
 
     def forward(self, token_embeds, attention_mask=None, mask_positions=None):
         del mask_positions

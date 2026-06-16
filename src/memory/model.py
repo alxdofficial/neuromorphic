@@ -4,7 +4,6 @@ The model takes one of the encoder variants (see VARIANTS) and the frozen
 Llama decoder, and produces the reconstruction loss for training.
 """
 from __future__ import annotations
-from contextlib import contextmanager
 from typing import Optional
 
 import torch
@@ -246,8 +245,8 @@ class ReprLearningModel(nn.Module):
 
     # compressor variants whose memory is a [B, M, d] prepend (capacity-relative
     # slicing applies to these; vanillas pass through at M=0 / M=T).
-    _MASKED_RECON_COMPRESSORS = ("icae_baseline", "ccm_baseline", "hlvocab_baseline",
-                        "autocompressor_baseline", "beacon_baseline",
+    _MASKED_RECON_COMPRESSORS = ("graph_baseline", "icae_baseline", "ccm_baseline",
+                        "hlvocab_baseline", "autocompressor_baseline", "beacon_baseline",
                         "soft_pointer_graph_baseline")  # slice to k too if selected (capacity-fair)
 
     def compute_masked_reconstruction_loss(
@@ -269,11 +268,6 @@ class ReprLearningModel(nn.Module):
         batch.k_slots for the compressor variants; vanilla_llama → M=0 (floor),
         vanilla_full_context → M=T (ceiling).
         """
-        # graph reads by INJECT (forward hook), not prepend — its own path.
-        if self.variant == "graph_baseline":
-            return self._graph_masked_reconstruction_loss(
-                batch, zero_memory=zero_memory, shuffle_memory=shuffle_memory,
-                mask_ratio=mask_ratio)
         device = batch.context_ids.device
         B, T = batch.context_ids.shape
         embed = self.decoder.llama.get_input_embeddings()
@@ -367,42 +361,16 @@ class ReprLearningModel(nn.Module):
                 out[_k] = _v.detach()
             elif isinstance(_v, (int, float)):
                 out[_k] = _v
+        if self.variant == "graph_baseline" and mem_aux.get("graph") is not None:
+            out.update(self._graph_canaries(mem_aux["graph"], memory))
         return out
 
-    @contextmanager
-    def _graph_inject(self, graph, cap=None):
-        """Install the graph reader as a forward hook on the inject layer (adds the
-        RMS-matched, gated read into the residual at that layer); remove on exit. No-op
-        when graph is None (the OFF control) or the variant isn't graph_baseline.
-        Shared by the MAE and the generic (QA/conditioned/continuation) loss paths so
-        the graph injects identically across objectives. `cap` (optional dict) stashes
-        the injected vector for read-eff-rank telemetry."""
-        if graph is None or self.variant != "graph_baseline":
-            yield
-            return
-        reader = self.encoder.reader
-        layer = self.decoder.llama.model.layers[self.encoder.inject_layer]
-
-        def _hook(module, args, output):
-            hidden = output[0] if isinstance(output, tuple) else output
-            inj = reader(hidden, graph).to(hidden.dtype)
-            if cap is not None:
-                cap["inj"] = inj
-            hidden = hidden + inj
-            return (hidden,) + tuple(output[1:]) if isinstance(output, tuple) else hidden
-
-        handle = layer.register_forward_hook(_hook)
-        try:
-            yield
-        finally:
-            handle.remove()
-
-    def _graph_canaries(self, graph, cap, content_mask) -> dict:
+    def _graph_canaries(self, graph, memory) -> dict:
         """Anti-collapse canaries for the graph model — shared by the MAE and generic
-        (QA/conditioned/continuation) loss paths so monitoring is identical across
-        objectives (docs/graph_model.md §7). SELECTION→ptr_entropy + nodes_used;
-        VOCABULARY→bank_effrank; RELATION→edge_effrank; READ→read_gate + read_effrank
-        (injected signal across content positions; REAL path only — cap holds it)."""
+        (QA/conditioned/continuation) loss paths (docs/graph_model.md §7). SELECTION →
+        ptr_entropy + nodes_used; VOCABULARY → bank_effrank; RELATION → edge_effrank;
+        READ → mem_effrank, the rank of the PREPENDED memory tokens across edges×batch
+        (the old inject read collapsed this to ≈1; prepend should restore it)."""
         enc = self.encoder
         out = {}
         with torch.no_grad():
@@ -416,114 +384,9 @@ class ReprLearningModel(nn.Module):
             out["graph_bank_effrank"] = _participation_ratio(enc.parser.node_bank)
             out["graph_edge_effrank"] = _participation_ratio(
                 graph["edge_state"].reshape(-1, d_g))
-            out["graph_read_gate"] = float(torch.tanh(enc.reader.gate).abs().mean().item())
-            if cap is not None and "inj" in cap:                       # REAL path only
-                out["graph_read_effrank"] = _participation_ratio(cap["inj"][content_mask])
-        return out
-
-    def _graph_masked_reconstruction_loss(
-        self,
-        batch,
-        zero_memory: bool = False,
-        shuffle_memory: bool = False,
-        mask_ratio: float = 0.85,
-    ) -> dict:
-        """MAE loss for the graph model — read by INJECT, not prepend.
-
-        Write: tap the frozen backbone for the observation → relational PARSER →
-        graph (E edges; endpoints POINTER-SELECTED from the learnable node bank +
-        regressed edge states). Read: a forward hook on the mid-late decoder layer
-        binds each edge op(src,dst,edge) and adds the reader's (RMS-matched, gated)
-        output to the residual stream — NO prepend, so the decode sequence is just
-        the masked span (M=0). REAL/OFF/SHUF: graph present / hook absent / rolled.
-        See docs/graph_model.md (source of truth).
-        """
-        device = batch.context_ids.device
-        B, T = batch.context_ids.shape
-        enc = self.encoder
-        embed = self.decoder.llama.get_input_embeddings()
-        with torch.no_grad():
-            ctx_embeds = embed(batch.context_ids)                       # [B,T,d]
-
-        # ---- 1. parse the observation into the graph ----
-        state = enc.init_streaming_state(B, device, ctx_embeds.dtype)
-        state, _ = enc.streaming_write(state, ctx_embeds, batch.context_mask)
-        _, mem_aux = enc.finalize_memory(state)
-        graph = mem_aux["graph"]
-
-        # capacity-relative read: slice to the same k=ceil(L/8) bins the baselines use
-        # (the parser predicts E_max edges; the read uses the first k — the Matryoshka
-        # prefix protocol). Obeys the cohort's compression ratio on the sentence task;
-        # non-MAE tasks (no k_slots) use the full edge budget.
-        k = getattr(batch, "k_slots", None)
-        if k is not None:
-            k = int(k)
-            graph = {kk: (v[:, :k] if torch.is_tensor(v) and v.dim() >= 2 else v)
-                     for kk, v in graph.items()}
-
-        # ---- 2. REAL / OFF / SHUF ----
-        inject = True
-        if zero_memory:                                                # OFF: no hook
-            inject = False
-        elif shuffle_memory:                                           # SHUF: roll graph along batch
-            if B == 1:
-                raise ValueError("shuffle_memory requires batch size > 1 (B==1 leaves REAL memory).")
-            graph = {key: (torch.roll(v, shifts=1, dims=0) if torch.is_tensor(v) and v.dim() >= 1 else v)
-                     for key, v in graph.items()}
-
-        # ---- 3. masked decoder input (no prepend; M=0) ----
-        mask_vec = self.decoder.mask_embed.to(ctx_embeds.dtype)
-        rnd = torch.rand(B, T, device=device)                          # eval: seeded in run_val
-        masked = (rnd < mask_ratio) & batch.context_mask
-        dec_in = torch.where(masked.unsqueeze(-1), mask_vec.view(1, 1, -1), ctx_embeds)
-        attn = batch.context_mask.long()
-
-        # ---- 4. inject hook on the mid-late decoder layer (no-op for OFF) ----
-        cap = {}                                        # stashes the injected vector for read-eff-rank
-        with self._graph_inject(graph if inject else None, cap=cap):
-            base_out = self.decoder.llama.model(
-                inputs_embeds=dec_in, attention_mask=attn, use_cache=False)
-            span_hidden = base_out.last_hidden_state                    # [B,T,d] (M=0)
-
-        # ---- 5. CE on masked positions (predict t_p from hidden p-1) ----
-        pred_hidden = span_hidden[:, :-1]
-        targets = batch.context_ids[:, 1:]
-        loss_mask = masked[:, 1:] & batch.context_mask[:, 1:]
-        if loss_mask.sum() == 0:                                        # degenerate batch
-            loss_mask[:, 0] = batch.context_mask[:, 1]
-        sel_hidden = pred_hidden[loss_mask]
-        sel_targets = targets[loss_mask]
-        logits = self.decoder.llama.lm_head(sel_hidden).float()
-        per_tok = F.cross_entropy(logits, sel_targets, reduction="none")
-        loss_recon = per_tok.mean()
-
-        with torch.no_grad():
-            top1 = (logits.argmax(-1) == sel_targets).float().mean()
-            rows = loss_mask.nonzero(as_tuple=False)[:, 0]
-            per_ex = torch.zeros(B, device=device)
-            cnt = torch.zeros(B, device=device)
-            per_ex.scatter_add_(0, rows, per_tok.detach())
-            cnt.scatter_add_(0, rows, torch.ones_like(per_tok))
-            per_ex = per_ex / cnt.clamp_min(1.0)
-
-        # No aux loss — anti-collapse is architectural (pointer-select + tags + fixed
-        # bank). Holistic recon only; keep mask_embed in-graph.
-        loss = loss_recon + 0.0 * self.decoder.mask_embed.float().sum()
-        out = {
-            "loss": loss, "loss_recon": loss_recon.detach(),
-            "top1_acc": top1, "per_example_loss": per_ex,
-            "loss_aux": torch.zeros((), device=device),
-            "n_content_positions": int(loss_mask.sum()),
-            "memory_shape": (B, graph["edge_state"].shape[1]),   # k edges (capacity-relative)
-            "mae_n_masked": float(loss_mask.sum()), "mae_M": 0.0,
-        }
-        # ---- 6. holistic anti-collapse telemetry (every step; cheap — PR via cov) ----
-        # Canaries at every stage of the pipeline (docs/graph_model.md §7), shared with
-        # the generic loss path via _graph_canaries: SELECTION→ptr_entropy + nodes_used,
-        # VOCABULARY→bank_effrank, RELATION→edge_effrank, READ→read_gate + read_effrank
-        # (the injected signal across span positions; prior models collapsed it to ~1 =
-        # membership-not-binding).
-        out.update(self._graph_canaries(graph, cap, batch.context_mask.bool()))
+            if memory is not None and memory.shape[1] > 0:
+                out["graph_mem_effrank"] = _participation_ratio(
+                    memory.reshape(-1, memory.shape[-1]))
         return out
 
     def compute_loss(
@@ -613,18 +476,9 @@ class ReprLearningModel(nn.Module):
         # memory: [B, M, d_llama] or [B, 0, d_llama] for MT/Vanilla/graph
         M = memory.shape[1]
 
-        # graph_baseline: memory is empty (M=0); the graph injects via a decoder hook
-        # (installed around the forward below). REAL = graph as-is; OFF (zero_memory) =
-        # no inject; SHUF = roll the graph along the batch. Same controls as the prepend
-        # arms, applied to the graph state. (Non-graph variants: graph_state stays None.)
-        graph_state = finalize_aux.get("graph")
-        if graph_state is not None:
-            if zero_memory:
-                graph_state = None                                   # OFF: no inject
-            elif shuffle_memory:
-                if B <= 1:
-                    raise ValueError("shuffle_memory (SHUF) needs batch size > 1.")
-                graph_state = {k: torch.roll(v, shifts=1, dims=0) for k, v in graph_state.items()}
+        # graph_baseline now PREPENDS its E memory tokens like any compressor (finalize
+        # returns [B,E,d_llama]); REAL/OFF/SHUF are handled by the shared prepend logic
+        # below. The parsed graph dict rides in finalize_aux["graph"] for the canaries.
 
         # ---- 2. MT branch: retrieve per-chunk using question as query ----
         mt_bank = finalize_aux.get("mt_bank")
@@ -862,14 +716,11 @@ class ReprLearningModel(nn.Module):
             # there is no autoregressive decode that reuses KV. Building the
             # cache adds a noticeable per-step cost (esp. for vanilla_full_ctx
             # where T_ctx ~= 8K).
-            # graph_baseline injects its read here via the hook (M=0 prepend).
-            graph_cap = {}                                  # stashes the inject for read-eff-rank
-            with self._graph_inject(graph_state, cap=graph_cap):
-                base_out = self.decoder.llama.model(
-                    inputs_embeds=full_embeds,
-                    attention_mask=attn_mask_full.to(torch.long),
-                    use_cache=False,
-                )
+            base_out = self.decoder.llama.model(
+                inputs_embeds=full_embeds,
+                attention_mask=attn_mask_full.to(torch.long),
+                use_cache=False,
+            )
             hidden = base_out.last_hidden_state            # [B, T_total, d_llama]
         finally:
             if hook_handle is not None:
@@ -1026,12 +877,11 @@ class ReprLearningModel(nn.Module):
             out.update(splat_telemetry)
         if graph_telemetry is not None:
             out.update(graph_telemetry)
-        # graph_baseline anti-collapse canaries (shared with the MAE path). The real
-        # parsed graph rides in finalize_aux["graph"] regardless of the REAL/OFF/SHUF
-        # control; read_effrank reads the injected vector (graph_cap), REAL/SHUF only.
+        # graph_baseline anti-collapse canaries (shared with the MAE path). The parsed
+        # graph rides in finalize_aux["graph"]; mem_effrank uses the prepended memory.
         _parsed_graph = finalize_aux.get("graph")
         if _parsed_graph is not None and self.variant == "graph_baseline":
-            out.update(self._graph_canaries(_parsed_graph, graph_cap, attn_mask_full.bool()))
+            out.update(self._graph_canaries(_parsed_graph, memory))
         if hlvocab_telemetry:
             out.update(hlvocab_telemetry)
         # flat_baseline codebook health → top-level so the trainer logs it to

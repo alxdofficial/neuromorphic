@@ -197,7 +197,7 @@ class ReprConfig:
     # from step 0 — the prime sweep knob if the pointer fails to sharpen.
     graph_ptr_logit_temp_init: float = 0.0
     graph_obs_tap_layer: int = 6        # frozen-backbone layer tapped for the observation
-    graph_inject_layer: int = 18        # frozen-backbone layer the reader injects into (mid-late)
+    graph_node_competition: bool = False  # slot-attention edge competition in selection (anti-hub-collapse)
 
     # ── Misc ───────────────────────────────────────────────────────────────
     seed: int = 42                  # wired in the trainer (torch/np/random) for reproducibility

@@ -44,6 +44,7 @@ class GraphConfig:
     heads: int = 4
     ffn_mult: int = 2
     ptr_logit_temp_init: float = 0.0  # pointer log-temp init (0 ⇒ temp=1; negative ⇒ sharper)
+    node_competition: bool = False    # slot-attention edge competition in _point (anti-hub-collapse)
 
 
 # ── attention with QK-RMSNorm + learnable temp (the read/select cold-start fix) ──
@@ -96,20 +97,18 @@ class _ParserBlock(nn.Module):
         return x
 
 
-class _Block(nn.Module):
-    """cross-attend(kv) → self-attend(x, optional causal) → FFN, pre-LN residual. (reader)"""
+class _SelfBlock(nn.Module):
+    """self-attend → FFN, pre-LN residual. The prepend memory-former: the E edge tokens
+    contextualize each other (a set, no causal mask), then project to d_llama. No decoder
+    cross-attn — the frozen LM reads the prepended tokens via its own attention."""
     def __init__(self, d: int, heads: int, ffn_mult: int):
         super().__init__()
-        self.cn = nn.LayerNorm(d); self.cross = _Attn(d, heads)
         self.sn = nn.LayerNorm(d); self.slf = _Attn(d, heads)
         self.fn = nn.LayerNorm(d)
         self.ff = nn.Sequential(nn.Linear(d, ffn_mult * d), nn.GELU(), nn.Linear(ffn_mult * d, d))
 
-    def forward(self, x: Tensor, kv: Tensor, kv_mask: Tensor = None,
-                self_causal: bool = False) -> Tensor:
-        x = x + self.cross(self.cn(x), kv, kv_mask=kv_mask)
-        xn = self.sn(x)
-        x = x + self.slf(xn, xn, causal=self_causal)
+    def forward(self, x: Tensor) -> Tensor:
+        xn = self.sn(x); x = x + self.slf(xn, xn)
         x = x + self.ff(self.fn(x))
         return x
 
@@ -137,14 +136,24 @@ class GraphParser(nn.Module):
         self.edge_head = nn.Linear(d, d)                          # head: edge slot → edge_state
 
     def _point(self, q: Tensor, which: int) -> tuple[Tensor, Tensor]:
-        """Snap: QK-RMSNorm + learnable-temp softmax over the bank → gather the RAW bank
-        value (stable identity). Never regresses an endpoint. Returns (value, ptr)."""
+        """Snap: QK-RMSNorm + learnable-temp affinity over the bank → gather the RAW bank
+        value (stable identity). Never regresses an endpoint. Returns (value, ptr).
+
+        node_competition (slot-attention style): instead of each edge softmax-ing over
+        nodes INDEPENDENTLY (which lets all E edges funnel to the same few hub nodes —
+        the 6/1024 collapse), edges COMPETE for each node (softmax over the E edges per
+        node), then renormalize per edge → an edge that loses a node is pushed onto a
+        different one. Endogenous anti-collapse (no aux loss)."""
         d = q.shape[-1]
         qn = _rmsnorm(q)                                           # [B,E,d]
         kn = _rmsnorm(self.bank_key(self.node_bank))             # [N,d]
         temp = self.log_temp[which].clamp(-3.0, 3.0).exp()
         scores = (qn @ kn.t()) * (d ** -0.5) / temp               # [B,E,N]
-        ptr = scores.softmax(-1)
+        if self.cfg.node_competition:
+            comp = scores.softmax(dim=1)                          # over E: edges compete per node
+            ptr = comp / comp.sum(dim=-1, keepdim=True).clamp_min(1e-9)   # renormalize per edge over N
+        else:
+            ptr = scores.softmax(-1)                              # independent per-edge (no competition)
         return ptr @ self.node_bank, ptr                          # gather raw bank (sharp → near-exact)
 
     def forward(self, obs: Tensor, obs_mask: Tensor, state: dict = None) -> dict:
@@ -176,14 +185,23 @@ class GraphParser(nn.Module):
                 "src_ptr": src_ptr, "dst_ptr": dst_ptr}
 
 
-# ── READ: per-edge bound vector → cross-attention inject ─────────────────────
+# ── READ: per-edge FiLM-bound token → PREPEND memory (read by the decoder natively) ──
 class GraphReader(nn.Module):
+    """Forms the graph's MEMORY TOKENS for a PREPEND read — NOT a custom inject.
+
+    Same FiLM token-creation as before: bind op(src,dst,edge)→one vector per edge
+    (binding installed in the WRITE, the side-car lesson). The E edge tokens then
+    self-attend to contextualize each other and project to d_llama; the frozen decoder
+    reads them as M=E prepended slots via its OWN attention. This replaces the old
+    cross-attention inject reader, whose injected signal collapsed to ≈rank-1 (the same
+    additive nudge at every position) — see scripts/diagnostics/why_graph_collapses_mae.
+    """
     def __init__(self, cfg: GraphConfig):
         super().__init__()
         self.cfg = cfg
         d, dl = cfg.d_graph, cfg.d_llama
         # per-edge bind op: bind the two endpoints, modulate by the relation (FiLM).
-        # binding installed BEFORE attention (the side-car lesson) — not pooling raw tokens.
+        # binding installed BEFORE the memory is read (the side-car lesson) — not pooling.
         self.w_sd = nn.Linear(2 * d, d)
         self.w_gamma = nn.Linear(d, d); self.w_beta = nn.Linear(d, d)
         # FiLM near-identity init: γ.bias=1, β.bias=0 anchors the bind (edge_vec≈sd at
@@ -192,24 +210,20 @@ class GraphReader(nn.Module):
         # flowing. NB: zeroing the γ/β *weights* would give edge_state zero path to the
         # output → starve edge_head (the relation channel) of gradient — don't.
         nn.init.ones_(self.w_gamma.bias); nn.init.zeros_(self.w_beta.bias)
-        self.q_in = nn.Linear(dl, d)
-        self.blocks = nn.ModuleList(_Block(d, cfg.heads, cfg.ffn_mult) for _ in range(cfg.read_layers))
+        # memory-former: the E edge tokens self-attend (reuses the read-layer budget so
+        # the graph stays capacity-matched), then a LN + projection to d_llama.
+        self.blocks = nn.ModuleList(_SelfBlock(d, cfg.heads, cfg.ffn_mult) for _ in range(cfg.read_layers))
+        self.norm = nn.LayerNorm(d)
         self.out = nn.Linear(d, dl)
-        # learnable gate, dim-scaled init (1/√d_llama) — small-but-NONZERO so the reader
-        # gets gradient from step 0; tanh-bounded so the inject can't exceed stream RMS.
-        self.gate = nn.Parameter(torch.tensor([dl ** -0.5]))
 
     def edge_tokens(self, graph: dict) -> Tensor:
         sd = self.w_sd(torch.cat([graph["src_value"], graph["dst_value"]], dim=-1))  # bind endpoints
         g = self.w_gamma(graph["edge_state"]); b = self.w_beta(graph["edge_state"])
         return g * sd + b                                          # [B,E,d] — relation FiLM-modulates the pair
 
-    def forward(self, dec_hidden: Tensor, graph: dict) -> Tensor:
-        mem = self.edge_tokens(graph)                             # [B,E,d]
-        x = self.q_in(dec_hidden.float())
+    def forward(self, graph: dict) -> Tensor:
+        """graph dict → [B, E, d_llama] memory tokens to PREPEND (decoder reads natively)."""
+        x = self.edge_tokens(graph)                               # [B,E,d]
         for blk in self.blocks:
-            x = blk(x, mem, self_causal=True)                    # cross-attend edges + causal self
-        inj = self.out(x)
-        stream_rms = dec_hidden.float().pow(2).mean(-1, keepdim=True).sqrt()
-        inj = _rmsnorm(inj) * stream_rms                          # RMS-match to the stream
-        return torch.tanh(self.gate) * inj.to(dec_hidden.dtype)
+            x = blk(x)                                            # edges contextualize each other
+        return self.out(self.norm(x))                            # [B,E,d_llama]
