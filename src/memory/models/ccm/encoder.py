@@ -142,13 +142,29 @@ class CCMBaselineEncoder(nn.Module):
         if attention_mask is None:
             attention_mask = torch.ones(token_embeds.shape[:2],
                                         device=token_embeds.device, dtype=torch.bool)
-        t = state["t"] + 1
-        prefix = state["mem"]                         # condition on prior memory (None@t=1)
+        B = token_embeds.shape[0]
+        has_real = attention_mask.any(dim=1)          # [B]: this window has ≥1 real token
+        prefix = state["mem"]                         # condition on prior memory (None@first window)
         h_comp = self._comp_forward(prefix, token_embeds, attention_mask)
         if self.fold == "merge":
-            new_mem = (h_comp if prefix is None
-                       else (1.0 - 1.0 / t) * prefix + (1.0 / t) * h_comp)
-        else:  # concat
+            # Per-row running mean over REAL windows only. t counts each row's real
+            # windows, so the 1/t weight tracks that row's own update count; an all-pad
+            # window (short row, late in a mixed-length batch) must carry the prefix
+            # UNCHANGED rather than blend in padding-derived COMP and dilute the mean.
+            prev_t = state["t"]
+            if not torch.is_tensor(prev_t):           # promote scalar init → per-row counter
+                prev_t = torch.zeros(B, device=token_embeds.device, dtype=torch.float32)
+            t = prev_t + has_real.to(prev_t.dtype)    # [B]
+            if prefix is None:
+                new_mem = h_comp                      # first window: nothing to carry
+            else:
+                # weight in prefix dtype (bf16) so blended/prefix match for torch.where;
+                # the t counter itself stays float32 for exact per-row window counts.
+                tt = t.clamp(min=1).to(prefix.dtype).view(-1, 1, 1)
+                blended = (1.0 - 1.0 / tt) * prefix + (1.0 / tt) * h_comp
+                new_mem = torch.where(has_real.view(-1, 1, 1), blended, prefix)
+        else:  # concat: grows memory; all-pad rows append a prefix-only COMP summary
+            t = state["t"] + 1
             new_mem = h_comp if prefix is None else torch.cat([prefix, h_comp], dim=1)
         return {**state, "mem": new_mem, "t": t}, {}
 

@@ -291,9 +291,12 @@ class ReprLearningModel(nn.Module):
         if k is not None and self.variant in self._MASKED_RECON_COMPRESSORS:
             memory = memory[:, :int(k)]
         # memory attention mask: real for compressor slots; context_mask for the
-        # full-context ceiling (its M=T memory has padded positions)
+        # full-context ceiling (its M=T memory has padded positions); a per-slot mask
+        # from the encoder (e.g. Beacon padding-beacons) when one is supplied.
         if self.variant == "vanilla_full_context":
             mem_mask = batch.context_mask.float()
+        elif mem_aux.get("memory_mask") is not None:
+            mem_mask = mem_aux["memory_mask"][:, :memory.shape[1]].float()   # k-sliced to match
         else:
             mem_mask = torch.ones(B, memory.shape[1], device=device)
 
@@ -394,6 +397,30 @@ class ReprLearningModel(nn.Module):
         finally:
             handle.remove()
 
+    def _graph_canaries(self, graph, cap, content_mask) -> dict:
+        """Anti-collapse canaries for the graph model — shared by the MAE and generic
+        (QA/conditioned/continuation) loss paths so monitoring is identical across
+        objectives (docs/graph_model.md §7). SELECTION→ptr_entropy + nodes_used;
+        VOCABULARY→bank_effrank; RELATION→edge_effrank; READ→read_gate + read_effrank
+        (injected signal across content positions; REAL path only — cap holds it)."""
+        enc = self.encoder
+        out = {}
+        with torch.no_grad():
+            d_g = enc.gcfg.d_graph
+            src_ptr, dst_ptr = graph["src_ptr"], graph["dst_ptr"]       # [B,E,N]
+            ent = -(src_ptr * src_ptr.clamp_min(1e-12).log()).sum(-1).mean() \
+                  - (dst_ptr * dst_ptr.clamp_min(1e-12).log()).sum(-1).mean()
+            sel = torch.cat([src_ptr.argmax(-1).reshape(-1), dst_ptr.argmax(-1).reshape(-1)])
+            out["graph_ptr_entropy"] = float((ent / 2).item())
+            out["graph_nodes_used"] = float(sel.unique().numel())
+            out["graph_bank_effrank"] = _participation_ratio(enc.parser.node_bank)
+            out["graph_edge_effrank"] = _participation_ratio(
+                graph["edge_state"].reshape(-1, d_g))
+            out["graph_read_gate"] = float(torch.tanh(enc.reader.gate).abs().mean().item())
+            if cap is not None and "inj" in cap:                       # REAL path only
+                out["graph_read_effrank"] = _participation_ratio(cap["inj"][content_mask])
+        return out
+
     def _graph_masked_reconstruction_loss(
         self,
         batch,
@@ -489,30 +516,14 @@ class ReprLearningModel(nn.Module):
             "n_content_positions": int(loss_mask.sum()),
             "memory_shape": (B, graph["edge_state"].shape[1]),   # k edges (capacity-relative)
             "mae_n_masked": float(loss_mask.sum()), "mae_M": 0.0,
-            "graph_read_gate": float(torch.tanh(enc.reader.gate).abs().mean().item()),
         }
         # ---- 6. holistic anti-collapse telemetry (every step; cheap — PR via cov) ----
-        # Canaries at every stage of the pipeline (docs/graph_model.md §7):
-        #   SELECTION → ptr_entropy (sharp→near-one-hot good; high→blending bad) +
-        #               nodes_used (distinct nodes pointed to = reuse / coverage).
-        #   VOCABULARY→ bank_effrank (node-bank collapse).
-        #   RELATION  → edge_effrank (edge-state rank across edges).
-        #   READ      → read_effrank (injected signal across positions; prior models
-        #               collapsed this to ~1 = membership-not-binding).
-        with torch.no_grad():
-            d_g = enc.gcfg.d_graph
-            src_ptr, dst_ptr = graph["src_ptr"], graph["dst_ptr"]       # [B,E,N]
-            ent = -(src_ptr * src_ptr.clamp_min(1e-12).log()).sum(-1).mean() \
-                  - (dst_ptr * dst_ptr.clamp_min(1e-12).log()).sum(-1).mean()
-            sel = torch.cat([src_ptr.argmax(-1).reshape(-1), dst_ptr.argmax(-1).reshape(-1)])
-            out["graph_ptr_entropy"] = float((ent / 2).item())
-            out["graph_nodes_used"] = float(sel.unique().numel())
-            out["graph_bank_effrank"] = _participation_ratio(enc.parser.node_bank)
-            out["graph_edge_effrank"] = _participation_ratio(
-                graph["edge_state"].reshape(-1, d_g))
-            if "inj" in cap:                                            # REAL path only
-                out["graph_read_effrank"] = _participation_ratio(
-                    cap["inj"][batch.context_mask.bool()])
+        # Canaries at every stage of the pipeline (docs/graph_model.md §7), shared with
+        # the generic loss path via _graph_canaries: SELECTION→ptr_entropy + nodes_used,
+        # VOCABULARY→bank_effrank, RELATION→edge_effrank, READ→read_gate + read_effrank
+        # (the injected signal across span positions; prior models collapsed it to ~1 =
+        # membership-not-binding).
+        out.update(self._graph_canaries(graph, cap, batch.context_mask.bool()))
         return out
 
     def compute_loss(
@@ -660,6 +671,12 @@ class ReprLearningModel(nn.Module):
         if shuffle_memory and not zero_memory and M > 0:
             if B > 1:
                 memory = torch.roll(memory, shifts=1, dims=0)
+                # Roll the per-slot memory mask in lockstep (vanilla_full_context sets it):
+                # rolling memory but not its mask would pair row i's rolled memory with
+                # row i's ORIGINAL pad mask, contaminating the SHUF control.
+                _mm = finalize_aux.get("memory_mask")
+                if _mm is not None:
+                    finalize_aux["memory_mask"] = torch.roll(_mm, shifts=1, dims=0)
             else:
                 raise ValueError(
                     "shuffle_memory (SHUF control) needs batch size > 1; "
@@ -846,7 +863,8 @@ class ReprLearningModel(nn.Module):
             # cache adds a noticeable per-step cost (esp. for vanilla_full_ctx
             # where T_ctx ~= 8K).
             # graph_baseline injects its read here via the hook (M=0 prepend).
-            with self._graph_inject(graph_state):
+            graph_cap = {}                                  # stashes the inject for read-eff-rank
+            with self._graph_inject(graph_state, cap=graph_cap):
                 base_out = self.decoder.llama.model(
                     inputs_embeds=full_embeds,
                     attention_mask=attn_mask_full.to(torch.long),
@@ -1008,6 +1026,12 @@ class ReprLearningModel(nn.Module):
             out.update(splat_telemetry)
         if graph_telemetry is not None:
             out.update(graph_telemetry)
+        # graph_baseline anti-collapse canaries (shared with the MAE path). The real
+        # parsed graph rides in finalize_aux["graph"] regardless of the REAL/OFF/SHUF
+        # control; read_effrank reads the injected vector (graph_cap), REAL/SHUF only.
+        _parsed_graph = finalize_aux.get("graph")
+        if _parsed_graph is not None and self.variant == "graph_baseline":
+            out.update(self._graph_canaries(_parsed_graph, graph_cap, attn_mask_full.bool()))
         if hlvocab_telemetry:
             out.update(hlvocab_telemetry)
         # flat_baseline codebook health → top-level so the trainer logs it to

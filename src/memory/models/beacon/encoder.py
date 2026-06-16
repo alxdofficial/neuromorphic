@@ -122,7 +122,11 @@ class BeaconBaselineEncoder(nn.Module):
         we = window_emb.view(B, n_units, alpha, d)
         wm = window_mask.view(B, n_units, alpha)
         beac = self.beacon_embed.to(window_emb.dtype).view(1, 1, 1, d).expand(B, n_units, 1, d)
-        bmk = torch.ones(B, n_units, 1, dtype=torch.bool, device=window_emb.device)
+        # A beacon is attendable iff its α-unit holds ≥1 real token. An all-pad unit
+        # (a short row's tail, or the final-window pad) must NOT contribute an attendable
+        # beacon — marking it valid (the old `ones`) let real positions attend to a
+        # padding-summary AND extracted it as a memory slot summarizing pure padding.
+        bmk = wm.any(dim=2, keepdim=True)             # [B, n_units, 1] bool
         seq = torch.cat([we, beac], dim=2).reshape(B, n_units * (alpha + 1), d)
         msk = torch.cat([wm, bmk], dim=2).reshape(B, n_units * (alpha + 1))
         is_beacon = torch.zeros(B, n_units * (alpha + 1), dtype=torch.bool,
@@ -141,9 +145,14 @@ class BeaconBaselineEncoder(nn.Module):
         alpha = self.cfg.beacon_ratio or 32
         seq, msk, is_beacon = self._interleave(token_embeds, attention_mask.bool(), alpha)
         prefix = state["mem"]                         # accumulated beacons (attend_prev)
+        prev_valid = state.get("valid")               # [B, n_prev] per-beacon validity (None@first)
         if prefix is not None:
             B = prefix.shape[0]
-            pm = torch.ones(B, prefix.shape[1], device=prefix.device, dtype=torch.bool)
+            # Carry the accumulated per-beacon validity as the prefix attention mask so a
+            # padding beacon from an earlier window stays non-attendable here too (the old
+            # all-ones would re-admit it as context). prev_valid aligns 1:1 with prefix beacons.
+            pm = (prev_valid if prev_valid is not None
+                  else torch.ones(B, prefix.shape[1], device=prefix.device, dtype=torch.bool))
             # is_beacon does double duty: it selects the beacon q/k/v projections AND
             # marks which positions are EXTRACTED as new beacons (`pos` below). Carried
             # prefix beacons are intentionally marked NOT-beacon: they are read as
@@ -152,7 +161,7 @@ class BeaconBaselineEncoder(nn.Module):
             # beacon would re-route AND re-extract them, double-counting memory).
             pb = torch.zeros(B, prefix.shape[1], device=prefix.device, dtype=torch.bool)
             seq = torch.cat([prefix.to(seq.dtype), seq], dim=1)
-            msk = torch.cat([pm, msk], dim=1)
+            msk = torch.cat([pm.bool(), msk], dim=1)
             is_beacon = torch.cat([pb, is_beacon], dim=1)
         self._mask[0] = is_beacon.unsqueeze(-1).to(seq.dtype)
         try:
@@ -161,8 +170,11 @@ class BeaconBaselineEncoder(nn.Module):
             self._mask[0] = None
         pos = is_beacon[0].nonzero(as_tuple=False).squeeze(-1)   # same across batch
         new_beacons = h[:, pos, :]                    # [B, n_beacon, d]
+        new_valid = msk[:, pos]                       # [B, n_beacon] bool: beacon's unit had real tokens
         new_mem = new_beacons if prefix is None else torch.cat([prefix, new_beacons], dim=1)
-        return {**state, "mem": new_mem}, {}
+        all_valid = (new_valid if prev_valid is None
+                     else torch.cat([prev_valid, new_valid], dim=1))
+        return {**state, "mem": new_mem, "valid": all_valid}, {}
 
     def forward(self, token_embeds, attention_mask=None, mask_positions=None):
         """Legacy single-window path (non-QA losses). Closed-book: no question."""
@@ -174,7 +186,12 @@ class BeaconBaselineEncoder(nn.Module):
 
     def finalize_memory(self, state) -> tuple[Tensor, dict]:
         mem = state["mem"]
+        valid = state.get("valid")
         if mem is None:
             mem = torch.zeros(state["B"], 1, self.cfg.d_llama,
                               device=state["device"], dtype=torch.float32)
-        return self.norm(mem.float()), {}
+            valid = torch.ones(state["B"], 1, device=state["device"], dtype=torch.bool)
+        # Per-beacon validity → memory_mask so the decoder never attends to a beacon that
+        # summarized only padding (consumed in compute_loss + the MAE prepend path).
+        aux = {} if valid is None else {"memory_mask": valid}
+        return self.norm(mem.float()), aux

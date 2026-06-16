@@ -42,8 +42,21 @@ class GraphEncoder(nn.Module):
         self.gcfg = gcfg
         self.parser = GraphParser(gcfg)
         self.reader = GraphReader(gcfg)
-        self.obs_tap_layer = cfg.graph_obs_tap_layer       # observation tap
-        self.inject_layer = cfg.graph_inject_layer         # reader inject point
+        # Depth guard: the absolute defaults (obs=6, inject=18) are tuned for SmolLM2-135M's
+        # 30 layers (0.20 / 0.60 of depth). On a shallower backbone (e.g. Llama-3.2-1B = 16
+        # layers, the config default), inject=18 would index past the stack. Keep the
+        # configured taps when they fit; otherwise re-derive depth-relative at the same
+        # fractions. Invariant: 0 ≤ obs < inject < n_layers (the read needs ≥1 layer after
+        # the inject to consume it; the obs tap reads hidden_states[obs+1] ≤ n_layers).
+        n_layers = base.config.num_hidden_layers
+        obs_tap, inject = cfg.graph_obs_tap_layer, cfg.graph_inject_layer
+        if not (0 <= obs_tap < inject < n_layers):
+            obs_tap = max(1, round(0.20 * n_layers))
+            inject = min(n_layers - 1, max(obs_tap + 1, round(0.60 * n_layers)))
+            print(f"[graph] tap/inject ({cfg.graph_obs_tap_layer}/{cfg.graph_inject_layer}) "
+                  f"out of range for {n_layers}-layer backbone → depth-relative {obs_tap}/{inject}")
+        self.obs_tap_layer = obs_tap                       # observation tap
+        self.inject_layer = inject                         # reader inject point
         print(f"[graph] relational parser: N={gcfg.n_nodes} bank, E={gcfg.n_edges} edges, "
               f"d_graph={gcfg.d_graph}, write×{gcfg.write_layers}/read×{gcfg.read_layers}, "
               f"obs_tap=L{self.obs_tap_layer} inject=L{self.inject_layer}")

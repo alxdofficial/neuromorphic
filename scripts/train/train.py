@@ -306,8 +306,7 @@ def train_one_variant(
     # LoRA off → keep sharing the single read-only frozen Llama (fast).
     llama_arg = None if cfg.use_llama_lora else llama
     model = ReprLearningModel(cfg, variant=variant, llama_model=llama_arg).to(device)
-    if getattr(cfg, "task_mode", None) == "masked_reconstruction":
-        model.task_mode = "masked_reconstruction"   # route compute_loss → compute_masked_reconstruction_loss
+    model.task_mode = task   # explicit dispatch (MAE→masked_reconstruction path; else generic compute_loss)
     n_trainable = model.n_trainable_params()
     # A variant is eval-only iff it has no trainable params. With LoRA-all on, the
     # two vanilla references DO train (their ~1.7M LoRA) — they become the LoRA'd
@@ -362,7 +361,7 @@ def train_one_variant(
     elif task == "continuation":
         # continuation: compress N → predict the NEXT tokens (gist/LM).
         _cont = dict(batch_size=cfg.batch_size, compress_len=compress_len, predict_len=predict_len,
-                     pad_token_id=cfg.pad_token_id, objective=task)
+                     pad_token_id=cfg.pad_token_id, objective=task, src_tokenizer_name=mae_src_tok)
         train_dl = None if is_eval_only else make_continuation_dataloader(
             tokenizer, split="train", seed=42, **_cont)
         val_dl = make_continuation_dataloader(tokenizer, split="validation", seed=7, **_cont)

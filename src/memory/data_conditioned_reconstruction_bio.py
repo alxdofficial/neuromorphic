@@ -150,10 +150,11 @@ class ConditionedReconstructionBioDataset(IterableDataset):
             if cum_end <= valid:
                 queryable.append(i)
         if len(queryable) < self.n_query:
-            raise ValueError(
-                f"context_len={self.context_len} too small: only {len(queryable)} of "
-                f"{len(keys)} packed facts fully fit the context; need n_query={self.n_query}. "
-                f"Raise --cond-recon-bio context length or lower n_query.")
+            # Unlucky draw: this example's first n_query rendered sentences were long
+            # enough that fewer than n_query fully fit the clamped context. Signal the
+            # caller to resample rather than crash the whole run; __iter__ distinguishes
+            # an occasional bad draw (retry) from a fundamentally-too-small config (raise).
+            return None
         qi = rng.sample(queryable, self.n_query)
         question_ids = self._ids(keys[qi[0]])
 
@@ -185,8 +186,21 @@ class ConditionedReconstructionBioDataset(IterableDataset):
     def __iter__(self):
         wi = torch.utils.data.get_worker_info()
         rng = random.Random(self.stream_seed + (wi.id if wi is not None else 0))
+        _MAX_RETRY = 50                       # tolerate unlucky long-sentence draws
         for _ in range(self.n_items):
-            yield self._gen(rng)
+            ex = None
+            for _try in range(_MAX_RETRY):
+                ex = self._gen(rng)
+                if ex is not None:
+                    break
+            if ex is None:
+                # Every one of _MAX_RETRY draws under-filled → the config is genuinely
+                # too small for n_query, not just an unlucky sentence-length draw.
+                raise ValueError(
+                    f"context_len={self.context_len} too small for n_query={self.n_query}: "
+                    f"{_MAX_RETRY} consecutive draws had fewer than n_query facts fully fit "
+                    f"the context. Raise --cond-recon-bio context length or lower n_query.")
+            yield ex
 
 
 def make_conditioned_reconstruction_bio_dataloader(tokenizer, context_len: int, batch_size: int,
