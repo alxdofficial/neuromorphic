@@ -119,14 +119,33 @@ the residual stream, **learnable dim-scaled gate** (`tanh(gate)`, init `1/√d_l
 
 ---
 
-## 5. Objective
-- **v1 (build first): single-passage `masked_reconstruction`** (the same MAE harness, data,
-  masking, and REAL/OFF/SHUF as HLV and the baselines). De-risks parse→read. **No persistence.**
-- **v2 (follow-on): streaming / continual.** Persistent graph across windows; edges
-  **content-addressed by `(src,dst)` identity** → survive→carry state forward, gone→evict,
-  new→`fresh_edge_init`; the parser **copy-defaults** to the carried state (persist unless the
-  observation demands restructure = bounded edits = stability); eviction at budget. This is
-  where reuse / editing / stability actually earn their keep over a flat bank.
+## 5. Persistence (BUILT) + objective
+
+### Persistent graph state — slot-carry, windowed (in the code)
+The observation is processed in **`graph_window`-token windows**, and the graph **persists
+and is UPDATED across them**: each window the parser ingests the **current graph state** as
+its input edge tokens (`src_value/dst_value/edge_state + role + tag`) and re-points endpoints
++ re-states edges. The **per-edge instance tag is the persistent slot identity** — edge slot
+`e` stays slot `e` across windows, so the parser *refines* it (and can copy-default to keep
+stable edges stable) instead of regenerating from scratch and scrambling identities. The `E`
+slots are fixed, so add/remove/evict happen *implicitly* by a slot re-pointing — no separate
+`fresh_edge_init` / pair-identity bookkeeping (this supersedes the earlier content-addressed-
+by-`(src,dst)` framing; slot-carry is the model that fits fixed-`E` instance-tagged slots).
+- **Window 1:** `state=None` → fresh `init_tok` slots.
+- **Window t+1:** `state =` the previous window's graph.
+- Implemented in `GraphParser.forward(obs, mask, state)` + the window loop in
+  `GraphEncoder.finalize_memory`. Full BPTT through the window chain (checkpoint per window if
+  long inputs OOM). *(Streaming TODO: per-example all-padding windows currently no-op via the
+  `_Attn` all-masked guard rather than truly skipping that example's update.)*
+
+### Objective
+- **v1 (current): single-passage `masked_reconstruction`** — same MAE harness, data, masking,
+  REAL/OFF/SHUF as HLV/baselines. Every MAE sentence is **≤ one window**, so the persistence
+  machinery runs exactly once (`state=None` → one parse) — i.e. MAE de-risks parse→read but
+  **does not exercise persistence**. The carry-forward is in the code, correct, and reduces to
+  the single-parse behavior here.
+- **next: a streaming / multi-window task** — the only thing that actually *tests* persistence
+  (reuse / editing / stability over a flat bank). Not yet added.
 
 ---
 

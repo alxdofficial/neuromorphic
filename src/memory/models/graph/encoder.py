@@ -77,11 +77,22 @@ class GraphEncoder(nn.Module):
         return state, {}
 
     def finalize_memory(self, state):
-        """Parse the observation into the graph; return EMPTY prepend memory + the
-        graph in aux. The reader injects via a decoder hook (loss path), so no prepend."""
-        graph = self.parser(state["hiddens"], state["mask"])
-        B = state["hiddens"].shape[0]
-        empty = torch.zeros(B, 0, self.cfg.d_llama, device=state["hiddens"].device)
+        """Parse the observation into the graph — WINDOWED + PERSISTENT: process the
+        accumulated hiddens in graph_window-token windows, carrying (and updating) the
+        graph across them (the parser ingests the prior graph each window). A short
+        input (≤ one window — every MAE sentence) runs once from the fresh init slots
+        = a single parse. The reader injects via a decoder hook (loss path), no prepend."""
+        hiddens, mask = state["hiddens"], state["mask"]          # [B,T,d_llama], [B,T]
+        W = self.cfg.graph_window
+        T = hiddens.shape[1]
+        graph = None
+        for s in range(0, T, W):
+            e = min(s + W, T)
+            if not mask[:, s:e].any():                           # all-padding tail window → skip
+                continue
+            graph = self.parser(hiddens[:, s:e], mask[:, s:e], state=graph)
+        B = hiddens.shape[0]
+        empty = torch.zeros(B, 0, self.cfg.d_llama, device=hiddens.device)
         return empty, {"graph": graph}
 
     def forward(self, token_embeds, attention_mask=None, mask_positions=None):

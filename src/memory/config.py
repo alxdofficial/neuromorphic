@@ -183,6 +183,9 @@ class ReprConfig:
     graph_d_graph: int = 256            # graph/vocabulary space width (decoupled from d_llama)
     graph_n_nodes: int = 1024           # N — node bank size (the learnable vocabulary)
     graph_n_edges: int = 16             # E — edge budget
+    graph_window: int = 256             # obs window for the PERSISTENT carry-forward: the
+                                        # parser ingests the prior graph + each window → updates
+                                        # it. Inputs ≤ one window (every MAE sentence) = one parse.
     graph_write_layers: int = 2         # parser depth (self-attend edges + cross-attend obs)
     graph_read_layers: int = 2          # reader depth (cross-attend edges + causal self)
     graph_heads: int = 4

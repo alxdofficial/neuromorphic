@@ -63,6 +63,12 @@ class _Attn(nn.Module):
             scores = scores.masked_fill(cm, float("-inf"))
         if kv_mask is not None:                                    # [B,Tk] True=valid
             scores = scores.masked_fill(~kv_mask[:, None, None, :], float("-inf"))
+            # guard: a query whose kv is ALL masked (e.g. an all-padding window for
+            # one example in the persistent carry) → all -inf → NaN softmax. Make it
+            # uniform instead (the caller treats such a window as a no-op update).
+            allmask = ~kv_mask.any(-1)                            # [B] True = no valid kv
+            if allmask.any():
+                scores = scores.masked_fill(allmask[:, None, None, None], 0.0)
         a = scores.softmax(-1)
         out = (a @ v).transpose(1, 2).reshape(B, Tq, self.h * self.dh)
         return self.o(out)
@@ -121,11 +127,22 @@ class GraphParser(nn.Module):
         val = ptr @ self.node_bank                                # [B,E,d] gather (sharp → near-exact)
         return val, ptr
 
-    def forward(self, obs: Tensor, obs_mask: Tensor) -> dict:
+    def forward(self, obs: Tensor, obs_mask: Tensor, state: dict = None) -> dict:
+        """Parse/UPDATE the graph from one observation window. `state` = the current
+        graph (carried across windows) or None (first window → fresh init_tok slots).
+        Ingesting the prior state lets the parser REFINE — re-point endpoints, re-state
+        edges relative to what's there — instead of regenerating from scratch and
+        scrambling slot identities. The per-edge instance tag is the persistent slot id."""
         B, E, d = obs.shape[0], self.cfg.n_edges, self.cfg.d_graph
         kv = self.obs_proj(obs.float())                           # [B,T,d]
-        base = self.init_tok + self.role[:, None, :] + self.tag[None, :, :]   # [3,E,d]
-        x = base.reshape(3 * E, d).unsqueeze(0).expand(B, 3 * E, d).contiguous()
+        if state is None:                                         # window 1: fresh slots
+            base = self.init_tok + self.role[:, None, :] + self.tag[None, :, :]   # [3,E,d]
+            x = base.reshape(3 * E, d).unsqueeze(0).expand(B, 3 * E, d).contiguous()
+        else:                                                     # window t+1: ingest carried state
+            src_in = state["src_value"] + self.role[0] + self.tag    # [B,E,d]
+            dst_in = state["dst_value"] + self.role[1] + self.tag
+            edge_in = state["edge_state"] + self.role[2] + self.tag
+            x = torch.stack([src_in, dst_in, edge_in], dim=1).reshape(B, 3 * E, d)
         for blk in self.blocks:
             x = blk(x, kv, kv_mask=obs_mask.bool())               # self-attend edges + cross-attend obs
         src_t, dst_t, edge_t = x.view(B, 3, E, d).unbind(1)
