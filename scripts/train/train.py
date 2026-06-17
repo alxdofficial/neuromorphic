@@ -1029,6 +1029,11 @@ def main():
     ap.add_argument("--graph-entmax-alpha", type=float, default=1.0,
                     help="graph: node-selection sparsity. 1.0 = softmax (dense blend, default); "
                          "1.5 = entmax (sparse, commits to a few nodes); 2.0 = sparsemax.")
+    ap.add_argument("--graph-encoder-lora-rank", type=int, default=0,
+                    help="graph: LoRA-adapt the encoder forward like the baselines (0=frozen tap). "
+                         "Evens the encoder footing (the graph historically read a frozen tap).")
+    ap.add_argument("--graph-read-final", action="store_true",
+                    help="graph: read the FINAL hidden (full forward) instead of the mid tap.")
     ap.add_argument("--beacon-param", nargs="+", default=None,
                     help="Beacon capacity knob: which projections get a trainable copy "
                          "(default q k v ≈ 102M). e.g. --beacon-param v shrinks toward ~17M.")
@@ -1397,6 +1402,12 @@ def main():
     if args.graph_entmax_alpha > 1.0:
         cfg.graph_entmax_alpha = args.graph_entmax_alpha
         print(f"[graph override] node selection = entmax α={cfg.graph_entmax_alpha}")
+    if args.graph_encoder_lora_rank > 0:
+        cfg.graph_encoder_lora_rank = args.graph_encoder_lora_rank
+        print(f"[graph override] encoder-LoRA rank = {cfg.graph_encoder_lora_rank}")
+    if args.graph_read_final:
+        cfg.graph_read_final = True
+        print("[graph override] reading FINAL hidden (full forward)")
     cfg.task_mode = args.task        # accurate ckpt metadata (dispatch still keys on this)
     cfg.seed = args.seed             # record the actual seed in ckpt metadata
 

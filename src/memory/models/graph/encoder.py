@@ -28,12 +28,22 @@ class GraphEncoder(nn.Module):
     def __init__(self, cfg: ReprConfig):
         super().__init__()
         self.cfg = cfg
-        from ...decoder import load_frozen_llama
+        from ...decoder import load_frozen_llama, apply_lora_to_llama
         from .substrate import GraphConfig, GraphParser, GraphReader
         base, _ = load_frozen_llama(cfg.llama_model)
         for p_ in base.parameters():
             p_.requires_grad_(False)
-        self.base = base                                   # frozen contextualizer
+        # Even-footing with the baselines: optionally LoRA-ADAPT the encoder forward (icae/
+        # ccm/ac/beacon all adapt theirs; the graph historically read a FROZEN tap). When on,
+        # the base forward runs WITH grad so the LoRA trains, and we read the FINAL hidden.
+        self._enc_lora = cfg.graph_encoder_lora_rank > 0
+        if self._enc_lora:
+            n_w = apply_lora_to_llama(
+                base, rank=cfg.graph_encoder_lora_rank,
+                alpha=cfg.graph_encoder_lora_alpha or 2 * cfg.graph_encoder_lora_rank,
+                target_names=tuple(cfg.llama_lora_target_names))
+            print(f"[graph] encoder-LoRA: {n_w} linears wrapped (rank={cfg.graph_encoder_lora_rank})")
+        self.base = base                                   # frozen contextualizer (+ optional LoRA)
         gcfg = GraphConfig(
             d_llama=cfg.d_llama, d_graph=cfg.graph_d_graph, n_nodes=cfg.graph_n_nodes,
             n_edges=cfg.graph_n_edges, write_layers=cfg.graph_write_layers,
@@ -47,11 +57,14 @@ class GraphEncoder(nn.Module):
         # 30 layers (0.20 of depth). On a shallower backbone, re-derive depth-relative so the
         # tap can't index past the stack. (The read is now a prepend — no inject layer.)
         n_layers = base.config.num_hidden_layers
-        obs_tap = cfg.graph_obs_tap_layer
-        if not (0 <= obs_tap < n_layers):
-            obs_tap = max(1, round(0.20 * n_layers))
-            print(f"[graph] obs_tap ({cfg.graph_obs_tap_layer}) out of range for "
-                  f"{n_layers}-layer backbone → depth-relative {obs_tap}")
+        if cfg.graph_read_final:                           # read the full-depth final hidden (like baselines)
+            obs_tap = n_layers - 1
+        else:
+            obs_tap = cfg.graph_obs_tap_layer
+            if not (0 <= obs_tap < n_layers):
+                obs_tap = max(1, round(0.20 * n_layers))
+                print(f"[graph] obs_tap ({cfg.graph_obs_tap_layer}) out of range for "
+                      f"{n_layers}-layer backbone → depth-relative {obs_tap}")
         self.obs_tap_layer = obs_tap                       # observation tap
         _sel = "softmax" if gcfg.entmax_alpha <= 1.0 else f"entmax-{gcfg.entmax_alpha}"
         print(f"[graph] relational parser: N={gcfg.n_nodes} bank, E={gcfg.n_edges} edges, "
@@ -73,7 +86,10 @@ class GraphEncoder(nn.Module):
         B, W = token_embeds.shape[:2]
         if attention_mask is None:
             attention_mask = torch.ones(B, W, device=token_embeds.device, dtype=torch.bool)
-        with torch.no_grad():                              # frozen base; parser trains on fixed hiddens
+        # no_grad only when the encoder is fully frozen; with encoder-LoRA the forward must
+        # build the graph so gradients reach the LoRA params.
+        from contextlib import nullcontext
+        with (nullcontext() if self._enc_lora else torch.no_grad()):
             out = self.base.model(inputs_embeds=token_embeds,
                                   attention_mask=attention_mask.long(),
                                   output_hidden_states=True, use_cache=False)

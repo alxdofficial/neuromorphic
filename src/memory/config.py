@@ -198,6 +198,9 @@ class ReprConfig:
     graph_ptr_logit_temp_init: float = 0.0
     graph_entmax_alpha: float = 1.0     # node-selection sparsity: 1.0=softmax, 1.5/2.0=sparse (entmax)
     graph_obs_tap_layer: int = 6        # frozen-backbone layer tapped for the observation
+    graph_encoder_lora_rank: int = 0    # >0: LoRA-adapt the encoder forward like the baselines (0=frozen tap)
+    graph_encoder_lora_alpha: int = 0   # 0 → 2×rank
+    graph_read_final: bool = False      # read the FINAL hidden (full forward) instead of the mid tap
 
     # ── slotmem factorization experiments (control / Exp1 discreteness / Exp2b graph-write)
     slotmem_n_slots: int = 16           # M memory tokens (= slots / edges); k-sliced like the cohort
