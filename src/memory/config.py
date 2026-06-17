@@ -199,5 +199,27 @@ class ReprConfig:
     graph_obs_tap_layer: int = 6        # frozen-backbone layer tapped for the observation
     graph_inject_layer: int = 18        # frozen-backbone layer the reader injects into (mid-late)
 
+    # ── biomem (gated fast-Hebbian cortical-column grid; models/biomem/) ─────
+    # The bet: memory lives in synaptic STATE — scalar fast edge weights W in
+    # [-1,1] updated by a gated Hebbian rule per input token, NOT in learned
+    # weights. Read and write are both signal propagation (a feed-forward sweep
+    # through H layers). The grid is C columns x K-wide x H-deep; C*K = d_llama so
+    # the token embedding reshapes into the input layer for free. The only LEARNED
+    # objects are small: the shared plasticity regulator MLP, per-(col,layer-pair)
+    # conditioning vectors, the readout MLP, the M query seeds, and the leak. theta
+    # thresholds are random-FIXED. Spirit of fast-weights (Ba 2016) + neuromodulated
+    # plasticity / Backpropamine (Miconi 2018).
+    biomem_n_cols: int = 9             # C — #columns; C*K must == d_llama (9*64=576)
+    biomem_k: int = 64                 # K — column width (keep small)
+    biomem_depth_h: int = 7            # H — layers per column (H-1 fast-edge layer-pairs)
+    biomem_n_slots: int = 16           # M — query seeds = prepend memory tokens (k-sliced)
+    biomem_d_cond: int = 48            # per-(col,layer-pair) conditioning vector width
+    biomem_reg_hidden: int = 64        # plasticity-regulator MLP hidden width (per-edge; keep narrow)
+    biomem_seed_hidden: int = 1280     # query-seed encoder MLP hidden width
+    biomem_readout_hidden: int = 3328  # readout MLP hidden width (grid activity -> memory token)
+    biomem_leak_init: float = 0.1      # initial leak lambda (learned, sigmoid-parameterized)
+    biomem_theta_scale: float = 0.1    # std of the random-fixed per-neuron threshold theta
+    biomem_grad_checkpoint: bool = True  # checkpoint the per-token sweep (essential for BPTT memory)
+
     # ── Misc ───────────────────────────────────────────────────────────────
     seed: int = 42                  # wired in the trainer (torch/np/random) for reproducibility

@@ -17,6 +17,7 @@ from .chat_template import ChatTemplate, build_chat_template
 from .config import ReprConfig
 from .models.autocompressor import AutoCompressorBaselineEncoder
 from .models.beacon import BeaconBaselineEncoder
+from .models.biomem import BioMemEncoder
 from .models.ccm import CCMBaselineEncoder
 from .models.graph import GraphEncoder
 from .models.hierarchical_learned_vocab import HLVocabEncoder
@@ -64,6 +65,9 @@ class ReprLearningModel(nn.Module):
         "ccm_baseline": CCMBaselineEncoder,    # CCM (ICLR'24) recurrent compressor, EMAT-retrained
         "beacon_baseline": BeaconBaselineEncoder,  # Activation Beacon (BAAI) per-layer beacon attn
         "autocompressor_baseline": AutoCompressorBaselineEncoder,  # AutoCompressors/RMT recurrent summary
+        # ORTHOGONAL ARM — gated fast-Hebbian cortical-column grid; memory in synaptic
+        # STATE (fast edges), read+write are signal propagation (models/biomem/).
+        "biomem_baseline": BioMemEncoder,
         "vanilla_llama": NullEncoder,         # loss floor — Llama with no memory
         "vanilla_full_context": FullContextEncoder,  # loss ceiling — Llama sees full evidence
     }
@@ -248,7 +252,8 @@ class ReprLearningModel(nn.Module):
     # slicing applies to these; vanillas pass through at M=0 / M=T).
     _MASKED_RECON_COMPRESSORS = ("icae_baseline", "ccm_baseline", "hlvocab_baseline",
                         "autocompressor_baseline", "beacon_baseline",
-                        "soft_pointer_graph_baseline")  # slice to k too if selected (capacity-fair)
+                        "soft_pointer_graph_baseline",
+                        "biomem_baseline")  # slice to k too if selected (capacity-fair)
 
     def compute_masked_reconstruction_loss(
         self,
