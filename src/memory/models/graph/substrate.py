@@ -87,6 +87,7 @@ class GraphConfig:
     ffn_mult: int = 2
     ptr_logit_temp_init: float = 0.0  # pointer log-temp init (0 ⇒ temp=1; negative ⇒ sharper)
     entmax_alpha: float = 1.0         # selection sparsity: 1.0 ⇒ softmax (dense), 1.5/2.0 ⇒ sparse
+    free_endpoints: bool = False      # True ⇒ regress FREE src/dst vectors (no bank, no selection)
 
 
 # ── attention with QK-RMSNorm + learnable temp (the read/select cold-start fix) ──
@@ -165,21 +166,29 @@ class GraphParser(nn.Module):
         super().__init__()
         self.cfg = cfg
         N, E, d = cfg.n_nodes, cfg.n_edges, cfg.d_graph
-        # the vocabulary: N learnable node vectors. Gradient-trained (not VQ-EMA).
-        self.node_bank = nn.Parameter(torch.randn(N, d) / math.sqrt(d))
-        self.bank_key = nn.Linear(d, d, bias=False)                # pointer match-keys (raw bank)
-        self.node_role_avail = nn.Parameter(torch.randn(d) / math.sqrt(d))   # "available" role (cross-attn)
+        self.free = cfg.free_endpoints
         self.obs_proj = nn.Linear(cfg.d_llama, d)                  # obs → d_graph (cross-attn)
         self.role = nn.Parameter(torch.randn(3, d) / math.sqrt(d))    # src / edge / dst role
         self.tag = nn.Parameter(torch.randn(E, d) / math.sqrt(d))     # per-edge instance tag
         self.part = nn.Parameter(torch.randn(2, d) / math.sqrt(d))    # current-graph vs prediction-slot
         self.init_graph = nn.Parameter(torch.randn(3, E, d) / math.sqrt(d))  # window-1 "initial graph" values
-        self.blocks = nn.ModuleList(_ParserBlock(d, cfg.heads, cfg.ffn_mult) for _ in range(cfg.write_layers))
-        self.q_src = nn.Linear(d, d, bias=False)                   # head: src/dst slot → pointer query
-        self.q_dst = nn.Linear(d, d, bias=False)
-        # learnable src/dst pointer sharpness; init from cfg (0 ⇒ temp=1; negative ⇒ sharper).
-        self.log_temp = nn.Parameter(torch.full((2,), float(cfg.ptr_logit_temp_init)))
+        self.blocks = nn.ModuleList(
+            _ParserBlock(d, cfg.heads, cfg.ffn_mult, use_nodes=not self.free)
+            for _ in range(cfg.write_layers))
         self.edge_head = nn.Linear(d, d)                          # head: edge slot → edge_state
+        if self.free:
+            # FREE endpoints: regress src/dst vectors directly (no bank, no selection, no topology).
+            self.src_head = nn.Linear(d, d)
+            self.dst_head = nn.Linear(d, d)
+        else:
+            # the vocabulary: N learnable node vectors. Gradient-trained (not VQ-EMA).
+            self.node_bank = nn.Parameter(torch.randn(N, d) / math.sqrt(d))
+            self.bank_key = nn.Linear(d, d, bias=False)            # pointer match-keys (raw bank)
+            self.node_role_avail = nn.Parameter(torch.randn(d) / math.sqrt(d))  # "available" role
+            self.q_src = nn.Linear(d, d, bias=False)               # head: src/dst slot → pointer query
+            self.q_dst = nn.Linear(d, d, bias=False)
+            # learnable src/dst pointer sharpness; init from cfg (0 ⇒ temp=1; negative ⇒ sharper).
+            self.log_temp = nn.Parameter(torch.full((2,), float(cfg.ptr_logit_temp_init)))
 
     def _point(self, q: Tensor, which: int) -> tuple[Tensor, Tensor]:
         """Snap: QK-RMSNorm + learnable-temp softmax over the bank → gather the RAW bank
@@ -202,7 +211,8 @@ class GraphParser(nn.Module):
         regress edge_state). `state` = carried graph (None on window 1 → init_graph)."""
         B, E, d = obs.shape[0], self.cfg.n_edges, self.cfg.d_graph
         obs_kv = self.obs_proj(obs.float())                       # [B,T,d]
-        nodes_kv = (self.node_bank + self.node_role_avail).unsqueeze(0).expand(B, -1, -1)  # [B,N,d]
+        nodes_kv = None if self.free else \
+            (self.node_bank + self.node_role_avail).unsqueeze(0).expand(B, -1, -1)  # [B,N,d]
         rt = self.role[:, None, :] + self.tag[None, :, :]        # [3,E,d] role+tag
         # Part 1 — current graph WITH values (window 1: learnable init; else carried)
         if state is None:
@@ -217,9 +227,12 @@ class GraphParser(nn.Module):
             x = blk(x, nodes_kv, obs_kv, obs_mask)
         # predict the new graph off Part 2 (the value-less prediction slots)
         src_t, edge_t, dst_t = x[:, 3 * E:].view(B, 3, E, d).unbind(1)
+        edge_state = self.edge_head(edge_t)
+        if self.free:                                            # regress free endpoints (no ptr)
+            return {"src_value": self.src_head(src_t), "dst_value": self.dst_head(dst_t),
+                    "edge_state": edge_state}
         src_v, src_ptr = self._point(self.q_src(src_t), 0)
         dst_v, dst_ptr = self._point(self.q_dst(dst_t), 1)
-        edge_state = self.edge_head(edge_t)
         return {"src_value": src_v, "dst_value": dst_v, "edge_state": edge_state,
                 "src_ptr": src_ptr, "dst_ptr": dst_ptr}
 

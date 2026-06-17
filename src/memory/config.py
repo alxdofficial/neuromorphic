@@ -201,6 +201,7 @@ class ReprConfig:
     graph_encoder_lora_rank: int = 0    # >0: LoRA-adapt the encoder forward like the baselines (0=frozen tap)
     graph_encoder_lora_alpha: int = 0   # 0 → 2×rank
     graph_read_final: bool = False      # read the FINAL hidden (full forward) instead of the mid tap
+    graph_free_endpoints: bool = False  # regress FREE src/dst vectors (no bank/selection/topology)
 
     # ── slotmem factorization experiments (control / Exp1 discreteness / Exp2b graph-write)
     slotmem_n_slots: int = 16           # M memory tokens (= slots / edges); k-sliced like the cohort

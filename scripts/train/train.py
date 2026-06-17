@@ -1034,6 +1034,8 @@ def main():
                          "Evens the encoder footing (the graph historically read a frozen tap).")
     ap.add_argument("--graph-read-final", action="store_true",
                     help="graph: read the FINAL hidden (full forward) instead of the mid tap.")
+    ap.add_argument("--graph-free-endpoints", action="store_true",
+                    help="graph: regress FREE src/dst vectors (drop the bank/selection/topology).")
     ap.add_argument("--beacon-param", nargs="+", default=None,
                     help="Beacon capacity knob: which projections get a trainable copy "
                          "(default q k v ≈ 102M). e.g. --beacon-param v shrinks toward ~17M.")
@@ -1408,6 +1410,9 @@ def main():
     if args.graph_read_final:
         cfg.graph_read_final = True
         print("[graph override] reading FINAL hidden (full forward)")
+    if args.graph_free_endpoints:
+        cfg.graph_free_endpoints = True
+        print("[graph override] FREE endpoints (no bank/selection)")
     cfg.task_mode = args.task        # accurate ckpt metadata (dispatch still keys on this)
     cfg.seed = args.seed             # record the actual seed in ckpt metadata
 

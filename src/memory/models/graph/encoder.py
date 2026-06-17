@@ -49,7 +49,7 @@ class GraphEncoder(nn.Module):
             n_edges=cfg.graph_n_edges, write_layers=cfg.graph_write_layers,
             read_layers=cfg.graph_read_layers, heads=cfg.graph_heads,
             ffn_mult=cfg.graph_ffn_mult, ptr_logit_temp_init=cfg.graph_ptr_logit_temp_init,
-            entmax_alpha=cfg.graph_entmax_alpha)
+            entmax_alpha=cfg.graph_entmax_alpha, free_endpoints=cfg.graph_free_endpoints)
         self.gcfg = gcfg
         self.parser = GraphParser(gcfg)
         self.reader = GraphReader(gcfg)                     # forms PREPEND memory tokens (not inject)

@@ -381,13 +381,14 @@ class ReprLearningModel(nn.Module):
         out = {}
         with torch.no_grad():
             d_g = enc.gcfg.d_graph
-            src_ptr, dst_ptr = graph["src_ptr"], graph["dst_ptr"]       # [B,E,N]
-            ent = -(src_ptr * src_ptr.clamp_min(1e-12).log()).sum(-1).mean() \
-                  - (dst_ptr * dst_ptr.clamp_min(1e-12).log()).sum(-1).mean()
-            sel = torch.cat([src_ptr.argmax(-1).reshape(-1), dst_ptr.argmax(-1).reshape(-1)])
-            out["graph_ptr_entropy"] = float((ent / 2).item())
-            out["graph_nodes_used"] = float(sel.unique().numel())
-            out["graph_bank_effrank"] = _participation_ratio(enc.parser.node_bank)
+            if "src_ptr" in graph:                                      # discrete bank (no ptr for free endpoints)
+                src_ptr, dst_ptr = graph["src_ptr"], graph["dst_ptr"]   # [B,E,N]
+                ent = -(src_ptr * src_ptr.clamp_min(1e-12).log()).sum(-1).mean() \
+                      - (dst_ptr * dst_ptr.clamp_min(1e-12).log()).sum(-1).mean()
+                sel = torch.cat([src_ptr.argmax(-1).reshape(-1), dst_ptr.argmax(-1).reshape(-1)])
+                out["graph_ptr_entropy"] = float((ent / 2).item())
+                out["graph_nodes_used"] = float(sel.unique().numel())
+                out["graph_bank_effrank"] = _participation_ratio(enc.parser.node_bank)
             out["graph_edge_effrank"] = _participation_ratio(
                 graph["edge_state"].reshape(-1, d_g))
             if memory is not None and memory.shape[1] > 0:
