@@ -1019,6 +1019,12 @@ def main():
                          "memory (then dropped). 1024 = 8x compression (the aligned default).")
     ap.add_argument("--predict-len", type=int, default=512,
                     help="continuation: # next tokens to predict from memory only (closed-book).")
+    ap.add_argument("--graph-d-graph", type=int, default=0,
+                    help="graph: override the graph/vocabulary width d_graph (0 = task default). "
+                         "576 matches d_llama → full-rank read tokens (removes the rank handicap).")
+    ap.add_argument("--graph-entmax-alpha", type=float, default=1.0,
+                    help="graph: node-selection sparsity. 1.0 = softmax (dense blend, default); "
+                         "1.5 = entmax (sparse, commits to a few nodes); 2.0 = sparsemax.")
     ap.add_argument("--beacon-param", nargs="+", default=None,
                     help="Beacon capacity knob: which projections get a trainable copy "
                          "(default q k v ≈ 102M). e.g. --beacon-param v shrinks toward ~17M.")
@@ -1376,6 +1382,14 @@ def main():
               f"~13M memory params (graph d_graph=384, E={_M}, baselines icae r223 / "
               f"ccm r111 / ac r110 / beacon 23L).")
     cfg.contrastive_shuf_coef = args.contrastive_shuf_coef
+    # graph experiment overrides (win over the task defaults above): wider node/edge
+    # vectors (removes the read-token rank handicap) + sparse node selection (entmax).
+    if args.graph_d_graph > 0:
+        cfg.graph_d_graph = args.graph_d_graph
+        print(f"[graph override] d_graph = {cfg.graph_d_graph}")
+    if args.graph_entmax_alpha > 1.0:
+        cfg.graph_entmax_alpha = args.graph_entmax_alpha
+        print(f"[graph override] node selection = entmax α={cfg.graph_entmax_alpha}")
     cfg.task_mode = args.task        # accurate ckpt metadata (dispatch still keys on this)
     cfg.seed = args.seed             # record the actual seed in ckpt metadata
 

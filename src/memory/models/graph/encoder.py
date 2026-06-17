@@ -38,7 +38,8 @@ class GraphEncoder(nn.Module):
             d_llama=cfg.d_llama, d_graph=cfg.graph_d_graph, n_nodes=cfg.graph_n_nodes,
             n_edges=cfg.graph_n_edges, write_layers=cfg.graph_write_layers,
             read_layers=cfg.graph_read_layers, heads=cfg.graph_heads,
-            ffn_mult=cfg.graph_ffn_mult, ptr_logit_temp_init=cfg.graph_ptr_logit_temp_init)
+            ffn_mult=cfg.graph_ffn_mult, ptr_logit_temp_init=cfg.graph_ptr_logit_temp_init,
+            entmax_alpha=cfg.graph_entmax_alpha)
         self.gcfg = gcfg
         self.parser = GraphParser(gcfg)
         self.reader = GraphReader(gcfg)                     # forms PREPEND memory tokens (not inject)
@@ -52,9 +53,10 @@ class GraphEncoder(nn.Module):
             print(f"[graph] obs_tap ({cfg.graph_obs_tap_layer}) out of range for "
                   f"{n_layers}-layer backbone → depth-relative {obs_tap}")
         self.obs_tap_layer = obs_tap                       # observation tap
+        _sel = "softmax" if gcfg.entmax_alpha <= 1.0 else f"entmax-{gcfg.entmax_alpha}"
         print(f"[graph] relational parser: N={gcfg.n_nodes} bank, E={gcfg.n_edges} edges, "
               f"d_graph={gcfg.d_graph}, write×{gcfg.write_layers}/read×{gcfg.read_layers}, "
-              f"obs_tap=L{self.obs_tap_layer}, prepend read")
+              f"obs_tap=L{self.obs_tap_layer}, prepend read, select={_sel}")
 
     def train(self, mode: bool = True):
         super().train(mode)

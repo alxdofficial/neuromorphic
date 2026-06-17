@@ -33,6 +33,48 @@ def _rmsnorm(x: Tensor, eps: float = 1e-6) -> Tensor:
     return x * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + eps).to(x.dtype)
 
 
+class _EntmaxBisect(torch.autograd.Function):
+    """α-entmax (Peters/Niculae/Martins 2019) via bisection on the threshold τ, with the
+    EXACT entmax Jacobian in backward (no straight-through bias). α=1 → softmax (dense),
+    α=2 → sparsemax, 1<α<2 → sparse-but-soft. p_i = [(α−1)z_i − τ]_+^{1/(α−1)}, Σp=1, so
+    sub-threshold entries are EXACTLY zero — a genuine selection, not a blend. The model
+    chooses how many survive (data-dependent support). α is a fixed hyperparameter here."""
+
+    @staticmethod
+    def forward(ctx, X, alpha, dim, n_iter):
+        ctx.alpha = alpha; ctx.dim = dim
+        d = X.shape[dim]
+        Xs = X * (alpha - 1.0)                                   # work in (α−1)·z
+        max_val, _ = Xs.max(dim=dim, keepdim=True)
+        tau_lo = max_val - 1.0                                   # τ bounds (sum decreases as τ↑)
+        tau_hi = max_val - ((1.0 / d) ** (alpha - 1.0))
+        dm = tau_hi - tau_lo
+        p = torch.clamp(Xs - tau_lo, min=0) ** (1.0 / (alpha - 1.0))
+        for _ in range(n_iter):                                  # bisection → τ with Σp=1
+            dm = dm / 2.0
+            tau_m = tau_lo + dm
+            p = torch.clamp(Xs - tau_m, min=0) ** (1.0 / (alpha - 1.0))
+            f_m = p.sum(dim=dim, keepdim=True) - 1.0
+            tau_lo = torch.where(f_m >= 0, tau_m, tau_lo)
+        p = torch.clamp(Xs - tau_lo, min=0) ** (1.0 / (alpha - 1.0))
+        p = p / p.sum(dim=dim, keepdim=True).clamp_min(1e-12)
+        ctx.save_for_backward(p)
+        return p
+
+    @staticmethod
+    def backward(ctx, dY):
+        (p,) = ctx.saved_tensors
+        gppr = torch.where(p > 0, p ** (2.0 - ctx.alpha), torch.zeros_like(p))  # 0 off-support
+        dX = dY * gppr
+        q = dX.sum(dim=ctx.dim, keepdim=True) / gppr.sum(dim=ctx.dim, keepdim=True).clamp_min(1e-12)
+        dX = dX - q * gppr
+        return dX, None, None, None
+
+
+def entmax(X: Tensor, alpha: float = 1.5, dim: int = -1, n_iter: int = 30) -> Tensor:
+    return _EntmaxBisect.apply(X, alpha, dim, n_iter)
+
+
 @dataclass
 class GraphConfig:
     d_llama: int = 576
@@ -44,6 +86,7 @@ class GraphConfig:
     heads: int = 4
     ffn_mult: int = 2
     ptr_logit_temp_init: float = 0.0  # pointer log-temp init (0 ⇒ temp=1; negative ⇒ sharper)
+    entmax_alpha: float = 1.0         # selection sparsity: 1.0 ⇒ softmax (dense), 1.5/2.0 ⇒ sparse
 
 
 # ── attention with QK-RMSNorm + learnable temp (the read/select cold-start fix) ──
@@ -142,7 +185,10 @@ class GraphParser(nn.Module):
         kn = _rmsnorm(self.bank_key(self.node_bank))             # [N,d]
         temp = self.log_temp[which].clamp(-3.0, 3.0).exp()
         scores = (qn @ kn.t()) * (d ** -0.5) / temp               # [B,E,N]
-        ptr = scores.softmax(-1)
+        if self.cfg.entmax_alpha > 1.0:                           # sparse selection (commits to few)
+            ptr = entmax(scores, alpha=self.cfg.entmax_alpha, dim=-1)
+        else:                                                     # α=1 ⇒ dense softmax (default)
+            ptr = scores.softmax(-1)
         return ptr @ self.node_bank, ptr                          # gather raw bank (sharp → near-exact)
 
     def forward(self, obs: Tensor, obs_mask: Tensor, state: dict = None) -> dict:

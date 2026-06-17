@@ -196,6 +196,7 @@ class ReprConfig:
     # graph_ptr_entropy). A negative init (e.g. -1 ⇒ temp≈0.37) biases toward selection
     # from step 0 — the prime sweep knob if the pointer fails to sharpen.
     graph_ptr_logit_temp_init: float = 0.0
+    graph_entmax_alpha: float = 1.0     # node-selection sparsity: 1.0=softmax, 1.5/2.0=sparse (entmax)
     graph_obs_tap_layer: int = 6        # frozen-backbone layer tapped for the observation
 
     # ── Misc ───────────────────────────────────────────────────────────────
