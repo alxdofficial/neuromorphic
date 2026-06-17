@@ -199,5 +199,18 @@ class ReprConfig:
     graph_entmax_alpha: float = 1.0     # node-selection sparsity: 1.0=softmax, 1.5/2.0=sparse (entmax)
     graph_obs_tap_layer: int = 6        # frozen-backbone layer tapped for the observation
 
+    # ── slotmem factorization experiments (control / Exp1 discreteness / Exp2b graph-write)
+    slotmem_n_slots: int = 16           # M memory tokens (= slots / edges); k-sliced like the cohort
+    slotmem_d_slot: int = 520           # control slot-attention width (param-matched ~6.1M)
+    slotmem_iters: int = 3              # slot-attention refinement iterations
+    slotmem_vocab_d_slot: int = 496     # Exp1 slot width (smaller to make room for the bank)
+    slotmem_vocab_n: int = 512          # Exp1 node-bank size
+    slotmem_vocab_entmax: float = 1.5   # Exp1 selection sparsity (1.0=softmax)
+    slotmem_d_graph: int = 336          # Exp2b free-graph width; param-matched
+    slotmem_n_edges: int = 16           # Exp2b edges (= M edge tokens)
+    slotmem_write_layers: int = 3       # Exp2b parser depth
+    slotmem_heads: int = 4
+    slotmem_ffn_mult: int = 2
+
     # ── Misc ───────────────────────────────────────────────────────────────
     seed: int = 42                  # wired in the trainer (torch/np/random) for reproducibility

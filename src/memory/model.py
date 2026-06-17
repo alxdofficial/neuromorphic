@@ -21,6 +21,7 @@ from .models.graph import GraphEncoder
 from .models.hierarchical_learned_vocab import HLVocabEncoder
 from .models.icae import ICAEBaselineEncoder
 from .models.soft_pointer_graph import SoftPointerGraphEncoder
+from .models.slotmem import SlotAttentionEncoder, VocabSlotEncoder, FreeGraphEncoder
 from .models.vanilla import FullContextEncoder, NullEncoder
 from .decoder import FrozenLlamaDecoder
 
@@ -63,6 +64,10 @@ class ReprLearningModel(nn.Module):
         "ccm_baseline": CCMBaselineEncoder,    # CCM (ICLR'24) recurrent compressor, EMAT-retrained
         "beacon_baseline": BeaconBaselineEncoder,  # Activation Beacon (BAAI) per-layer beacon attn
         "autocompressor_baseline": AutoCompressorBaselineEncoder,  # AutoCompressors/RMT recurrent summary
+        # factorization experiments (prepend, k-sliced): control vs discreteness vs graph-write
+        "slotattn_baseline": SlotAttentionEncoder,   # control: M free slots (Slot Attention)
+        "vocabslot_baseline": VocabSlotEncoder,      # Exp1: slots = sparse combo of a node bank
+        "freegraph_baseline": FreeGraphEncoder,      # Exp2b: free-endpoint TokenGT write
         "vanilla_llama": NullEncoder,         # loss floor — Llama with no memory
         "vanilla_full_context": FullContextEncoder,  # loss ceiling — Llama sees full evidence
     }
@@ -247,7 +252,8 @@ class ReprLearningModel(nn.Module):
     # slicing applies to these; vanillas pass through at M=0 / M=T).
     _MASKED_RECON_COMPRESSORS = ("graph_baseline", "icae_baseline", "ccm_baseline",
                         "hlvocab_baseline", "autocompressor_baseline", "beacon_baseline",
-                        "soft_pointer_graph_baseline")  # slice to k too if selected (capacity-fair)
+                        "soft_pointer_graph_baseline",
+                        "slotattn_baseline", "vocabslot_baseline", "freegraph_baseline")
 
     def compute_masked_reconstruction_loss(
         self,

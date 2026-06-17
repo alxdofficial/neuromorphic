@@ -122,18 +122,22 @@ class _Attn(nn.Module):
 
 
 class _ParserBlock(nn.Module):
-    """self-attend(working set) → cross-attend(available nodes) → cross-attend(obs) → FFN."""
-    def __init__(self, d: int, heads: int, ffn_mult: int):
+    """self-attend(working set) → cross-attend(available nodes) → cross-attend(obs) → FFN.
+    nodes=None (the free-endpoint graph, no bank) skips the node cross-attention."""
+    def __init__(self, d: int, heads: int, ffn_mult: int, use_nodes: bool = True):
         super().__init__()
         self.sn = nn.LayerNorm(d); self.slf = _Attn(d, heads)
-        self.nn_norm = nn.LayerNorm(d); self.cross_nodes = _Attn(d, heads)
+        self.use_nodes = use_nodes
+        if use_nodes:
+            self.nn_norm = nn.LayerNorm(d); self.cross_nodes = _Attn(d, heads)
         self.on = nn.LayerNorm(d); self.cross_obs = _Attn(d, heads)
         self.fn = nn.LayerNorm(d)
         self.ff = nn.Sequential(nn.Linear(d, ffn_mult * d), nn.GELU(), nn.Linear(ffn_mult * d, d))
 
     def forward(self, x: Tensor, nodes: Tensor, obs: Tensor, obs_mask: Tensor) -> Tensor:
         xn = self.sn(x); x = x + self.slf(xn, xn)                 # self-attend the working set
-        x = x + self.cross_nodes(self.nn_norm(x), nodes)         # cross-attend available nodes (all valid)
+        if self.use_nodes and nodes is not None:
+            x = x + self.cross_nodes(self.nn_norm(x), nodes)     # cross-attend available nodes (all valid)
         x = x + self.cross_obs(self.on(x), obs, kv_mask=obs_mask.bool())   # cross-attend observation
         x = x + self.ff(self.fn(x))
         return x
