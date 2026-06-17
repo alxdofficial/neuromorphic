@@ -1022,6 +1022,10 @@ def main():
     ap.add_argument("--graph-d-graph", type=int, default=0,
                     help="graph: override the graph/vocabulary width d_graph (0 = task default). "
                          "576 matches d_llama → full-rank read tokens (removes the rank handicap).")
+    ap.add_argument("--graph-n-nodes", type=int, default=0,
+                    help="graph: override the node-bank size N (0 = task default 1024). "
+                         "Smaller (384/512) = a tighter vocabulary (the '1024 is oversized' lever); "
+                         "barely affects params (bank is N×d_graph).")
     ap.add_argument("--graph-entmax-alpha", type=float, default=1.0,
                     help="graph: node-selection sparsity. 1.0 = softmax (dense blend, default); "
                          "1.5 = entmax (sparse, commits to a few nodes); 2.0 = sparsemax.")
@@ -1387,6 +1391,9 @@ def main():
     if args.graph_d_graph > 0:
         cfg.graph_d_graph = args.graph_d_graph
         print(f"[graph override] d_graph = {cfg.graph_d_graph}")
+    if args.graph_n_nodes > 0:
+        cfg.graph_n_nodes = args.graph_n_nodes
+        print(f"[graph override] n_nodes = {cfg.graph_n_nodes}")
     if args.graph_entmax_alpha > 1.0:
         cfg.graph_entmax_alpha = args.graph_entmax_alpha
         print(f"[graph override] node selection = entmax α={cfg.graph_entmax_alpha}")
