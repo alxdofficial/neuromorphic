@@ -134,13 +134,21 @@ class ConditionedReconstructionDataset(IterableDataset):
         # each subsequent `key = value`) is reproduced in the answer slot. Loss only on value
         # tokens — the inline keys are teacher-forced cues (given), not predicted.
         qi = rng.sample(range(self.n_pairs), self.n_query)
-        question_ids = self._ids(keys[qi[0]])
+        # Condition with the SAME "key =" form the context uses ("k = v\n"), so the
+        # decoder predicts the value IN-DISTRIBUTION. A bare key (no " =") made the
+        # model — especially the full-context ceiling, primed by the literal "k ="
+        # pattern in its memory — predict " =" instead of the value, scoring the value
+        # span as a miss: that was the inverted-band bug. Matches the multi-query cue.
+        question_ids = self._ids(keys[qi[0]] + " =")
 
         answer_ids: List[int] = []
         content: List[bool] = []
         for n, j in enumerate(qi):
             if n == 0:
-                v_ids = self._ids(values[j])                                 # start of assistant turn
+                # space-prefixed value (the single-token " word" form the val-pool was
+                # filtered for; matches the "= v" form in the context) — was bare,
+                # which both mis-tokenized and broke the format match.
+                v_ids = self._ids(f" {values[j]}")                           # start of assistant turn
             else:
                 cue = self._ids(f" {keys[j]} =")                            # inline cue for the next pair
                 answer_ids += cue

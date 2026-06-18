@@ -140,6 +140,93 @@ def _collate_bucketed(samples, pad_token_id):
     return batch
 
 
+class LongPassageMAEDataset(IterableDataset):
+    """Contiguous-passage MAE: yield one fixed-length contiguous FineWeb-EDU span
+    per example (NOT sentence pairs). Same QABatch contract the sentence MAE emits,
+    so `compute_masked_reconstruction_loss` consumes it unchanged — the MAE path
+    masks positions internally; we add NO question/answer.
+
+    Per example: pick a doc with >= ctx_len tokens, a random start offset, and emit
+    the contiguous span as context_ids with a full (all-True) context_mask. k_slots
+    is the FIXED memory budget M (the mixed-mode uniform interface), so the MAE path's
+    capacity-relative slice `memory[:, :k]` keeps all M emitted tokens.
+
+    Span loading mirrors data_continuation.ContinuationDataset: decode the parquet's
+    SOURCE-tokenizer ids → text (cached) → re-tokenize with the BACKBONE tokenizer.
+    """
+
+    def __init__(self, parquet_path, tokenizer, *, src_tokenizer_name: str,
+                 split: str, ctx_len: int = 1024, m_slots: int = 32,
+                 seed: int = 0, n_items: int = 1_000_000, pad_token_id: int = 0):
+        super().__init__()
+        self.tok = tokenizer
+        self.ctx_len = ctx_len
+        self.m_slots = m_slots
+        self.seed = seed
+        self.n_items = n_items
+        self.pad_token_id = pad_token_id
+        self.trigger_ids = tokenizer("Reconstruct the text above.",
+                                     add_special_tokens=False).input_ids
+        cache = _decode_cache(Path(parquet_path), split, src_tokenizer_name)
+        self.docs = []
+        n_total = 0
+        for line in open(cache):
+            n_total += 1
+            arr = np.asarray(self.tok(json.loads(line)["text"],
+                                      add_special_tokens=False).input_ids, dtype=np.int64)
+            if arr.shape[0] >= ctx_len:
+                self.docs.append(arr)
+        if not self.docs:
+            raise ValueError(
+                f"No FineWeb-edu doc has >= {ctx_len} tokens in {parquet_path} after "
+                f"re-tokenization. Lower --mixed-ctx.")
+        print(f"[data_masked_reconstruction:long_passage] {split}: "
+              f"{len(self.docs)}/{n_total} docs >= {ctx_len} tok; M={m_slots} "
+              f"(ratio {ctx_len}/{m_slots} = {ctx_len // m_slots}:1)", flush=True)
+
+    def _gen(self, rng: np.random.Generator) -> dict:
+        d = self.docs[rng.integers(len(self.docs))]
+        s = int(rng.integers(0, len(d) - self.ctx_len + 1))
+        span = torch.tensor(d[s: s + self.ctx_len], dtype=torch.long)
+        return {
+            "context_ids": span,
+            "context_mask": torch.ones(self.ctx_len, dtype=torch.bool),   # full span, no pad
+            "question_ids": torch.tensor(self.trigger_ids, dtype=torch.long),
+            "answer_ids": span.clone(),
+            "answer_content_mask_list": [True] * self.ctx_len,
+            "task_family": "masked_reconstruction", "question_type": "masked_reconstruction",
+            "answer_refs": [], "k_slots": self.m_slots, "n_tokens": self.ctx_len,
+        }
+
+    def __iter__(self):
+        wi = torch.utils.data.get_worker_info()
+        rng = np.random.default_rng(self.seed + (wi.id if wi is not None else 0))
+        for _ in range(self.n_items):
+            yield self._gen(rng)
+
+
+def _collate_long_passage(samples, pad_token_id):
+    """Fixed-length contiguous spans → collate_qa; stamp the uniform k_slots."""
+    batch = collate_qa(samples, pad_token_id)
+    batch.k_slots = max(int(s["k_slots"]) for s in samples)   # uniform M
+    batch.n_tokens = [int(s["n_tokens"]) for s in samples]
+    return batch
+
+
+def make_long_passage_mae_dataloader(tokenizer, batch_size: int, *, src_tokenizer_name: str,
+                                     split: str = "train", ctx_len: int = 1024,
+                                     m_slots: int = 32, seed: int = 0,
+                                     pad_token_id: int = 0, num_workers: int = 2) -> DataLoader:
+    """Contiguous-passage MAE loader (the mixed-mode compression task). Selectable
+    alongside the sentence-pair MAE; both feed the same masked_reconstruction loss."""
+    path = FINEWEB_TRAIN if split == "train" else FINEWEB_VAL
+    ds = LongPassageMAEDataset(path, tokenizer, src_tokenizer_name=src_tokenizer_name,
+                               split=split, ctx_len=ctx_len, m_slots=m_slots,
+                               seed=seed, pad_token_id=pad_token_id)
+    return DataLoader(ds, batch_size=batch_size, num_workers=num_workers,
+                      collate_fn=lambda s: _collate_long_passage(s, pad_token_id))
+
+
 def make_sentence_dataloader(tokenizer, batch_size: int, *, src_tokenizer_name: str,
                              split: str = "train", ratio: int = 8, min_len: int = 24,
                              max_len: int = 128, seed: int = 0, pad_token_id: int = 0,

@@ -34,6 +34,8 @@ from src.memory.data_conditioned_reconstruction import (
     make_conditioned_reconstruction_dataloader, ConditionedReconstructionDataset)
 from src.memory.data_continuation import make_continuation_dataloader
 from src.memory.data_conditioned_reconstruction_bio import make_conditioned_reconstruction_bio_dataloader
+from src.memory.data_babi import make_babi_dataloader, DEFAULT_TASKS as BABI_DEFAULT_TASKS
+from src.memory.data_masked_reconstruction import make_long_passage_mae_dataloader
 from src.memory.decoder import load_frozen_llama
 from src.memory.model import ReprLearningModel
 
@@ -82,6 +84,140 @@ def materialize_val_set(val_dl, n_batches: int) -> list:
     return fixed
 
 
+# ── Mixed multi-task harness ────────────────────────────────────────────────
+# A single model per architecture trained on an equal round-robin of these tasks,
+# evaluated PER-TASK. Each entry: task key → (data task_family, model.task_mode).
+# task_mode routes compute_loss: "masked_reconstruction" → the MAE infill path;
+# anything else → the generic QA-path compute_loss (used by babi + continuation).
+MIXED_TASKS_DEFAULT = ("mae", "babi", "continuation", "condrecon")
+# model.task_mode per mixed task. MAE uses the infill path; babi/continuation/condrecon
+# use the generic compute_loss (a non-MAE sentinel string routes there).
+MIXED_TASK_MODE = {
+    "mae": "masked_reconstruction",
+    "babi": "babi",
+    "continuation": "continuation",
+    "condrecon": "conditioned_reconstruction",
+}
+CONT_EARLY_TOKENS = 16   # continuation early-token loss = mean over the first N predict positions
+# conditioned-reconstruction's word pool caps n_pairs at ~93; single-token values fill only
+# ~456 of the 1024 buffer, so we use multi-token values (value_len) to reach ~850 (~27:1).
+MIXED_CONDRECON_N_PAIRS = 90
+MIXED_CONDRECON_VALUE_LEN = 4
+
+
+def make_mixed_train_dataloaders(mixed_tasks, tokenizer, cfg, *, ctx_len: int,
+                                 m_slots: int, mae_src_tok: str, babi_tasks,
+                                 predict_len: int, num_workers: int = 1) -> dict:
+    """One TRAIN dataloader per mixed task, all on the uniform interface
+    (context_len/chunk = ctx_len, M = m_slots). Homogeneous batches; the
+    round-robin alternates which loader is pulled each step."""
+    _pad = cfg.pad_token_id if cfg.pad_token_id is not None else 0
+    dls = {}
+    for t in mixed_tasks:
+        if t == "mae":
+            dls[t] = make_long_passage_mae_dataloader(
+                tokenizer, batch_size=cfg.batch_size, src_tokenizer_name=mae_src_tok,
+                split="train", ctx_len=ctx_len, m_slots=m_slots, seed=42,
+                pad_token_id=_pad, num_workers=num_workers)
+        elif t == "babi":
+            dls[t] = make_babi_dataloader(
+                tokenizer, context_len=ctx_len, batch_size=cfg.batch_size,
+                split="train", seed=42, pad_token_id=_pad, tasks=babi_tasks,
+                num_workers=num_workers)
+        elif t == "continuation":
+            dls[t] = make_continuation_dataloader(
+                tokenizer, batch_size=cfg.batch_size, compress_len=ctx_len,
+                predict_len=predict_len, split="train", seed=42, pad_token_id=_pad,
+                objective="continuation", src_tokenizer_name=mae_src_tok,
+                num_workers=num_workers)
+        elif t == "condrecon":
+            dls[t] = make_conditioned_reconstruction_dataloader(
+                tokenizer, context_len=ctx_len, batch_size=cfg.batch_size,
+                n_pairs=MIXED_CONDRECON_N_PAIRS, n_query=1, value_len=MIXED_CONDRECON_VALUE_LEN,
+                split="train", seed=42, pad_token_id=_pad, num_workers=num_workers)
+        else:
+            raise ValueError(f"unknown mixed task {t!r} (expected mae/babi/continuation/condrecon)")
+    return dls
+
+
+def make_mixed_val_sets(mixed_tasks, tokenizer, cfg, val_batches, *, ctx_len: int,
+                        m_slots: int, mae_src_tok: str, babi_tasks,
+                        predict_len: int) -> dict:
+    """One materialized (fixed) VAL set per mixed task — disjoint val seed so the
+    eval data never overlaps the training stream."""
+    _pad = cfg.pad_token_id if cfg.pad_token_id is not None else 0
+    sets = {}
+    for t in mixed_tasks:
+        if t == "mae":
+            dl = make_long_passage_mae_dataloader(
+                tokenizer, batch_size=cfg.batch_size, src_tokenizer_name=mae_src_tok,
+                split="val", ctx_len=ctx_len, m_slots=m_slots, seed=7,
+                pad_token_id=_pad, num_workers=0)
+        elif t == "babi":
+            dl = make_babi_dataloader(
+                tokenizer, context_len=ctx_len, batch_size=cfg.batch_size,
+                split="validation", seed=7, pad_token_id=_pad, tasks=babi_tasks,
+                num_workers=0)
+        elif t == "continuation":
+            dl = make_continuation_dataloader(
+                tokenizer, batch_size=cfg.batch_size, compress_len=ctx_len,
+                predict_len=predict_len, split="validation", seed=7, pad_token_id=_pad,
+                objective="continuation", src_tokenizer_name=mae_src_tok, num_workers=0)
+        elif t == "condrecon":
+            dl = make_conditioned_reconstruction_dataloader(
+                tokenizer, context_len=ctx_len, batch_size=cfg.batch_size,
+                n_pairs=MIXED_CONDRECON_N_PAIRS, n_query=1, value_len=MIXED_CONDRECON_VALUE_LEN,
+                split="validation", seed=7, pad_token_id=_pad, num_workers=0)
+        sets[t] = materialize_val_set(dl, val_batches)
+    return sets
+
+
+def run_mixed_val(model, mixed_tasks, val_sets, device, n_batches, window_size) -> dict:
+    """Evaluate ALL mixed val sets, switching model.task_mode per task so each
+    routes to its own loss path. Returns {task: per-task metric dict}. The
+    continuation set additionally reports an early-token loss (mean CE over the
+    first CONT_EARLY_TOKENS predict positions, since the late positions are
+    increasingly local-autoregressive and dilute the memory signal)."""
+    prev_mode = getattr(model, "task_mode", None)
+    per_task = {}
+    for t in mixed_tasks:
+        model.task_mode = MIXED_TASK_MODE[t]
+        # gate_batches=0: the REAL/SHUF/OFF controls aren't needed for the
+        # mixed per-task dashboard and triple the eval cost.
+        vm = run_val(model, val_sets[t], device, n_batches, window_size, gate_batches=0)
+        if t == "continuation":
+            vm["val_cont_early_loss"] = _continuation_early_loss(
+                model, val_sets[t], device, n_batches, window_size)
+        per_task[t] = vm
+    model.task_mode = prev_mode
+    return per_task
+
+
+@torch.no_grad()
+def _continuation_early_loss(model, val_set, device, n_batches, window_size) -> float:
+    """Mean CE over the FIRST CONT_EARLY_TOKENS answer positions of each continuation
+    example (predict_len=64; the early tokens depend most on the compressed memory).
+    Implemented by zeroing answer_content_mask past the early window before the
+    generic compute_loss, so loss_recon is restricted to those positions."""
+    import dataclasses
+    model.train(False)
+    losses = []
+    for i, batch in enumerate(val_set):
+        if i >= n_batches:
+            break
+        torch.manual_seed(20260527 + i)
+        batch = to_device(batch, device)
+        # restrict the content mask to the first CONT_EARLY_TOKENS valid positions
+        cm = batch.answer_content_mask.clone()
+        cm[:, CONT_EARLY_TOKENS:] = False
+        early = dataclasses.replace(batch, answer_content_mask=cm)
+        with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            out = model.compute_loss(early, window_size=window_size)
+        losses.append(float(out["loss_recon"]))
+    model.train(True)
+    return sum(losses) / max(len(losses), 1)
+
+
 def run_val(model, val_set, device, n_batches: int, window_size: int,
             gate_batches: int = 8) -> dict:
     """Eval on a fixed val_set (list of batches from materialize_val_set).
@@ -97,6 +233,7 @@ def run_val(model, val_set, device, n_batches: int, window_size: int,
     """
     model.train(False)
     losses, accs, per_fam_stats = [], [], {}
+    babi_em_hits, babi_em_n = 0.0, 0   # bAbI exact-match (teacher-forced answer span)
     # REAL/SHUF/OFF binding gate, accumulated over the first gate_batches.
     shuf_abs, shuf_gap, off_abs, off_gap = [], [], [], []
     last_spg_eval: dict[str, float] = {}  # soft_pointer_graph eval-only health telemetry
@@ -164,6 +301,16 @@ def run_val(model, val_set, device, n_batches: int, window_size: int,
             d = per_fam_stats.setdefault(fam, {"n": 0, "loss": 0.0})
             d["n"] += 1
             d["loss"] += float(l)
+        # bAbI is scored by exact-match answer accuracy. per_example_em is the
+        # per-row teacher-forced argmax EM over the (all-content) answer span;
+        # for list tasks (task 8) the answer is comma-joined so token-exact
+        # match == set-match (same token sequence). Aggregate over babi rows.
+        if "per_example_em" in out:
+            ems = out["per_example_em"].detach().cpu().tolist()
+            for fam, em in zip(batch.task_family, ems):
+                if fam == "babi":
+                    babi_em_hits += float(em)
+                    babi_em_n += 1
     model.train(True)
     # Restore training RNG state so eval doesn't perturb the training stream.
     torch.set_rng_state(rng_state)
@@ -185,6 +332,8 @@ def run_val(model, val_set, device, n_batches: int, window_size: int,
     if shuf_abs:
         result["val_loss_recon_shuf"] = sum(shuf_abs) / len(shuf_abs)
         result["val_shuf_minus_real"] = sum(shuf_gap) / len(shuf_gap)
+    if babi_em_n:
+        result["val_babi_em"] = babi_em_hits / babi_em_n
     for k, v in last_spg_eval.items():
         result[f"val_{k}"] = v
     for k, v in last_hlvocab_eval.items():
@@ -295,7 +444,8 @@ def train_one_variant(
     task: str = "masked_reconstruction",     # "masked_reconstruction" = sentence-pair MAE (active); "qa" = composite-QA mix; "conditioned_reconstruction" = key→value; "continuation" = gist-LM
     cond_recon_n_pairs: int = 64, cond_recon_n_query: int = 1, cond_recon_value_len: int = 1,
     cond_recon_bio_n_facts: int = 3, cond_recon_bio_world_seed: int = 0,
-    compress_len: int = 2048, predict_len: int = 512,
+    babi_tasks: tuple = BABI_DEFAULT_TASKS,
+    compress_len: int = 2048, predict_len: int = 64,
     mae_src_tok: str = "meta-llama/Llama-3.2-1B",
 ) -> dict:
     device = "cuda"
@@ -358,6 +508,17 @@ def train_one_variant(
         train_dl = None if is_eval_only else make_conditioned_reconstruction_bio_dataloader(
             tokenizer, split="train", stream_seed=42, **_eb)
         val_dl = make_conditioned_reconstruction_bio_dataloader(tokenizer, split="validation", stream_seed=7, **_eb)
+    elif task == "babi":
+        # bAbI story→question→answer (memory-focused task subset): context = a
+        # short bAbI story (question-agnostic) distractor-padded to chunk_size,
+        # condition on the question, reproduce the 1-word answer (closed-book).
+        # Same encoder→memory→prepend→CE path; only the DATA differs. Train/val
+        # use the HF train/validation splits (disjoint stories).
+        _babi = dict(context_len=chunk_size, batch_size=cfg.batch_size,
+                     pad_token_id=cfg.pad_token_id, tasks=babi_tasks)
+        train_dl = None if is_eval_only else make_babi_dataloader(
+            tokenizer, split="train", seed=42, **_babi)
+        val_dl = make_babi_dataloader(tokenizer, split="validation", seed=7, **_babi)
     elif task == "continuation":
         # continuation: compress N → predict the NEXT tokens (gist/LM).
         _cont = dict(batch_size=cfg.batch_size, compress_len=compress_len, predict_len=predict_len,
@@ -600,11 +761,20 @@ def train_one_variant(
                 "p_bank": ("encoder.parser.node_bank", "encoder.parser.node_role_avail"),
                 "p_slots": ("encoder.parser.init_graph", "encoder.parser.role",
                             "encoder.parser.tag", "encoder.parser.part"),
-                "r_op": ("encoder.reader.w_sd", "encoder.reader.w_gamma", "encoder.reader.w_beta"),
-                "r_qin": ("encoder.reader.q_in",),
-                "r_blocks": ("encoder.reader.blocks",),
+                # Perceiver read: latent queries + role/tag KV features + cross/self
+                # blocks (each incl. its pre-LN) + FFN(+final norm) + out projection.
+                "r_queries": ("encoder.reader.queries",),
+                "r_kv": ("encoder.reader.role_emb", "encoder.reader.tag"),
+                "r_cross": tuple(p for i in range(cfg.graph_read_layers)
+                                 for p in (f"encoder.reader.blocks.{i}.cross",
+                                           f"encoder.reader.blocks.{i}.cn")),
+                "r_self": tuple(p for i in range(cfg.graph_read_layers)
+                                for p in (f"encoder.reader.blocks.{i}.slf",
+                                          f"encoder.reader.blocks.{i}.sn")),
+                "r_ffn": tuple(p for i in range(cfg.graph_read_layers)
+                               for p in (f"encoder.reader.blocks.{i}.ff",
+                                         f"encoder.reader.blocks.{i}.fn")) + ("encoder.reader.norm",),
                 "r_out": ("encoder.reader.out",),
-                "r_gate": ("encoder.reader.gate",),
             }
             for _lab, _prefs in _gmech.items():
                 graph_gn[f"graph_gn_{_lab}"] = _grad_group_norm(
@@ -743,6 +913,8 @@ def train_one_variant(
                 extra_parts.append(f"OFF-REAL={vm['val_off_minus_real']:+.3f}")
             if "val_shuf_minus_real" in vm:
                 extra_parts.append(f"SHUF-REAL={vm['val_shuf_minus_real']:+.3f}")
+            if "val_babi_em" in vm:
+                extra_parts.append(f"babi_EM={vm['val_babi_em']*100:.1f}%")
             extra = ("  " + "  ".join(extra_parts)) if extra_parts else ""
             print(f"    [val @ {step}]  recon={vm['val_loss_recon']:.4f}  "
                   f"top1={vm['val_top1_acc']*100:.1f}%{extra}",
@@ -856,6 +1028,191 @@ def train_one_variant(
         "best_val_step": best_val_step,
         "early_stopped": early_stopped,
         "stopped_at_step": stopped_at_step,
+    }
+    del model, opt
+    torch.cuda.empty_cache()
+    return summary
+
+
+def train_mixed_variant(
+    variant: str, llama, tokenizer, cfg: ReprConfig,
+    n_steps: int, log_every: int, val_every: int, save_every: int,
+    val_batches: int, out_dir: Path, window_size: int,
+    mixed_tasks: tuple, mixed_ctx: int, mixed_M: int,
+    babi_tasks: tuple, predict_len: int, mae_src_tok: str,
+    resume: bool = False,
+) -> dict:
+    """ONE model per architecture, trained on an EQUAL round-robin of mixed_tasks,
+    evaluated PER-TASK. Homogeneous batches; tasks alternate step-to-step. Before
+    each compute_loss the model's task_mode is set from the batch's task so MAE
+    routes to the infill path and babi/continuation to the generic QA path.
+
+    Distinct from train_one_variant (single-task) so the single-task path stays
+    untouched. Per-task val rows are logged to the run jsonl, each tagged with
+    `task` + `step`; per-task best_step/best_metric are tracked independently."""
+    device = "cuda"
+    llama_arg = None if cfg.use_llama_lora else llama
+    model = ReprLearningModel(cfg, variant=variant, llama_model=llama_arg).to(device)
+    n_trainable = model.n_trainable_params()
+    print(f"\n{'='*78}")
+    print(f"Variant: {variant}  ({n_trainable:,} trainable, {n_steps} steps, "
+          f"MIXED={'+'.join(mixed_tasks)})")
+    print(f"{'='*78}")
+    if n_trainable == 0:
+        raise SystemExit(
+            f"mixed training requires trainable params; {variant} has none "
+            f"(vanilla floor/ceiling are single-task eval-only references).")
+
+    opt = torch.optim.AdamW(
+        model.trainable_parameters(), lr=cfg.learning_rate,
+        weight_decay=cfg.weight_decay, betas=(0.9, 0.95),
+        fused=torch.cuda.is_available())
+
+    train_dls = make_mixed_train_dataloaders(
+        mixed_tasks, tokenizer, cfg, ctx_len=mixed_ctx, m_slots=mixed_M,
+        mae_src_tok=mae_src_tok, babi_tasks=babi_tasks, predict_len=predict_len)
+    print(f"  Materializing fixed per-task val sets ({val_batches} batches each)...")
+    val_sets = make_mixed_val_sets(
+        mixed_tasks, tokenizer, cfg, val_batches, ctx_len=mixed_ctx, m_slots=mixed_M,
+        mae_src_tok=mae_src_tok, babi_tasks=babi_tasks, predict_len=predict_len)
+    print(f"  Val sets ready: {{ {', '.join(f'{t}:{len(val_sets[t])}' for t in mixed_tasks)} }}")
+
+    jsonl_path = out_dir / f"jsonl/{variant}.jsonl"
+    ckpt_path = out_dir / f"ckpts/{variant}.last.pt"
+    jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+    if jsonl_path.exists() and not resume:
+        jsonl_path.unlink()
+    jsonl_fp = open(jsonl_path, "a", buffering=1)
+
+    # Per-task best tracking — each task plateaus on its own schedule, so we keep
+    # an independent best_step/best_metric per task (the primary metric is val_loss).
+    best = {t: {"metric": float("inf"), "step": -1} for t in mixed_tasks}
+
+    t_start = time.time()
+    last_print_step, last_print_time = 0, t_start
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+
+    # One persistent iterator per task; round-robin pulls the next task in rotation.
+    iters = {t: iter(dl) for t, dl in train_dls.items()}
+
+    def next_batch(t):
+        try:
+            return next(iters[t])
+        except StopIteration:                # streaming loaders are ~infinite; re-arm defensively
+            iters[t] = iter(train_dls[t])
+            return next(iters[t])
+
+    rotation = []   # diagnostic: the realized task sequence (capped for the smoke print)
+    for step in range(n_steps):
+        task = mixed_tasks[step % len(mixed_tasks)]   # equal round-robin
+        if len(rotation) < 24:
+            rotation.append(task)
+        model.task_mode = MIXED_TASK_MODE[task]       # per-batch dispatch (E/D)
+        batch = next_batch(task)
+
+        lr = lr_at_step(step, n_steps, cfg.learning_rate, cfg.warmup_steps)
+        for g in opt.param_groups:
+            g["lr"] = lr
+
+        batch = to_device(batch, device)
+        opt.zero_grad(set_to_none=True)
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            out = model.compute_loss(batch, window_size=window_size)
+        loss = out["loss"]
+        if not torch.isfinite(loss):
+            print(f"  [step {step}] FATAL: non-finite loss = {float(loss)} (task={task})")
+            break
+        loss.backward()
+        _mem_params = [p for n, p in model.named_parameters()
+                       if p.requires_grad and not n.startswith("decoder.llama.")]
+        _lora_params = [p for n, p in model.named_parameters()
+                        if p.requires_grad and n.startswith("decoder.llama.")]
+        gn_mem = torch.nn.utils.clip_grad_norm_(_mem_params, cfg.grad_clip)
+        gn_lora = torch.nn.utils.clip_grad_norm_(_lora_params, cfg.grad_clip)
+        gn = (gn_mem ** 2 + gn_lora ** 2) ** 0.5
+        opt.step()
+
+        # Per-step TRAIN row, tagged with the task that produced this batch.
+        jsonl_fp.write(json.dumps({
+            "step": step, "variant": variant, "task": task, "phase": "train",
+            "loss": float(out["loss"].detach()),
+            "loss_recon": float(out["loss_recon"]),
+            "top1_acc": float(out["top1_acc"]),
+            "grad_norm": float(gn),
+            "memory_M": out["memory_shape"][1],
+            "lr": lr,
+        }) + "\n")
+
+        if step % log_every == 0:
+            now = time.time()
+            sps = (step - last_print_step) / max(now - last_print_time, 1e-9)
+            last_print_step, last_print_time = step, now
+            print(f"  step {step:6d}/{n_steps}  [{task:12}]  "
+                  f"recon={float(out['loss_recon']):.4f}  "
+                  f"top1={float(out['top1_acc'])*100:5.1f}%  "
+                  f"M={out['memory_shape'][1]}  gnorm={float(gn):6.2f}  "
+                  f"lr={lr:.2e}  ({sps:.1f} step/s)", flush=True)
+
+        if step > 0 and step % val_every == 0:
+            per_task = run_mixed_val(model, mixed_tasks, val_sets, device,
+                                     val_batches, window_size)
+            # one PER-TASK val row each, tagged with task + step (E/E).
+            parts = []
+            for t in mixed_tasks:
+                vm = per_task[t]
+                row = {"phase": "val", "step": step, "variant": variant, "task": t,
+                       "val_loss": vm["val_loss_recon"], "top1": vm["val_top1_acc"]}
+                if "val_babi_em" in vm:
+                    row["val_babi_em"] = vm["val_babi_em"]
+                if "val_cont_early_loss" in vm:
+                    row["val_cont_early_loss"] = vm["val_cont_early_loss"]
+                # per-task best on val_loss
+                if vm["val_loss_recon"] < best[t]["metric"]:
+                    best[t]["metric"] = vm["val_loss_recon"]
+                    best[t]["step"] = step
+                row["best_step"] = best[t]["step"]
+                row["best_metric"] = best[t]["metric"]
+                jsonl_fp.write(json.dumps(row) + "\n")
+                tag = f"{t}={vm['val_loss_recon']:.3f}"
+                if "val_babi_em" in vm:
+                    tag += f"(EM={vm['val_babi_em']*100:.0f}%)"
+                if "val_cont_early_loss" in vm:
+                    tag += f"(early={vm['val_cont_early_loss']:.3f})"
+                parts.append(tag)
+            print(f"    [val @ {step}]  " + "  ".join(parts), flush=True)
+
+        if step > 0 and step % save_every == 0:
+            save_checkpoint(model, opt, step, ckpt_path)
+
+    save_checkpoint(model, opt, max(n_steps - 1, 0), ckpt_path)
+    final = run_mixed_val(model, mixed_tasks, val_sets, device, val_batches, window_size)
+    for t in mixed_tasks:
+        vm = final[t]
+        row = {"phase": "val", "step": n_steps, "variant": variant, "task": t,
+               "final": True, "val_loss": vm["val_loss_recon"], "top1": vm["val_top1_acc"],
+               "best_step": best[t]["step"], "best_metric": best[t]["metric"]}
+        if "val_babi_em" in vm:
+            row["val_babi_em"] = vm["val_babi_em"]
+        if "val_cont_early_loss" in vm:
+            row["val_cont_early_loss"] = vm["val_cont_early_loss"]
+        jsonl_fp.write(json.dumps(row) + "\n")
+    jsonl_fp.close()
+
+    elapsed = time.time() - t_start
+    peak_vram_gb = (torch.cuda.max_memory_allocated() / 1e9
+                    if torch.cuda.is_available() else 0.0)
+    print(f"  DONE (mixed): {n_steps} steps in {elapsed/60:.1f} min  "
+          f"peak_vram={peak_vram_gb:.1f}GB", flush=True)
+    print(f"  rotation[:{len(rotation)}] = {rotation}", flush=True)
+    summary = {
+        "variant": variant, "trainable_params": n_trainable, "n_steps": n_steps,
+        "elapsed_s": elapsed, "peak_vram_gb": peak_vram_gb, "mixed": True,
+        "mixed_tasks": list(mixed_tasks),
+        "per_task_final": {t: {"val_loss": final[t]["val_loss_recon"],
+                               "top1": final[t]["val_top1_acc"],
+                               "best_step": best[t]["step"],
+                               "best_metric": best[t]["metric"]} for t in mixed_tasks},
     }
     del model, opt
     torch.cuda.empty_cache()
@@ -982,12 +1339,24 @@ def main():
                          "Manual override accepted as positive int.")
     ap.add_argument("--task", type=str, default="masked_reconstruction",
                     choices=["masked_reconstruction", "qa", "conditioned_reconstruction",
-                             "conditioned_reconstruction_bio", "continuation"],
+                             "conditioned_reconstruction_bio", "continuation", "babi", "mixed"],
                     help="masked_reconstruction = sentence-pair MAE compression (default, active); "
                          "qa = composite-QA mix; "
                          "conditioned_reconstruction = random-word key→value (MQAR); "
                          "conditioned_reconstruction_bio = biographical key-phrase→fact-dense-sentence (binding); "
-                         "continuation = compress N → predict next (AutoComp/Beacon gist/LM).")
+                         "continuation = compress N → predict next (AutoComp/Beacon gist/LM); "
+                         "babi = bAbI story→question→answer (memory-focused tasks, distractor-padded, EM-scored); "
+                         "mixed = ONE model trained on an equal round-robin of --mixed-tasks, evaluated per-task.")
+    ap.add_argument("--mixed-tasks", nargs="+", default=list(MIXED_TASKS_DEFAULT),
+                    choices=["mae", "babi", "continuation"],
+                    help="mixed: tasks in the equal round-robin (default: mae babi continuation). "
+                         "mae = long-passage contiguous MAE compression; babi = relational; "
+                         "continuation = next-token prediction. Used only when --task mixed.")
+    ap.add_argument("--mixed-ctx", type=int, default=1024,
+                    help="mixed: uniform context_len/chunk for ALL tasks (default 1024).")
+    ap.add_argument("--mixed-M", type=int, default=32,
+                    help="mixed: uniform memory budget M (slots/edges) for ALL tasks "
+                         "(default 32 → ~32:1 compression at ctx=1024).")
     ap.add_argument("--mae-mask-ratio", type=float, default=0.85,
                     help="mae: fraction of answer tokens replaced by <mask> in the forward.")
     ap.add_argument("--hlvocab-emit", choices=["edge_query", "slotattn"], default="edge_query",
@@ -1017,8 +1386,12 @@ def main():
     ap.add_argument("--compress-len", type=int, default=1024,
                     help="continuation/ae/mae: # natural-text tokens compressed into the 128-token "
                          "memory (then dropped). 1024 = 8x compression (the aligned default).")
-    ap.add_argument("--predict-len", type=int, default=512,
-                    help="continuation: # next tokens to predict from memory only (closed-book).")
+    ap.add_argument("--predict-len", type=int, default=64,
+                    help="continuation: # next tokens to predict from memory only (closed-book). "
+                         "Default 64 isolates the memory signal (less local-autoregression dilution).")
+    ap.add_argument("--babi-tasks", type=int, nargs="+", default=list(BABI_DEFAULT_TASKS),
+                    help="babi: which bAbI task ids to pool (default = memory-focused subset "
+                         "1/2/3/7/8/11/12/13/14: supporting facts, counting, lists, coreference, time).")
     ap.add_argument("--graph-d-graph", type=int, default=0,
                     help="graph: override the graph/vocabulary width d_graph (0 = task default). "
                          "576 matches d_llama → full-rank read tokens (removes the rank handicap).")
@@ -1165,12 +1538,27 @@ def main():
         args.chunk_size = 1024
         args.window_size = min(args.window_size, args.chunk_size)
         print(f"[auto] conditioned_reconstruction_bio: chunk_size={args.chunk_size}, window_size={args.window_size}")
+    if args.task == "babi" and args.chunk_size == 8192:
+        # bAbI stories are short (~60 tok); distractor-padding fills to chunk_size.
+        # 1024 matches the other conditioned-reconstruction objectives' input length.
+        args.chunk_size = 1024
+        args.window_size = min(args.window_size, args.chunk_size)
+        print(f"[auto] babi: chunk_size={args.chunk_size}, window_size={args.window_size}")
     if args.task == "continuation":
         # the encoder must ingest exactly compress_len tokens → chunk_size = compress_len
         args.chunk_size = args.compress_len
         args.window_size = min(args.window_size, args.chunk_size)
         print(f"[auto] {args.task}: chunk_size={args.chunk_size} (=compress_len), "
               f"window_size={args.window_size}")
+    if args.task == "mixed":
+        # mixed: the uniform interface — ALL tasks share context_len = mixed_ctx and
+        # M = mixed_M. Drive chunk_size/window/compress_len/predict_len from it so the
+        # downstream capacity block + per-task loaders all see one consistent length.
+        args.chunk_size = args.mixed_ctx
+        args.window_size = min(args.window_size, args.chunk_size)
+        args.compress_len = args.mixed_ctx          # continuation compress span
+        print(f"[auto] mixed: tasks={args.mixed_tasks}  ctx={args.mixed_ctx}  "
+              f"M={args.mixed_M}  window_size={args.window_size}  predict_len={args.predict_len}")
 
     if "/" in args.out_tag:
         ap.error(
@@ -1308,12 +1696,12 @@ def main():
               f"{len(cfg.hlvocab_nodes)} layers, d_code={cfg.hlvocab_d_code}, "
               f"top_k={cfg.hlvocab_top_k}; emits up to m_max={cfg.hlvocab_m_max} "
               f"node-tokens, sliced to k. Prepend compressor (masked_reconstruction).")
-    if args.task == "masked_reconstruction":
-        # MAE ignores --mem-tokens: the override below sets M_max=16, sliced to
-        # batch.k_slots per example. The QA-shaped budget figures above (M, _beacon_M)
-        # do NOT describe what MAE emits — skip the multi-window beacon assertion.
-        print("   [masked_reconstruction] the above --mem-tokens budget is IGNORED; "
-              "every arm emits M_max=16 node/slot tokens sliced to per-example k_slots.")
+    if args.task in ("masked_reconstruction", "mixed"):
+        # MAE / mixed ignore --mem-tokens: the override below sets a FIXED M (16 for
+        # MAE, mixed_M for mixed). The QA-shaped budget figures above (M, _beacon_M)
+        # do NOT describe what these emit — skip the multi-window beacon assertion.
+        print(f"   [{args.task}] the above --mem-tokens budget is IGNORED; the "
+              f"compression-line override below sets the fixed memory budget.")
     elif abs(_beacon_M - M) > max(1, M // 10):
         raise SystemExit(
             f"[memory budget] beacon M={_beacon_M} is >10% off mem_tokens={M} "
@@ -1364,8 +1752,53 @@ def main():
                 f"SmolLM2-135M (d=576); got d_llama={cfg.d_llama} "
                 f"(backbone={cfg.llama_model}). Pass --backbone HuggingFaceTB/SmolLM2-135M, "
                 f"or --allow-unmatched-backbone to override (capacity match will be off).")
+    elif args.task == "mixed":
+        # MIXED multi-task: ONE model per arch on a round-robin of mae+babi+
+        # continuation, per-task eval. UNIFORM interface: context_len = mixed_ctx
+        # and a FIXED M = mixed_M for EVERY task (override the per-task ceil(ctx/30)
+        # / k-bucket logic). compute_loss is dispatched per batch (MAE → infill;
+        # babi/continuation → generic), so we set BOTH the MAE compressor slots AND
+        # the generic prepend budget to the same fixed M. cfg.task_mode = "mixed"
+        # is metadata only — the trainer sets model.task_mode per batch.
+        cfg.task_mode = "mixed"
+        cfg.use_llama_lora = True
+        cfg.llama_lora_rank = 16; cfg.llama_lora_alpha = 32
+        _M = args.mixed_M                                # FIXED budget (no ceil(chunk/30))
+        # MAE-calibrated, param-matched ranks (verified to hold at M=32 within ~0.1M:
+        # icae 6.01M / ccm 6.01M / ac 6.03M / beacon 6.08M memory; graph ~6.9M (d_graph=256) —
+        # M barely affects params. See scripts/diagnostics/param_count.py.)
+        cfg.n_flat_codes = _M
+        cfg.icae_n_slots = _M; cfg.icae_lora_rank = 104; cfg.icae_lora_alpha = 208
+        cfg.ccm_n_comp = _M; cfg.ccm_lora_rank = 52; cfg.ccm_lora_alpha = 104
+        cfg.autocompressor_n_slots = _M
+        cfg.autocompressor_lora_rank = 52; cfg.autocompressor_lora_alpha = 104
+        cfg.beacon_ratio = max(1, args.mixed_ctx // _M)  # ratio honors the uniform ctx:M (32:1)
+        from transformers import AutoConfig as _ACLM
+        from src.memory.common import beacon_wrap_layers as _bwlm
+        _nlayersm = _ACLM.from_pretrained(cfg.llama_model).num_hidden_layers
+        cfg.beacon_wrap_layers = _bwlm(_nlayersm, 11)
+        # graph: PERCEIVER read DECOUPLES the prepend budget M from the edge budget E.
+        # The reader emits M=graph_n_read_queries latent tokens (not E). At d_graph=128,
+        # N=2048, E=128, M=32, the trainable graph memory lands at ~6.0M. WIDE+SHALLOW
+        # (d=256, write=3/read=2) instead of narrow+deep (d=128, 12/12): same ~6.0M params
+        # but ~5 layers vs 24 → ~3x faster + far less activation memory (profiling: d=128/12/12
+        # was 3x slower than icae and OOM'd above BS=4). M=32 set independently — E not tied to M.
+        cfg.graph_d_graph = 256; cfg.graph_write_layers = 3; cfg.graph_read_layers = 2
+        cfg.graph_n_nodes = 2048; cfg.graph_n_edges = 128
+        cfg.graph_n_read_queries = _M   # M latent read-queries = prepend tokens (decoupled from E)
+        cfg.graph_read_final = True   # final-layer tap (backbone-agnostic n_layers-1) — locked design
+        print(f"[capacity] mixed: FIXED M={_M} (graph read-queries, decoupled from "
+              f"E={cfg.graph_n_edges}), beacon_ratio={cfg.beacon_ratio} (ctx "
+              f"{args.mixed_ctx}:M = {args.mixed_ctx // _M}:1); baselines icae r104 / "
+              f"ccm r52 / ac r52 / beacon 11L (MAE-calibrated, param-matched ~6.0M).")
+        if cfg.d_llama != 576 and not args.allow_unmatched_backbone:
+            raise SystemExit(
+                f"mixed param-matched ranks are calibrated for SmolLM2-135M (d=576); "
+                f"got d_llama={cfg.d_llama} (backbone={cfg.llama_model}). Pass "
+                f"--backbone HuggingFaceTB/SmolLM2-135M, or --allow-unmatched-backbone "
+                f"to override (capacity match will be off).")
     elif args.task in ("qa", "conditioned_reconstruction",
-                       "conditioned_reconstruction_bio", "continuation"):
+                       "conditioned_reconstruction_bio", "continuation", "babi"):
         # The longer-context objectives: 30:1 COMPRESSION + ~13M memory params (the
         # "fully using" config; MAE keeps its 8:1 / ~6M de-risk). Memory budget
         # M = ceil(context / 30); params matched to the graph anchor (d_graph=384,
@@ -1463,46 +1896,78 @@ def main():
         return
 
     summaries = []
-    for variant in args.variants:
-        out_dir = REPO / f"outputs/memory/{args.out_tag}_{variant}"
-        out_dir.mkdir(parents=True, exist_ok=True)
-        s = train_one_variant(
-            variant=variant, llama=llama, tokenizer=tokenizer, cfg=cfg,
-            n_steps=args.steps, log_every=args.log_every,
-            val_every=args.val_every, save_every=args.save_every,
-            val_batches=args.val_batches, out_dir=out_dir,
-            chunk_size=args.chunk_size, window_size=args.window_size,
-            passages_per_chunk=args.passages_per_chunk,
-            resume=args.resume,
-            use_hotpot=not args.no_hotpot,
-            use_narrative=args.narrative,
-            use_musique=args.musique,
-            use_babilong=args.babilong,
-            babilong_config=args.babilong_config,
-            mix_weights=tuple(args.mix_weights),
-            composite_task_weights=composite_task_weights,
-            patience=args.patience,
-            min_step_for_stop=args.min_step_for_stop,
-            min_delta=args.early_stop_min_delta,
-            task=args.task,
-            cond_recon_n_pairs=args.cond_recon_n_pairs, cond_recon_n_query=args.cond_recon_n_query,
-            cond_recon_value_len=args.cond_recon_value_len,
-            cond_recon_bio_n_facts=args.cond_recon_bio_n_facts, cond_recon_bio_world_seed=args.cond_recon_bio_world_seed,
-            compress_len=args.compress_len, predict_len=args.predict_len,
-            mae_src_tok=args.src_tokenizer,
-        )
-        summaries.append(s)
+    # MIXED multi-task: vanilla floor/ceiling have no trainable params in the mixed
+    # round-robin (they are single-task eval-only references) — skip them.
+    if args.task == "mixed":
+        mixed_variants = [v for v in args.variants if not v.startswith("vanilla_")]
+        skipped = [v for v in args.variants if v.startswith("vanilla_")]
+        if skipped:
+            print(f"[mixed] skipping eval-only vanilla references: {skipped}")
+        for variant in mixed_variants:
+            out_dir = REPO / f"outputs/memory/{args.out_tag}_{variant}"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            s = train_mixed_variant(
+                variant=variant, llama=llama, tokenizer=tokenizer, cfg=cfg,
+                n_steps=args.steps, log_every=args.log_every,
+                val_every=args.val_every, save_every=args.save_every,
+                val_batches=args.val_batches, out_dir=out_dir,
+                window_size=args.window_size,
+                mixed_tasks=tuple(args.mixed_tasks), mixed_ctx=args.mixed_ctx,
+                mixed_M=args.mixed_M, babi_tasks=tuple(args.babi_tasks),
+                predict_len=args.predict_len, mae_src_tok=args.src_tokenizer,
+                resume=args.resume,
+            )
+            summaries.append(s)
+    else:
+        for variant in args.variants:
+            out_dir = REPO / f"outputs/memory/{args.out_tag}_{variant}"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            s = train_one_variant(
+                variant=variant, llama=llama, tokenizer=tokenizer, cfg=cfg,
+                n_steps=args.steps, log_every=args.log_every,
+                val_every=args.val_every, save_every=args.save_every,
+                val_batches=args.val_batches, out_dir=out_dir,
+                chunk_size=args.chunk_size, window_size=args.window_size,
+                passages_per_chunk=args.passages_per_chunk,
+                resume=args.resume,
+                use_hotpot=not args.no_hotpot,
+                use_narrative=args.narrative,
+                use_musique=args.musique,
+                use_babilong=args.babilong,
+                babilong_config=args.babilong_config,
+                mix_weights=tuple(args.mix_weights),
+                composite_task_weights=composite_task_weights,
+                patience=args.patience,
+                min_step_for_stop=args.min_step_for_stop,
+                min_delta=args.early_stop_min_delta,
+                task=args.task,
+                cond_recon_n_pairs=args.cond_recon_n_pairs, cond_recon_n_query=args.cond_recon_n_query,
+                cond_recon_value_len=args.cond_recon_value_len,
+                cond_recon_bio_n_facts=args.cond_recon_bio_n_facts, cond_recon_bio_world_seed=args.cond_recon_bio_world_seed,
+                babi_tasks=tuple(args.babi_tasks),
+                compress_len=args.compress_len, predict_len=args.predict_len,
+                mae_src_tok=args.src_tokenizer,
+            )
+            summaries.append(s)
 
     print("\n" + "=" * 78)
     print("v1h SUMMARY")
     print("=" * 78)
-    print(f"  {'variant':<25}{'params':>12}{'final_recon':>13}{'top1':>8}{'time(min)':>12}")
-    print("  " + "-" * 70)
-    for s in summaries:
-        print(f"  {s['variant']:<25}{s['trainable_params']:>12,}"
-              f"{s['final_val_loss_recon']:>13.4f}"
-              f"{s['final_val_top1_acc']*100:>7.1f}%"
-              f"{s['elapsed_s']/60:>12.1f}")
+    if args.task == "mixed":
+        print(f"  {'variant':<25}{'params':>12}   per-task final val_loss")
+        print("  " + "-" * 70)
+        for s in summaries:
+            pt = "  ".join(f"{t}={s['per_task_final'][t]['val_loss']:.3f}"
+                           for t in s["mixed_tasks"])
+            print(f"  {s['variant']:<25}{s['trainable_params']:>12,}   {pt}")
+    else:
+        print(f"  {'variant':<25}{'params':>12}{'final_recon':>13}{'top1':>8}{'time(min)':>12}")
+        print("  " + "-" * 70)
+        for s in summaries:
+            print(f"  {s['variant']:<25}{s['trainable_params']:>12,}"
+                  f"{s['final_val_loss_recon']:>13.4f}"
+                  f"{s['final_val_top1_acc']*100:>7.1f}%"
+                  f"{s['elapsed_s']/60:>12.1f}")
 
     summary_path = REPO / f"outputs/memory/{args.out_tag}_summary.json"
     with open(summary_path, "w") as f:

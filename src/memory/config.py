@@ -183,6 +183,11 @@ class ReprConfig:
     graph_d_graph: int = 256            # graph/vocabulary space width (decoupled from d_llama)
     graph_n_nodes: int = 1024           # N — node bank size (the learnable vocabulary)
     graph_n_edges: int = 16             # E — edge budget
+    # M = number of PREPENDED memory tokens / Perceiver latent read-queries. 0 ⇒ fall
+    # back to M = n_edges (the legacy concat-per-edge read). >0 DECOUPLES the prepend
+    # budget from E: the reader's latent queries cross-attend the 3E graph tokens and
+    # emit exactly M tokens (Perceiver-IO / DETR style). The mixed branch sets 32.
+    graph_n_read_queries: int = 0
     graph_window: int = 256             # obs window for the PERSISTENT carry-forward: the
                                         # parser ingests the prior graph + each window → updates
                                         # it. Inputs ≤ one window (every MAE sentence) = one parse.

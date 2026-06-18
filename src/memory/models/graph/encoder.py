@@ -1,11 +1,12 @@
-"""graph encoder — frozen-backbone observation tap + relational parser + reader.
+"""graph encoder — frozen-backbone observation tap + relational parser + Perceiver reader.
 
-A FROZEN base contextualizes the span (the ICAE/CCM separate-frozen-copy pattern);
-one mid layer is tapped as the OBSERVATION. The `GraphParser` (TokenGT-style) parses
-it into E edges over a learnable node bank (pointer-select endpoints + edge states).
-The custom `GraphReader` is NOT prepended — the MAE loss path installs a forward hook
-on a mid-late decoder layer that binds each edge and injects (RMS-matched, gated) into
-the frozen residual stream. See docs/graph_model.md (source of truth).
+A FROZEN base contextualizes the span (the ICAE/CCM separate-frozen-copy pattern); the
+FINAL layer is tapped as the OBSERVATION (depth-relative `n_layers-1`, backbone-agnostic).
+The `GraphParser` (TokenGT-style) parses it into E edges over a learnable node bank
+(pointer-select endpoints + edge states). The `GraphReader` is a Perceiver: M learnable
+latent queries cross/self-attend over the per-edge {src,dst,edge} tokens and project to
+d_llama — those M tokens are PREPENDED to the frozen decoder (read via its own attention;
+no inject). M (n_read_queries) is decoupled from E. See docs/graph_model.md.
 """
 from __future__ import annotations
 
@@ -19,10 +20,10 @@ from ...config import ReprConfig
 class GraphEncoder(nn.Module):
     """Relational-parser graph memory over a learnable node bank (the current line).
 
-    The read is an INJECT, not a prepend: finalize_memory builds the graph state and
-    returns an EMPTY [B,0,d_llama] memory (the harness prepends nothing); the loss path
-    reaches into `self.reader` + the graph via a decoder forward-hook. The graph dict
-    (src_value/dst_value/edge_state + pointer diagnostics) rides in the finalize aux.
+    The read is a PREPEND (not an inject): finalize_memory parses the span into the graph,
+    then the Perceiver `GraphReader` forms M memory tokens [B,M,d_llama] that the harness
+    PREPENDS to the decoder. The parsed graph dict (src_value/dst_value/edge_state +
+    pointer diagnostics) rides in the finalize aux for the canaries.
     """
 
     def __init__(self, cfg: ReprConfig):
@@ -46,7 +47,8 @@ class GraphEncoder(nn.Module):
         self.base = base                                   # frozen contextualizer (+ optional LoRA)
         gcfg = GraphConfig(
             d_llama=cfg.d_llama, d_graph=cfg.graph_d_graph, n_nodes=cfg.graph_n_nodes,
-            n_edges=cfg.graph_n_edges, write_layers=cfg.graph_write_layers,
+            n_edges=cfg.graph_n_edges, n_read_queries=cfg.graph_n_read_queries,
+            write_layers=cfg.graph_write_layers,
             read_layers=cfg.graph_read_layers, heads=cfg.graph_heads,
             ffn_mult=cfg.graph_ffn_mult, ptr_logit_temp_init=cfg.graph_ptr_logit_temp_init,
             entmax_alpha=cfg.graph_entmax_alpha, free_endpoints=cfg.graph_free_endpoints)
@@ -67,9 +69,11 @@ class GraphEncoder(nn.Module):
                       f"{n_layers}-layer backbone → depth-relative {obs_tap}")
         self.obs_tap_layer = obs_tap                       # observation tap
         _sel = "softmax" if gcfg.entmax_alpha <= 1.0 else f"entmax-{gcfg.entmax_alpha}"
+        _M = gcfg.n_read_queries or gcfg.n_edges
         print(f"[graph] relational parser: N={gcfg.n_nodes} bank, E={gcfg.n_edges} edges, "
-              f"d_graph={gcfg.d_graph}, write×{gcfg.write_layers}/read×{gcfg.read_layers}, "
-              f"obs_tap=L{self.obs_tap_layer}, prepend read, select={_sel}")
+              f"M={_M} read-queries, d_graph={gcfg.d_graph}, "
+              f"write×{gcfg.write_layers}/read×{gcfg.read_layers}, "
+              f"obs_tap=L{self.obs_tap_layer}, perceiver prepend read, select={_sel}")
 
     def train(self, mode: bool = True):
         super().train(mode)
@@ -107,8 +111,9 @@ class GraphEncoder(nn.Module):
         accumulated hiddens in graph_window-token windows, carrying (and updating) the
         graph across them (the parser ingests the prior graph each window). A short
         input (≤ one window — every MAE sentence) runs once from the fresh init slots
-        = a single parse. The reader forms E memory tokens (FiLM-bound edges) that the
-        loss path PREPENDS — the decoder reads them via its own attention (no inject)."""
+        = a single parse. The Perceiver reader forms M memory tokens (latent queries over
+        the per-edge {src,dst,edge} tokens) that the loss path PREPENDS — the decoder reads
+        them via its own attention (no inject)."""
         hiddens, mask = state["hiddens"], state["mask"]          # [B,T,d_llama], [B,T]
         W = self.cfg.graph_window
         T = hiddens.shape[1]
@@ -131,7 +136,7 @@ class GraphEncoder(nn.Module):
                          for k in new}
         if graph is None:                                        # fully-padded batch (degenerate) → one parse
             graph = self.parser(hiddens, mask, state=None)       # avoids a None-deref downstream
-        memory = self.reader(graph)                              # [B, E, d_llama] — FiLM-bound edge tokens
+        memory = self.reader(graph)                              # [B, M, d_llama] — Perceiver latent read
         return memory, {"graph": graph}
 
     def forward(self, token_embeds, attention_mask=None, mask_positions=None):

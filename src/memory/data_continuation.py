@@ -46,7 +46,7 @@ class ContinuationDataset(IterableDataset):
     def __init__(self, parquet_path, tokenizer, *,
                  src_tokenizer_name: str = "meta-llama/Llama-3.2-1B",
                  split: str = "train", compress_len: int = 4096,
-                 predict_len: int = 512, seed: int = 0, n_items: int = 1_000_000,
+                 predict_len: int = 64, seed: int = 0, n_items: int = 1_000_000,
                  pad_token_id: int = 128_001, trigger: str = None,
                  objective: str = "continuation"):
         import json
@@ -112,7 +112,7 @@ class ContinuationDataset(IterableDataset):
 
 
 def make_continuation_dataloader(tokenizer, batch_size: int, compress_len: int = 4096,
-                                 predict_len: int = 512, split: str = "train", seed: int = 0,
+                                 predict_len: int = 64, split: str = "train", seed: int = 0,
                                  pad_token_id: int = None, num_workers: int = 2,
                                  objective: str = "continuation",
                                  src_tokenizer_name: str = "meta-llama/Llama-3.2-1B") -> DataLoader:

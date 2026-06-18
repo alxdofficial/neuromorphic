@@ -70,6 +70,11 @@ def build_batch(obj, *, ctx, batch_size, compress=None, predict=None):
             _TOK, context_len=ctx, batch_size=batch_size, n_pairs=16, n_query=1, n_facts=3,
             split="train", world_seed=0, stream_seed=0,
             pad_token_id=resolve_special_ids(_TOK)[0], num_workers=0)
+    elif obj == "babi":
+        from src.memory.data_babi import make_babi_dataloader
+        dl = make_babi_dataloader(
+            _TOK, context_len=ctx, batch_size=batch_size, split="validation", seed=0,
+            pad_token_id=resolve_special_ids(_TOK)[0], num_workers=0)
     elif obj == "continuation":
         from src.memory.data_continuation import make_continuation_dataloader
         dl = make_continuation_dataloader(

@@ -16,8 +16,10 @@ node (pointer-select, never regressed), edge_state from the edge slot itself. Re
 off fresh value-less slots (not in-place on Part 1) teaches active re-arrangement, not
 copy-the-current-graph.
 
-READ (GraphReader) — per edge bind op(src,dst,edge)→one vector, cross-attn inject
-(RMS-matched, gated) into the frozen LLM at a mid-late layer.
+READ (GraphReader) — a Perceiver: M learnable latent queries cross/self-attend over the
+per-edge {src,dst,edge} tokens (role+instance-tagged), ×read_layers, project to d_llama,
+and are PREPENDED to the frozen decoder (read via its own attention; no inject). M
+(n_read_queries) is decoupled from E — many edges can pool into a small prepend budget.
 """
 from __future__ import annotations
 
@@ -81,6 +83,7 @@ class GraphConfig:
     d_graph: int = 256               # graph/vocabulary space (decoupled from d_llama)
     n_nodes: int = 1024              # N — node bank size (the learnable vocabulary)
     n_edges: int = 16                # E — edge budget
+    n_read_queries: int = 0          # M — Perceiver latent read-queries / prepend tokens; 0 ⇒ M=E
     write_layers: int = 3            # parser depth (self → cross-nodes → cross-obs); ≥3
     read_layers: int = 2             # reader depth (cross-attend edges + causal self)
     heads: int = 4
@@ -237,45 +240,65 @@ class GraphParser(nn.Module):
                 "src_ptr": src_ptr, "dst_ptr": dst_ptr}
 
 
-# ── READ: per-edge FiLM-bound token → PREPEND memory (read by the decoder natively) ──
-class GraphReader(nn.Module):
-    """Forms the graph's MEMORY TOKENS for a PREPEND read — NOT a custom inject.
+class _PerceiverBlock(nn.Module):
+    """One Perceiver-IO / DETR read block: latent queries cross-attend the graph KV,
+    then self-attend among themselves, then FFN — each pre-LN residual. The KV is the
+    3E graph tokens (src/dst/edge per edge); the queries are M learnable latents, so M
+    is DECOUPLED from E. Cross-attn lets each latent GATHER from any subset of the graph
+    (grouped by the role+tag KV features); self-attn lets the M latents differentiate."""
+    def __init__(self, d: int, heads: int, ffn_mult: int):
+        super().__init__()
+        self.cn = nn.LayerNorm(d); self.cross = _Attn(d, heads)   # queries ← KV
+        self.sn = nn.LayerNorm(d); self.slf = _Attn(d, heads)     # queries ← queries
+        self.fn = nn.LayerNorm(d)
+        self.ff = nn.Sequential(nn.Linear(d, ffn_mult * d), nn.GELU(), nn.Linear(ffn_mult * d, d))
 
-    Same FiLM token-creation as before: bind op(src,dst,edge)→one vector per edge
-    (binding installed in the WRITE, the side-car lesson). The E edge tokens then
-    self-attend to contextualize each other and project to d_llama; the frozen decoder
-    reads them as M=E prepended slots via its OWN attention. This replaces the old
-    cross-attention inject reader, whose injected signal collapsed to ≈rank-1 (the same
-    additive nudge at every position) — see scripts/diagnostics/why_graph_collapses_mae.
+    def forward(self, q: Tensor, kv: Tensor) -> Tensor:
+        q = q + self.cross(self.cn(q), kv)                       # gather from the graph
+        qn = self.sn(q); q = q + self.slf(qn, qn)               # latents differentiate
+        q = q + self.ff(self.fn(q))
+        return q
+
+
+# ── READ: Perceiver-IO / DETR latent-query read → PREPEND memory (decoder reads natively) ──
+class GraphReader(nn.Module):
+    """Forms the graph's MEMORY TOKENS via a PERCEIVER-IO / DETR latent-query read.
+
+    The reader DECOUPLES the number of prepended memory tokens M from the edge budget E.
+    The graph is exposed as a set of 3E KV tokens — for each edge e and role r∈{src,dst,
+    edge} a token = value[e,r] + role_emb[r] + tag[e] (role+tag let a query group the KV
+    by edge and by role). M learnable latent QUERIES cross-attend this KV (gather), then
+    self-attend (differentiate), then FFN — ×read_layers Perceiver blocks. A final LN +
+    Linear maps each latent to d_llama. Replaces the per-edge concat+project reader, whose
+    M was pinned to E and whose pooled read collapsed toward rank-1.
     """
     def __init__(self, cfg: GraphConfig):
         super().__init__()
         self.cfg = cfg
-        d, dl = cfg.d_graph, cfg.d_llama
-        # per-edge bind op: bind the two endpoints, modulate by the relation (FiLM).
-        # binding installed BEFORE the memory is read (the side-car lesson) — not pooling.
-        self.w_sd = nn.Linear(2 * d, d)
-        self.w_gamma = nn.Linear(d, d); self.w_beta = nn.Linear(d, d)
-        # FiLM near-identity init: γ.bias=1, β.bias=0 anchors the bind (edge_vec≈sd at
-        # start, so a random relation can't drown the endpoint binding — R1-L5), while
-        # the (default-init, nonzero) weights keep edge_state effective AND gradient-
-        # flowing. NB: zeroing the γ/β *weights* would give edge_state zero path to the
-        # output → starve edge_head (the relation channel) of gradient — don't.
-        nn.init.ones_(self.w_gamma.bias); nn.init.zeros_(self.w_beta.bias)
-        # memory-former: the E edge tokens self-attend (reuses the read-layer budget so
-        # the graph stays capacity-matched), then a LN + projection to d_llama.
-        self.blocks = nn.ModuleList(_SelfBlock(d, cfg.heads, cfg.ffn_mult) for _ in range(cfg.read_layers))
+        d, dl, E = cfg.d_graph, cfg.d_llama, cfg.n_edges
+        M = cfg.n_read_queries or cfg.n_edges                    # M = read-queries (0 ⇒ M=E fallback)
+        self.M = M
+        # M learnable latent read-queries (the prepend slots). 1/sqrt(d) init.
+        self.queries = nn.Parameter(torch.randn(M, d) / math.sqrt(d))
+        # KV features so a query can group the 3E graph tokens by role and by edge.
+        self.role_emb = nn.Parameter(torch.randn(3, d) / math.sqrt(d))   # src / dst / edge
+        self.tag = nn.Parameter(torch.randn(E, d) / math.sqrt(d))        # per-edge instance tag
+        self.blocks = nn.ModuleList(
+            _PerceiverBlock(d, cfg.heads, cfg.ffn_mult) for _ in range(cfg.read_layers))
         self.norm = nn.LayerNorm(d)
-        self.out = nn.Linear(d, dl)
+        self.out = nn.Linear(d, dl)                              # latent (d_graph) → d_llama token
 
-    def edge_tokens(self, graph: dict) -> Tensor:
-        sd = self.w_sd(torch.cat([graph["src_value"], graph["dst_value"]], dim=-1))  # bind endpoints
-        g = self.w_gamma(graph["edge_state"]); b = self.w_beta(graph["edge_state"])
-        return g * sd + b                                          # [B,E,d] — relation FiLM-modulates the pair
+    def _kv(self, graph: dict) -> Tensor:
+        """Build the 3E graph KV: token[e,r] = value[e,r] + role_emb[r] + tag[e]."""
+        vals = torch.stack(                                      # [B,E,3,d] (order: src,dst,edge)
+            [graph["src_value"], graph["dst_value"], graph["edge_state"]], dim=2)
+        kv = vals + self.role_emb[None, None] + self.tag[None, :, None]   # [B,E,3,d]
+        return kv.reshape(vals.shape[0], -1, vals.shape[-1])    # [B,3E,d]
 
     def forward(self, graph: dict) -> Tensor:
-        """graph dict → [B, E, d_llama] memory tokens to PREPEND (decoder reads natively)."""
-        x = self.edge_tokens(graph)                               # [B,E,d]
+        """graph dict → [B, M, d_llama] memory tokens to PREPEND (decoder reads natively)."""
+        kv = self._kv(graph)                                     # [B,3E,d]
+        q = self.queries.unsqueeze(0).expand(kv.shape[0], -1, -1)  # [B,M,d]
         for blk in self.blocks:
-            x = blk(x)                                            # edges contextualize each other
-        return self.out(self.norm(x))                            # [B,E,d_llama]
+            q = blk(q, kv)
+        return self.out(self.norm(q))                           # [B,M,d_llama]

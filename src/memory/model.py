@@ -862,9 +862,22 @@ class ReprLearningModel(nn.Module):
             n_content_total = pred_mask.float().sum().clamp(min=1.0)
             if pred_mask.any():
                 sel_preds = sel_logits.argmax(dim=-1)          # [N_pred]
-                top1_acc = (sel_preds == sel_targets).float().sum() / n_content_total
+                tok_correct = (sel_preds == sel_targets)       # [N_pred] bool
+                top1_acc = tok_correct.float().sum() / n_content_total
+                # Per-example teacher-forced exact match: a row is correct iff
+                # ALL its content-position argmax predictions match the gold
+                # answer tokens. With all-content answers (bAbI/EMAT) this is the
+                # answer-span EM under teacher forcing. Mirrors per_example_loss's
+                # scatter aggregation. Rows with no content position score 0.
+                row_idx = pred_mask.nonzero(as_tuple=False)[:, 0]   # [N_pred]
+                row_cnt = torch.zeros(B, device=device)
+                row_hit = torch.zeros(B, device=device)
+                row_cnt.scatter_add_(0, row_idx, torch.ones_like(tok_correct, dtype=torch.float))
+                row_hit.scatter_add_(0, row_idx, tok_correct.float())
+                per_example_em = ((row_hit == row_cnt) & (row_cnt > 0)).float()  # [B]
             else:
                 top1_acc = torch.zeros((), device=device)
+                per_example_em = torch.zeros(B, device=device)
 
         out = {
             "loss": loss,
@@ -878,6 +891,7 @@ class ReprLearningModel(nn.Module):
             "n_content_positions": int(pred_mask.sum().item()),
             "top1_acc": top1_acc.detach(),
             "per_example_loss": per_example_loss,             # [B] for per-family aggregation
+            "per_example_em": per_example_em.detach(),        # [B] teacher-forced exact match (bAbI EM)
             "aux": finalize_aux,
         }
         if splat_telemetry is not None:
