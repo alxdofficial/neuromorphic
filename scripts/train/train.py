@@ -89,20 +89,21 @@ def materialize_val_set(val_dl, n_batches: int) -> list:
 # evaluated PER-TASK. Each entry: task key → (data task_family, model.task_mode).
 # task_mode routes compute_loss: "masked_reconstruction" → the MAE infill path;
 # anything else → the generic QA-path compute_loss (used by babi + continuation).
-MIXED_TASKS_DEFAULT = ("mae", "babi", "continuation", "condrecon")
-# model.task_mode per mixed task. MAE uses the infill path; babi/continuation/condrecon
+MIXED_TASKS_DEFAULT = ("mae", "babi", "continuation", "condrecon_bio")
+# model.task_mode per mixed task. MAE uses the infill path; babi/continuation/condrecon_bio
 # use the generic compute_loss (a non-MAE sentinel string routes there).
 MIXED_TASK_MODE = {
     "mae": "masked_reconstruction",
     "babi": "babi",
     "continuation": "continuation",
-    "condrecon": "conditioned_reconstruction",
+    "condrecon_bio": "conditioned_reconstruction_bio",
 }
 CONT_EARLY_TOKENS = 16   # continuation early-token loss = mean over the first N predict positions
-# conditioned-reconstruction's word pool caps n_pairs at ~93; single-token values fill only
-# ~456 of the 1024 buffer, so we use multi-token values (value_len) to reach ~850 (~27:1).
-MIXED_CONDRECON_N_PAIRS = 90
-MIXED_CONDRECON_VALUE_LEN = 4
+# BIOGRAPHICAL conditioned-reconstruction (natural fact-dense value sentences, NOT random words):
+# fill-to-budget packs key=value lines to ~ctx_len; n_pairs is the MAX entity pool (the world
+# supports ~32 after the train/val name-firewall), n_facts = attributes packed per value sentence.
+MIXED_CONDRECON_BIO_N_PAIRS = 24
+MIXED_CONDRECON_BIO_N_FACTS = 3
 
 
 def make_mixed_train_dataloaders(mixed_tasks, tokenizer, cfg, *, ctx_len: int,
@@ -130,13 +131,13 @@ def make_mixed_train_dataloaders(mixed_tasks, tokenizer, cfg, *, ctx_len: int,
                 predict_len=predict_len, split="train", seed=42, pad_token_id=_pad,
                 objective="continuation", src_tokenizer_name=mae_src_tok,
                 num_workers=num_workers)
-        elif t == "condrecon":
-            dls[t] = make_conditioned_reconstruction_dataloader(
+        elif t == "condrecon_bio":
+            dls[t] = make_conditioned_reconstruction_bio_dataloader(
                 tokenizer, context_len=ctx_len, batch_size=cfg.batch_size,
-                n_pairs=MIXED_CONDRECON_N_PAIRS, n_query=1, value_len=MIXED_CONDRECON_VALUE_LEN,
-                split="train", seed=42, pad_token_id=_pad, num_workers=num_workers)
+                n_pairs=MIXED_CONDRECON_BIO_N_PAIRS, n_query=1, n_facts=MIXED_CONDRECON_BIO_N_FACTS,
+                split="train", world_seed=0, stream_seed=42, pad_token_id=_pad, num_workers=num_workers)
         else:
-            raise ValueError(f"unknown mixed task {t!r} (expected mae/babi/continuation/condrecon)")
+            raise ValueError(f"unknown mixed task {t!r} (expected mae/babi/continuation/condrecon_bio)")
     return dls
 
 
@@ -163,11 +164,11 @@ def make_mixed_val_sets(mixed_tasks, tokenizer, cfg, val_batches, *, ctx_len: in
                 tokenizer, batch_size=cfg.batch_size, compress_len=ctx_len,
                 predict_len=predict_len, split="validation", seed=7, pad_token_id=_pad,
                 objective="continuation", src_tokenizer_name=mae_src_tok, num_workers=0)
-        elif t == "condrecon":
-            dl = make_conditioned_reconstruction_dataloader(
+        elif t == "condrecon_bio":
+            dl = make_conditioned_reconstruction_bio_dataloader(
                 tokenizer, context_len=ctx_len, batch_size=cfg.batch_size,
-                n_pairs=MIXED_CONDRECON_N_PAIRS, n_query=1, value_len=MIXED_CONDRECON_VALUE_LEN,
-                split="validation", seed=7, pad_token_id=_pad, num_workers=0)
+                n_pairs=MIXED_CONDRECON_BIO_N_PAIRS, n_query=1, n_facts=MIXED_CONDRECON_BIO_N_FACTS,
+                split="validation", world_seed=0, stream_seed=7, pad_token_id=_pad, num_workers=0)
         sets[t] = materialize_val_set(dl, val_batches)
     return sets
 

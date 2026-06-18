@@ -156,13 +156,17 @@ class ConditionedReconstructionBioDataset(IterableDataset):
             # an occasional bad draw (retry) from a fundamentally-too-small config (raise).
             return None
         qi = rng.sample(queryable, self.n_query)
-        question_ids = self._ids(keys[qi[0]])
+        # Condition with the "key =" form the context uses ("k = v\n") so the decoder
+        # predicts the value IN-DISTRIBUTION (a bare key makes the model — esp. the
+        # full-context ceiling — predict " =" instead of the value: the inverted-band bug).
+        question_ids = self._ids(keys[qi[0]] + " =")
 
         answer_ids: List[int] = []
         content: List[bool] = []
         for n, j in enumerate(qi):
             if n == 0:
-                v_ids, v_content = self._value_ids_content(values[j], names[j], givens[j], False)
+                # space-prefixed value (matches "= v" in the context), like the multi-query cue below.
+                v_ids, v_content = self._value_ids_content(values[j], names[j], givens[j], True)
             else:
                 cue = self._ids(f" {keys[j]} =")          # inline cue for the next pair (given)
                 answer_ids += cue
