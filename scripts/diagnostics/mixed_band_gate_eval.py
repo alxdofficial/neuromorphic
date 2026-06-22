@@ -63,8 +63,10 @@ def _ckpt_path(out_tag: str, variant: str) -> Path:
 
 
 def _load_cfg_from_ckpt(ckpt: Path) -> tuple[ReprConfig, dict]:
+    import dataclasses
     sd = torch.load(ckpt, map_location="cpu", weights_only=False)
-    cfg = ReprConfig(**sd["metadata"]["cfg_dict"])
+    valid = {f.name for f in dataclasses.fields(ReprConfig)}     # drop fields removed since training
+    cfg = ReprConfig(**{k: v for k, v in sd["metadata"]["cfg_dict"].items() if k in valid})
     return cfg, sd
 
 
