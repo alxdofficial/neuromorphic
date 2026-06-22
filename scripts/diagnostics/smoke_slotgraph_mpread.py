@@ -96,13 +96,15 @@ def main():
     print(f"\n{'='*74}\nslotgraph MP-READ smoke (matched mixed config, REAL bf16 path)\n{'='*74}")
     print(f"params = {tot:,} ({tot/1e6:.2f}M)   | cohort target ≈ icae (rebalance LoRA if off)")
 
-    vs = make_mixed_val_sets(["mae", "babi"], tok, cfg, 2, ctx_len=1024, m_slots=32,
-                             mae_src_tok="meta-llama/Llama-3.2-1B",
+    # ALL 4 mixed tasks (condrecon_bio + continuation matter: a concentrated-graph condrecon_bio batch
+    # is what overflowed the un-normalized MP aggregation → NaN; check every task's forward is finite).
+    vs = make_mixed_val_sets(["mae", "babi", "continuation", "condrecon_bio"], tok, cfg, 2,
+                             ctx_len=1024, m_slots=32, mae_src_tok="meta-llama/Llama-3.2-1B",
                              babi_tasks=(1, 2, 3, 7, 8, 11, 12, 13, 14), predict_len=64)
 
     # ── 1+2. forward: shape, finiteness, MP canaries ──
     embed = m.decoder.llama.get_input_embeddings()
-    for t in ("mae", "babi"):
+    for t in ("mae", "babi", "continuation", "condrecon_bio"):
         m.task_mode = MIXED_TASK_MODE[t]
         b = to_device(vs[t][0], DEV)
         with torch.no_grad():

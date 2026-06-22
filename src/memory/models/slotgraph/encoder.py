@@ -238,6 +238,12 @@ class SlotGraphEncoder(nn.Module):
             m_to_src = self.msg(torch.cat([h_dst, h], -1)) * edge_w   # symmetric: dst node + edge → src
             agg = (torch.einsum("bmn,bmd->bnd", dst_n, m_to_dst)      # gather messages at endpoint nodes
                    + torch.einsum("bmn,bmd->bnd", src_n, m_to_src))
+            # MEAN aggregation (divide by in-degree): a node that many edges point to would otherwise get
+            # a sum that scales with its degree, and over the multi-hop residual that compounds and can
+            # overflow bf16 on a concentrated graph → NaN. Degree-normalizing bounds each hop to ~|msg|.
+            deg = torch.einsum("bmn,bm->bn", (src_n + dst_n).detach(),
+                               edge_w.squeeze(-1)).clamp(min=1.0)     # [B,M] incident-edge count per node
+            agg = agg / deg.unsqueeze(-1)
             h = h + gate * self.update(agg) * node_recv            # residual relay; only nodes update
         memory = self.norm(h.float())
         info = {"hops": K, "gate": gate.detach(),
