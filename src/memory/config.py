@@ -173,6 +173,9 @@ class ReprConfig:
     # (reachability saturation), capped at max_hops — enough to propagate, not so deep it over-smooths.
     slotgraph_mp_read: bool = True       # False ⇒ plain prepend read (the inert-structure baseline)
     slotgraph_max_hops: int = 5          # cap on the adaptive hop count (over-smoothing / compute guard)
+    slotgraph_inject: bool = True        # False ⇒ drop the per-layer structure injection, keep heads+MP
+                                         # read = "MP-read-only" (the STABLE ablation; injection-only
+                                         # over-drives the fragile injection). See encoder MAGNITUDE POLICY.
 
     # ── vqicae (ICAE with VQ-VAE-discretized slots; models/vqicae/) ──────────
     # ICAE write, then each slot is quantized to its nearest code in a large EMA codebook

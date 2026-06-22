@@ -25,6 +25,18 @@ Design decisions:
   • ID = slot POSITION via a FIXED near-orthonormal code table (a buffer, not learnable → distinct,
     reload-stable). Edge endpoint code = id[src] + id[dst] (transparent SUM) so attention can match an
     edge back to its two endpoint nodes. No aux loss, no pooling read.
+
+MAGNITUDE POLICY (unified — no free-floating scale hyperparameters; everything is measured or bounded):
+  1. Mixing weights are sigmoid(raw) ∈ [0,1] — naturally bounded, NO arbitrary `*_max` caps. Inits are a
+     gentle start (≈0.1), not tuned ceilings.
+  2. A learnable vector that combines ADDITIVELY with a fixed unit-norm reference is CLAMP-capped at the
+     reference's scale (role_embed ≤ the id codes' unit norm). Clamp, NOT normalize: normalize has a
+     1/‖·‖ gradient singularity as ‖·‖→0 AND forces full magnitude (kills self-regulation). Clamp caps
+     the upside (stops the injection growing out-of-distribution → frozen-LM amplification → overflow)
+     while still letting the model shrink it.
+  3. Aggregates are mean/degree-normalized (the MP read) — magnitude is degree-invariant.
+  4. Output / combined-stream magnitudes are matched to MEASURED references: the read → the LM's token
+     embedding norm (_NormMatch); head inputs → √d so content and id streams are balanced (id_head_scale).
 """
 from __future__ import annotations
 
@@ -79,6 +91,10 @@ class SlotGraphEncoder(nn.Module):
         sl = int(getattr(cfg, "slotgraph_start_layer", 0))
         self.start_layer = sl if 0 <= sl < n_layers else 0
         self.use_structure = bool(getattr(cfg, "slotgraph_use_structure", True))
+        # inject = write the predicted structure back into the slot hiddens per-layer. inject=False keeps
+        # the structure heads + MP read but drops the per-layer injection → "MP-read-only" (the STABLE
+        # ablation; injection-ONLY diverges because its objective over-drives the fragile injection).
+        self.inject = bool(getattr(cfg, "slotgraph_inject", True))
 
         # slot content seeds (appended to the passage, icae-style: centered in Llama's token region)
         embed = base.get_input_embeddings()
@@ -108,10 +124,9 @@ class SlotGraphEncoder(nn.Module):
         self.id_head_scale = math.sqrt(d)
         self.src_head = nn.Linear(2 * d, self.M); self.dst_head = nn.Linear(2 * d, self.M)
         self.log_temp = nn.Parameter(torch.tensor(math.log(float(cfg.slotgraph_temp_init))))
-        # BOUNDED injection: scale = inject_max·sigmoid(raw) ∈ (0, inject_max). Re-injecting an
-        # unbounded learnable scalar before all LM layers can distort the residual stream; cap it.
-        self.inject_max = 0.5
-        self.inject_raw = nn.Parameter(torch.tensor(-1.386))  # 0.5·sigmoid(-1.386) ≈ 0.1 at init
+        # injection strength = sigmoid(raw) ∈ [0,1] (a naturally-bounded mixing weight — no arbitrary
+        # cap; the injected e is itself bounded by the role_embed clamp). Init for a gentle ~0.1 start.
+        self.inject_raw = nn.Parameter(torch.tensor(-2.197))  # sigmoid(-2.197) ≈ 0.1
 
         # ── multi-hop message-passing READ ──────────────────────────────────
         # Make the prepended memory a FUNCTION of the topology, so the edge heads get loss gradient (a
@@ -126,10 +141,9 @@ class SlotGraphEncoder(nn.Module):
         # any graph message — a content-free bypass that defeats the point of a topology read.
         self.msg = nn.Linear(2 * d, d, bias=False)   # [source node ; edge content] → message
         self.update = nn.Linear(d, d, bias=False)    # aggregated incoming → node-state delta
-        # gentle cold-start gate: the MP delta starts small so step-0 ≈ icae read, but the gate is
-        # NONZERO so gradient reaches msg/update/heads from step 0 (no zero-init block).
-        self.mp_gate_max = 0.5
-        self.mp_gate_raw = nn.Parameter(torch.tensor(-1.386))   # 0.5·sigmoid(-1.386) ≈ 0.1 at init
+        # MP read gate = sigmoid(raw) ∈ [0,1] (naturally bounded — no cap). Gentle ~0.1 start so step-0 ≈
+        # plain read, but nonzero so gradient reaches msg/update/heads from step 0 (no zero-init block).
+        self.mp_gate_raw = nn.Parameter(torch.tensor(-2.197))   # sigmoid(-2.197) ≈ 0.1
 
         self.norm = _NormMatch(d)
         with torch.no_grad():
@@ -172,6 +186,14 @@ class SlotGraphEncoder(nn.Module):
         d = d.masked_fill(block, torch.finfo(d.dtype).min)
         return s, d
 
+    def _role_e(self) -> Tensor:
+        """role_embed rows CLAMP-capped at the fixed id codes' unit scale (magnitude policy #2). Clamp,
+        not normalize: normalize has a 1/‖·‖ gradient singularity as a row → cancels an id code, and it
+        forces full magnitude (the model can no longer shrink the injection to self-regulate). Clamp caps
+        the upside so the injected structure can't grow out-of-distribution (→ frozen-LM overflow)."""
+        n = self.role_embed.norm(dim=-1, keepdim=True).clamp(min=1e-6)   # [2,1]
+        return self.role_embed * (1.0 / n).clamp(max=1.0)               # rows capped at unit L2 (id scale)
+
     # ── structure concretization (fixed roles; per-layer-shared endpoint heads) ──
     def _structure(self, slot_h: Tensor):
         """slot_h [B,M,d] → (e [B,M,d] structural embed, role[B,M,2] fixed, src/dst[B,M,M] hard-ST).
@@ -182,10 +204,11 @@ class SlotGraphEncoder(nn.Module):
         s_logits, d_logits = self._endpoint_logits(hh)             # edges→nodes ONLY (constant mask)
         src = _st_onehot(s_logits, temp)                           # [B,M,M] one-hot src (a node position)
         dst = _st_onehot(d_logits, temp)                           # [B,M,M] one-hot dst (a node position)
+        role_e = self._role_e()                                    # [2,d] clamp-bounded type tags
         is_node = self.is_node.view(1, self.M, 1)                  # [1,M,1] fixed partition
-        node_e = (self.role_embed[0] + self.id_embed).unsqueeze(0)  # [1,M,d] node id = own position
+        node_e = (role_e[0] + self.id_embed).unsqueeze(0)          # [1,M,d] node id = own position
         endp = torch.einsum("bmn,nd->bmd", src, self.id_embed) + torch.einsum("bmn,nd->bmd", dst, self.id_embed)
-        edge_e = self.role_embed[1] + endp                          # [B,M,d] transparent SUM of endpoint ids
+        edge_e = role_e[1] + endp                                  # [B,M,d] transparent SUM of endpoint ids
         e = is_node * node_e + (1.0 - is_node) * edge_e            # node slots → node_e, edge slots → edge_e
         role = self.role_fixed.unsqueeze(0).expand(B, -1, -1)      # [B,M,2] fixed (constant)
         return e, role, src, dst
@@ -227,7 +250,7 @@ class SlotGraphEncoder(nn.Module):
         node_recv = self.is_node.view(1, self.M, 1)               # [1,M,1] only node slots receive
 
         K = self._adaptive_hops(role, src_n, dst_n)
-        gate = self.mp_gate_max * torch.sigmoid(self.mp_gate_raw)
+        gate = torch.sigmoid(self.mp_gate_raw)                    # ∈ [0,1], naturally bounded
         pre = self.norm(slot_final.float())                       # icae read (for the inert-MP canary)
 
         h = slot_final
@@ -262,7 +285,7 @@ class SlotGraphEncoder(nn.Module):
                 if h is None or h.shape[1] < self.M:
                     return None
                 e, _, _, _ = self._structure(h[:, -self.M:])
-                scale = self.inject_max * torch.sigmoid(self.inject_raw)   # bounded ∈ (0, inject_max)
+                scale = torch.sigmoid(self.inject_raw)            # ∈ [0,1]; e is bounded by the role clamp
                 new = h.clone()
                 new[:, -self.M:] = new[:, -self.M:] + scale * e.to(h.dtype)
                 if args:
@@ -282,7 +305,7 @@ class SlotGraphEncoder(nn.Module):
         inp = torch.cat([emb, slots0], dim=1)                       # [B,T+M,d]
         attn = torch.cat([mask, torch.ones(B, self.M, device=mask.device, dtype=mask.dtype)], dim=1).long()
 
-        handles = self._install_struct_hooks() if self.use_structure else []
+        handles = self._install_struct_hooks() if (self.use_structure and self.inject) else []
         try:
             h = self.base.model(inputs_embeds=inp, attention_mask=attn,
                                 use_cache=False).last_hidden_state    # single fwd, no generation → no KV cache
@@ -312,7 +335,7 @@ class SlotGraphEncoder(nn.Module):
             aux["slotgraph_dst_entropy"] = _ent(dst_soft)
             aux["slotgraph_role_entropy"] = torch.zeros((), device=emb.device)  # roles fixed → 0
             aux["slotgraph_temp"] = temp.detach()
-            aux["slotgraph_inject_scale"] = (self.inject_max * torch.sigmoid(self.inject_raw)).detach()
+            aux["slotgraph_inject_scale"] = torch.sigmoid(self.inject_raw).detach()
             aux["slotgraph_mem_effrank"] = torch.tensor(
                 _participation_ratio(memory.reshape(-1, memory.shape[-1])), device=emb.device)
             # for viz: fixed role + predicted endpoints of the final structure

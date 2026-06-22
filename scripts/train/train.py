@@ -1110,8 +1110,11 @@ def train_mixed_variant(
             out = model.compute_loss(batch, window_size=window_size)
         loss = out["loss"]
         if not torch.isfinite(loss):
-            print(f"  [step {step}] FATAL: non-finite loss = {float(loss)} (task={task})")
-            break
+            # Skip a rare non-finite batch instead of dying (grads are still zeroed from above, so the
+            # model is NOT poisoned). A SYSTEMATIC divergence would skip every step → visible in the log.
+            print(f"  [step {step}] non-finite loss = {float(loss.detach())} (task={task}) — skipping batch")
+            opt.zero_grad(set_to_none=True)
+            continue
         loss.backward()
         _mem_params = [p for n, p in model.named_parameters()
                        if p.requires_grad and not n.startswith("decoder.llama.")]
@@ -1426,6 +1429,9 @@ def main():
     ap.add_argument("--slotgraph-no-mp-read", action="store_true",
                     help="slotgraph: disable the multi-hop message-passing read (plain prepend instead) "
                          "= injection-only control. Ablation: does the topology-USING read earn its keep?")
+    ap.add_argument("--slotgraph-no-inject", action="store_true",
+                    help="slotgraph: drop the per-layer structure injection, keep heads + MP read = "
+                         "MP-read-only control (the STABLE ablation). Does the read earn its keep alone?")
     ap.add_argument("--graph-encoder-lora-rank", type=int, default=0,
                     help="graph: LoRA-adapt the encoder forward like the baselines (0=frozen tap). "
                          "Evens the encoder footing (the graph historically read a frozen tap).")
@@ -1796,6 +1802,9 @@ def main():
     if args.slotgraph_no_mp_read:
         cfg.slotgraph_mp_read = False
         print("[slotgraph override] MP read OFF = injection-only control (plain prepend read)")
+    if args.slotgraph_no_inject:
+        cfg.slotgraph_inject = False
+        print("[slotgraph override] injection OFF = MP-read-only control (heads + MP read, no injection)")
     cfg.task_mode = args.task        # accurate ckpt metadata (dispatch still keys on this)
     cfg.seed = args.seed             # record the actual seed in ckpt metadata
 
