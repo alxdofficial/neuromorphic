@@ -1,10 +1,10 @@
 """Config dataclass for the memory / compression module.
 
-Only fields consumed by the LIVE code path are kept here. The active line is
-masked_reconstruction (MAE) on a frozen backbone; the models that read this
-config are: the `graph` relational parser (the current model; docs/graph_model.md),
-the abandoned hlvocab / soft_pointer_graph, and the four faithful baseline ports
-(icae / ccm / autocompressor / beacon) plus the vanilla floor/ceiling.
+Only fields consumed by the LIVE code path are kept here. The active line is the mixed
+4-task objective on a frozen backbone; the models that read this config are: the four
+published baseline ports (icae / ccm / autocompressor / beacon), biomem (fast-Hebbian),
+slotgraph (emergent-topology slots), vqicae (VQ-discretized slots), and the vanilla
+floor/ceiling. (The old `graph` relational parser was retired — slotgraph supersedes it.)
 """
 from __future__ import annotations
 from dataclasses import dataclass
@@ -123,56 +123,6 @@ class ReprConfig:
     grad_clip: float = 1.0
     log_every: int = 50
     save_every: int = 5000
-
-    # ── graph (relational-parser graph memory over a learnable node bank) ────
-    # models/graph/; design: docs/graph_model.md (SOURCE OF TRUTH). A learnable
-    # NODE BANK is the vocabulary (replaces the VQ-VAE — no encode-snap/EMA/commit
-    # collapse). The WRITE is a TokenGT parser: E edge-query slots self-attend +
-    # cross-attend the observation, and each POINTS into the bank to select src/dst
-    # (sharp learnable-temp softmax, never regresses) + regresses an edge state.
-    # The READ binds each edge op(src,dst,edge)→one vector and cross-attends those
-    # into the frozen LLM (RMS-matched, gated) at a mid-late layer.
-    graph_d_graph: int = 256            # graph/vocabulary space width (decoupled from d_llama)
-    graph_n_nodes: int = 1024           # N — node bank size (the learnable vocabulary)
-    graph_n_edges: int = 16             # E — edge budget
-    # M = number of PREPENDED memory tokens / Perceiver latent read-queries. 0 ⇒ fall
-    # back to M = n_edges (the legacy concat-per-edge read). >0 DECOUPLES the prepend
-    # budget from E: the reader's latent queries cross-attend the 3E graph tokens and
-    # emit exactly M tokens (Perceiver-IO / DETR style). The mixed branch sets 32.
-    graph_n_read_queries: int = 0
-    graph_window: int = 256             # obs window for the PERSISTENT carry-forward: the
-                                        # parser ingests the prior graph + each window → updates
-                                        # it. Inputs ≤ one window (every MAE sentence) = one parse.
-    graph_write_layers: int = 3         # parser depth (self → cross-nodes → cross-obs); ≥3
-    graph_read_layers: int = 2          # reader depth (cross-attend edges + causal self)
-    graph_heads: int = 4
-    graph_ffn_mult: int = 2             # FFN expansion (capacity-matches ~4.6M to the baselines)
-    # pointer-softmax sharpness at init (log-temp; 0 ⇒ temp=1, consistent with every
-    # attention block). Over QK-RMSNorm'd cosine-scale logits this starts SOFT/near-
-    # uniform (the gradient-rich cold-start) and the learnable temp sharpens it (watch
-    # graph_ptr_entropy). A negative init (e.g. -1 ⇒ temp≈0.37) biases toward selection
-    # from step 0 — the prime sweep knob if the pointer fails to sharpen.
-    graph_ptr_logit_temp_init: float = 0.0
-    graph_entmax_alpha: float = 1.0     # node-selection sparsity: 1.0=softmax, 1.5/2.0=sparse (entmax)
-    graph_obs_tap_layer: int = 6        # frozen-backbone layer tapped for the observation
-    graph_encoder_lora_rank: int = 0    # >0: LoRA-adapt the encoder forward like the baselines (0=frozen tap)
-    graph_encoder_lora_alpha: int = 0   # 0 → 2×rank
-    graph_read_final: bool = False      # read the FINAL hidden (full forward) instead of the mid tap
-    graph_free_endpoints: bool = False  # regress FREE src/dst vectors (no bank/selection/topology)
-    # ── read mechanism (docs/graph_neighborhood_read.md) ───────────────────────
-    # "perceiver"            = the bag-of-edges Perceiver-IO read (control; pools 3E
-    #                          edge tokens into M latents — no inter-edge structure).
-    # "neighborhood_tokengt" = the node-centric read: each of M slots SELECTS one bank
-    #                          node, gathers its incident-edge neighbourhood, and
-    #                          TokenGT-aggregates that local subgraph into one token
-    #                          (the center node read out after L self-attn layers). The
-    #                          slot↔edge incidence w[m,e]=S[m]·(p_src[e]+p_dst[e]) is
-    #                          differentiable, so the read pushes gradient into BOTH the
-    #                          read-selection AND the write-pointers (topology repair).
-    graph_read_mode: str = "perceiver"
-    graph_read_degree_cap: int = 0      # k = max incident edges per node window; 0 ⇒ max(1, E//8)
-    graph_read_gumbel: bool = True      # Gumbel-softmax node selection (sharp-but-explorable) vs plain softmax
-    graph_read_gumbel_temp: float = 1.0 # Gumbel temperature (>0; lower ⇒ sharper/harder selection)
 
     # ── biomem (gated fast-Hebbian cortical-column grid; models/biomem/) ─────
     biomem_n_cols: int = 36            # C — #columns; C*K must == d_llama (36*16=576)

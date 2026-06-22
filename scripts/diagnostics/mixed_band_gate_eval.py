@@ -46,8 +46,7 @@ from scripts.train.train import (
 )
 
 TRAINED_VARIANTS = [
-    "graph_baseline", "icae_baseline", "ccm_baseline",
-    "autocompressor_baseline", "beacon_baseline",
+    "icae_baseline", "ccm_baseline", "autocompressor_baseline", "beacon_baseline",
     # our memory arms (use the same mixed harness; missing ckpts are skipped gracefully)
     "slotgraph_baseline", "vqicae_baseline", "biomem_baseline",
 ]

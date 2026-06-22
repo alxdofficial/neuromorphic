@@ -1715,16 +1715,6 @@ def main():
         from src.memory.common import beacon_wrap_layers as _bwlm
         _nlayersm = _ACLM.from_pretrained(cfg.llama_model).num_hidden_layers
         cfg.beacon_wrap_layers = _bwlm(_nlayersm, 11)
-        # graph: PERCEIVER read DECOUPLES the prepend budget M from the edge budget E.
-        # The reader emits M=graph_n_read_queries latent tokens (not E). At d_graph=128,
-        # N=2048, E=128, M=32, the trainable graph memory lands at ~6.0M. WIDE+SHALLOW
-        # (d=256, write=3/read=2) instead of narrow+deep (d=128, 12/12): same ~6.0M params
-        # but ~5 layers vs 24 → ~3x faster + far less activation memory (profiling: d=128/12/12
-        # was 3x slower than icae and OOM'd above BS=4). M=32 set independently — E not tied to M.
-        cfg.graph_d_graph = 256; cfg.graph_write_layers = 3; cfg.graph_read_layers = 2
-        cfg.graph_n_nodes = 2048; cfg.graph_n_edges = 128
-        cfg.graph_n_read_queries = _M   # M latent read-queries = prepend tokens (decoupled from E)
-        cfg.graph_read_final = True   # final-layer tap (backbone-agnostic n_layers-1) — locked design
         # slotgraph (icae-write + hard-ST structure): own frozen base + encoder-LoRA (matched to
         # icae's rank so params ≈ icae) + tiny structure heads; structure injected at every LM layer.
         cfg.slotgraph_n_slots = _M
@@ -1737,8 +1727,8 @@ def main():
         cfg.vqicae_codebook_size = 8192; cfg.vqicae_d_code = 256
         print(f"[capacity] mixed: FIXED M={_M}, beacon_ratio={cfg.beacon_ratio} (ctx "
               f"{args.mixed_ctx}:M = {args.mixed_ctx // _M}:1); baselines icae r104 / "
-              f"ccm r52 / ac r52 / beacon 11L / graph d256 / slotgraph r104 / "
-              f"vqicae r96+K{cfg.vqicae_codebook_size} (param-matched ~6.9-7.0M).")
+              f"ccm r52 / ac r52 / beacon 11L / slotgraph r104 / "
+              f"vqicae r100+K{cfg.vqicae_codebook_size} (param-matched ~6.9-7.0M).")
         if cfg.d_llama != 576 and not args.allow_unmatched_backbone:
             raise SystemExit(
                 f"mixed param-matched ranks are calibrated for SmolLM2-135M (d=576); "

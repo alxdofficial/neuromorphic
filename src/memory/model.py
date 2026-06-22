@@ -17,7 +17,6 @@ from .config import ReprConfig
 from .models.autocompressor import AutoCompressorBaselineEncoder
 from .models.beacon import BeaconBaselineEncoder
 from .models.ccm import CCMBaselineEncoder
-from .models.graph import GraphEncoder
 from .models.icae import ICAEBaselineEncoder
 from .models.biomem import BioMemEncoder
 from .models.slotgraph import SlotGraphEncoder
@@ -53,8 +52,6 @@ class ReprLearningModel(nn.Module):
     """
 
     VARIANTS = {
-        # relational-parser graph memory over a learnable node bank
-        "graph_baseline": GraphEncoder,
         "icae_baseline": ICAEBaselineEncoder,  # ICAE (ICLR'24) compressor
         "ccm_baseline": CCMBaselineEncoder,    # CCM (ICLR'24) recurrent compressor
         "beacon_baseline": BeaconBaselineEncoder,  # Activation Beacon (BAAI) per-layer beacon attn
@@ -250,7 +247,7 @@ class ReprLearningModel(nn.Module):
 
     # compressor variants whose memory is a [B, M, d] prepend (capacity-relative
     # slicing applies to these; vanillas pass through at M=0 / M=T).
-    _MASKED_RECON_COMPRESSORS = ("graph_baseline", "icae_baseline", "ccm_baseline",
+    _MASKED_RECON_COMPRESSORS = ("icae_baseline", "ccm_baseline",
                         "autocompressor_baseline", "beacon_baseline",
                         "slotgraph_baseline", "vqicae_baseline")
 

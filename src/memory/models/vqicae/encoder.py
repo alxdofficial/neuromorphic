@@ -131,7 +131,9 @@ class VQICAEEncoder(nn.Module):
 
         def _run(inp_, attn_):
             return self.base.model(inputs_embeds=inp_, attention_mask=attn_).last_hidden_state
-        if self.training and torch.is_grad_enabled():
+        # Only gradient-checkpoint the base forward for LONG sequences (the QA ~8k-chunk regime);
+        # at the mixed ctx (~1k+M tokens) the forward fits comfortably, so run it directly (faster).
+        if self.training and torch.is_grad_enabled() and inp.shape[1] > 2048:
             import torch.utils.checkpoint as _ckpt
             h = _ckpt.checkpoint(_run, inp, attn, use_reentrant=False)
         else:
