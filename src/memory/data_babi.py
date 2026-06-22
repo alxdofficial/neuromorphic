@@ -50,6 +50,20 @@ def _split_sents(text: str) -> List[str]:
     flat = text.replace("\n", " ").strip()
     return [s.strip() for s in _SENT_SPLIT.split(flat) if s.strip()]
 
+
+def _caps_names(text: str) -> set:
+    """bAbI named entities = capitalized alphabetic tokens (Mary/John/Sandra…), minus the only
+    common sentence-initial non-name ('The'). Used to keep distractor entities DISJOINT from the
+    gold story: bAbI reuses a tiny global name pool, so a same-name distractor pulled from another
+    story silently contradicts/updates the queried entity's state while the label stays from the
+    gold story (ill-posed). All default tasks are person-entity, so this filter fully de-ambiguates."""
+    out = set()
+    for w in text.replace("\n", " ").split():
+        w = w.strip(".,!?;:'\"")
+        if w and w[0].isupper() and w.isalpha() and w != "The":
+            out.add(w)
+    return out
+
 # Memory-focused task subset (default). 1/2/3 = one/two/three supporting facts,
 # 7 = counting, 8 = lists/sets, 11/12/13 = (indefinite/conjunctive/compound)
 # coreference, 14 = time reasoning.
@@ -96,10 +110,13 @@ def _load_babi_rows(tasks, split: str):
             print(f"[babi] {name} unavailable ({type(e).__name__}: {str(e)[:80]}); "
                   f"trying next source", flush=True)
 
-    # Offline fallback: synthesize task-1 single-supporting-fact stories.
-    print("[babi] HF bAbI unreachable — generating programmatic task-1 stories "
-          "(offline fallback)", flush=True)
-    gen = random.Random(1234)
+    # Offline fallback: synthesize task-1 single-supporting-fact stories. Seed by SPLIT so the
+    # train/val fallback streams are disjoint — a fixed 1234 for both made offline val a verbatim
+    # copy of train (silent leakage when HF is unreachable).
+    is_val = split in ("validation", "val")
+    print(f"[babi] HF bAbI unreachable — generating programmatic task-1 stories "
+          f"(offline fallback, split={'val' if is_val else 'train'})", flush=True)
+    gen = random.Random(5678 if is_val else 1234)
     rows = []
     for _ in range(4000):
         n_facts = gen.randint(2, 8)
@@ -167,10 +184,15 @@ class BabiDataset(IterableDataset):
 
         # Distractor padding: append irrelevant bAbI sentences until ~context_len.
         # Tests retrieval-among-noise while keeping the supporting facts present.
+        # REJECT distractors that share a named entity with the gold story (see _caps_names) —
+        # otherwise the noise can contradict the queried entity's labelled state (ill-posed example).
+        gold_names = _caps_names(story)
         guard = 0
-        while len(ctx_ids) < self.context_len and guard < 4 * self.context_len:
+        while len(ctx_ids) < self.context_len and guard < 8 * self.context_len:
             guard += 1
             d = rng.choice(self._distractor_sents)
+            if _caps_names(d) & gold_names:        # shares a gold entity → would contaminate the label
+                continue
             d_ids = self._ids(d + "\n")
             if len(ctx_ids) + len(d_ids) > self.context_len:
                 # Append a final truncated distractor to fill exactly, then stop.

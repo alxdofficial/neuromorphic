@@ -91,6 +91,10 @@ class GraphConfig:
     ptr_logit_temp_init: float = 0.0  # pointer log-temp init (0 ⇒ temp=1; negative ⇒ sharper)
     entmax_alpha: float = 1.0         # selection sparsity: 1.0 ⇒ softmax (dense), 1.5/2.0 ⇒ sparse
     free_endpoints: bool = False      # True ⇒ regress FREE src/dst vectors (no bank, no selection)
+    read_mode: str = "perceiver"      # "perceiver" (bag-of-edges) | "neighborhood_tokengt" (node-centric)
+    read_degree_cap: int = 0          # k = max incident edges per node window; 0 ⇒ max(1, E//8)
+    read_gumbel: bool = True          # Gumbel-softmax node selection (sharp-but-explorable)
+    read_gumbel_temp: float = 1.0     # Gumbel temperature
 
 
 # ── attention with QK-RMSNorm + learnable temp (the read/select cold-start fix) ──
@@ -295,10 +299,79 @@ class GraphReader(nn.Module):
         kv = vals + self.role_emb[None, None] + self.tag[None, :, None]   # [B,E,3,d]
         return kv.reshape(vals.shape[0], -1, vals.shape[-1])    # [B,3E,d]
 
-    def forward(self, graph: dict) -> Tensor:
-        """graph dict → [B, M, d_llama] memory tokens to PREPEND (decoder reads natively)."""
+    def forward(self, graph: dict, node_bank: Tensor = None) -> Tensor:
+        """graph dict → [B, M, d_llama] memory tokens to PREPEND (decoder reads natively).
+        node_bank is accepted for a uniform reader interface but unused by the Perceiver."""
+        del node_bank
         kv = self._kv(graph)                                     # [B,3E,d]
         q = self.queries.unsqueeze(0).expand(kv.shape[0], -1, -1)  # [B,M,d]
         for blk in self.blocks:
             q = blk(q, kv)
         return self.out(self.norm(q))                           # [B,M,d_llama]
+
+
+# ── READ (alt): node-centric TokenGT neighbourhood read → PREPEND ────────────
+class NeighborhoodReader(nn.Module):
+    """Node-centric TokenGT read (docs/graph_neighborhood_read.md).
+
+    Each of M slots SELECTS one bank node (learnable read-query · bank, Gumbel-softmax),
+    gathers that node's incident-edge neighbourhood (top-k by incidence
+    w[m,e] = S[m]·(src_ptr[e]+dst_ptr[e])), renders the local subgraph as TokenGT tokens
+    (center node + edge tokens carrying both soft endpoint IDs = src/dst_value), self-attends
+    ×read_layers, and reads out the CENTER token. The M readouts are differentiated by a final
+    self-attn and PREPENDED. Unlike the Perceiver bag-of-edges pool, edges that share a node
+    interact (structure is COMPUTED, not averaged); the edge tokens' endpoint IDs carry
+    gradient into the write-pointers, and the center read carries gradient into the bank +
+    selection — the two paths that repair the topology.
+    """
+    def __init__(self, cfg: GraphConfig):
+        super().__init__()
+        self.cfg = cfg
+        d, dl, E = cfg.d_graph, cfg.d_llama, cfg.n_edges
+        self.M = cfg.n_read_queries or cfg.n_edges
+        self.k = cfg.read_degree_cap or max(1, E // 8)       # per-node window degree cap
+        self.gumbel = cfg.read_gumbel
+        self.gumbel_temp = max(cfg.read_gumbel_temp, 1e-3)
+        self.queries = nn.Parameter(torch.randn(self.M, d) / math.sqrt(d))  # M node-anchor queries
+        self.sel_key = nn.Linear(d, d, bias=False)           # node_bank → selection keys
+        self.type_center = nn.Parameter(torch.randn(d) / math.sqrt(d))      # TokenGT type embeds
+        self.type_edge = nn.Parameter(torch.randn(d) / math.sqrt(d))
+        self.blocks = nn.ModuleList(
+            _SelfBlock(d, cfg.heads, cfg.ffn_mult) for _ in range(cfg.read_layers))
+        self.slot_mix = _SelfBlock(d, cfg.heads, cfg.ffn_mult)             # differentiate the M slots
+        self.norm = nn.LayerNorm(d)
+        self.out = nn.Linear(d, dl)
+
+    def _select(self, node_bank: Tensor) -> Tensor:
+        """M read-queries → distribution over the N bank nodes (Gumbel-softmax in train)."""
+        logits = self.queries @ self.sel_key(node_bank).t()  # [M,N]
+        if self.training and self.gumbel:                    # explorable sharp selection
+            u = torch.rand_like(logits).clamp_(1e-9, 1.0)
+            logits = logits - torch.log(-torch.log(u))
+        return (logits / self.gumbel_temp).softmax(-1)       # [M,N]
+
+    def forward(self, graph: dict, node_bank: Tensor = None) -> Tensor:
+        assert node_bank is not None and "src_ptr" in graph, \
+            "NeighborhoodReader needs the node bank + pointer selections (not free_endpoints)"
+        src_ptr, dst_ptr = graph["src_ptr"], graph["dst_ptr"]            # [B,E,N]
+        edge_state = graph["edge_state"]                                 # [B,E,d]
+        src_val, dst_val = graph["src_value"], graph["dst_value"]        # [B,E,d] = soft endpoint IDs
+        B, E, N = src_ptr.shape
+        d, M, k = self.cfg.d_graph, self.M, min(self.k, E)
+        dt = edge_state.dtype
+        nb = node_bank.to(dt)
+        S = self._select(nb).to(dt)                                      # [M,N]
+        center = (S @ nb) + self.type_center                            # [M,d]
+        # incidence of each slot's selected node to each edge → top-k window
+        adj = (src_ptr + dst_ptr).to(dt)                                # [B,E,N]
+        w = torch.einsum("mn,ben->bme", S, adj)                        # [B,M,E]
+        _, idx = w.topk(k, dim=-1)                                      # [B,M,k]
+        etok = edge_state + src_val + dst_val                          # [B,E,d] TokenGT edge tokens
+        idx_e = idx.unsqueeze(-1).expand(B, M, k, d)
+        et = torch.gather(etok.unsqueeze(1).expand(B, M, E, d), 2, idx_e) + self.type_edge  # [B,M,k,d]
+        ctr = center.unsqueeze(0).expand(B, M, d).unsqueeze(2)         # [B,M,1,d]
+        x = torch.cat([ctr, et], dim=2).reshape(B * M, 1 + k, d)       # [B·M, 1+k, d]
+        for blk in self.blocks:
+            x = blk(x)
+        h = self.slot_mix(x[:, 0].reshape(B, M, d))                    # center readout → differentiate slots
+        return self.out(self.norm(h))                                  # [B,M,d_llama]

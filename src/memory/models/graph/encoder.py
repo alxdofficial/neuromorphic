@@ -30,7 +30,7 @@ class GraphEncoder(nn.Module):
         super().__init__()
         self.cfg = cfg
         from ...decoder import load_frozen_llama, apply_lora_to_llama
-        from .substrate import GraphConfig, GraphParser, GraphReader
+        from .substrate import GraphConfig, GraphParser, GraphReader, NeighborhoodReader
         base, _ = load_frozen_llama(cfg.llama_model)
         for p_ in base.parameters():
             p_.requires_grad_(False)
@@ -51,10 +51,19 @@ class GraphEncoder(nn.Module):
             write_layers=cfg.graph_write_layers,
             read_layers=cfg.graph_read_layers, heads=cfg.graph_heads,
             ffn_mult=cfg.graph_ffn_mult, ptr_logit_temp_init=cfg.graph_ptr_logit_temp_init,
-            entmax_alpha=cfg.graph_entmax_alpha, free_endpoints=cfg.graph_free_endpoints)
+            entmax_alpha=cfg.graph_entmax_alpha, free_endpoints=cfg.graph_free_endpoints,
+            read_mode=cfg.graph_read_mode, read_degree_cap=cfg.graph_read_degree_cap,
+            read_gumbel=cfg.graph_read_gumbel, read_gumbel_temp=cfg.graph_read_gumbel_temp)
         self.gcfg = gcfg
         self.parser = GraphParser(gcfg)
-        self.reader = GraphReader(gcfg)                     # forms PREPEND memory tokens (not inject)
+        # READ: bag-of-edges Perceiver (control) or node-centric TokenGT neighbourhood read.
+        if gcfg.read_mode == "neighborhood_tokengt":
+            if gcfg.free_endpoints:
+                raise ValueError("graph_read_mode=neighborhood_tokengt needs the node bank "
+                                 "+ pointer selections; incompatible with graph_free_endpoints.")
+            self.reader = NeighborhoodReader(gcfg)
+        else:
+            self.reader = GraphReader(gcfg)                 # forms PREPEND memory tokens (not inject)
         # Depth guard for the observation tap: the default (obs=6) is tuned for SmolLM2-135M's
         # 30 layers (0.20 of depth). On a shallower backbone, re-derive depth-relative so the
         # tap can't index past the stack. (The read is now a prepend — no inject layer.)
@@ -70,10 +79,12 @@ class GraphEncoder(nn.Module):
         self.obs_tap_layer = obs_tap                       # observation tap
         _sel = "softmax" if gcfg.entmax_alpha <= 1.0 else f"entmax-{gcfg.entmax_alpha}"
         _M = gcfg.n_read_queries or gcfg.n_edges
+        _readdesc = (f"neighborhood-tokengt read (k={self.reader.k})"
+                     if gcfg.read_mode == "neighborhood_tokengt" else "perceiver prepend read")
         print(f"[graph] relational parser: N={gcfg.n_nodes} bank, E={gcfg.n_edges} edges, "
               f"M={_M} read-queries, d_graph={gcfg.d_graph}, "
               f"write×{gcfg.write_layers}/read×{gcfg.read_layers}, "
-              f"obs_tap=L{self.obs_tap_layer}, perceiver prepend read, select={_sel}")
+              f"obs_tap=L{self.obs_tap_layer}, {_readdesc}, select={_sel}")
 
     def train(self, mode: bool = True):
         super().train(mode)
@@ -136,7 +147,7 @@ class GraphEncoder(nn.Module):
                          for k in new}
         if graph is None:                                        # fully-padded batch (degenerate) → one parse
             graph = self.parser(hiddens, mask, state=None)       # avoids a None-deref downstream
-        memory = self.reader(graph)                              # [B, M, d_llama] — Perceiver latent read
+        memory = self.reader(graph, node_bank=getattr(self.parser, "node_bank", None))
         return memory, {"graph": graph}
 
     def forward(self, token_embeds, attention_mask=None, mask_positions=None):

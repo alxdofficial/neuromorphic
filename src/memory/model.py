@@ -18,12 +18,12 @@ from .models.autocompressor import AutoCompressorBaselineEncoder
 from .models.beacon import BeaconBaselineEncoder
 from .models.ccm import CCMBaselineEncoder
 from .models.graph import GraphEncoder
-from .models.hierarchical_learned_vocab import HLVocabEncoder
 from .models.icae import ICAEBaselineEncoder
-from .models.soft_pointer_graph import SoftPointerGraphEncoder
-from .models.slotmem import SlotAttentionEncoder, VocabSlotEncoder, FreeGraphEncoder
+from .models.biomem import BioMemEncoder
+from .models.slotgraph import SlotGraphEncoder
+from .models.vqicae import VQICAEEncoder
 from .models.vanilla import FullContextEncoder, NullEncoder
-from .decoder import FrozenLlamaDecoder
+from .decoder import FrozenLlamaDecoder, disable_lora
 
 
 def _participation_ratio(x: Tensor) -> float:
@@ -53,21 +53,21 @@ class ReprLearningModel(nn.Module):
     """
 
     VARIANTS = {
-        # ── ABANDONED (2026-06-15) — kept loadable for reproducing prior results,
-        # NOT in the active suite. Both hit the rank-1 read/membership wall; the
-        # line moved to the VQ-VAE→graph+TokenGT model. See project_mae_4k_collapse_result.
-        "soft_pointer_graph_baseline": SoftPointerGraphEncoder,   # ABANDONED (was graph_v6, free-endpoint)
-        "hlvocab_baseline": HLVocabEncoder,                       # ABANDONED (was graph_v9, compression-by-vocab)
-        # the current line: relational-parser graph memory over a learnable node bank
+        # relational-parser graph memory over a learnable node bank
         "graph_baseline": GraphEncoder,
-        "icae_baseline": ICAEBaselineEncoder,  # ICAE (ICLR'24) compressor, EMAT-retrained
-        "ccm_baseline": CCMBaselineEncoder,    # CCM (ICLR'24) recurrent compressor, EMAT-retrained
+        "icae_baseline": ICAEBaselineEncoder,  # ICAE (ICLR'24) compressor
+        "ccm_baseline": CCMBaselineEncoder,    # CCM (ICLR'24) recurrent compressor
         "beacon_baseline": BeaconBaselineEncoder,  # Activation Beacon (BAAI) per-layer beacon attn
         "autocompressor_baseline": AutoCompressorBaselineEncoder,  # AutoCompressors/RMT recurrent summary
-        # factorization experiments (prepend, k-sliced): control vs discreteness vs graph-write
-        "slotattn_baseline": SlotAttentionEncoder,   # control: M free slots (Slot Attention)
-        "vocabslot_baseline": VocabSlotEncoder,      # Exp1: slots = sparse combo of a node bank
-        "freegraph_baseline": FreeGraphEncoder,      # Exp2b: free-endpoint TokenGT write
+        # gated fast-Hebbian cortical-column grid — memory lives in fast synaptic
+        # STATE (fast edges), read+write are signal propagation (models/biomem/).
+        "biomem_baseline": BioMemEncoder,
+        # emergent-topology slot memory — ICAE write + a per-LM-layer head that predicts HARD
+        # node/edge role + (for edges) which slot-positions connect, concretized as TokenGT
+        # role/identity embeddings, re-injected each LM layer; prepend read (models/slotgraph/).
+        "slotgraph_baseline": SlotGraphEncoder,
+        # ICAE but each slot is a VQ-VAE code from a large codebook (discreteness experiment).
+        "vqicae_baseline": VQICAEEncoder,
         "vanilla_llama": NullEncoder,         # loss floor — Llama with no memory
         "vanilla_full_context": FullContextEncoder,  # loss ceiling — Llama sees full evidence
     }
@@ -251,9 +251,8 @@ class ReprLearningModel(nn.Module):
     # compressor variants whose memory is a [B, M, d] prepend (capacity-relative
     # slicing applies to these; vanillas pass through at M=0 / M=T).
     _MASKED_RECON_COMPRESSORS = ("graph_baseline", "icae_baseline", "ccm_baseline",
-                        "hlvocab_baseline", "autocompressor_baseline", "beacon_baseline",
-                        "soft_pointer_graph_baseline",
-                        "slotattn_baseline", "vocabslot_baseline", "freegraph_baseline")
+                        "autocompressor_baseline", "beacon_baseline",
+                        "slotgraph_baseline", "vqicae_baseline")
 
     def compute_masked_reconstruction_loss(
         self,
@@ -281,8 +280,10 @@ class ReprLearningModel(nn.Module):
             ctx_embeds = embed(batch.context_ids)                       # [B,T,d]
 
         # ---- 1. encode the span → memory [B, M, d] (single window) ----
+        # biomem/arrivalmem ingest the frozen LM's FINAL hidden (not raw embeds); others raw.
+        enc_in = self._encode_for_memory(ctx_embeds, batch.context_mask)
         state = self.encoder.init_streaming_state(B, device, ctx_embeds.dtype)
-        state, _ = self.encoder.streaming_write(state, ctx_embeds, batch.context_mask)
+        state, _ = self.encoder.streaming_write(state, enc_in, batch.context_mask)
         memory, mem_aux = self.encoder.finalize_memory(state)          # [B, M, d]
         memory = memory.to(ctx_embeds.dtype)
 
@@ -319,8 +320,20 @@ class ReprLearningModel(nn.Module):
         full = torch.cat([memory, dec_in], dim=1)                      # [B, M+T, d]
         attn = torch.cat([mem_mask, batch.context_mask.float()], dim=1).long()
 
-        base_out = self.decoder.llama.model(
-            inputs_embeds=full, attention_mask=attn, use_cache=False)
+        # biomem: query-conditioned READ — a zero-init pre-hook at the tap layer reads
+        # every position's hidden through the frozen written edges and fuses the recall
+        # back. REAL = read; OFF (zero_memory) = no read; SHUF = read wrong-example edges.
+        hook_handle = self._install_conditioned_read_hook(zero_memory, shuffle_memory, B)
+        # slotgraph: re-inject the structural embed at each LM layer (memory is at positions [0:M]).
+        reinforce = self._install_prepend_reinforce_hooks(mem_aux, M, 0, shuffle_memory)
+        try:
+            base_out = self.decoder.llama.model(
+                inputs_embeds=full, attention_mask=attn, use_cache=False)
+        finally:
+            if hook_handle is not None:
+                hook_handle.remove()
+            for hh in reinforce:
+                hh.remove()
         span_hidden = base_out.last_hidden_state[:, M:]                 # [B,T,d]
 
         # ---- 4. CE on masked positions (predict t_p from hidden p-1) ----
@@ -352,6 +365,9 @@ class ReprLearningModel(nn.Module):
         loss_aux = mem_aux.get("load_balance_loss") if mem_aux else None
         if loss_aux is not None:
             loss = loss + self.cfg.load_balance_coef * loss_aux
+        _vq = mem_aux.get("vq_loss") if mem_aux else None      # vqicae commitment (pre-weighted by beta)
+        if _vq is not None:
+            loss = loss + _vq.to(loss.dtype)
         out = {
             "loss": loss, "loss_recon": loss_recon.detach(),
             "top1_acc": top1, "per_example_loss": per_ex,
@@ -391,10 +407,98 @@ class ReprLearningModel(nn.Module):
                 out["graph_bank_effrank"] = _participation_ratio(enc.parser.node_bank)
             out["graph_edge_effrank"] = _participation_ratio(
                 graph["edge_state"].reshape(-1, d_g))
+            # WRITE-SIDE collapse canaries (docs/graph_neighborhood_read.md): the parser
+            # can collapse INDEPENDENTLY of the read — all E edges → the same vector, and/or
+            # the output ignoring the observation. Watch these live (project_graph_write_collapse).
+            es = graph["edge_state"].float()                        # [B,E,d]
+            if es.shape[1] > 1:                                     # within-sample edge SIMILARITY (→1 = all edges identical)
+                esn = torch.nn.functional.normalize(es, dim=-1)
+                cos = esn @ esn.transpose(-1, -2)                  # [B,E,E]
+                E_ = es.shape[1]
+                off = cos.sum(dim=(-1, -2)) - cos.diagonal(dim1=-2, dim2=-1).sum(-1)
+                out["graph_edge_cos"] = float((off / (E_ * (E_ - 1))).mean())
+            if es.shape[0] > 1:                                     # eff-rank across INPUTS (→1 = parser ignores the obs)
+                out["graph_input_sens"] = _participation_ratio(es.mean(dim=1))
             if memory is not None and memory.shape[1] > 0:
                 out["graph_mem_effrank"] = _participation_ratio(
                     memory.reshape(-1, memory.shape[-1]))
         return out
+
+    def _install_conditioned_read_hook(self, zero_memory: bool, shuffle_memory: bool, B=None):
+        """Query-conditioned READ (biomem): register a pre-hook at the encoder's
+        tap layer that reads every position's hidden state through the written memory and
+        fuses the recall back into the residual stream. The read is the SOLE recall path
+        for these arms (finalize_memory returns an empty prepend). Returns a hook handle
+        (caller removes in finally), or None for non-conditioned-read arms / the OFF gate.
+        REAL = read; OFF (zero_memory) = no read; SHUF = read wrong-example memory state."""
+        enc = self.encoder
+        if not getattr(enc, "is_conditioned_read", False) or zero_memory:
+            return None
+        if not enc.has_read_state():
+            return None
+        if shuffle_memory:                                   # SHUF: roll the memory across the batch
+            if (B if B is not None else 2) == 1:
+                raise ValueError("shuffle_memory requires batch size > 1.")
+            enc.roll_read_state()
+        layers = self.decoder.llama.model.layers
+        L = min(enc.read_tap_layer + 1, len(layers) - 1)     # fuse into the input of layer L
+        def _hook(module, args, kwargs):
+            h = args[0] if args else kwargs.get("hidden_states")
+            h = h + enc.conditioned_read(h)                  # gated read → gentle at step 0
+            if args:
+                return (h,) + tuple(args[1:]), kwargs
+            kwargs = dict(kwargs); kwargs["hidden_states"] = h
+            return args, kwargs
+        return layers[L].register_forward_pre_hook(_hook, with_kwargs=True)
+
+    def _install_prepend_reinforce_hooks(self, mem_aux, M: int, offset: int, shuffle_memory: bool):
+        """slotgraph: re-inject the structural embedding into the M prepend positions BEFORE every
+        frozen-LM layer (the scaffold can't wash out through depth). The struct rides in
+        mem_aux['prepend_struct'] [B,M,d_llama]; gradient flows back through it to the structure
+        heads, so this is also a training signal. Returns hook handles (caller removes in finally).
+        Assumes the memory occupies positions [offset:offset+M] (true for the no-chat-template
+        prepend layout used by the active runs). No-op for non-slotgraph arms / M==0."""
+        enc = self.encoder
+        if not getattr(enc, "reinforce_prepend_each_layer", False) or M <= 0:
+            return []
+        struct = mem_aux.get("prepend_struct") if mem_aux else None
+        if struct is None:
+            return []
+        struct = struct[:, :M]
+        if shuffle_memory and struct.shape[0] > 1:        # match the rolled memory (SHUF control)
+            struct = torch.roll(struct, shifts=1, dims=0)
+
+        def _mk():
+            def _hook(module, args, kwargs):
+                h = args[0] if args else kwargs.get("hidden_states")
+                if h is None or h.shape[1] < offset + M:
+                    return None
+                new = h.clone()
+                new[:, offset:offset + M] = new[:, offset:offset + M] + struct.to(h.dtype)
+                if args:
+                    return (new,) + tuple(args[1:]), kwargs
+                kw = dict(kwargs); kw["hidden_states"] = new
+                return args, kw
+            return _hook
+        return [layer.register_forward_pre_hook(_mk(), with_kwargs=True)
+                for layer in self.decoder.llama.model.layers]
+
+    def _encode_for_memory(self, ctx_embeds, ctx_mask):
+        """What the memory WRITE ingests. Arms that set `ingest_lm_final_hidden` (biomem,
+        arrivalmem) ingest the FROZEN LM's FINAL-layer hidden state — run the full backbone
+        over the context — NOT raw token embeddings, so they encode with the pretrained LM's
+        depth like the baselines (no_grad: a fixed pretrained encoder; the memory's own
+        modules do the learning). Other arms keep their existing input (raw embeds)."""
+        if not getattr(self.encoder, "ingest_lm_final_hidden", False):
+            return ctx_embeds
+        # FROZEN contextualizer: bypass the trainable read-side LoRA (disable_lora) so the write
+        # input is the PURE pretrained backbone, not a moving target shaped by an adapter that
+        # receives NO gradient from this no_grad path. Without it every ingest_lm_final_hidden arm
+        # (arrivalmem / biomem) silently encoded against a drifting feature distribution.
+        with torch.no_grad(), disable_lora():
+            out = self.decoder.llama.model(
+                inputs_embeds=ctx_embeds, attention_mask=ctx_mask.long(), use_cache=False)
+        return out.last_hidden_state
 
     def compute_loss(
         self,
@@ -449,7 +553,8 @@ class ReprLearningModel(nn.Module):
             ctx_embeds = embed(batch.context_ids)
             ctx_surprise = None   # was the plastic_baseline neuromod signal (retired)
 
-        enc_input = ctx_embeds
+        # biomem/arrivalmem ingest the frozen LM's FINAL hidden (not raw embeds); others raw.
+        enc_input = self._encode_for_memory(ctx_embeds, batch.context_mask)
 
         n_windows = (T_ctx + window_size - 1) // window_size
         state = self.encoder.init_streaming_state(B, device, ctx_embeds.dtype)
@@ -711,8 +816,13 @@ class ReprLearningModel(nn.Module):
         # finalize_memory returns [B, K_edge, d_llama] memory that is prepended
         # like every other arm (no privileged per-position inject hook), so the
         # comparison isolates the write mechanism and the REAL/SHUF/OFF binding
-        # gate applies to the graph too.
-        hook_handle = None
+        # gate applies to the graph too. biomem is the exception: its read is
+        # query-conditioned via a tap-layer hook (installed below), not a prepend.
+        hook_handle = self._install_conditioned_read_hook(zero_memory, shuffle_memory, B)
+        # slotgraph: re-inject the structural embed at each LM layer. Memory is at positions [0:M]
+        # only when there is NO chat scaffold (L_pre=0); guard on that (the active backbone).
+        reinforce = (self._install_prepend_reinforce_hooks(finalize_aux, M, 0, shuffle_memory)
+                     if self.chat_template is None else [])
 
         try:
             # Selective lm_head: run base model for hidden states, then only
@@ -732,6 +842,8 @@ class ReprLearningModel(nn.Module):
         finally:
             if hook_handle is not None:
                 hook_handle.remove()
+            for hh in reinforce:
+                hh.remove()
             # MT-faithful: always clear the kNN datastore so the shared decoder
             # Llama is left in OFF/vanilla state for the next variant or call.
             if hasattr(self.encoder, "mt_attn_wrapper"):
@@ -808,6 +920,9 @@ class ReprLearningModel(nn.Module):
         # keys are derived signals (u, age, pick strength, overwrite rate).
         # Legacy keys (L_connect, L_adjust, saliency_mean) kept as None for
         # back-compat with downstream plotting code that .get()s them.
+        _vq = finalize_aux.get("vq_loss", None)                # vqicae commitment (pre-weighted by beta)
+        if _vq is not None:
+            loss = loss + _vq.to(loss.dtype)
         graph_aux = finalize_aux.get("graph_aux", None)
         graph_telemetry = None
         if graph_aux is not None:
@@ -905,6 +1020,17 @@ class ReprLearningModel(nn.Module):
             out.update(self._graph_canaries(_parsed_graph, memory))
         if hlvocab_telemetry:
             out.update(hlvocab_telemetry)
+        # biomem / slotgraph / arrival structure canaries — surface every scalar so the
+        # trainer's biomem_/slotgraph_/arrival_ globs log them on EVERY mixed subtask, not just
+        # MAE (the masked-recon path merges these at its own return; the generic path must too
+        # or babi/continuation drop them).
+        for _k, _v in (finalize_aux or {}).items():
+            if not (_k.startswith("biomem_") or _k.startswith("slotgraph_") or _k.startswith("vqicae_")):
+                continue
+            if torch.is_tensor(_v) and _v.numel() == 1:
+                out[_k] = _v.detach()
+            elif isinstance(_v, (int, float)):
+                out[_k] = _v
         # flat_baseline codebook health → top-level so the trainer logs it to
         # jsonl (codes_active = #live codes; collapse = the flat analogue of
         # graph routing collapse).

@@ -30,8 +30,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from src.memory.config import ReprConfig
 from src.memory.data_qa import make_qa_dataloader, make_mixed_qa_dataloader, collate_qa
-from src.memory.data_conditioned_reconstruction import (
-    make_conditioned_reconstruction_dataloader, ConditionedReconstructionDataset)
 from src.memory.data_continuation import make_continuation_dataloader
 from src.memory.data_conditioned_reconstruction_bio import make_conditioned_reconstruction_bio_dataloader
 from src.memory.data_babi import make_babi_dataloader, DEFAULT_TASKS as BABI_DEFAULT_TASKS
@@ -237,8 +235,10 @@ def run_val(model, val_set, device, n_batches: int, window_size: int,
     babi_em_hits, babi_em_n = 0.0, 0   # bAbI exact-match (teacher-forced answer span)
     # REAL/SHUF/OFF binding gate, accumulated over the first gate_batches.
     shuf_abs, shuf_gap, off_abs, off_gap = [], [], [], []
-    last_spg_eval: dict[str, float] = {}  # soft_pointer_graph eval-only health telemetry
-    last_hlvocab_eval: dict[str, float] = {}  # hlvocab read/write health telemetry
+    last_graph_eval: dict[str, float] = {}  # graph read+write collapse canaries
+    last_biomem_eval: dict[str, float] = {}  # biomem edge/state saturation + leak/eta canaries
+    last_slotgraph_eval: dict[str, float] = {}  # slotgraph edge-frac / src-dst entropy / mem-rank canaries
+    last_vqicae_eval: dict[str, float] = {}  # vqicae codebook perplexity / active-code / batch-used canaries
     # Deterministic-eval seed: the soft_pointer_graph chunk-fresh init samples
     # fresh noise per call → seeding torch RNG per batch makes eval reproducible.
     # In eval mode (model.train(False)) dropout is off so this is safe.
@@ -275,22 +275,19 @@ def run_val(model, val_set, device, n_batches: int, window_size: int,
                                                  shuffle_memory=True)
                     shuf_abs.append(float(shuf["loss_recon"]))
                     shuf_gap.append(float(shuf["loss_recon"]) - real_l)
-        # soft_pointer_graph read-side eval-only health probes.
-        for k in ("spg_node_gate_mean_avg", "spg_edge_gate_mean_avg",
-                  "spg_fact_norm", "spg_rezero_scale_eff",
-                  "spg_state_effect", "spg_node_collapse_cos",
-                  "spg_read_src_entropy", "spg_read_dst_entropy",
-                  "spg_node_active_frac"):
-            v = out.get(k)
-            if v is not None:
-                last_spg_eval[k] = float(v)
         for k, v in out.items():
-            if not k.startswith("hlvocab_") or v is None:
+            if v is None:
+                continue
+            sink = last_graph_eval if k.startswith("graph_") else (
+                last_biomem_eval if k.startswith("biomem_") else (
+                last_slotgraph_eval if k.startswith("slotgraph_") else (
+                last_vqicae_eval if k.startswith("vqicae_") else None)))
+            if sink is None:
                 continue
             if isinstance(v, (int, float)):
-                last_hlvocab_eval[k] = float(v)
+                sink[k] = float(v)
             elif torch.is_tensor(v) and v.numel() == 1:
-                last_hlvocab_eval[k] = float(v.detach())
+                sink[k] = float(v.detach())
         # Per-family: use per-row loss instead of batch-wide mean (a 2-row
         # batch with rows from families X and Y was previously credited
         # the same mean to both, hiding genuine per-family differences).
@@ -335,9 +332,13 @@ def run_val(model, val_set, device, n_batches: int, window_size: int,
         result["val_shuf_minus_real"] = sum(shuf_gap) / len(shuf_gap)
     if babi_em_n:
         result["val_babi_em"] = babi_em_hits / babi_em_n
-    for k, v in last_spg_eval.items():
+    for k, v in last_graph_eval.items():
         result[f"val_{k}"] = v
-    for k, v in last_hlvocab_eval.items():
+    for k, v in last_biomem_eval.items():
+        result[f"val_{k}"] = v
+    for k, v in last_slotgraph_eval.items():
+        result[f"val_{k}"] = v
+    for k, v in last_vqicae_eval.items():
         result[f"val_{k}"] = v
     return result
 
@@ -489,80 +490,33 @@ def train_one_variant(
     else:
         opt = None
 
-    if task == "conditioned_reconstruction":
-        # Conditioned reconstruction (random-word MQAR): context = N (key=value) pairs, condition
-        # on a verbatim key, reproduce its value (closed-book). Same encoder→memory→prepend→CE
-        # path; only the DATA differs. Train/val share the word pools but use different RNG seeds
-        # (every example is a fresh random pairing, so there is no binding overlap to leak).
-        _cr = dict(context_len=chunk_size, batch_size=cfg.batch_size, pad_token_id=cfg.pad_token_id,
-                     n_pairs=cond_recon_n_pairs, n_query=cond_recon_n_query, value_len=cond_recon_value_len)
-        train_dl = None if is_eval_only else make_conditioned_reconstruction_dataloader(
-            tokenizer, split="train", seed=42, **_cr)
-        val_dl = make_conditioned_reconstruction_dataloader(tokenizer, split="validation", seed=7, **_cr)
-    elif task == "conditioned_reconstruction_bio":
-        # Biographical conditioned reconstruction: context = N (key-phrase = fact-dense sentence)
-        # pairs, condition on a verbatim key phrase, reproduce its value sentence (closed-book).
-        # Train/val build DISJOINT worlds (different world_seed → different entities).
-        _eb = dict(context_len=chunk_size, batch_size=cfg.batch_size, pad_token_id=cfg.pad_token_id,
-                   n_pairs=cond_recon_n_pairs, n_query=cond_recon_n_query,
-                   n_facts=cond_recon_bio_n_facts, world_seed=cond_recon_bio_world_seed)
-        train_dl = None if is_eval_only else make_conditioned_reconstruction_bio_dataloader(
-            tokenizer, split="train", stream_seed=42, **_eb)
-        val_dl = make_conditioned_reconstruction_bio_dataloader(tokenizer, split="validation", stream_seed=7, **_eb)
-    elif task == "babi":
-        # bAbI story→question→answer (memory-focused task subset): context = a
-        # short bAbI story (question-agnostic) distractor-padded to chunk_size,
-        # condition on the question, reproduce the 1-word answer (closed-book).
-        # Same encoder→memory→prepend→CE path; only the DATA differs. Train/val
-        # use the HF train/validation splits (disjoint stories).
-        _babi = dict(context_len=chunk_size, batch_size=cfg.batch_size,
-                     pad_token_id=cfg.pad_token_id, tasks=babi_tasks)
-        train_dl = None if is_eval_only else make_babi_dataloader(
-            tokenizer, split="train", seed=42, **_babi)
-        val_dl = make_babi_dataloader(tokenizer, split="validation", seed=7, **_babi)
-    elif task == "continuation":
-        # continuation: compress N → predict the NEXT tokens (gist/LM).
-        _cont = dict(batch_size=cfg.batch_size, compress_len=compress_len, predict_len=predict_len,
-                     pad_token_id=cfg.pad_token_id, objective=task, src_tokenizer_name=mae_src_tok)
-        train_dl = None if is_eval_only else make_continuation_dataloader(
-            tokenizer, split="train", seed=42, **_cont)
-        val_dl = make_continuation_dataloader(tokenizer, split="validation", seed=7, **_cont)
-    elif task == "masked_reconstruction":
-        # sentence-pair masked reconstruction (FineWeb-EDU, MAE). Variable code size k per
-        # bucket; the loader yields fully-collated uniform-k batches.
-        from src.memory.data_masked_reconstruction import make_sentence_dataloader
-        _pad = cfg.pad_token_id if cfg.pad_token_id is not None else 0
-        train_dl = None if is_eval_only else make_sentence_dataloader(
-            tokenizer, batch_size=cfg.batch_size, src_tokenizer_name=mae_src_tok,
-            split="train", seed=42, pad_token_id=_pad, num_workers=2)
-        val_dl = make_sentence_dataloader(
-            tokenizer, batch_size=cfg.batch_size, src_tokenizer_name=mae_src_tok,
-            split="val", seed=7, pad_token_id=_pad, num_workers=0)
-    else:
-        train_dl = None if is_eval_only else make_mixed_qa_dataloader(
-            cfg, tokenizer,
-            composite_passages_path=COMPOSITE_TRAIN_P,
-            composite_questions_path=COMPOSITE_TRAIN_Q,
-            use_hotpot=use_hotpot, use_narrative=use_narrative,
-            use_musique=use_musique, use_babilong=use_babilong,
-            babilong_config=babilong_config,
-            split="train",
-            chunk_size=chunk_size, passages_per_chunk=passages_per_chunk,
-            weights=mix_weights, composite_task_weights=composite_task_weights,
-            num_workers=2, seed=42,
-        )
-        val_dl = make_mixed_qa_dataloader(
-            cfg, tokenizer,
-            composite_passages_path=COMPOSITE_VAL_P,
-            composite_questions_path=COMPOSITE_VAL_Q,
-            use_hotpot=use_hotpot, use_narrative=use_narrative,
-            use_musique=use_musique, use_babilong=use_babilong,
-            babilong_config=babilong_config,
-            split="validation",
-            chunk_size=chunk_size, passages_per_chunk=passages_per_chunk,
-            weights=mix_weights, composite_task_weights=composite_task_weights,
-            num_workers=2, seed=7,
-        )
+    # qa (composite multi-hop mix) — the only single-task path; the 4-task `mixed`
+    # benchmark has its own trainer (train_mixed_variant). Same encoder→memory→
+    # prepend→CE path; only the DATA differs.
+    train_dl = None if is_eval_only else make_mixed_qa_dataloader(
+        cfg, tokenizer,
+        composite_passages_path=COMPOSITE_TRAIN_P,
+        composite_questions_path=COMPOSITE_TRAIN_Q,
+        use_hotpot=use_hotpot, use_narrative=use_narrative,
+        use_musique=use_musique, use_babilong=use_babilong,
+        babilong_config=babilong_config,
+        split="train",
+        chunk_size=chunk_size, passages_per_chunk=passages_per_chunk,
+        weights=mix_weights, composite_task_weights=composite_task_weights,
+        num_workers=2, seed=42,
+    )
+    val_dl = make_mixed_qa_dataloader(
+        cfg, tokenizer,
+        composite_passages_path=COMPOSITE_VAL_P,
+        composite_questions_path=COMPOSITE_VAL_Q,
+        use_hotpot=use_hotpot, use_narrative=use_narrative,
+        use_musique=use_musique, use_babilong=use_babilong,
+        babilong_config=babilong_config,
+        split="validation",
+        chunk_size=chunk_size, passages_per_chunk=passages_per_chunk,
+        weights=mix_weights, composite_task_weights=composite_task_weights,
+        num_workers=2, seed=7,
+    )
     # Fixes #614: drain val_dl ONCE into a fixed list so every run_val call
     # sees the same batches. Without this, in-training val and final-eval got
     # different random draws → 0.4-0.7 nat noise → streaming-best was biased
@@ -1080,17 +1034,51 @@ def train_mixed_variant(
 
     jsonl_path = out_dir / f"jsonl/{variant}.jsonl"
     ckpt_path = out_dir / f"ckpts/{variant}.last.pt"
+    best_ckpt_path = out_dir / f"ckpts/{variant}.best.pt"
     jsonl_path.parent.mkdir(parents=True, exist_ok=True)
-    if jsonl_path.exists() and not resume:
-        jsonl_path.unlink()
-    jsonl_fp = open(jsonl_path, "a", buffering=1)
 
     # Per-task best tracking — each task plateaus on its own schedule, so we keep
     # an independent best_step/best_metric per task (the primary metric is val_loss).
     best = {t: {"metric": float("inf"), "step": -1} for t in mixed_tasks}
+    # Aggregate (mean val_loss across tasks) best — the SINGLE selection metric backed by a saved
+    # .best.pt. One model serves all tasks, so a per-task best can't each own weights; the aggregate
+    # is the principled selection criterion (per-task best_metric stays as informational telemetry).
+    agg_best = {"metric": float("inf"), "step": -1}
+
+    # ── resume: restore model + optimizer + step + best tracking from .last.pt ──
+    start_step = 0
+    if resume and ckpt_path.exists():
+        sd = torch.load(ckpt_path, map_location=device, weights_only=False)
+        _meta = sd.get("metadata", {}) or {}
+        _ck_cfg = _meta.get("cfg_dict", {}) or {}
+        for _field, _now in (("backbone_model", model.cfg.llama_model),
+                             ("task_mode", getattr(model.cfg, "task_mode", None))):
+            _was = _meta.get(_field, _ck_cfg.get(_field))
+            if _was is not None and _was != _now:
+                raise RuntimeError(
+                    f"[resume] {_field} drift: checkpoint has {_was!r} but this run is {_now!r}. "
+                    f"Refusing to mix objectives/backbones — use a fresh --out-tag.")
+        _res = model.load_state_dict(sd["model_state_dict"], strict=False)
+        _bad = [k for k in (_res.missing_keys + _res.unexpected_keys)
+                if "llama" not in k.lower() and not k.startswith("encoder.base.")
+                and not k.startswith("decoder.llama.")]
+        if _bad:
+            raise RuntimeError(f"[resume] checkpoint/arch mismatch — would leave params random: {_bad[:12]}")
+        opt.load_state_dict(sd["optimizer_state_dict"])
+        start_step = int(sd.get("step", 0)) + 1
+        if "mixed_best" in sd:
+            best = {t: dict(sd["mixed_best"].get(t, {"metric": float("inf"), "step": -1}))
+                    for t in mixed_tasks}
+        if "mixed_agg_best" in sd:
+            agg_best = dict(sd["mixed_agg_best"])
+        print(f"  [resume] loaded {ckpt_path.name} @ step {start_step - 1} "
+              f"(agg_best={agg_best['metric']:.4f} @ {agg_best['step']})")
+    elif jsonl_path.exists() and not resume:
+        jsonl_path.unlink()
+    jsonl_fp = open(jsonl_path, "a", buffering=1)
 
     t_start = time.time()
-    last_print_step, last_print_time = 0, t_start
+    last_print_step, last_print_time = start_step, t_start
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
 
@@ -1105,7 +1093,7 @@ def train_mixed_variant(
             return next(iters[t])
 
     rotation = []   # diagnostic: the realized task sequence (capped for the smoke print)
-    for step in range(n_steps):
+    for step in range(start_step, n_steps):
         task = mixed_tasks[step % len(mixed_tasks)]   # equal round-robin
         if len(rotation) < 24:
             rotation.append(task)
@@ -1168,6 +1156,9 @@ def train_mixed_variant(
                     row["val_babi_em"] = vm["val_babi_em"]
                 if "val_cont_early_loss" in vm:
                     row["val_cont_early_loss"] = vm["val_cont_early_loss"]
+                for _k, _v in vm.items():               # graph read+write collapse canaries
+                    if _k.startswith(("val_graph_", "val_biomem_", "val_slotgraph_", "val_vqicae_")):
+                        row[_k] = _v
                 # per-task best on val_loss
                 if vm["val_loss_recon"] < best[t]["metric"]:
                     best[t]["metric"] = vm["val_loss_recon"]
@@ -1180,13 +1171,34 @@ def train_mixed_variant(
                     tag += f"(EM={vm['val_babi_em']*100:.0f}%)"
                 if "val_cont_early_loss" in vm:
                     tag += f"(early={vm['val_cont_early_loss']:.3f})"
+                if "val_graph_edge_cos" in vm:          # write/read collapse at a glance
+                    tag += (f"[ec={vm['val_graph_edge_cos']:.2f}"
+                            f" nu={int(vm.get('val_graph_nodes_used', 0))}"
+                            f" isns={vm.get('val_graph_input_sens', 0):.1f}"
+                            f" mr={vm.get('val_graph_mem_effrank', 0):.1f}]")
+                if "val_vqicae_perplexity" in vm:       # vqicae codebook-usage canary at a glance
+                    tag += (f"[ppl={vm['val_vqicae_perplexity']:.0f}"
+                            f" act={int(vm.get('val_vqicae_active_codes', 0))}]")
+                if "val_slotgraph_edge_frac" in vm:     # slotgraph structure canary at a glance
+                    tag += (f"[ef={vm['val_slotgraph_edge_frac']:.2f}"
+                            f" se={vm.get('val_slotgraph_src_entropy', 0):.1f}"
+                            f" mr={vm.get('val_slotgraph_mem_effrank', 0):.1f}]")
                 parts.append(tag)
             print(f"    [val @ {step}]  " + "  ".join(parts), flush=True)
+            # Aggregate selection: mean val_loss across tasks → save the single .best.pt.
+            agg = sum(per_task[t]["val_loss_recon"] for t in mixed_tasks) / len(mixed_tasks)
+            if agg < agg_best["metric"]:
+                agg_best["metric"], agg_best["step"] = agg, step
+                save_checkpoint(model, opt, step, best_ckpt_path,
+                                mixed_best=best, mixed_agg_best=agg_best)
+                print(f"    [best @ {step}]  agg_val={agg:.4f} → saved {best_ckpt_path.name}", flush=True)
 
         if step > 0 and step % save_every == 0:
-            save_checkpoint(model, opt, step, ckpt_path)
+            save_checkpoint(model, opt, step, ckpt_path,
+                            mixed_best=best, mixed_agg_best=agg_best)
 
-    save_checkpoint(model, opt, max(n_steps - 1, 0), ckpt_path)
+    save_checkpoint(model, opt, max(n_steps - 1, 0), ckpt_path,
+                    mixed_best=best, mixed_agg_best=agg_best)
     final = run_mixed_val(model, mixed_tasks, val_sets, device, val_batches, window_size)
     for t in mixed_tasks:
         vm = final[t]
@@ -1197,6 +1209,9 @@ def train_mixed_variant(
             row["val_babi_em"] = vm["val_babi_em"]
         if "val_cont_early_loss" in vm:
             row["val_cont_early_loss"] = vm["val_cont_early_loss"]
+        for _k, _v in vm.items():                       # graph/biomem/slotgraph/arrival collapse canaries
+            if _k.startswith(("val_graph_", "val_biomem_", "val_slotgraph_", "val_vqicae_")):
+                row[_k] = _v
         jsonl_fp.write(json.dumps(row) + "\n")
     jsonl_fp.close()
 
@@ -1214,6 +1229,7 @@ def train_mixed_variant(
                                "top1": final[t]["val_top1_acc"],
                                "best_step": best[t]["step"],
                                "best_metric": best[t]["metric"]} for t in mixed_tasks},
+        "agg_best_metric": agg_best["metric"], "agg_best_step": agg_best["step"],
     }
     del model, opt
     torch.cuda.empty_cache()
@@ -1227,9 +1243,12 @@ def probe_bs(variants, llama, tokenizer, cfg, args):
     run, so the reported max-BS is directly usable as that arm's --batch-size."""
     import time
     from dataclasses import replace as _dc_replace
+    from src.memory.data_conditioned_reconstruction_bio import ConditionedReconstructionBioDataset
     device = "cuda"
-    ds = ConditionedReconstructionDataset(tokenizer, context_len=args.chunk_size, n_pairs=args.cond_recon_n_pairs,
-                     n_query=args.cond_recon_n_query, value_len=args.cond_recon_value_len, seed=0)
+    _pad = cfg.pad_token_id if cfg.pad_token_id is not None else 128_001
+    ds = ConditionedReconstructionBioDataset(tokenizer, context_len=args.chunk_size, n_pairs=args.cond_recon_n_pairs,
+                     n_query=args.cond_recon_n_query, n_facts=args.cond_recon_bio_n_facts,
+                     world_seed=0, stream_seed=0, pad_token_id=_pad)
     pool, it = [], iter(ds)
     for _ in range(max(args.probe_bs_list)):
         pool.append(next(it))
@@ -1338,21 +1357,18 @@ def main():
                     help="composite_v1 passages sampled per chunk. 0 = auto: "
                          "scales with chunk_size (~75 per 1024 tokens). "
                          "Manual override accepted as positive int.")
-    ap.add_argument("--task", type=str, default="masked_reconstruction",
-                    choices=["masked_reconstruction", "qa", "conditioned_reconstruction",
-                             "conditioned_reconstruction_bio", "continuation", "babi", "mixed"],
-                    help="masked_reconstruction = sentence-pair MAE compression (default, active); "
-                         "qa = composite-QA mix; "
-                         "conditioned_reconstruction = random-word key→value (MQAR); "
-                         "conditioned_reconstruction_bio = biographical key-phrase→fact-dense-sentence (binding); "
-                         "continuation = compress N → predict next (AutoComp/Beacon gist/LM); "
-                         "babi = bAbI story→question→answer (memory-focused tasks, distractor-padded, EM-scored); "
-                         "mixed = ONE model trained on an equal round-robin of --mixed-tasks, evaluated per-task.")
+    ap.add_argument("--task", type=str, default="mixed",
+                    choices=["mixed", "qa"],
+                    help="mixed = ONE model trained on an equal round-robin of --mixed-tasks "
+                         "(mae babi continuation condrecon_bio), evaluated per-task (default, active); "
+                         "qa = composite multi-hop QA mix. (Standalone single-task entry points were "
+                         "removed; the per-task loaders live on as components of --task mixed.)")
     ap.add_argument("--mixed-tasks", nargs="+", default=list(MIXED_TASKS_DEFAULT),
-                    choices=["mae", "babi", "continuation"],
-                    help="mixed: tasks in the equal round-robin (default: mae babi continuation). "
-                         "mae = long-passage contiguous MAE compression; babi = relational; "
-                         "continuation = next-token prediction. Used only when --task mixed.")
+                    choices=list(MIXED_TASK_MODE),
+                    help="mixed: tasks in the equal round-robin (default: mae babi continuation "
+                         "condrecon_bio). mae = long-passage contiguous MAE compression; babi = "
+                         "relational; continuation = next-token prediction; condrecon_bio = "
+                         "biographical key→value closed-book recall. Used only when --task mixed.")
     ap.add_argument("--mixed-ctx", type=int, default=1024,
                     help="mixed: uniform context_len/chunk for ALL tasks (default 1024).")
     ap.add_argument("--mixed-M", type=int, default=32,
@@ -1403,6 +1419,9 @@ def main():
     ap.add_argument("--graph-entmax-alpha", type=float, default=1.0,
                     help="graph: node-selection sparsity. 1.0 = softmax (dense blend, default); "
                          "1.5 = entmax (sparse, commits to a few nodes); 2.0 = sparsemax.")
+    ap.add_argument("--slotgraph-no-structure", action="store_true",
+                    help="slotgraph: disable the structure heads/injection = pure ICAE control. "
+                         "Ablation: does the emergent hard topology add anything over icae?")
     ap.add_argument("--graph-encoder-lora-rank", type=int, default=0,
                     help="graph: LoRA-adapt the encoder forward like the baselines (0=frozen tap). "
                          "Evens the encoder footing (the graph historically read a frozen tap).")
@@ -1525,32 +1544,6 @@ def main():
             f"--contrastive-shuf-coef {args.contrastive_shuf_coef} needs batch_size>=2 "
             f"(SHUF rolls memory along the batch dim; B==1 would leave REAL memory).")
 
-    # Conditioned-reconstruction context (N small key=value lines) is far shorter than the QA
-    # default 8192. If the user left chunk-size at the QA default, tighten it so the encoder
-    # isn't padding/processing thousands of pad positions (≈300 tok for N=64). window=chunk
-    # → one window. Override only the untouched default; an explicit --chunk-size wins.
-    if args.task == "conditioned_reconstruction" and args.chunk_size == 8192:
-        args.chunk_size = 1024
-        args.window_size = min(args.window_size, args.chunk_size)
-        print(f"[auto] conditioned_reconstruction: chunk_size={args.chunk_size}, window_size={args.window_size}")
-    if args.task == "conditioned_reconstruction_bio" and args.chunk_size == 8192:
-        # 8x compression vs the 128-token memory → input 1024. Fill-to-budget packs
-        # as many key→value pairs as fit (~22-24); never overflows.
-        args.chunk_size = 1024
-        args.window_size = min(args.window_size, args.chunk_size)
-        print(f"[auto] conditioned_reconstruction_bio: chunk_size={args.chunk_size}, window_size={args.window_size}")
-    if args.task == "babi" and args.chunk_size == 8192:
-        # bAbI stories are short (~60 tok); distractor-padding fills to chunk_size.
-        # 1024 matches the other conditioned-reconstruction objectives' input length.
-        args.chunk_size = 1024
-        args.window_size = min(args.window_size, args.chunk_size)
-        print(f"[auto] babi: chunk_size={args.chunk_size}, window_size={args.window_size}")
-    if args.task == "continuation":
-        # the encoder must ingest exactly compress_len tokens → chunk_size = compress_len
-        args.chunk_size = args.compress_len
-        args.window_size = min(args.window_size, args.chunk_size)
-        print(f"[auto] {args.task}: chunk_size={args.chunk_size} (=compress_len), "
-              f"window_size={args.window_size}")
     if args.task == "mixed":
         # mixed: the uniform interface — ALL tasks share context_len = mixed_ctx and
         # M = mixed_M. Drive chunk_size/window/compress_len/predict_len from it so the
@@ -1665,12 +1658,6 @@ def main():
     cfg.icae_n_slots = M
     cfg.ccm_n_comp = M
     cfg.autocompressor_n_slots = M
-    cfg.spg_K_edge = M               # soft_pointer_graph prepends M fact-tokens (matched read)
-    cfg.hlvocab_m_max = M            # hlvocab obeys the matched budget too [fix G]
-    # edge_cand must stay >= n_edges (= m_max//2) or HLVocabConfig.__post_init__
-    # rejects the build. Scale it with the budget instead of leaving the default 48
-    # (which crashed non-MAE tasks at the default mem_tokens=144 → n_edges=72).
-    cfg.hlvocab_edge_cand = max(cfg.hlvocab_edge_cand, (M + 1) // 2)
     cfg.n_flat_codes = M             # flat/continuous/MT prepend M too (was 192 -> mismatch)
     cfg.beacon_ratio = max(1, args.chunk_size // M)
     if args.beacon_param is not None:
@@ -1688,19 +1675,12 @@ def main():
                  * _ceil(args.window_size, cfg.beacon_ratio))
     print(f"[memory budget] mem_tokens={M} × d_llama={cfg.d_llama} = "
           f"{M * cfg.d_llama:,} prepend decoder-read floats/arm")
-    for _a, _m in (("soft_pointer_graph", M), ("icae", M), ("ccm", M),
-                   ("autocompressor", M), ("beacon", _beacon_M)):
+    for _a, _m in (("icae", M), ("ccm", M), ("autocompressor", M), ("beacon", _beacon_M)):
         print(f"   {_a:<18} M={_m:<4} → {_m * cfg.d_llama:,} floats")
-    if "hlvocab_baseline" in args.variants:
-        _vocab = sum(cfg.hlvocab_nodes)
-        print(f"   hlvocab (Compression-by-Vocabulary): {_vocab} nodes over "
-              f"{len(cfg.hlvocab_nodes)} layers, d_code={cfg.hlvocab_d_code}, "
-              f"top_k={cfg.hlvocab_top_k}; emits up to m_max={cfg.hlvocab_m_max} "
-              f"node-tokens, sliced to k. Prepend compressor (masked_reconstruction).")
-    if args.task in ("masked_reconstruction", "mixed"):
-        # MAE / mixed ignore --mem-tokens: the override below sets a FIXED M (16 for
-        # MAE, mixed_M for mixed). The QA-shaped budget figures above (M, _beacon_M)
-        # do NOT describe what these emit — skip the multi-window beacon assertion.
+    if args.task == "mixed":
+        # mixed ignores --mem-tokens: the override below sets a FIXED M (mixed_M). The
+        # QA-shaped budget figures above (M, _beacon_M) do NOT describe what it emits —
+        # skip the multi-window beacon assertion.
         print(f"   [{args.task}] the above --mem-tokens budget is IGNORED; the "
               f"compression-line override below sets the fixed memory budget.")
     elif abs(_beacon_M - M) > max(1, M // 10):
@@ -1710,50 +1690,7 @@ def main():
             f"matched memory budget holds before launching.")
 
     # ── compression line: param-matched baselines (backbone resolved above) ───
-    if args.task == "masked_reconstruction":
-        cfg.task_mode = "masked_reconstruction"
-        # decoder LoRA: a frozen decoder can't learn the MAE protocol (mask
-        # handling + memory-use) — the band-needs-training finding. Every variant
-        # (incl. the vanilla floor/ceiling) gets a shared-size decoder LoRA so the
-        # PROTOCOL is learnable; competitors ADD their ~2M compression encoder.
-        cfg.use_llama_lora = True
-        cfg.llama_lora_rank = 16; cfg.llama_lora_alpha = 32
-        # M_max = 16 (k in [3,16]). Memory-mechanism trainable params matched to
-        # the `graph` anchor (relational parser over a node bank, write=3/read=2,
-        # 2-part working set + dual cross-attn ≈ 6.90M total / 5.98M memory) on 135M:
-        #   icae r104 → 6.00M, ccm r52 → 6.00M, autocompressor r52 → 6.01M,
-        #   beacon 11 wrap layers → 6.08M. (See scripts/diagnostics/param_count.py.)
-        cfg.n_flat_codes = 16
-        cfg.icae_n_slots = 16; cfg.icae_lora_rank = 104; cfg.icae_lora_alpha = 208
-        cfg.ccm_n_comp = 16; cfg.ccm_lora_rank = 52; cfg.ccm_lora_alpha = 104
-        cfg.autocompressor_n_slots = 16
-        cfg.autocompressor_lora_rank = 52; cfg.autocompressor_lora_alpha = 104
-        cfg.beacon_ratio = 8
-        # Beacon wraps 11 evenly-spaced layers (≈6.08M on SmolLM2-135M, matched to
-        # the graph anchor). Shared helper derives indices from the backbone depth.
-        from transformers import AutoConfig as _ACL
-        from src.memory.common import beacon_wrap_layers as _bwl
-        _nlayers = _ACL.from_pretrained(cfg.llama_model).num_hidden_layers
-        cfg.beacon_wrap_layers = _bwl(_nlayers, 11)
-        cfg.hlvocab_m_max = 16           # masked_reconstruction: emit up to 16, sliced to k [fix G]
-        cfg.hlvocab_edge_cand = 48       # calibrated for the 16-token MAE regime (overrides budget-scaled)
-        cfg.hlvocab_emit = args.hlvocab_emit   # edge_query (default) | slotattn (competition)
-        # soft_pointer_graph (our other primary graph; "free endpoint selection")
-        # capacity-matched to hlvocab on d=576: ≈3.30M memory / 4.22M total. Defaults
-        # are sized for the retired ~48M QA regime, so shrink for the MAE cohort.
-        cfg.spg_K_edge = 16              # cap fact-tokens to k (sliced to per-example k_slots)
-        cfg.spg_K_node = 64
-        cfg.spg_d_node = 176; cfg.spg_d_state = 176; cfg.spg_d_read = 176
-        cfg.spg_d_updater = 240; cfg.spg_updater_layers = 2; cfg.spg_updater_heads = 8
-        cfg.spg_read_ffn_mult = 2
-        cfg.spg_builder_mlp_hidden = 224; cfg.spg_film_hidden = 176
-        if cfg.d_llama != 576 and not args.allow_unmatched_backbone:
-            raise SystemExit(
-                f"masked_reconstruction param-matched ranks are calibrated for "
-                f"SmolLM2-135M (d=576); got d_llama={cfg.d_llama} "
-                f"(backbone={cfg.llama_model}). Pass --backbone HuggingFaceTB/SmolLM2-135M, "
-                f"or --allow-unmatched-backbone to override (capacity match will be off).")
-    elif args.task == "mixed":
+    if args.task == "mixed":
         # MIXED multi-task: ONE model per arch on a round-robin of mae+babi+
         # continuation, per-task eval. UNIFORM interface: context_len = mixed_ctx
         # and a FIXED M = mixed_M for EVERY task (override the per-task ceil(ctx/30)
@@ -1788,20 +1725,28 @@ def main():
         cfg.graph_n_nodes = 2048; cfg.graph_n_edges = 128
         cfg.graph_n_read_queries = _M   # M latent read-queries = prepend tokens (decoupled from E)
         cfg.graph_read_final = True   # final-layer tap (backbone-agnostic n_layers-1) — locked design
-        print(f"[capacity] mixed: FIXED M={_M} (graph read-queries, decoupled from "
-              f"E={cfg.graph_n_edges}), beacon_ratio={cfg.beacon_ratio} (ctx "
+        # slotgraph (icae-write + hard-ST structure): own frozen base + encoder-LoRA (matched to
+        # icae's rank so params ≈ icae) + tiny structure heads; structure injected at every LM layer.
+        cfg.slotgraph_n_slots = _M
+        cfg.slotgraph_lora_rank = 104; cfg.slotgraph_lora_alpha = 208   # match icae encoder-LoRA params
+        cfg.slotgraph_start_layer = 0
+        # vqicae (icae + VQ-discretized slots): encoder-LoRA r96 + projns + EMA codebook (a buffer,
+        # not gradient-trained) → ~7.0M trainable, matched to icae. Large codebook K=8192.
+        cfg.vqicae_n_slots = _M
+        cfg.vqicae_lora_rank = 100; cfg.vqicae_lora_alpha = 200
+        cfg.vqicae_codebook_size = 8192; cfg.vqicae_d_code = 256
+        print(f"[capacity] mixed: FIXED M={_M}, beacon_ratio={cfg.beacon_ratio} (ctx "
               f"{args.mixed_ctx}:M = {args.mixed_ctx // _M}:1); baselines icae r104 / "
-              f"ccm r52 / ac r52 / beacon 11L (MAE-calibrated, param-matched ~6.0M).")
+              f"ccm r52 / ac r52 / beacon 11L / graph d256 / slotgraph r104 / "
+              f"vqicae r96+K{cfg.vqicae_codebook_size} (param-matched ~6.9-7.0M).")
         if cfg.d_llama != 576 and not args.allow_unmatched_backbone:
             raise SystemExit(
                 f"mixed param-matched ranks are calibrated for SmolLM2-135M (d=576); "
                 f"got d_llama={cfg.d_llama} (backbone={cfg.llama_model}). Pass "
                 f"--backbone HuggingFaceTB/SmolLM2-135M, or --allow-unmatched-backbone "
                 f"to override (capacity match will be off).")
-    elif args.task in ("qa", "conditioned_reconstruction",
-                       "conditioned_reconstruction_bio", "continuation", "babi"):
-        # The longer-context objectives: 30:1 COMPRESSION + ~13M memory params (the
-        # "fully using" config; MAE keeps its 8:1 / ~6M de-risk). Memory budget
+    elif args.task == "qa":
+        # composite multi-hop QA: 30:1 COMPRESSION + ~13M memory params. Memory budget
         # M = ceil(context / 30); params matched to the graph anchor (d_graph=384,
         # write=3/read=2, N=1024 ≈ 13.0M) on SmolLM2-135M (d=576). Ranks calibrated
         # for d=576 — capacity match is approximate on other backbones.
@@ -1847,6 +1792,9 @@ def main():
     if args.graph_free_endpoints:
         cfg.graph_free_endpoints = True
         print("[graph override] FREE endpoints (no bank/selection)")
+    if args.slotgraph_no_structure:
+        cfg.slotgraph_use_structure = False
+        print("[slotgraph override] structure OFF = pure ICAE control (no heads / no injection)")
     cfg.task_mode = args.task        # accurate ckpt metadata (dispatch still keys on this)
     cfg.seed = args.seed             # record the actual seed in ckpt metadata
 
