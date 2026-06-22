@@ -30,7 +30,8 @@ def apply_mixed_capacity(cfg):
     cfg.use_llama_lora = True
     cfg.llama_lora_rank = 16; cfg.llama_lora_alpha = 32
     cfg.slotgraph_n_slots = 32
-    cfg.slotgraph_lora_rank = 104; cfg.slotgraph_lora_alpha = 208
+    cfg.slotgraph_n_nodes = 16          # FIXED partition (matches train.py: M//2)
+    cfg.slotgraph_lora_rank = 85; cfg.slotgraph_lora_alpha = 170   # +MP modules → params ≈ icae (matches train.py)
     cfg.slotgraph_start_layer = 0
 
 
@@ -102,8 +103,8 @@ def main():
     with torch.amp.autocast("cuda", dtype=torch.bfloat16):
         out = m.compute_masked_reconstruction_loss(b)
     out["loss"].backward()
-    comps = ["slot_init", "role_embed", "struct_norm", "role_head", "src_head", "dst_head",
-             "log_temp", "inject_scale", "norm"]
+    comps = ["slot_init", "role_embed", "struct_norm", "src_head", "dst_head",
+             "log_temp", "inject_raw", "msg", "update", "mp_gate_raw", "norm"]
     pd = dict(enc.named_parameters())
     ok = True
     for c in comps:

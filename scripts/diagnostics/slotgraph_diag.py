@@ -66,12 +66,12 @@ def structure(enc, ctx, mask):
         for hh in handles:
             hh.remove()
     slot_final = h[:, -M:].float()
-    hhin = torch.cat([enc.struct_norm(slot_final),
-                      enc.id_embed.unsqueeze(0).expand(B, -1, -1).float()], -1)
+    hhin = enc._head_in(slot_final)                       # [struct_norm(slot) ; scaled id]
     temp = float(enc.log_temp.exp().clamp_min(1e-2))
-    role = (enc.role_head(hhin) / temp).softmax(-1)
-    src = (enc.src_head(hhin) / temp).softmax(-1)
-    dst = (enc.dst_head(hhin) / temp).softmax(-1)
+    role = enc.role_fixed.unsqueeze(0).expand(B, -1, -1).float()   # FIXED partition (0=node, 1=edge)
+    s_logits, d_logits = enc._endpoint_logits(hhin)      # masked to the fixed node pool (edges→nodes)
+    src = (s_logits / temp).softmax(-1)
+    dst = (d_logits / temp).softmax(-1)
     return slot_final, role, src, dst
 
 

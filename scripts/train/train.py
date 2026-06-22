@@ -1319,7 +1319,7 @@ def main():
     # hlvocab_baseline + soft_pointer_graph_baseline are ABANDONED (2026-06-15) —
     # still selectable via explicit --variants for reproduction, out of the default.
     ap.add_argument("--variants", nargs="+", default=[
-        "graph_baseline",             # the current line: relational parser over a learnable node bank
+        "slotgraph_baseline",         # emergent-topology slot memory (supersedes graph_baseline)
         "icae_baseline",              # ICAE (ICLR'24)
         "ccm_baseline",               # CCM (ICLR'24)
         "autocompressor_baseline",    # AutoCompressor/RMT-style recurrent summary
@@ -1420,8 +1420,12 @@ def main():
                     help="graph: node-selection sparsity. 1.0 = softmax (dense blend, default); "
                          "1.5 = entmax (sparse, commits to a few nodes); 2.0 = sparsemax.")
     ap.add_argument("--slotgraph-no-structure", action="store_true",
-                    help="slotgraph: disable the structure heads/injection = pure ICAE control. "
-                         "Ablation: does the emergent hard topology add anything over icae?")
+                    help="slotgraph: disable the structure heads/injection/MP = 'id-tagged ICAE' "
+                         "(slots keep the fixed id tags; true pure-ICAE = the icae_baseline variant). "
+                         "Ablation: does the emergent hard topology add anything over id-tagged slots?")
+    ap.add_argument("--slotgraph-no-mp-read", action="store_true",
+                    help="slotgraph: disable the multi-hop message-passing read (plain prepend instead) "
+                         "= injection-only control. Ablation: does the topology-USING read earn its keep?")
     ap.add_argument("--graph-encoder-lora-rank", type=int, default=0,
                     help="graph: LoRA-adapt the encoder forward like the baselines (0=frozen tap). "
                          "Evens the encoder footing (the graph historically read a frozen tap).")
@@ -1715,10 +1719,13 @@ def main():
         from src.memory.common import beacon_wrap_layers as _bwlm
         _nlayersm = _ACLM.from_pretrained(cfg.llama_model).num_hidden_layers
         cfg.beacon_wrap_layers = _bwlm(_nlayersm, 11)
-        # slotgraph (icae-write + hard-ST structure): own frozen base + encoder-LoRA (matched to
-        # icae's rank so params ≈ icae) + tiny structure heads; structure injected at every LM layer.
+        # slotgraph (icae-write + hard-ST structure + multi-hop message-passing read): own frozen base
+        # + encoder-LoRA + structure heads + the MP read modules (msg/update ≈1.0M). Encoder-LoRA rank
+        # TRIMMED to r85 (from icae's r104) to offset the MP params → total ≈ icae's ~6.9M (the trim
+        # also slightly narrows the flat bypass, which we want). See smoke_slotgraph_mpread.py.
         cfg.slotgraph_n_slots = _M
-        cfg.slotgraph_lora_rank = 104; cfg.slotgraph_lora_alpha = 208   # match icae encoder-LoRA params
+        cfg.slotgraph_n_nodes = _M // 2          # FIXED partition: half nodes, half edges
+        cfg.slotgraph_lora_rank = 85; cfg.slotgraph_lora_alpha = 170   # +MP modules → params ≈ icae
         cfg.slotgraph_start_layer = 0
         # vqicae (icae + VQ-discretized slots): encoder-LoRA r96 + projns + EMA codebook (a buffer,
         # not gradient-trained) → ~7.0M trainable, matched to icae. Large codebook K=8192.
@@ -1727,7 +1734,7 @@ def main():
         cfg.vqicae_codebook_size = 8192; cfg.vqicae_d_code = 256
         print(f"[capacity] mixed: FIXED M={_M}, beacon_ratio={cfg.beacon_ratio} (ctx "
               f"{args.mixed_ctx}:M = {args.mixed_ctx // _M}:1); baselines icae r104 / "
-              f"ccm r52 / ac r52 / beacon 11L / slotgraph r104 / "
+              f"ccm r52 / ac r52 / beacon 11L / slotgraph r85+MP-read / "
               f"vqicae r100+K{cfg.vqicae_codebook_size} (param-matched ~6.9-7.0M).")
         if cfg.d_llama != 576 and not args.allow_unmatched_backbone:
             raise SystemExit(
@@ -1784,7 +1791,11 @@ def main():
         print("[graph override] FREE endpoints (no bank/selection)")
     if args.slotgraph_no_structure:
         cfg.slotgraph_use_structure = False
-        print("[slotgraph override] structure OFF = pure ICAE control (no heads / no injection)")
+        print("[slotgraph override] structure OFF = id-tagged ICAE (no heads/injection/MP; slots keep "
+              "id tags — true pure-ICAE is the icae_baseline variant)")
+    if args.slotgraph_no_mp_read:
+        cfg.slotgraph_mp_read = False
+        print("[slotgraph override] MP read OFF = injection-only control (plain prepend read)")
     cfg.task_mode = args.task        # accurate ckpt metadata (dispatch still keys on this)
     cfg.seed = args.seed             # record the actual seed in ckpt metadata
 
