@@ -90,6 +90,7 @@ def main():
 
     # ── aggregate over several batches for the histograms ──
     edge_frac, edge_ent, node_usage, mem_er, role_ent_all = [], [], [], [], []
+    edge_valid = []   # per-edge: are BOTH endpoints node slots? (else invalid: edge→non-node)
     keep_example = None
     for bi, batch in enumerate(vs):
         batch = to_device(batch, DEV)
@@ -106,9 +107,11 @@ def main():
             em = is_edge[b]
             if em.any():
                 edge_ent.extend(ee[b][em].tolist())
-                # node-target usage: which slot-positions the edges point to (src & dst argmax)
-                tgts = torch.cat([src[b][em].argmax(-1), dst[b][em].argmax(-1)])
-                node_usage.append(tgts.cpu())
+                s_arg = src[b].argmax(-1); d_arg = dst[b].argmax(-1)   # [M] endpoint positions
+                node_usage.append(torch.cat([s_arg[em], d_arg[em]]).cpu())
+                isnode = ~em                                            # [M] True where slot is a node
+                for e in em.nonzero(as_tuple=True)[0]:                 # edge is VALID iff both endpoints are nodes
+                    edge_valid.append(bool(isnode[s_arg[e]] and isnode[d_arg[e]]))
             # memory eff-rank per example (slot vectors)
             x = slot_final[b] - slot_final[b].mean(0, keepdim=True)
             C = x.t() @ x
@@ -136,25 +139,32 @@ def main():
     print(f"  node-target usage: {n_used}/{M} slots ever targeted; top-2 capture {top2_frac*100:.0f}% of endpoints "
           f"({'COLLAPSED' if top2_frac>0.5 else 'spread'})")
     print(f"  memory eff-rank:  mean={mem_er.mean():.2f} / {M}  ({'collapsed' if mem_er.mean()<3 else 'healthy'})")
+    inv = (1 - np.mean(edge_valid)) if edge_valid else float("nan")
+    print(f"  invalid edges:    {inv*100:.0f}% of edges point to a NON-node slot (no edges→nodes constraint)")
 
-    # ── PLOT 1: UMAP of one example's slots + predicted edges ──
-    sv, rh, sh, dh = keep_example
+    # ── PLOT 1: UMAP of NODE slots only; edges are arrows between node endpoints (not points) ──
+    sv, rh, sh, dh = keep_example                       # slot vecs, role(0=node), src/dst argmax positions
+    node_idx = np.where(rh == 0)[0]; node_set = set(int(i) for i in node_idx)
+    edge_idx = np.where(rh == 1)[0]
     import umap
-    emb2d = umap.UMAP(n_neighbors=min(10, M - 1), min_dist=0.3, random_state=0).fit_transform(sv)
+    node2d = umap.UMAP(n_neighbors=min(8, max(2, len(node_idx) - 1)), min_dist=0.3,
+                       random_state=0).fit_transform(sv[node_idx])   # ONLY the node entities
+    pos = {int(p): node2d[i] for i, p in enumerate(node_idx)}        # slot-position → 2D (nodes only)
     fig, ax = plt.subplots(figsize=(8, 8))
-    node_idx = np.where(rh == 0)[0]; edge_idx = np.where(rh == 1)[0]
-    # draw predicted edges (src→dst) as arrows
-    for e in edge_idx:
-        s, d = sh[e], dh[e]
-        ax.annotate("", xy=emb2d[d], xytext=emb2d[s],
-                    arrowprops=dict(arrowstyle="->", color="crimson", alpha=0.5, lw=1.2))
-    ax.scatter(emb2d[node_idx, 0], emb2d[node_idx, 1], c="steelblue", s=180, label=f"node ({len(node_idx)})", zorder=3, edgecolors="k")
-    ax.scatter(emb2d[edge_idx, 0], emb2d[edge_idx, 1], c="crimson", marker="^", s=140, label=f"edge ({len(edge_idx)})", zorder=3, edgecolors="k")
-    for i in range(M):
-        ax.text(emb2d[i, 0], emb2d[i, 1], str(i), fontsize=7, ha="center", va="center", zorder=4)
-    ax.set_title(f"slotgraph — one bAbI example: 32 slots (UMAP) + predicted edges\n"
-                 f"edges drawn src→dst; {len(edge_idx)} edges, {len(node_idx)} nodes")
-    ax.legend(); ax.set_xticks([]); ax.set_yticks([])
+    n_valid = n_invalid = 0
+    for e in edge_idx:                                                # each edge slot = an ARROW node→node
+        s, d = int(sh[e]), int(dh[e])
+        if s in node_set and d in node_set:
+            ax.annotate("", xy=pos[d], xytext=pos[s],
+                        arrowprops=dict(arrowstyle="->", color="crimson", alpha=0.55, lw=1.3)); n_valid += 1
+        else:
+            n_invalid += 1                                            # edge points to a non-node slot → can't draw
+    ax.scatter(node2d[:, 0], node2d[:, 1], c="steelblue", s=200, zorder=3, edgecolors="k")
+    for i, p in enumerate(node_idx):
+        ax.text(node2d[i, 0], node2d[i, 1], str(int(p)), fontsize=7, ha="center", va="center", zorder=4)
+    ax.set_title(f"slotgraph — one bAbI example: NODE slots in UMAP, edges as src→dst arrows\n"
+                 f"{len(node_idx)} nodes; edges: {n_valid} valid (node→node), {n_invalid} INVALID (→ non-node, not drawn)")
+    ax.set_xticks([]); ax.set_yticks([])
     p1 = OUT / "slotgraph_umap_example.png"; fig.tight_layout(); fig.savefig(p1, dpi=130); plt.close(fig)
 
     # ── PLOT 2: histogram panel ──

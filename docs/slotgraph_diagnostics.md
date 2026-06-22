@@ -5,27 +5,28 @@ relational-parser `graph` model) · **Backbone:** frozen SmolLM2-135M · **Objec
 (mae / babi / continuation / condrecon_bio), 1024→32 compression, 4000 steps.
 
 ## TL;DR
-slotgraph is the **cohort leader on the binding task** (bAbI EM **0.352** vs icae 0.273) and ties
-icae on gist — but the diagnostics show the **graph structure did not form**: the learned edges are
-near-random (endpoint entropy 98% of maximum), and the structure-prediction machinery is sitting
-**untrained at its random initialization** (the injection gate and the role/src/dst heads never
-moved). So the babi win is **not** from learned topology — it comes from the richer (id-tagged,
-role-marked) slot identities on top of the icae base. This is the **membership-only wall**, made
-literal: the flat icae channel does the work and the graph machinery is bypassed.
+slotgraph leads the cohort on the binding task (bAbI EM **0.352** vs icae 0.273) and ties on gist —
+but a four-way diagnosis shows the **emergent graph is inert**: an ablation with the structure turned
+OFF performs identically (0.355), the structure machinery is sitting at its **random initialization**,
+its gradient is **~100× weaker** than the content path, and 75% of the predicted edges are even
+**invalid** (point to non-node slots). **The entire gain over icae comes from the fixed orthonormal
+*id-tags* on the memory slots, not the graph.** This is the membership-only wall: the flat channel
+(encoder-LoRA + id-tagged slots) already solves the task, so the structure gets no pressure to form.
 
 ## 1. What slotgraph is (one paragraph)
-ICAE write (own frozen base + encoder-LoRA, M=32 slots appended to the passage and run through the
-LM's own layers) **+** a per-LM-layer head that predicts, hard via straight-through, whether each
-slot is a NODE or an EDGE and (for edges) which two slot-positions it connects. The prediction is
-concretized into a TokenGT embedding `e = role + identity` (id = fixed orthonormal per-position code;
-edge endpoint = transparent **sum** id[src]+id[dst]) and re-injected (gated by `inject_scale`) into
-the slot positions before each layer. Read = prepend the 32 slots. `use_structure=False` = pure icae.
+ICAE write (own frozen base + encoder-LoRA, M=32 slots appended to the passage, run through the LM's
+own layers) **+** a per-LM-layer head predicting, hard via straight-through, node-vs-edge role and
+(for edges) which two slot-positions it links — concretized as a TokenGT embedding `e = role +
+identity` (id = fixed orthonormal per-position code; edge endpoint = transparent sum id[src]+id[dst])
+and re-injected (gated by `inject_scale`) before each layer. Read = prepend the 32 slots.
+`use_structure=False` = the same model with the structure path disabled.
 
 ## 2. Cohort result (4000 steps, sorted by bAbI EM)
 
 | model | mae ↓ | **babi EM ↑** | babi loss ↓ | cont ↓ | cont-early ↓ | condrec ↓ |
 |---|---|---|---|---|---|---|
 | **slotgraph** | **6.574** | **0.352** | 0.970 | 3.364 | 4.022 | 2.378 |
+| slotgraph (structure OFF) | 6.579 | **0.355** | 0.928 | 3.369 | — | 2.360 |
 | icae | 6.581 | 0.273 | 0.984 | 3.363 | 4.017 | 2.353 |
 | ccm | 6.610 | 0.242 | 1.032 | 3.373 | 4.040 | 2.358 |
 | vqicae | 6.690 | 0.234 | 1.066 | 3.494 | 4.344 | 2.365 |
@@ -34,80 +35,80 @@ the slot positions before each layer. Read = prepend the 32 slots. `use_structur
 | graph (retired) | 6.634 | 0.203 | 1.026 | 3.418 | 4.157 | 2.370 |
 | beacon | 6.587 | 0.176 | 1.116 | 3.405 | 4.109 | 2.478 |
 
-slotgraph tops babi and mae; the question the diagnostics answer is **where that comes from**.
+## 3. The structure is inert — ablation (the decisive test)
+`use_structure=False` keeps slotgraph's id-tagged slots but disables the per-layer role/edge
+injection. It scores **babi EM 0.355 ≈ 0.352 with structure ON** (and ties on mae/cont/condrec). So
+the emergent graph contributes nothing. The three-way attribution:
 
-## 3. Structure diagnostics (`scripts/diagnostics/slotgraph_diag.py`, 64 bAbI examples)
+| variant | what it adds over icae | babi EM |
+|---|---|---|
+| icae | — | 0.273 |
+| slotgraph, structure **OFF** | fixed orthonormal **id-tags** on slots | **0.355** |
+| slotgraph, structure **ON** | id-tags **+ per-layer role/edges** | 0.352 |
+
+→ **The +0.08 gain is the id-tags (distinct, addressable memory slots); the graph adds nothing.**
+
+## 4. Structure diagnostics (`slotgraph_diag.py`, 64 bAbI examples)
 
 | signal | value | reading |
 |---|---|---|
-| edge fraction | 0.229 (~7 edges/example) | role head is used — a real node/edge mix |
-| role entropy | 0.638 / 0.693 (ln2) | role is fairly soft but does split |
-| **endpoint entropy** | **3.408 / 3.466 (ln32) = 98%** | **edges are near-random** (uniform src/dst) |
-| node-target usage | 21/32 slots; top-2 = 40% | spread (not hub-collapsed) — but spread *by randomness* |
-| memory eff-rank | 5.64 / 32 | **healthy** — slots diverse, no rank collapse |
+| edge fraction | 0.229 | a real node/edge mix forms |
+| **endpoint entropy** | **3.408 / 3.466 (ln32) = 98%** | edges are near-random (uniform src/dst) |
+| **invalid edges** | **75% point to a non-node slot** | no edges→nodes constraint; mostly invalid graphs |
+| node-target usage | 21/32 slots; top-2 = 40% | spread — but by *randomness* |
+| memory eff-rank | 5.64 / 32 | healthy — slots diverse, no rank collapse |
 
-The slots are healthy (diverse, not collapsed — inherited from the icae base, which is why babi EM
-is genuinely high). But the **edges carry no information**: their src/dst distributions sit at 98% of
-maximum entropy, i.e. each edge points to an effectively uniform/random node.
-
-### Visualizations
-**One bAbI example — 32 slots in UMAP, with the predicted edges drawn (src→dst):**
+**Node slots in UMAP, edges drawn as src→dst arrows** (edges are relations, not points; arrows that
+point to non-node slots are invalid and not drawn):
 
 ![slotgraph UMAP + edges](figures/slotgraph_umap_example.png)
 
-The arrows do not connect any coherent cluster structure — they scatter, consistent with random edges.
-
-**Histogram panel** (edge fraction; per-edge endpoint entropy vs the dashed `ln32` max; node-target
-usage; memory eff-rank):
+**Histogram panel** — note the per-edge endpoint entropy (top-right) sits on the dashed `ln32` max:
 
 ![slotgraph histograms](figures/slotgraph_histograms.png)
 
-The decisive panel is top-right: per-edge endpoint entropy is piled **right on the maximum line**.
+## 5. WHY the topology doesn't form (measured)
+1. **Not a wiring bug.** All learnable topology components (`role/src/dst` heads, `inject_raw`,
+   `log_temp`, `role_embed`) are `requires_grad=True` and in the optimizer; `id_embed` is a fixed
+   buffer by design. So they *can* train.
+2. **They didn't move.** Trained `inject_scale` = 0.1000 (its init), `temp` = 0.999 (init), and the
+   role/src/dst head weight norms are within ~2% of fresh-init. The machinery sits at random init →
+   hence the near-uniform (random) edges.
+3. **The gradient is starved.** On the trained model, the edge-defining components get ~100–1000×
+   weaker gradient than the content path:
 
-## 4. WHY the topology didn't form (weight inspection of the trained checkpoint)
+   ```
+   src_head 9.3e-3   dst_head 1.2e-2   inject_raw 2.5e-3   log_temp 1.1e-3
+   vs.  slot_init 9.4e-1   encoder_LoRA 1.9   decoder_LoRA 6.2
+   ```
 
-The structure machinery is essentially **frozen at its random initialization**:
+**Root cause (confidence ~85%, measured):** the content path (encoder-LoRA + id-tagged slots) already
+minimizes the loss, so the structure path offers no marginal benefit → tiny gradient → the heads and
+the inject-gate stay at init → random edges → which keeps the gate small. A self-consistent dead
+equilibrium = the **membership-only wall**: a free flat channel is the bypass the optimizer always
+takes. (Not fully excluded: a "symmetry-stuck at the near-uniform init" optimization component; a
+forced-gate run would separate it — see §6.)
 
-| parameter | trained value | init | moved? |
-|---|---|---|---|
-| `inject_scale` (= 0.5·σ(inject_raw)) | **0.1000** | 0.10 | **no** — the gate that lets structure into the LM never grew |
-| `temp` (= exp(log_temp)) | **0.999** | 1.0 | no — distributions never sharpened |
-| `role_head` ‖W‖ | 0.859 | ≈0.816 fresh | ~no |
-| `src_head` ‖W‖ | 3.338 | ≈3.266 fresh | ~no |
-| `dst_head` ‖W‖ | 3.340 | ≈3.266 fresh | ~no |
-| `slot_init` (content seeds) | trained | — | **yes** (the slots *did* learn) |
+## 6. How to improve the design (ranked by leverage)
+1. **Close the bypass** — bottleneck the slot content / weaken the encoder-LoRA / make the read
+   structure-dependent, so the graph *must* carry information. (Highest leverage; vqicae shows a blunt
+   discreteness bottleneck just hurts, so it must be paired with a usable structure channel.)
+2. **Make structure non-optional** — remove/force the `inject_scale` gate (it stayed at 0.10), so the
+   LM must process the structure → real backward pressure on the heads. (Cheapest, most diagnostic.)
+3. **Constrain edges→nodes** — mask `src/dst` to node-role slots (75% are currently invalid). Needed
+   for a valid graph; not sufficient alone.
+4. **Help endpoints escape the symmetric init** — Gumbel-softmax + temperature annealing. Only helps
+   once pressure (1/2) exists.
+5. **A structure-necessary objective** — gist/babi are solvable by flat memory, so *no architecture
+   forces structure if the task doesn't need it*. A multi-hop relational task where a flat 32-slot
+   bank provably fails is the real prerequisite.
 
-So the **content/identity slots trained, but the structure heads + injection gate did not**. The
-heads still output near-uniform distributions (hence the 98%-entropy random edges), and the gate
-stays at 0.10 so the structure barely perturbs the LM.
-
-**Root cause — no gradient pressure (a flat-channel bypass).** The icae base plus the trained slot
-identities already minimize the loss; the structure path provides no *marginal* benefit, so the
-optimizer leaves `inject_scale` and the structure heads at their init. With the gate small, the
-structure barely affects the loss → near-zero backward signal to the heads → they never learn → random
-edges → which confirms the gate should stay small. A self-consistent dead equilibrium. This is the
-**membership-only wall** that retired the old graph model, here made literal: a free, easy flat
-channel (the icae slots) is the bypass the optimizer always takes, so the structure is never forced
-to carry information.
-
-## 5. Attribution test (running)
-`--slotgraph-no-structure` ablation (= pure icae with slotgraph's exact slot machinery), 4000 steps.
-Prediction from §4: it should land at **≈ slotgraph's babi (~0.35)**, since the structure is inert —
-confirming the gain is the slot/identity machinery + the icae base, **not** the graph.
-*(Result will be appended here when the run lands.)*
-
-## 6. Implications / next steps
-The lesson is the project-wide one: **structure has to be forced, not offered.** Concretely, to make
-the topology actually form one of:
-- **Remove/strengthen the gate** — make the structure non-optional (no small `inject_scale`, or init
-  it large) so the LM *must* process it → real backward pressure on the heads.
-- **Bottleneck the slot content** — so the slots alone can't solve the task and the structure must
-  carry information (no free flat channel).
-- **A structure-necessary objective / harder binding task** where the icae base alone fails.
-
-Until one of those forces information through the edges, slotgraph is "icae with richer slot ids" —
-which is a real, useful gain on babi, but not the emergent graph we set out to build.
+**The honest takeaway:** the diagnostics say *the id-tags are the win and the graph is inert*. Before
+more graph engineering, weigh (a) **following the evidence** — pursue richer/learnable memory-slot
+*identities* and drop the graph framing — or (b) the **fast-weights pivot** (memory in fast synaptic
+state, not prepended slots), which sidesteps the flat-prepend bypass entirely.
 
 ---
-*Repro:* `scripts/diagnostics/slotgraph_diag.py` (structure + visuals), `debug_sweep_new_models.py`
-(gradient/magnitude health), `mixed_band_gate_eval.py` (REAL/SHUF/OFF binding gate).
+*Repro:* `scripts/diagnostics/slotgraph_diag.py` (structure + visuals), `slotgraph_gradflow.py`
+(per-component gradient), `mixed_band_gate_eval.py` (REAL/SHUF/OFF gate). Ablation:
+`train.py … --slotgraph-no-structure`.
