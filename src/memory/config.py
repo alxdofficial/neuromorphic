@@ -133,6 +133,9 @@ class ReprConfig:
                                        # (n_pairs*K=32; trades column width/depth to hit parity).
     biomem_read_mode: str = "prepend"  # "prepend" (v2: M learned seeds → propagate W → prepend, LM
                                        # attention reads) | "conditioned" (legacy: tap-layer fuse read)
+    biomem_use_surprise: bool = True   # feed the frozen LM's per-token next-token prediction error
+                                       # (−log p, a free pretrained surprise signal) into the write gate +
+                                       # input-dependent decay (surprising token → write harder / retain).
     biomem_per_layer_refresh: bool = True  # prepend mode: at EVERY decoder layer, re-read W with the
                                        # current (attention-mixed, query-aware) slot hiddens and add a
                                        # zero-init-gated recall back → the slots become context-conditioned

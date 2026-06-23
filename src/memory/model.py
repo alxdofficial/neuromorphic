@@ -4,6 +4,7 @@ The model takes one of the encoder variants (see VARIANTS) and the frozen
 Llama decoder, and produces the reconstruction loss for training.
 """
 from __future__ import annotations
+import math
 from typing import Optional
 
 import torch
@@ -279,8 +280,10 @@ class ReprLearningModel(nn.Module):
         # ---- 1. encode the span → memory [B, M, d] (single window) ----
         # biomem/arrivalmem ingest the frozen LM's FINAL hidden (not raw embeds); others raw.
         enc_in = self._encode_for_memory(ctx_embeds, batch.context_mask)
+        surprise = (self._token_surprise(enc_in, getattr(batch, "context_ids", None), batch.context_mask)
+                    if getattr(self.encoder, "wants_surprise", False) else None)
         state = self.encoder.init_streaming_state(B, device, ctx_embeds.dtype)
-        state, _ = self.encoder.streaming_write(state, enc_in, batch.context_mask)
+        state, _ = self.encoder.streaming_write(state, enc_in, batch.context_mask, surprise=surprise)
         memory, mem_aux = self.encoder.finalize_memory(state)          # [B, M, d]
         memory = memory.to(ctx_embeds.dtype)
 
@@ -532,6 +535,29 @@ class ReprLearningModel(nn.Module):
                 inputs_embeds=ctx_embeds, attention_mask=ctx_mask.long(), use_cache=False)
         return out.last_hidden_state
 
+    def _token_surprise(self, hidden, ctx_ids, ctx_mask, chunk: int = 256):
+        """Per-token next-token SURPRISE from the FROZEN LM: surprise_t = −log p_LM(ctx_{t+1} | ctx_≤t),
+        normalized by log(vocab) → ~[0,1]. A FREE, pretrained 'this token was unexpected' signal — the LM
+        is already a next-token predictor, so its prediction error is a principled surprise (no extra net,
+        unlike Titans which constructs one). no_grad + disable_lora (pure backbone); chunked over T to bound
+        the [B,chunk,V] logits; detached (a fixed write-time conditioning feature). Returns [B,T] or None."""
+        if ctx_ids is None:
+            return None
+        B, T, _ = hidden.shape
+        V = self.cfg.llama_vocab_size
+        surprise = hidden.new_zeros(B, T)
+        with torch.no_grad(), disable_lora():
+            for s in range(0, max(T - 1, 1), chunk):
+                e = min(s + chunk, T - 1)
+                if e <= s:
+                    break
+                logits = self.decoder.llama.lm_head(hidden[:, s:e]).float()         # [B, blk, V]
+                tgt = ctx_ids[:, s + 1:e + 1]                                        # next-token ids
+                ce = F.cross_entropy(logits.reshape(-1, V), tgt.reshape(-1),
+                                     reduction="none").view(B, e - s)
+                surprise[:, s:e] = ce
+        return (surprise / math.log(V) * ctx_mask.float()).detach()                  # ~[0,1], padding→0
+
     def compute_loss(
         self,
         batch,                          # QABatch from data_qa.py
@@ -587,6 +613,10 @@ class ReprLearningModel(nn.Module):
 
         # biomem/arrivalmem ingest the frozen LM's FINAL hidden (not raw embeds); others raw.
         enc_input = self._encode_for_memory(ctx_embeds, batch.context_mask)
+        # biomem next-token SURPRISE (write-time conditioning); None for arms that don't want it.
+        surprise_full = (self._token_surprise(enc_input, getattr(batch, "context_ids", None),
+                                              batch.context_mask)
+                         if getattr(self.encoder, "wants_surprise", False) else None)
 
         n_windows = (T_ctx + window_size - 1) // window_size
         state = self.encoder.init_streaming_state(B, device, ctx_embeds.dtype)
@@ -602,15 +632,16 @@ class ReprLearningModel(nn.Module):
             e = min(s + window_size, T_ctx)
             win_emb = enc_input[:, s:e, :]
             win_mask = batch.context_mask[:, s:e]
+            win_sur = surprise_full[:, s:e] if surprise_full is not None else None
             if ckpt_stream:
-                def _write(st, em, mk, off=s):
-                    new_st, _ = self.encoder.streaming_write(st, em, mk, chunk_offset=off)
+                def _write(st, em, mk, su=win_sur, off=s):
+                    new_st, _ = self.encoder.streaming_write(st, em, mk, chunk_offset=off, surprise=su)
                     return new_st
                 state = torch.utils.checkpoint.checkpoint(
                     _write, state, win_emb, win_mask, use_reentrant=False)
             else:
                 state, _ = self.encoder.streaming_write(
-                    state, win_emb, win_mask, chunk_offset=s)
+                    state, win_emb, win_mask, chunk_offset=s, surprise=win_sur)
         # Hand the question to the encoder (dict-state variants may read it;
         # NullEncoder (Tensor state) and Mamba (list state) are non-dict — guard).
         if isinstance(state, dict):

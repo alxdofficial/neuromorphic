@@ -96,8 +96,9 @@ def main():
         with torch.no_grad():
             ctx = embed(b.context_ids)
             enc_in = m._encode_for_memory(ctx, b.context_mask)   # biomem ingests LM final hidden
+            sur = m._token_surprise(enc_in, b.context_ids, b.context_mask)   # frozen-LM next-token surprise
             st = enc.init_streaming_state(ctx.shape[0], DEV, ctx.dtype)
-            st, _ = enc.streaming_write(st, enc_in, b.context_mask)
+            st, _ = enc.streaming_write(st, enc_in, b.context_mask, surprise=sur)
             mem, aux = enc.finalize_memory(st)
         print(f"\n=== {t} ({MIXED_TASK_MODE[t]}) ===")
         print(f"  prepend mem shape = {tuple(mem.shape)} (M=32 prepend tokens expected) "
@@ -106,7 +107,8 @@ def main():
               f"edge_absmean={float(aux['biomem_edge_absmean']):.4f}  "
               f"edge_satfrac={float(aux['biomem_edge_satfrac']):.3f}  "
               f"state_satfrac={float(aux['biomem_state_satfrac']):.3f}")
-        print(f"  decay(mean α)={float(aux['biomem_decay']):.4f}  eta={float(aux['biomem_eta']):.4f}")
+        print(f"  decay(mean α)={float(aux['biomem_decay']):.4f}  eta={float(aux['biomem_eta']):.4f}  "
+              f"surprise(mean −logp/lnV)={float(aux['biomem_surprise']):.4f}")
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             out = (m.compute_masked_reconstruction_loss(b)
                    if MIXED_TASK_MODE[t] == "masked_reconstruction"

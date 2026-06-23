@@ -75,15 +75,17 @@ def _hardtanh(x: Tensor) -> Tensor:
 
 
 class _Regulator(nn.Module):
-    """Shared per-edge plasticity regulator: g_ij = tanh(MLP([dW, s_pre, s_post, cond])).
+    """Shared per-edge plasticity regulator: g_ij = tanh(MLP([dW, s_pre, s_post, cond, surprise])).
 
     Vectorized over the full (B,C,K,K) edge tensor of one layer-pair. Output in [-1,1]:
-    apply (g~1) / freeze (g~0) / reverse (g~-1). Soft tanh gate → fully differentiable.
+    apply (g~1) / freeze (g~0) / reverse (g~-1). Soft tanh gate → fully differentiable. The frozen
+    LM's per-token surprise (−log p of the next token) is a broadcast scalar input → the gate can
+    write HARDER on surprising (informative) tokens, the Titans surprise→write mechanism for free.
     """
 
     def __init__(self, d_cond: int, hidden: int):
         super().__init__()
-        d_in = 3 + d_cond                              # [dW_ij, s_pre_i, s_post_j, cond]
+        d_in = 4 + d_cond                              # [dW_ij, s_pre_i, s_post_j, surprise, cond]
         self.fc1 = nn.Linear(d_in, hidden)
         self.fc2 = nn.Linear(hidden, hidden)
         self.fc3 = nn.Linear(hidden, 1)
@@ -95,12 +97,14 @@ class _Regulator(nn.Module):
         nn.init.normal_(self.fc3.weight, std=1.0 / math.sqrt(hidden))
         nn.init.zeros_(self.fc3.bias)
 
-    def forward(self, dW: Tensor, s_pre: Tensor, s_post: Tensor, cond: Tensor) -> Tensor:
+    def forward(self, dW: Tensor, s_pre: Tensor, s_post: Tensor, cond: Tensor,
+                surprise: Tensor) -> Tensor:
         B, C, K, _ = dW.shape
         feat = torch.cat([
             dW.unsqueeze(-1),                                   # [B,C,K,K,1]
             s_pre[:, :, :, None, None].expand(B, C, K, K, 1),   # pre on dim i
             s_post[:, :, None, :, None].expand(B, C, K, K, 1),  # post on dim j
+            surprise[:, None, None, None, None].expand(B, C, K, K, 1),  # LM next-token surprise (per example)
             cond[None, :, None, None, :].expand(B, C, K, K, cond.shape[-1]),
         ], dim=-1)
         h = self.act(self.fc1(feat))
@@ -139,9 +143,11 @@ class BioMemEncoder(nn.Module):
         self.M = int(getattr(cfg, "biomem_n_slots", 32))       # # read seeds = # prepend tokens
         self.is_conditioned_read = (self.read_mode == "conditioned")   # instance attr (set by mode)
         self.wants_prepend_refresh = False                     # set True by the prepend branch below
+        self.wants_surprise = bool(getattr(cfg, "biomem_use_surprise", True))   # model.py computes & feeds it
         self._read_W = None                                    # stashed each finalize
         self.register_buffer("_sat_last", torch.zeros(()), persistent=False)
         self.register_buffer("_decay_last", torch.zeros(()), persistent=False)   # mean α canary
+        self.register_buffer("_surprise_last", torch.zeros(()), persistent=False)  # mean LM surprise canary
 
         # ── learned objects (all small) ──────────────────────────────────────
         self.in_proj = nn.Linear(cfg.d_llama, self.d_grid)     # token embed -> grid input
@@ -151,8 +157,8 @@ class BioMemEncoder(nn.Module):
         # #2 INPUT-DEPENDENT decay (Gated DeltaNet / Mamba2): per-column retention α_t = sigmoid(decay_proj(h_t))
         # ∈ (0,1) replaces the old constant scalar leak. W ← α_t·W + (g+eta0)·dW. Zero-init weight + a bias
         # at logit(decay_init) ⇒ α starts uniform ≈ decay_init (= the old constant-decay behavior) then LEARNS
-        # input-dependence (α→0 clears at context boundaries; α→1 retains within a passage).
-        self.decay_proj = nn.Linear(cfg.d_llama, C)
+        # input-dependence (α→0 clears at context boundaries; α→1 retains). Input = [h_t ; surprise_t].
+        self.decay_proj = nn.Linear(cfg.d_llama + 1, C)
         nn.init.zeros_(self.decay_proj.weight)
         d0 = float(cfg.biomem_decay_init)
         nn.init.constant_(self.decay_proj.bias, math.log(d0 / (1 - d0)))   # logit(decay_init)
@@ -214,9 +220,9 @@ class BioMemEncoder(nn.Module):
         return self
 
     # ── write sweep: one feed-forward pass, updating the edges (gated delta rule) ──
-    def _sweep(self, x0: Tensor, W: Tensor, alpha: Tensor, eta: Tensor):
-        """x0: [B,C,K] input activity; W: [B,n_pairs,C,K,K]; alpha: [B,C] per-column retention ∈ (0,1).
-        Returns (s_final, W_out). #1 L2-normalized key + #2 input-dependent decay."""
+    def _sweep(self, x0: Tensor, W: Tensor, alpha: Tensor, eta: Tensor, surprise: Tensor):
+        """x0: [B,C,K] input activity; W: [B,n_pairs,C,K,K]; alpha: [B,C] per-column retention ∈ (0,1);
+        surprise: [B] the frozen LM's next-token surprise for this token. Returns (s_final, W_out)."""
         invK = self.K ** -0.5
         a = alpha.unsqueeze(-1).unsqueeze(-1)                   # [B,C,1,1] broadcast over the K×K edges
         s = _hardtanh(x0)
@@ -230,7 +236,7 @@ class BioMemEncoder(nn.Module):
             s_out = _hardtanh(inp - self.theta[l])             # target post-activity
             # DELTA rule (error-correcting): write the residual (target − current), fan-in scaled.
             dW = torch.einsum("bci,bcj->bcij", s, s_out - inp) * invK
-            g = self.regulator(dW, s, s_out, self.cond[l])     # [B,C,K,K] in [-1,1]
+            g = self.regulator(dW, s, s_out, self.cond[l], surprise)   # [B,C,K,K] in [-1,1]; surprise→write
             # #2 input-dependent per-column decay α replaces the constant leak: W ← α·W + (g+eta)·dW.
             Wl = torch.clamp(a * Wl + (g + eta) * dW, -1.0, 1.0)
             new_W.append(Wl)
@@ -245,35 +251,41 @@ class BioMemEncoder(nn.Module):
         return {"W": W, "device": device, "n_written": 0}
 
     def streaming_write(self, state, token_embeds, attention_mask=None, chunk_offset=0,
-                        **extra):
-        """Stream the passage into the fast edges (one gated-delta sweep per token)."""
+                        surprise=None, **extra):
+        """Stream the passage into the fast edges (one gated-delta sweep per token). `surprise` [B,W] is
+        the frozen LM's per-token next-token prediction error (∈~[0,1]); feeds the write gate + decay."""
         del chunk_offset, extra
         B, Wlen = token_embeds.shape[:2]
         if attention_mask is None:
             attention_mask = torch.ones(B, Wlen, device=token_embeds.device, dtype=torch.bool)
         mask = attention_mask.float()                          # [B,W]
+        if surprise is None:                                  # standalone path (no LM logits) → no surprise
+            surprise = token_embeds.new_zeros(B, Wlen)
         # edge precision is load-bearing → run the grid in fp32 (autocast disabled).
         with torch.autocast(device_type="cuda", enabled=False):
             tok = token_embeds.float()
+            sur = surprise.float()                             # [B,W]
             x = self.in_proj(tok)                              # [B,W,d_grid]
             x = x.view(B, Wlen, self.C, self.K)
             x = x * mask.view(B, Wlen, 1, 1)                   # mask padded tokens to 0 (no nan)
-            alpha = torch.sigmoid(self.decay_proj(tok))        # [B,W,C] per-column retention ∈ (0,1)
+            alpha = torch.sigmoid(self.decay_proj(                          # [B,W,C] per-column retention
+                torch.cat([tok, sur.unsqueeze(-1)], dim=-1)))              # decay sees [h_t ; surprise_t]
             eta = self.eta.float()
             W = state["W"].float()
             for t in range(Wlen):
-                x_t, m_t, a_t = x[:, t], mask[:, t], alpha[:, t]
+                x_t, m_t, a_t, sur_t = x[:, t], mask[:, t], alpha[:, t], sur[:, t]
                 if self.grad_checkpoint and self.training and torch.is_grad_enabled():
-                    def _step(_xt, _W, _a, _eta):
-                        return self._sweep(_xt, _W, _a, _eta)[1]
+                    def _step(_xt, _W, _a, _eta, _su):
+                        return self._sweep(_xt, _W, _a, _eta, _su)[1]
                     W_new = torch.utils.checkpoint.checkpoint(
-                        _step, x_t, W, a_t, eta, use_reentrant=False)
+                        _step, x_t, W, a_t, eta, sur_t, use_reentrant=False)
                 else:
-                    _, W_new = self._sweep(x_t, W, a_t, eta)
+                    _, W_new = self._sweep(x_t, W, a_t, eta, sur_t)
                 # per-row delta: a padded row (m_t=0) is left bit-identical.
                 W = W + m_t.view(B, 1, 1, 1, 1) * (W_new - W)
             self._decay_last = ((alpha * mask.unsqueeze(-1)).sum()
                                 / mask.sum().clamp_min(1.0) / self.C).detach()   # mean α canary
+            self._surprise_last = ((sur * mask).sum() / mask.sum().clamp_min(1.0)).detach()  # mean surprise
         state["W"] = W
         state["n_written"] = state.get("n_written", 0) + Wlen
         return state, {}
@@ -327,6 +339,7 @@ class BioMemEncoder(nn.Module):
                 "biomem_edge_satfrac": (W.abs() > 0.99).float().mean(),
                 "biomem_state_satfrac": self._sat_last,
                 "biomem_decay": self._decay_last,             # mean per-column retention α (was constant leak)
+                "biomem_surprise": self._surprise_last,       # mean LM next-token surprise (write-time signal)
                 "biomem_eta": self.eta,
             }
             if self.read_mode == "prepend":
