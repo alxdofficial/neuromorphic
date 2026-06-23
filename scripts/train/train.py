@@ -1724,6 +1724,7 @@ def main():
         # TRIMMED to r85 (from icae's r104) to offset the MP params → total ≈ icae's ~6.9M.
         cfg.slotgraph_n_slots = _M
         cfg.slotgraph_n_nodes = _M // 2          # FIXED partition: half nodes, half edges
+        cfg.slotgraph_lora_rank = 85; cfg.slotgraph_lora_alpha = 170   # +MP modules → params ≈ icae
         # vqicae (icae + VQ-discretized slots): encoder-LoRA r96 + projns + EMA codebook (a buffer,
         # not gradient-trained) → ~7.0M trainable, matched to icae. Large codebook K=8192.
         cfg.vqicae_n_slots = _M

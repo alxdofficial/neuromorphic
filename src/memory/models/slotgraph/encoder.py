@@ -15,9 +15,12 @@ APPENDED to the passage, run through the LM's OWN layers) — and read the slots
     use_structure=False ⇒ plain prepend of the id-tagged slots (id-tagged ICAE control).
 
 MAGNITUDE / GRADIENT POLICY (unified — no free-floating scale coefficients, no gates):
-  1. Bound every internal magnitude with a NORMALIZATION, not a gate or a squashing activation. The MP
-     read RMSNorm's the node state each hop: bounded by construction (no overflow → sum aggregation is
-     safe) and gradient-alive (rescales, never saturates — unlike tanh/sigmoid or a stuck scalar gate).
+  1. Bound internal magnitude with PRE-norm + degree-normalized aggregation, not a gate or a squashing
+     activation. The MP read RMSNorm's the residual stream BEFORE each message step (so messages are
+     bounded) and mean-aggregates (degree-invariant); the residual then accumulates without a post-norm.
+     Pre-norm (not post-norm) is essential: rmsnorm(h+update) would have a 1/‖·‖ gradient singularity
+     when the update cancels h, but rmsnorm(h) is safe because h always contains slot_final (never ≈0).
+     RMSNorm rescales (gradient-alive); unlike tanh/sigmoid or a stuck scalar gate it can't saturate.
   2. The ONLY boundary scaling is a MEASURED rescale of the output to the LM's token-embedding norm
      (_NormMatch). Unit-RMS ≠ the LM's input scale, so this one conversion is necessary; it is measured,
      not tuned. Head inputs are likewise balanced to a measured scale (√d) so content and id streams
@@ -194,17 +197,24 @@ class SlotGraphEncoder(nn.Module):
         edge_w = (1.0 - self.is_node).view(1, self.M, 1)          # [1,M,1] edge slots emit messages
         node_recv = self.is_node.view(1, self.M, 1)              # [1,M,1] node slots receive
         K = self._adaptive_hops(src, dst)
+        deg = torch.einsum("bmn,bm->bn", (src + dst).detach(),     # incident-edge count per node (mean-agg)
+                           (1.0 - self.is_node).view(1, self.M).expand(src.shape[0], -1)).clamp(min=1.0)
         pre = self.norm(slot_final.float())                       # plain read (for the inert-MP canary)
 
+        # PRE-norm residual GNN (the stable transformer pattern). RMSNorm the residual stream BEFORE
+        # computing messages: h always contains slot_final, so it's never near-zero → no 1/‖·‖ singularity
+        # (a POST-norm rmsnorm(h+update) would have it, when the update cancels h). The residual then
+        # accumulates without a post-norm; the final _NormMatch handles the accumulated magnitude.
         h = slot_final
         for _ in range(K):
-            h_src = torch.einsum("bmn,bnd->bmd", src, h)          # source-endpoint node state per edge
-            h_dst = torch.einsum("bmn,bnd->bmd", dst, h)          # dst-endpoint node state per edge
-            m_to_dst = self.msg(torch.cat([h_src, h], -1)) * edge_w   # src node + THIS edge's content → dst
-            m_to_src = self.msg(torch.cat([h_dst, h], -1)) * edge_w   # symmetric: dst node + edge → src
-            agg = (torch.einsum("bmn,bmd->bnd", dst, m_to_dst)       # SUM messages at endpoint nodes
-                   + torch.einsum("bmn,bmd->bnd", src, m_to_src))    # (per-hop RMSNorm below bounds it)
-            h = _rmsnorm(h + self.update(agg) * node_recv)         # bounded, gradient-alive, ungated relay
+            hn = _rmsnorm(h)                                       # normalize the stream → bounded messages
+            h_src = torch.einsum("bmn,bnd->bmd", src, hn)         # source-endpoint node state per edge
+            h_dst = torch.einsum("bmn,bnd->bmd", dst, hn)         # dst-endpoint node state per edge
+            m_to_dst = self.msg(torch.cat([h_src, hn], -1)) * edge_w   # src node + THIS edge's content → dst
+            m_to_src = self.msg(torch.cat([h_dst, hn], -1)) * edge_w   # symmetric: dst node + edge → src
+            agg = (torch.einsum("bmn,bmd->bnd", dst, m_to_dst)       # mean-aggregate messages at endpoint nodes
+                   + torch.einsum("bmn,bmd->bnd", src, m_to_src)) / deg.unsqueeze(-1)
+            h = h + self.update(agg) * node_recv                  # residual relay (no post-norm), only nodes
         memory = self.norm(h.float())
         info = {"hops": K, "delta": (1.0 - F.cosine_similarity(pre, memory, dim=-1)).mean().detach()}
         return memory, info
