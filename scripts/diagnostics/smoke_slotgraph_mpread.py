@@ -35,12 +35,9 @@ DEV = "cuda"
 GROUPS = {
     "TOPO src_head":   ("encoder.src_head",),
     "TOPO dst_head":   ("encoder.dst_head",),
-    "TOPO role_embed": ("encoder.role_embed",),
-    "TOPO inject_raw": ("encoder.inject_raw",),
     "TOPO log_temp":   ("encoder.log_temp",),
     "MP   msg":        ("encoder.msg",),
     "MP   update":     ("encoder.update",),
-    "MP   mp_gate_raw": ("encoder.mp_gate_raw",),
     "CONT slot_init":  ("encoder.slot_init",),
     "CONT norm":       ("encoder.norm",),
     "encoder_LoRA":    ("encoder.base", "lora"),
@@ -48,7 +45,7 @@ GROUPS = {
 }
 
 
-def build(mp_read=True, seed=0):
+def build(structure=True, seed=0):
     torch.manual_seed(seed)
     cfg = ReprConfig(use_llama_lora=True, batch_size=4)
     bc = AutoConfig.from_pretrained(BACKBONE)
@@ -61,9 +58,7 @@ def build(mp_read=True, seed=0):
     cfg.use_llama_lora = True; cfg.llama_lora_rank = 16; cfg.llama_lora_alpha = 32
     cfg.slotgraph_n_slots = 32
     cfg.slotgraph_lora_rank = 85; cfg.slotgraph_lora_alpha = 170
-    cfg.slotgraph_start_layer = 0
-    cfg.slotgraph_use_structure = True
-    cfg.slotgraph_mp_read = mp_read
+    cfg.slotgraph_use_structure = structure
     m = ReprLearningModel(cfg, variant="slotgraph_baseline", llama_model=None).to(DEV)
     m.train(True)
     return m, tok, cfg
@@ -90,7 +85,7 @@ def backward_once(m, batch, task):
 
 
 def main():
-    m, tok, cfg = build(mp_read=True)
+    m, tok, cfg = build(structure=True)
     enc = m.encoder
     tot = sum(p.numel() for p in m.parameters() if p.requires_grad)
     print(f"\n{'='*74}\nslotgraph MP-READ smoke (matched mixed config, REAL bf16 path)\n{'='*74}")
@@ -116,7 +111,7 @@ def main():
         print(f"\n=== {t} ({MIXED_TASK_MODE[t]}) ===")
         print(f"  memory shape = {tuple(mem.shape)}  (M should be 32 — same prepend budget as icae)")
         print(f"  finite = {bool(torch.isfinite(mem).all())}")
-        print(f"  MP read: hops={int(aux['slotgraph_mp_hops'])}  gate={float(aux['slotgraph_mp_gate']):.3f}  "
+        print(f"  MP read: hops={int(aux['slotgraph_mp_hops'])}  "
               f"delta(1-cos pre→post)={float(aux['slotgraph_mp_delta']):.3f}  "
               f"({'INERT (≈0)' if float(aux['slotgraph_mp_delta'])<1e-3 else 'read uses the graph'})")
         print(f"  struct: edge_frac={float(aux['slotgraph_edge_frac']):.3f}  "
@@ -140,7 +135,7 @@ def main():
 
     # ── 4. A/B vs plain-prepend read (same seed) ──
     print(f"\n=== A/B: does the MP read LIFT the endpoint-head gradient? (same seed/data) ===")
-    m_off, _, _ = build(mp_read=False, seed=0)
+    m_off, _, _ = build(structure=False, seed=0)
     backward_once(m_off, to_device(vs["mae"][0], DEV), "mae")
     for g in ("TOPO src_head", "TOPO dst_head"):
         off = grad_norm(m_off, GROUPS[g])

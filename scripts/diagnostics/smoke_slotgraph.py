@@ -32,7 +32,6 @@ def apply_mixed_capacity(cfg):
     cfg.slotgraph_n_slots = 32
     cfg.slotgraph_n_nodes = 16          # FIXED partition (matches train.py: M//2)
     cfg.slotgraph_lora_rank = 85; cfg.slotgraph_lora_alpha = 170   # +MP modules → params ≈ icae (matches train.py)
-    cfg.slotgraph_start_layer = 0
 
 
 def build(use_structure=True):
@@ -83,8 +82,7 @@ def main():
         print(f"  canaries: edge_frac={float(aux['slotgraph_edge_frac']):.3f}  "
               f"src_ent={float(aux['slotgraph_src_entropy']):.2f}  dst_ent={float(aux['slotgraph_dst_entropy']):.2f}  "
               f"(max ln32={torch.log(torch.tensor(32.)):.2f})")
-        print(f"  role_ent={float(aux['slotgraph_role_entropy']):.3f}  temp={float(aux['slotgraph_temp']):.2f}  "
-              f"inject_scale={float(aux['slotgraph_inject_scale']):.3f}  "
+        print(f"  temp={float(aux['slotgraph_temp']):.2f}  "
               f"mem_effrank={float(aux['slotgraph_mem_effrank']):.2f}/{cfg.d_llama}")
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             out = (m.compute_masked_reconstruction_loss(b)
@@ -103,8 +101,8 @@ def main():
     with torch.amp.autocast("cuda", dtype=torch.bfloat16):
         out = m.compute_masked_reconstruction_loss(b)
     out["loss"].backward()
-    comps = ["slot_init", "role_embed", "struct_norm", "src_head", "dst_head",
-             "log_temp", "inject_raw", "msg", "update", "mp_gate_raw", "norm"]
+    comps = ["slot_init", "struct_norm", "src_head", "dst_head",
+             "log_temp", "msg", "update", "norm"]
     pd = dict(enc.named_parameters())
     ok = True
     for c in comps:

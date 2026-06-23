@@ -58,13 +58,8 @@ def structure(enc, ctx, mask):
     slots0 = (enc.slot_init.unsqueeze(0).expand(B, M, d) + enc.id_embed.unsqueeze(0)).to(ctx.dtype)
     inp = torch.cat([ctx, slots0], 1)
     attn = torch.cat([mask, torch.ones(B, M, device=mask.device, dtype=mask.dtype)], 1).long()
-    handles = enc._install_struct_hooks()
-    try:
-        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            h = enc.base.model(inputs_embeds=inp, attention_mask=attn).last_hidden_state
-    finally:
-        for hh in handles:
-            hh.remove()
+    with torch.amp.autocast("cuda", dtype=torch.bfloat16):   # no injection hooks (structure is read-only now)
+        h = enc.base.model(inputs_embeds=inp, attention_mask=attn, use_cache=False).last_hidden_state
     slot_final = h[:, -M:].float()
     hhin = enc._head_in(slot_final)                       # [struct_norm(slot) ; scaled id]
     temp = float(enc.log_temp.exp().clamp_min(1e-2))

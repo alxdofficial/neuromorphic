@@ -147,11 +147,12 @@ class ReprConfig:
     # ICAE write (own frozen base + encoder-LoRA, M slots appended to the passage, run through the
     # LM's OWN layers) with a FIXED node/edge partition (slots 0..K-1 nodes, K..M-1 edges; see
     # slotgraph_n_nodes). Each EDGE slot predicts HARD (straight-through) which two NODE slots it links
-    # (masked to the node pool → every edge is node→node); concretized as a TokenGT role+identity
-    # embedding (id = fixed orthonormal per-position code; transparent SUM of endpoint ids for edges)
-    # and re-injected before the next layer. READ = a multi-hop residual message-passing GNN over the
-    # predicted graph (slotgraph_mp_read), so the prepended memory is a FUNCTION of the topology and the
-    # endpoint heads get real loss gradient. use_structure=False ⇒ id-tagged ICAE control.
+    # (masked to the node pool → every edge is node→node). READ = a multi-hop residual message-passing
+    # GNN over the predicted graph (node state RMSNorm-bounded each hop, ungated; zero-init update for a
+    # plain-read cold-start), so the prepended memory is a FUNCTION of the topology and the endpoint
+    # heads get real loss gradient. use_structure=False ⇒ plain prepend (id-tagged ICAE control).
+    # Magnitudes: bounded internally by RMSNorm + one measured output rescale to the embedding norm;
+    # no scale coefficients/gates, no per-layer injection (see the encoder MAGNITUDE/GRADIENT POLICY).
     slotgraph_n_slots: int = 32          # M — slots = PREPEND tokens (matches baselines' M=32)
     slotgraph_n_nodes: int = 16          # K — slots 0..K-1 are NODES, K..M-1 are EDGES (FIXED partition).
                                          # Role is assigned by position, NOT predicted: "which slot is a
@@ -161,21 +162,12 @@ class ReprConfig:
                                          # GIVEN; only the connectivity (endpoints) + content are learned.
     slotgraph_lora_rank: int = 32        # encoder-LoRA rank (mixed block sets ~85 to match icae+MP params)
     slotgraph_lora_alpha: int = 64
-    slotgraph_start_layer: int = 0       # predict/inject structure from this base layer onward (0 = all)
     slotgraph_temp_init: float = 1.0     # straight-through surrogate temperature (gradient sharpness)
-    slotgraph_use_structure: bool = True # False ⇒ no structure heads/injection/MP = "id-tagged ICAE"
+    slotgraph_use_structure: bool = True # False ⇒ plain prepend of the id-tagged slots = "id-tagged ICAE"
                                          # (slots still carry the fixed id tags; the TRUE pure-ICAE
                                          # control is the separate icae_baseline variant). The ablation.
-    # READ: multi-hop residual message passing over the predicted graph (nodes relay along predicted
-    # edges; edges keep their relation content). Output is still M vectors (same prepend budget as icae).
-    # This makes the prepended memory a FUNCTION of the topology → the edge/role heads finally get
-    # loss gradient (the plain-prepend read left them inert). #hops = the predicted graph's DIAMETER
-    # (reachability saturation), capped at max_hops — enough to propagate, not so deep it over-smooths.
-    slotgraph_mp_read: bool = True       # False ⇒ plain prepend read (the inert-structure baseline)
-    slotgraph_max_hops: int = 5          # cap on the adaptive hop count (over-smoothing / compute guard)
-    slotgraph_inject: bool = True        # False ⇒ drop the per-layer structure injection, keep heads+MP
-                                         # read = "MP-read-only" (the STABLE ablation; injection-only
-                                         # over-drives the fragile injection). See encoder MAGNITUDE POLICY.
+    slotgraph_max_hops: int = 5          # cap on the adaptive MP hop count (over-smoothing / compute guard);
+                                         # #hops = the predicted graph's DIAMETER (reachability saturation)
 
     # ── vqicae (ICAE with VQ-VAE-discretized slots; models/vqicae/) ──────────
     # ICAE write, then each slot is quantized to its nearest code in a large EMA codebook
