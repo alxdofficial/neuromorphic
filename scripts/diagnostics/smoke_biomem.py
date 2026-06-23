@@ -7,8 +7,9 @@ read query-conditioned via a decoder-layer hook — NO prepend). This checks, in
   - both compute paths finite: mae → masked_reconstruction; babi → generic compute_loss
   - the conditioned-read hook is exercised (loss goes through write → finalize(stash W) → read-fuse)
   - gradient reaches EVERY component — esp. the WRITE side (in_proj/regulator/cond/eta/leak): the
-    read propagates the query through W(write), so write-grad starvation (the wall that killed prior
-    arms) would show as a starved write side here. eta0>0 + read_gate=0.1 are the cold-start guards.
+    prepend read propagates the M seeds through W(write), so write-grad starvation (the wall that
+    killed prior arms) would show as a starved write side here. The read is non-plastic (recall by
+    propagation, no edge update) and prepended; the LM's attention does the addressing.
   - write canaries: edge_absmean, edge/state saturation, leak, eta
 """
 from __future__ import annotations
@@ -28,17 +29,18 @@ from scripts.train.train import make_mixed_val_sets, to_device, MIXED_TASK_MODE
 BACKBONE = "HuggingFaceTB/SmolLM2-135M"
 DEV = "cuda"
 
-# component-name → (group, prefixes). WRITE = write-side (must NOT be starved); READ = read-side.
+# component-name → prefixes. WRITE = write-side (must NOT be starved); READ = prepend-read side.
 GROUPS = {
     "WRITE in_proj":   ("encoder.in_proj",),
     "WRITE regulator": ("encoder.regulator",),
     "WRITE cond":      ("encoder.cond",),
     "WRITE eta_raw":   ("encoder.eta_raw",),
     "WRITE leak_raw":  ("encoder.leak_raw",),
-    "READ query_proj": ("encoder.read_query_proj",),
-    "READ fuse_proj":  ("encoder.read_fuse_proj",),
-    "READ gate":       ("encoder.read_gate",),
+    "READ seeds":      ("encoder.read_seeds",),
     "READ readout":    ("encoder.readout",),
+    "READ out_norm":   ("encoder.out_norm",),
+    "REFRESH read_in": ("encoder.read_in",),
+    "REFRESH gate":    ("encoder.refresh_gate",),
     "decoder_LoRA":    ("decoder.llama", "lora"),
 }
 
@@ -72,12 +74,12 @@ def main():
     m, tok, cfg = build()
     enc = m.encoder
     tot = sum(p.numel() for p in m.parameters() if p.requires_grad)
-    Wfloats = 2 * cfg.biomem_n_cols * cfg.biomem_k * cfg.biomem_k * 0 + \
-        enc.n_pairs * cfg.biomem_n_cols * cfg.biomem_k * cfg.biomem_k
+    Wfloats = enc.n_pairs * cfg.biomem_n_cols * cfg.biomem_k * cfg.biomem_k
     print(f"\n{'='*74}\nbiomem smoke (matched mixed config, REAL bf16 path)\n{'='*74}")
-    print(f"params = {tot:,} ({tot/1e6:.2f}M)   | cohort target ≈ icae 6.93M")
-    print(f"capacity: W = n_pairs*C*K^2 = {enc.n_pairs}*{cfg.biomem_n_cols}*{cfg.biomem_k}^2 "
-          f"= {Wfloats:,} floats/example  (cohort read budget = 32*576 = 18,432)")
+    print(f"params = {tot:,} ({tot/1e6:.2f}M)   | cohort target ≈ icae 6.93M  read_mode={enc.read_mode}")
+    print(f"read budget = M*d = {enc.M}*{cfg.d_llama} = {enc.M * cfg.d_llama:,} floats (prepend; matched to cohort)")
+    print(f"internal state W = n_pairs*C*K^2 = {enc.n_pairs}*{cfg.biomem_n_cols}*{cfg.biomem_k}^2 "
+          f"= {Wfloats:,} floats/example (the MECHANISM — uncounted, like a KV cache)")
 
     tasks = ["mae", "babi", "continuation", "condrecon_bio"]
     print(f"\nLoading real mixed val sets {tasks}...")
@@ -97,7 +99,8 @@ def main():
             st, _ = enc.streaming_write(st, enc_in, b.context_mask)
             mem, aux = enc.finalize_memory(st)
         print(f"\n=== {t} ({MIXED_TASK_MODE[t]}) ===")
-        print(f"  prepend mem shape = {tuple(mem.shape)} (M=0 expected — read is query-conditioned)")
+        print(f"  prepend mem shape = {tuple(mem.shape)} (M=32 prepend tokens expected) "
+              f"finite={bool(torch.isfinite(mem).all())}  mem_effrank={float(aux.get('biomem_mem_effrank', 0)):.2f}/{cfg.d_llama}")
         print(f"  edges finite = {bool(torch.isfinite(enc._read_W).all())}  "
               f"edge_absmean={float(aux['biomem_edge_absmean']):.4f}  "
               f"edge_satfrac={float(aux['biomem_edge_satfrac']):.3f}  "
@@ -114,6 +117,11 @@ def main():
 
     # ── 3. gradient flow (real mae loss → backward): WRITE side must not be starved ──
     print(f"\n=== gradient flow (real mae loss → backward) ===")
+    # refresh_gate is zero-init (ReZero) → read_in is correctly a no-op at step 0 (it gets gradient
+    # only once the gate ramps off zero). Set the gate nonzero here so the smoke exercises read_in.
+    if getattr(enc, "wants_prepend_refresh", False):
+        enc.refresh_gate.data.fill_(0.1)
+        print("  (refresh_gate set to 0.1 to exercise read_in; default is ReZero 0 → no-op at init)")
     m.zero_grad(set_to_none=True)
     m.task_mode = "masked_reconstruction"
     b = to_device(vs["mae"][0], DEV)

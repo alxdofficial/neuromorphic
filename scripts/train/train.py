@@ -1759,6 +1759,9 @@ def main():
         cfg.vqicae_n_slots = _M
         cfg.vqicae_lora_rank = 100; cfg.vqicae_lora_alpha = 200
         cfg.vqicae_codebook_size = 8192; cfg.vqicae_d_code = 256
+        # biomem (gated fast-Hebbian grid): M seeds → prepend = the same M×d read budget as the
+        # cohort; readout_h tuned to ~6.9M trainable (W is per-example fast state, NOT counted).
+        cfg.biomem_n_slots = _M
         print(f"[capacity] mixed: FIXED M={_M}, beacon_ratio={cfg.beacon_ratio} (ctx "
               f"{args.mixed_ctx}:M = {args.mixed_ctx // _M}:1); baselines icae r104 / "
               f"ccm r52 / ac r52 / beacon 11L / slotgraph r85+MP-read / "

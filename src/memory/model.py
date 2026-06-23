@@ -325,6 +325,8 @@ class ReprLearningModel(nn.Module):
         # reinforce_prepend_each_layer + emits 'prepend_struct'. The current slotgraph does NEITHER
         # (its structure lives entirely in the post-LM message-passing read), so this returns [].
         reinforce = self._install_prepend_reinforce_hooks(mem_aux, M, 0, shuffle_memory)
+        # biomem-prepend: re-read W at every layer with the current slot hiddens (no-op for others).
+        refresh = self._install_prepend_refresh_hooks(M, 0, zero_memory, shuffle_memory)
         try:
             base_out = self.decoder.llama.model(
                 inputs_embeds=full, attention_mask=attn, use_cache=False)
@@ -332,6 +334,8 @@ class ReprLearningModel(nn.Module):
             if hook_handle is not None:
                 hook_handle.remove()
             for hh in reinforce:
+                hh.remove()
+            for hh in refresh:
                 hh.remove()
         span_hidden = base_out.last_hidden_state[:, M:]                 # [B,T,d]
 
@@ -480,6 +484,35 @@ class ReprLearningModel(nn.Module):
                 return args, kw
             return _hook
         return [layer.register_forward_pre_hook(_mk(), with_kwargs=True)
+                for layer in self.decoder.llama.model.layers]
+
+    def _install_prepend_refresh_hooks(self, M: int, offset: int, zero_memory: bool,
+                                       shuffle_memory: bool):
+        """biomem-prepend PER-LAYER REFRESH: before every decoder layer, re-read the written edges
+        with the current (attention-mixed, query-aware) slot hiddens and ADD a zero-init-gated recall
+        to the M prepend positions [offset:offset+M]. The slots become a working memory refined through
+        depth — recovering the generation-time conditioning a static prepend gives up, and letting each
+        slot see the others (dedup). No-op unless the encoder sets wants_prepend_refresh.
+        REAL = refresh; OFF (zero_memory) = none; SHUF = re-read the WRONG-example edges (rolled W)."""
+        enc = self.encoder
+        if not getattr(enc, "wants_prepend_refresh", False) or zero_memory or M <= 0:
+            return []
+        if not getattr(enc, "has_read_state", lambda: False)():
+            return []
+        if shuffle_memory:                                   # roll W to match the rolled prepend memory
+            enc.roll_read_state()                            # (harness already enforces B>1 for SHUF)
+        def _hook(module, args, kwargs):
+            h = args[0] if args else kwargs.get("hidden_states")
+            if h is None or h.shape[1] < offset + M:
+                return None
+            delta = enc.refresh_prepend(h[:, offset:offset + M])      # [B,M,d] gated recall
+            new = h.clone()
+            new[:, offset:offset + M] = new[:, offset:offset + M] + delta.to(h.dtype)
+            if args:
+                return (new,) + tuple(args[1:]), kwargs
+            kw = dict(kwargs); kw["hidden_states"] = new
+            return args, kw
+        return [layer.register_forward_pre_hook(_hook, with_kwargs=True)
                 for layer in self.decoder.llama.model.layers]
 
     def _encode_for_memory(self, ctx_embeds, ctx_mask):
@@ -822,6 +855,9 @@ class ReprLearningModel(nn.Module):
         # only when there is NO chat scaffold (L_pre=0); guard on that (the active backbone).
         reinforce = (self._install_prepend_reinforce_hooks(finalize_aux, M, 0, shuffle_memory)
                      if self.chat_template is None else [])
+        # biomem-prepend per-layer refresh (memory at [0:M] only with no chat scaffold).
+        refresh = (self._install_prepend_refresh_hooks(M, 0, zero_memory, shuffle_memory)
+                   if self.chat_template is None else [])
 
         try:
             # Selective lm_head: run base model for hidden states, then only
@@ -842,6 +878,8 @@ class ReprLearningModel(nn.Module):
             if hook_handle is not None:
                 hook_handle.remove()
             for hh in reinforce:
+                hh.remove()
+            for hh in refresh:
                 hh.remove()
             # MT-faithful: always clear the kNN datastore so the shared decoder
             # Llama is left in OFF/vanilla state for the next variant or call.

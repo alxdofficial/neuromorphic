@@ -36,11 +36,22 @@ fix). The sweep runs in fp32 (autocast disabled) — edge precision is load-bear
 Write/Read (both = propagation)
 -------------------------------
   * WRITE: stream the passage; each token sweeps forward, edges accumulate via the
-    gated delta rule. Padded tokens leave their row's edges bit-identical.
-  * READ (query-conditioned): the frozen decoder's hidden state at a tap layer is the
-    QUERY — `conditioned_read` propagates it through the WRITTEN edges and returns a
-    recall delta fused (zero-init) back into the decoder. NO fixed seeds, NO prepend.
-  * edges RESET to zero each example (per-passage fast memory).
+    gated delta rule. Padded tokens leave their row's edges bit-identical. The write
+    ingests the frozen LM's FINAL hidden (deepest, already-integrated representation —
+    intermediate layers add nothing over it, so the write is single-layer).
+  * READ — two modes (cfg.biomem_read_mode):
+      - "prepend" (v2 DEFAULT): M learned SEED probes propagate (read-only, NO edge
+        update) through the WRITTEN edges; a per-slot learned readout turns each seed's
+        final grid activity into one d_llama token → M tokens PREPENDED. The frozen LM's
+        OWN attention does the addressing (the endogenous reader — prepend beats every
+        hand-built read). Recall is still propagation through the synapses; only the
+        DELIVERY changed. No cross-slot pooling (M independent seed-readouts) → slot
+        addressing survives to the decoder; the per-slot D_grid→d readout is a within-slot
+        projection, not a count-reducing pool.
+      - "conditioned" (legacy): the decoder's tap-layer hidden is the query; the recall
+        delta is fused (gated) back into the residual stream. NO prepend.
+  * edges RESET to zero each example (per-passage fast memory). The read is non-plastic
+    (pure propagation, no dW) in BOTH modes → reads never corrupt the written memory.
 
 Engineering: the per-token write sweep is gradient-CHECKPOINTED (recompute in
 backward); leak/eta are passed positionally so their gradient survives checkpointing.
@@ -54,6 +65,7 @@ import torch.nn.functional as F
 import torch.utils.checkpoint
 from torch import Tensor
 
+from ...common import _NormMatch
 from ...config import ReprConfig
 
 
@@ -96,35 +108,41 @@ class _Regulator(nn.Module):
 
 
 class BioMemEncoder(nn.Module):
-    """Gated fast-Hebbian (delta-rule) grid memory encoder with a query-conditioned read.
+    """Gated fast-Hebbian (delta-rule) grid memory encoder.
 
     Interface: init_streaming_state / streaming_write (accumulate the passage into the
-    fast edges — NO backbone forward) / finalize_memory (stash the written edges; return
-    an EMPTY prepend). The READ is query-conditioned: the harness calls `conditioned_read`
-    from a decoder-layer hook with the live hidden states. See docs / model.py.
+    fast edges — NO backbone forward) / finalize_memory. Read modes (cfg.biomem_read_mode):
+      - "prepend" (default): finalize propagates M learned seeds through the edges and
+        returns M prepend tokens [B,M,d_llama]; the LM's attention reads them (is_conditioned_read=False).
+      - "conditioned" (legacy): finalize returns an EMPTY prepend + stashes the edges; the
+        harness calls `conditioned_read` from a decoder-layer hook (is_conditioned_read=True).
     """
 
-    is_conditioned_read = True            # uses the tap-layer read hook, not a prepend
     ingest_lm_final_hidden = True         # WRITE ingests the frozen LM's final hidden, not raw embeds
 
     def __init__(self, cfg: ReprConfig):
         super().__init__()
         self.cfg = cfg
         C, K, H = cfg.biomem_n_cols, cfg.biomem_k, cfg.biomem_depth_h
-        if C * K != cfg.d_llama:
-            raise ValueError(
-                f"biomem: n_cols*k = {C}*{K} = {C * K} must equal d_llama={cfg.d_llama} "
-                f"(token embedding reshapes into the C x K input layer).")
+        # D_grid = C*K is DECOUPLED from d_llama: in_proj (d_llama→D_grid) projects the LM hidden
+        # into grid space, the per-slot readout (D_grid→d_llama) projects back. The grid's binding
+        # capacity (K²/column) is no longer hostage to the LM's hidden size. (C*K==d_llama is still
+        # the cheap default that makes the projections square.)
         self.C, self.K, self.H = C, K, H
         self.n_pairs = H - 1                                    # fast-edge layer-pairs
+        self.d_grid = C * K                                     # grid activity dim (= d_llama while coupled)
         self.d_llama = cfg.d_llama
         self.grad_checkpoint = bool(cfg.biomem_grad_checkpoint)
         self.read_tap_layer = int(cfg.biomem_read_tap_layer)
+        self.read_mode = str(getattr(cfg, "biomem_read_mode", "prepend"))
+        self.M = int(getattr(cfg, "biomem_n_slots", 32))       # # read seeds = # prepend tokens
+        self.is_conditioned_read = (self.read_mode == "conditioned")   # instance attr (set by mode)
+        self.wants_prepend_refresh = False                     # set True by the prepend branch below
         self._read_W = None                                    # stashed each finalize
         self.register_buffer("_sat_last", torch.zeros(()), persistent=False)
 
         # ── learned objects (all small) ──────────────────────────────────────
-        self.in_proj = nn.Linear(cfg.d_llama, cfg.d_llama)     # token embed -> grid input
+        self.in_proj = nn.Linear(cfg.d_llama, self.d_grid)     # token embed -> grid input
         d_cond = cfg.biomem_d_cond
         self.cond = nn.Parameter(torch.randn(self.n_pairs, C, d_cond) / math.sqrt(d_cond))
         self.regulator = _Regulator(d_cond, cfg.biomem_reg_hidden)
@@ -133,30 +151,49 @@ class BioMemEncoder(nn.Module):
         self.leak_raw = nn.Parameter(torch.tensor(math.log(leak0 / (1 - leak0))))
         eta0 = float(cfg.biomem_base_write_rate_init)
         self.eta_raw = nn.Parameter(torch.tensor(math.log(math.expm1(eta0))))  # softplus⁻¹(eta0)
-        # readout: grid activity (d_llama) -> recall vector (d_llama).
+        # readout: per-slot grid activity (d_grid) -> one recall token (d_llama).
         ro_h = cfg.biomem_readout_hidden
         self.readout = nn.Sequential(
-            nn.Linear(cfg.d_llama, ro_h), nn.GELU(), nn.Linear(ro_h, cfg.d_llama))
-        # query-conditioned read projections: query_proj maps the decoder hidden into the
-        # grid input; fuse_proj maps the recall back into the residual stream and is
-        # ZERO-INIT (ReZero) so the read is a no-op at step 0 (clean gradient + no decoder
-        # destabilization). query_proj has normal init so the read path gets gradient as
-        # soon as fuse_proj lifts off zero.
-        self.read_query_proj = nn.Linear(cfg.d_llama, cfg.d_llama)
-        self.read_fuse_proj = nn.Linear(cfg.d_llama, cfg.d_llama)
-        # ReZero-style contribution scale, init SMALL but NONZERO (not zero): the read
-        # perturbs the residual gently at step 0 (decoder stays usable) AND — critically —
-        # gradient reaches the write-side (in_proj/regulator/eta/leak) from the first step.
-        # A zero-init fuse would make the read a no-op and re-create the write-side
-        # gradient starvation we fought all along (dead until fuse drifts off zero).
-        self.read_gate = nn.Parameter(torch.tensor(0.1))
+            nn.Linear(self.d_grid, ro_h), nn.GELU(), nn.Linear(ro_h, cfg.d_llama))
+
+        if self.read_mode == "prepend":
+            # M learned SEED probes [M,C,K] (the COLD read inputs, before any decoder mixing).
+            # Unit-std init keeps hardtanh(seed) in its gradient-carrying band; distinct rows →
+            # seeds probe different aspects of W.
+            self.read_seeds = nn.Parameter(torch.randn(self.M, C, K))
+            # boundary scaling: put the M prepend tokens in Llama's embedding-norm region
+            # (else they are attention distractors — the prepend-baseline failure _NormMatch fixes).
+            self.out_norm = _NormMatch(cfg.d_llama)
+            # per-layer refresh: re-read W using the current (attention-mixed) slot hidden. read_in
+            # maps a d_llama slot hidden into grid space (d→D_grid); refresh_gate is ZERO-INIT (ReZero)
+            # so the refresh is a no-op at step 0 (the initial prepend already feeds the write-side
+            # gradient, so zero-init here is safe — no starvation) and ramps in as it learns.
+            self.per_layer_refresh = bool(getattr(cfg, "biomem_per_layer_refresh", True))
+            self.wants_prepend_refresh = self.per_layer_refresh
+            if self.per_layer_refresh:
+                self.read_in = nn.Linear(cfg.d_llama, self.d_grid)
+                self.refresh_gate = nn.Parameter(torch.zeros(()))
+        elif self.read_mode == "conditioned":
+            # query-conditioned read projections: query_proj maps the decoder hidden into the grid;
+            # fuse_proj maps the recall back into the residual; read_gate is SMALL but NONZERO so the
+            # read is gentle at step 0 AND the write-side gets gradient from step 1 (cold-start; a
+            # zero-init fuse would re-create the write-grad starvation we fought all along).
+            self.read_query_proj = nn.Linear(cfg.d_llama, self.d_grid)
+            self.read_fuse_proj = nn.Linear(cfg.d_llama, cfg.d_llama)
+            self.read_gate = nn.Parameter(torch.tensor(0.1))
+        else:
+            raise ValueError(f"biomem_read_mode must be 'prepend' or 'conditioned', got {self.read_mode!r}")
         # random-FIXED per-neuron thresholds theta [n_pairs, C, K] (fp32 buffer).
         self.register_buffer(
             "theta", cfg.biomem_theta_scale * torch.randn(self.n_pairs, C, K))
 
+        _read = (f"PREPEND {self.M} seeds (LM attention reads"
+                 + (", per-layer refresh" if getattr(self, "per_layer_refresh", False) else "") + ")"
+                 if self.read_mode == "prepend"
+                 else f"query-conditioned read @ tap L{self.read_tap_layer}")
         print(f"[biomem] gated fast-Hebbian (delta-rule) grid: C={C} x K={K} x H={H} "
               f"({self.n_pairs} edge layer-pairs, {C * self.n_pairs * K * K:,} fast "
-              f"edges/example), query-conditioned read @ tap L{self.read_tap_layer}, "
+              f"edges/example), d_grid={self.d_grid}, read={_read}, "
               f"d_cond={d_cond}, reg_h={cfg.biomem_reg_hidden}, readout_h={ro_h}, "
               f"checkpoint={self.grad_checkpoint}")
 
@@ -227,12 +264,49 @@ class BioMemEncoder(nn.Module):
         state["n_written"] = state.get("n_written", 0) + Wlen
         return state, {}
 
+    def _propagate_read(self, x_grid: Tensor, W: Tensor) -> Tensor:
+        """Shared read core (read-only, fp32): propagate a grid-space query [B,M,C,K] through the
+        WRITTEN edges (NO edge update → reads never corrupt memory), per-slot readout → M tokens
+        [B,M,d_llama] at Llama's embedding norm. Recall = propagation through the synapses."""
+        Bn, Mn = x_grid.shape[:2]
+        invK = self.K ** -0.5
+        s = _hardtanh(x_grid)
+        for l in range(self.n_pairs):
+            inp = torch.einsum("bcij,bmci->bmcj", W[:, l].float(), s) * invK
+            s = _hardtanh(inp - self.theta[l])                 # theta[l] [C,K] broadcasts
+        r = self.readout(s.reshape(Bn, Mn, self.d_grid))       # [B,M,d_llama]
+        return self.out_norm(r)                                # embedding-norm region (no distractors)
+
+    def _read_prepend(self, W: Tensor) -> Tensor:
+        """Initial PREPEND read: the COLD learned seeds (pre-decoder-mixing) propagate through W."""
+        B = W.shape[0]
+        with torch.autocast(device_type="cuda", enabled=False):
+            x = self.read_seeds.unsqueeze(0).expand(B, self.M, self.C, self.K)   # [B,M,C,K]
+            return self._propagate_read(x, W.float())
+
+    def refresh_prepend(self, slot_h: Tensor) -> Tensor:
+        """Per-layer REFRESH (read-only): re-read W with the CURRENT slot hiddens (attention-mixed →
+        query-aware + each slot has seen the others → dedup). slot_h [B,M,d_llama] → read_in → grid →
+        propagate W → readout → out_norm; gated by the zero-init refresh_gate (no-op at step 0). Returns
+        a delta [B,M,d_llama] to ADD to the prepend positions. Reads the stashed (SHUF-rolled) self._read_W."""
+        W = self._read_W
+        assert W is not None, "refresh_prepend called before finalize_memory stashed W"
+        B, M, _ = slot_h.shape
+        with torch.autocast(device_type="cuda", enabled=False):
+            x = self.read_in(slot_h.float()).view(B, M, self.C, self.K)   # d_llama → grid space
+            recall = self._propagate_read(x, W.float())                   # [B,M,d_llama]
+            delta = self.refresh_gate * recall
+        return delta.to(slot_h.dtype)
+
     def finalize_memory(self, state):
-        """Stash the written edges for the query-conditioned read; return an EMPTY
-        prepend (the read happens in the decoder hook, not as prepended tokens)."""
+        """prepend mode: propagate seeds → M prepend tokens. conditioned mode: stash edges,
+        return an EMPTY prepend (the read happens later in the decoder hook)."""
         W = state["W"]                                         # [B,n_pairs,C,K,K]
         self._read_W = W
-        memory = W.new_zeros(W.shape[0], 0, self.d_llama)      # no prepend
+        if self.read_mode == "prepend":
+            memory = self._read_prepend(W).to(W.dtype)         # [B,M,d_llama]
+        else:
+            memory = W.new_zeros(W.shape[0], 0, self.d_llama)  # no prepend (conditioned read)
         with torch.no_grad():
             aux = {
                 "biomem_edge_absmean": W.abs().mean(),
@@ -241,7 +315,19 @@ class BioMemEncoder(nn.Module):
                 "biomem_leak": self.leak,
                 "biomem_eta": self.eta,
             }
+            if self.read_mode == "prepend":
+                m = memory.reshape(-1, memory.shape[-1])
+                aux["biomem_mem_effrank"] = self._participation_ratio(m)
         return memory, aux
+
+    @staticmethod
+    def _participation_ratio(x: Tensor) -> Tensor:
+        """Effective rank (tr C)²/‖C‖_F² of the emitted memory (PR≈1 ⇒ rank-1 collapse)."""
+        x = x.detach().float()
+        if x.shape[0] < 2:
+            return torch.zeros((), device=x.device)
+        xc = x - x.mean(0, keepdim=True); C = xc.t() @ xc
+        return torch.diagonal(C).sum() ** 2 / (C * C).sum().clamp_min(1e-12)
 
     def conditioned_read(self, h: Tensor) -> Tensor:
         """Query-conditioned READ. h: [B,T,d_llama] decoder hidden at the tap layer.
@@ -258,7 +344,7 @@ class BioMemEncoder(nn.Module):
             for l in range(self.n_pairs):
                 inp = torch.einsum("bcij,btci->btcj", W[:, l], s) * invK
                 s = _hardtanh(inp - self.theta[l])             # theta[l] [C,K] broadcasts
-            r = self.readout(s.reshape(B, T, self.d_llama))    # [B,T,d_llama]
+            r = self.readout(s.reshape(B, T, self.d_grid))     # [B,T,d_llama]
             delta = self.read_gate * self.read_fuse_proj(r)    # small-init gate → gentle, nonzero
         return delta.to(h.dtype)
 

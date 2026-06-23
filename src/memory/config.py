@@ -131,16 +131,22 @@ class ReprConfig:
                                        # C=36,K=16,H=3 → W = 2*36*16^2 = 18,432 floats = EXACT
                                        # raw-float match to the baselines' 32-token memory-state
                                        # (n_pairs*K=32; trades column width/depth to hit parity).
-    biomem_n_slots: int = 16           # M — query seeds = prepend memory tokens (k-sliced)
+    biomem_read_mode: str = "prepend"  # "prepend" (v2: M learned seeds → propagate W → prepend, LM
+                                       # attention reads) | "conditioned" (legacy: tap-layer fuse read)
+    biomem_per_layer_refresh: bool = True  # prepend mode: at EVERY decoder layer, re-read W with the
+                                       # current (attention-mixed, query-aware) slot hiddens and add a
+                                       # zero-init-gated recall back → the slots become context-conditioned
+                                       # (recovers what static prepend gives up) + see each other (dedup).
+    biomem_n_slots: int = 32           # M — # learned read seeds = # prepend memory tokens (32×576 read budget)
     biomem_d_cond: int = 48            # per-(col,layer-pair) conditioning vector width
     biomem_reg_hidden: int = 64        # plasticity-regulator MLP hidden width (per-edge; keep narrow)
-    biomem_seed_hidden: int = 1280     # query-seed encoder MLP hidden width
-    biomem_readout_hidden: int = 4352  # readout MLP hidden width (param-matched ~6.9M to the cohort)
+    biomem_readout_hidden: int = 4600  # readout MLP hidden width (param-matched ~6.9M; trimmed to offset
+                                       # the per-layer-refresh read_in projection — keeps prepend mode at ~icae)
     biomem_leak_init: float = 0.1      # initial leak lambda (learned, sigmoid-parameterized)
     biomem_base_write_rate_init: float = 0.1  # eta0 — learnable base write-rate (softplus); >0 so the
                                        # write-side gets gradient even when the gate g≈0 (cold-start fix)
     biomem_theta_scale: float = 0.1    # std of the random-fixed per-neuron threshold theta
-    biomem_read_tap_layer: int = 15    # decoder layer whose hidden state seeds the query-conditioned read
+    biomem_read_tap_layer: int = 15    # (conditioned mode only) decoder layer whose hidden seeds the read
     biomem_grad_checkpoint: bool = True  # checkpoint the per-token sweep (essential for BPTT memory)
 
     # ── slotgraph (fixed-partition graph slot memory; models/slotgraph/) ──────
