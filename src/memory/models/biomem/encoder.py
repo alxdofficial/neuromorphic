@@ -41,7 +41,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-from fla.ops.gated_delta_rule import chunk_gated_delta_rule
+try:                                                   # guarded: only biomem needs fla — a missing fla must
+    from fla.ops.gated_delta_rule import chunk_gated_delta_rule   # not break the whole model registry / other arms
+except ImportError:                                    # pragma: no cover
+    chunk_gated_delta_rule = None
 
 from ...common import _NormMatch
 from ...config import ReprConfig
@@ -64,15 +67,17 @@ class BioMemEncoder(nn.Module):
 
     def __init__(self, cfg: ReprConfig):
         super().__init__()
+        if chunk_gated_delta_rule is None:
+            raise ImportError("biomem requires flash-linear-attention (the chunk_gated_delta_rule kernel): "
+                              "pip install flash-linear-attention")
         self.cfg = cfg
         C, K, H = cfg.biomem_n_cols, cfg.biomem_k, cfg.biomem_depth_h
         self.C, self.K, self.H = C, K, H
-        self.n_pairs = H - 1                                    # fast-edge column-layers (DeltaNet stack)
+        self.n_pairs = H - 1                                    # stacked synaptic column-layers (deep grid)
         self.d_grid = C * K                                     # grid activity dim
         self.d_llama = cfg.d_llama
         self.M = int(getattr(cfg, "biomem_n_slots", 32))       # # read seeds = # prepend tokens
         self.scale = K ** -0.5                                  # DeltaNet readout scale (o = scale·qᵀW)
-        self.read_tap_layer = int(cfg.biomem_read_tap_layer)
         self.wants_surprise = bool(getattr(cfg, "biomem_use_surprise", True))
         self.per_layer_refresh = bool(getattr(cfg, "biomem_per_layer_refresh", True))
         self.wants_prepend_refresh = self.per_layer_refresh
@@ -143,19 +148,23 @@ class BioMemEncoder(nn.Module):
             W_in = state["W"].float()
             new_W, beta_means = [], []
             for l in range(self.n_pairs):
-                v = torch.einsum("btck,ckv->btcv", u, self.V_w[l])               # per-col value
+                un = F.normalize(u, dim=-1, eps=1e-6)         # per-column pre-norm for the projections
+                v = torch.einsum("btck,ckv->btcv", un, self.V_w[l])             # per-col value
                 beta = torch.sigmoid(
-                    torch.einsum("btck,ck->btc", u, self.beta_w[l]) + self.beta_b[l]
-                    + self.beta_s[l] * sur.unsqueeze(-1)) * mask.unsqueeze(-1)    # [B,W,C] write rate (pad→0)
+                    torch.einsum("btck,ck->btc", un, self.beta_w[l]) + self.beta_b[l]
+                    + self.beta_s[l] * sur.unsqueeze(-1)) * mask.unsqueeze(-1)   # [B,W,C] write rate (pad→0)
                 g = torch.log(alpha[:, :, l].clamp_min(1e-6)) * mask.unsqueeze(-1)  # log-decay (pad→0=no decay)
                 o, W_l = chunk_gated_delta_rule(
-                    q=u.contiguous(), k=u.contiguous(), v=v.contiguous(),
+                    q=un.contiguous(), k=un.contiguous(), v=v.contiguous(),
                     g=g.contiguous(), beta=beta.contiguous(),
                     initial_state=W_in[:, l].contiguous(), output_final_state=True,
                     use_qk_l2norm_in_kernel=True, scale=self.scale)
                 new_W.append(W_l)
                 beta_means.append((beta.sum() / mask.sum().clamp_min(1.0) / self.C))
-                u = _hardtanh(o - self.theta[l])              # nonlinearity + compounding → next layer input
+                # RESIDUAL compounding (GCNII): the input persists through depth so the deep layers don't
+                # over-smooth below θ to a constant (the write analogue of the read residual — without it the
+                # per-token rank decays 88→1 and the "deep synaptic column" collapses to ~2 effective layers).
+                u = u + _hardtanh(o - self.theta[l])          # next layer reads layer l's memory readout + carries u
             W = torch.stack(new_W, dim=1)                     # [B,n_pairs,C,K,K]
             with torch.no_grad():
                 self._decay_last = (alpha.mean(2) * mask.unsqueeze(-1)).sum() / mask.sum().clamp_min(1.0) / self.C

@@ -124,35 +124,24 @@ class ReprConfig:
     log_every: int = 50
     save_every: int = 5000
 
-    # ── biomem (gated fast-Hebbian cortical-column grid; models/biomem/) ─────
-    biomem_n_cols: int = 36            # C — #columns (= attention heads); C*K = d_grid = 576
+    # ── biomem (chunk-parallel gated-delta synaptic-grid memory; models/biomem/) ─────
+    biomem_n_cols: int = 36            # C — #columns (= scan heads); C*K = d_grid = 576
     biomem_k: int = 16                 # K — column width (per-column fast-weight head_dim)
-    biomem_depth_h: int = 5            # H — layers per column → H-1=4 STACKED synaptic fast-weight layers
-                                       # (the deep all-synaptic column is what makes this biomem and not a
-                                       # 1-layer DeltaNet — info flows through 4 fast-weight layers with a
-                                       # learned per-neuron threshold between each). W = n_pairs*C*K² floats/
-                                       # example is per-example transient state (UNCOUNTED, like a KV cache);
-                                       # the read budget (M*d=32*576) is what's matched to the baselines.
-    biomem_read_mode: str = "prepend"  # (retained for config compat; the encoder is prepend-only now)
-    biomem_use_surprise: bool = True   # feed the frozen LM's per-token next-token prediction error
-                                       # (−log p, a free pretrained surprise signal) into the write gate +
-                                       # input-dependent decay (surprising token → write harder / retain).
-    biomem_per_layer_refresh: bool = True  # prepend mode: at EVERY decoder layer, re-read W with the
-                                       # current (attention-mixed, query-aware) slot hiddens and add a
-                                       # zero-init-gated recall back → the slots become context-conditioned
-                                       # (recovers what static prepend gives up) + see each other (dedup).
+    biomem_depth_h: int = 5            # H — layers per column → H-1=4 STACKED synaptic fast-weight layers.
+                                       # The DEEP all-synaptic column (info through 4 fast-weight layers with a
+                                       # learned per-neuron threshold + residual between each) is what makes this
+                                       # biomem and not a 1-layer DeltaNet. W = n_pairs*C*K² floats/example is
+                                       # per-example transient state (UNCOUNTED, like a KV cache); the read
+                                       # budget (M*d=32*576) is what's matched to the baselines.
     biomem_n_slots: int = 32           # M — # learned read seeds = # prepend memory tokens (32×576 read budget)
-    biomem_d_cond: int = 48            # per-(col,layer-pair) conditioning vector width
-    biomem_reg_hidden: int = 64        # plasticity-regulator MLP hidden width (per-edge; keep narrow)
-    biomem_readout_hidden: int = 4500  # readout MLP hidden width (param-matched ~6.9M to the cohort;
-                                       # trimmed to offset the deeper-column + refresh projections)
-    biomem_decay_init: float = 0.99    # init per-column retention α (input-dependent decay = sigmoid(decay_proj);
+    biomem_use_surprise: bool = True   # feed the frozen LM's per-token next-token prediction error (−log p, a
+                                       # free pretrained surprise signal) into the write-rate gate + decay.
+    biomem_per_layer_refresh: bool = True  # at EVERY decoder layer, re-read W with the current (attention-mixed)
+                                       # slot hiddens and add a zero-init-gated recall → slots become query-aware.
+    biomem_readout_hidden: int = 4500  # readout MLP hidden width (param-matched ~6.9M to the cohort)
+    biomem_decay_init: float = 0.99    # init per-(layer,col) retention α (input-dependent decay = sigmoid(decay_proj);
                                        # zero-init weight ⇒ α starts uniform ≈ this, then LEARNS input-dependence)
-    biomem_base_write_rate_init: float = 0.1  # eta0 — learnable base write-rate (softplus); >0 so the
-                                       # write-side gets gradient even when the gate g≈0 (cold-start fix)
-    biomem_theta_scale: float = 0.1    # std of the per-neuron threshold theta (random INIT; now learned)
-    biomem_read_tap_layer: int = 15    # (conditioned mode only) decoder layer whose hidden seeds the read
-    biomem_grad_checkpoint: bool = True  # checkpoint the per-token sweep (essential for BPTT memory)
+    biomem_theta_scale: float = 0.1    # std of the per-neuron threshold theta (random INIT; learned)
 
     # ── slotgraph (fixed-partition graph slot memory; models/slotgraph/) ──────
     # ICAE write (own frozen base + encoder-LoRA, M slots appended to the passage, run through the
