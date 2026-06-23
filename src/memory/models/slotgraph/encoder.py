@@ -15,12 +15,13 @@ APPENDED to the passage, run through the LM's OWN layers) — and read the slots
     use_structure=False ⇒ plain prepend of the id-tagged slots (id-tagged ICAE control).
 
 MAGNITUDE / GRADIENT POLICY (unified — no free-floating scale coefficients, no gates):
-  1. Bound internal magnitude with PRE-norm + degree-normalized aggregation, not a gate or a squashing
-     activation. The MP read RMSNorm's the residual stream BEFORE each message step (so messages are
-     bounded) and mean-aggregates (degree-invariant); the residual then accumulates without a post-norm.
-     Pre-norm (not post-norm) is essential: rmsnorm(h+update) would have a 1/‖·‖ gradient singularity
-     when the update cancels h, but rmsnorm(h) is safe because h always contains slot_final (never ≈0).
-     RMSNorm rescales (gradient-alive); unlike tanh/sigmoid or a stuck scalar gate it can't saturate.
+  1. Bound the MP read's per-node update with an ELEMENTWISE clamp to [-1,1] + degree-normalized
+     aggregation — NOT a gate, a squashing activation, an L2-norm clamp, or a normalization. The clamp
+     hard-bounds the residual (h ≤ ‖slot_final‖ + K·√d, no overflow) with no gate to get stuck, and has a
+     clean 0/1 backward. This avoids two NaN traps that bit earlier versions: (a) normalizing a
+     cancellable quantity — rmsnorm(h±u) or normalize(e) — has a 1/‖·‖ gradient blow-up when its argument
+     → 0; (b) an L2 `u.norm()` clamp is NaN-in-the-backward at u=0 (0/0), which happens for any node with
+     no incoming messages. Elementwise clamp has neither (no division, no norm). Aggregation is mean.
   2. The ONLY boundary scaling is a MEASURED rescale of the output to the LM's token-embedding norm
      (_NormMatch). Unit-RMS ≠ the LM's input scale, so this one conversion is necessary; it is measured,
      not tuned. Head inputs are likewise balanced to a measured scale (√d) so content and id streams
@@ -50,12 +51,6 @@ def _participation_ratio(x: Tensor) -> float:
         return 0.0
     xc = x - x.mean(0, keepdim=True); C = xc.t() @ xc
     return float((torch.diagonal(C).sum() ** 2 / (C * C).sum().clamp_min(1e-12)).item())
-
-
-def _rmsnorm(x: Tensor, eps: float = 1e-6) -> Tensor:
-    """Magnitude bound that preserves gradient: rescale each row to unit RMS (no learnable gain, no
-    saturation). Unlike a scalar gate or tanh, this can't get stuck or kill gradient — it just rescales."""
-    return x * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + eps).to(x.dtype)
 
 
 def _st_onehot(logits: Tensor, temp: float) -> Tensor:
@@ -201,20 +196,23 @@ class SlotGraphEncoder(nn.Module):
                            (1.0 - self.is_node).view(1, self.M).expand(src.shape[0], -1)).clamp(min=1.0)
         pre = self.norm(slot_final.float())                       # plain read (for the inert-MP canary)
 
-        # PRE-norm residual GNN (the stable transformer pattern). RMSNorm the residual stream BEFORE
-        # computing messages: h always contains slot_final, so it's never near-zero → no 1/‖·‖ singularity
-        # (a POST-norm rmsnorm(h+update) would have it, when the update cancels h). The residual then
-        # accumulates without a post-norm; the final _NormMatch handles the accumulated magnitude.
+        # Residual relay. The per-node update is bounded by an ELEMENTWISE clamp to [-1,1] (the unit-RMS
+        # per-element scale, matching h). Elementwise clamp — not an L2-norm clamp or a normalization —
+        # because it has NO division/norm: clean 0/1 backward, no 1/‖·‖ or 0/0 singularity (an L2
+        # `u.norm()` is NaN-in-the-backward at u=0, which happens for nodes with no incoming messages;
+        # a normalization rmsnorm(h±u) blows up when an ungated update cancels h). It hard-bounds
+        # h ≤ ‖slot_final‖ + K·√d (no overflow, no gate), full gradient below the cap. Mean aggregation
+        # keeps it degree-invariant; the final _NormMatch sets the output magnitude.
         h = slot_final
         for _ in range(K):
-            hn = _rmsnorm(h)                                       # normalize the stream → bounded messages
-            h_src = torch.einsum("bmn,bnd->bmd", src, hn)         # source-endpoint node state per edge
-            h_dst = torch.einsum("bmn,bnd->bmd", dst, hn)         # dst-endpoint node state per edge
-            m_to_dst = self.msg(torch.cat([h_src, hn], -1)) * edge_w   # src node + THIS edge's content → dst
-            m_to_src = self.msg(torch.cat([h_dst, hn], -1)) * edge_w   # symmetric: dst node + edge → src
+            h_src = torch.einsum("bmn,bnd->bmd", src, h)          # source-endpoint node state per edge
+            h_dst = torch.einsum("bmn,bnd->bmd", dst, h)          # dst-endpoint node state per edge
+            m_to_dst = self.msg(torch.cat([h_src, h], -1)) * edge_w   # src node + THIS edge's content → dst
+            m_to_src = self.msg(torch.cat([h_dst, h], -1)) * edge_w   # symmetric: dst node + edge → src
             agg = (torch.einsum("bmn,bmd->bnd", dst, m_to_dst)       # mean-aggregate messages at endpoint nodes
                    + torch.einsum("bmn,bmd->bnd", src, m_to_src)) / deg.unsqueeze(-1)
-            h = h + self.update(agg) * node_recv                  # residual relay (no post-norm), only nodes
+            u = self.update(agg).clamp(-1.0, 1.0)                  # bounded node-state delta (no norm → safe backward)
+            h = h + u * node_recv                                  # residual relay, only node slots update
         memory = self.norm(h.float())
         info = {"hops": K, "delta": (1.0 - F.cosine_similarity(pre, memory, dim=-1)).mean().detach()}
         return memory, info
