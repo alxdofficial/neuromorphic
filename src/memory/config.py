@@ -166,6 +166,9 @@ class ReprConfig:
     slotgraph_use_structure: bool = True # False ⇒ plain prepend of the id-tagged slots = "id-tagged ICAE"
                                          # (slots still carry the fixed id tags; the TRUE pure-ICAE
                                          # control is the separate icae_baseline variant). The ablation.
+    slotgraph_use_id: bool = True        # False ⇒ drop the fixed orthonormal id_embed from the slots (and
+                                         # routing-head input) ⇒ pure-ICAE-via-same-code. The id-tag ablation:
+                                         # does the FREE (0-param buffer) identity tagging beat plain ICAE?
     slotgraph_max_hops: int = 5          # cap on the adaptive MP hop count (over-smoothing / compute guard);
                                          # #hops = the predicted graph's DIAMETER (reachability saturation)
     slotgraph_d_key: int = 64            # query/key dim for content-addressed endpoint routing (edge

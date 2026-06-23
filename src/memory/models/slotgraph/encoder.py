@@ -71,6 +71,7 @@ class SlotGraphEncoder(nn.Module):
         self.d = d
         self.K = max(1, min(int(getattr(cfg, "slotgraph_n_nodes", self.M // 2)), self.M - 1))  # node slots 0..K-1
         self.use_structure = bool(getattr(cfg, "slotgraph_use_structure", True))
+        self.use_id = bool(getattr(cfg, "slotgraph_use_id", True))   # False ⇒ pure-ICAE-via-same-code (id ablation)
         self.max_hops = int(getattr(cfg, "slotgraph_max_hops", 5))
 
         # slot content seeds (appended to the passage, icae-style: centered in Llama's token region)
@@ -112,7 +113,7 @@ class SlotGraphEncoder(nn.Module):
         print(f"[slotgraph] icae-write + FIXED partition ({self.K} nodes / {self.M - self.K} edges) + "
               f"content-addressed routing (d_k={self.d_k}, Sinkhorn competition) + fp32 MP read "
               f"(≤{self.max_hops} hops), encoder-LoRA r{cfg.slotgraph_lora_rank} ({n_wrapped} layers), "
-              f"use_structure={self.use_structure}")
+              f"use_structure={self.use_structure}, use_id={self.use_id}")
 
     def train(self, mode: bool = True):
         super().train(mode); self.base.train(False); return self
@@ -131,10 +132,12 @@ class SlotGraphEncoder(nn.Module):
                 "mask": torch.cat([state["mask"], attention_mask.bool()], dim=1)}, {}
 
     def _head_in(self, slot_h: Tensor) -> Tensor:
-        """Routing-head input = [struct_norm(slot) ; √d·id] (both streams at the measured √d scale)."""
-        return torch.cat([self.struct_norm(slot_h),
-                          self.id_head_scale * self.id_embed.unsqueeze(0).expand(slot_h.shape[0], -1, -1)],
-                         dim=-1)                                                              # [B,M,2d]
+        """Routing-head input = [struct_norm(slot) ; √d·id] (both streams at the measured √d scale).
+        id ablation (use_id=False): zero the id stream so endpoints are chosen on content alone."""
+        id_stream = self.id_head_scale * self.id_embed.unsqueeze(0).expand(slot_h.shape[0], -1, -1)
+        if not self.use_id:
+            id_stream = torch.zeros_like(id_stream)
+        return torch.cat([self.struct_norm(slot_h), id_stream], dim=-1)                       # [B,M,2d]
 
     @staticmethod
     def _sinkhorn1(scores: Tensor) -> Tensor:
@@ -228,8 +231,10 @@ class SlotGraphEncoder(nn.Module):
     def finalize_memory(self, state):
         emb, mask = state["emb"], state["mask"]                    # [B,T,d], [B,T]
         B, _T, d = emb.shape
-        slots0 = (self.slot_init.unsqueeze(0).expand(B, self.M, d)   # content seed
-                  + self.id_embed.unsqueeze(0)).to(emb.dtype)        # + fixed identity
+        slots0 = self.slot_init.unsqueeze(0).expand(B, self.M, d)    # content seed
+        if self.use_id:
+            slots0 = slots0 + self.id_embed.unsqueeze(0)             # + fixed identity (ablatable)
+        slots0 = slots0.to(emb.dtype)
         inp = torch.cat([emb, slots0], dim=1)                       # [B,T+M,d]
         attn = torch.cat([mask, torch.ones(B, self.M, device=mask.device, dtype=mask.dtype)], dim=1).long()
         h = self.base.model(inputs_embeds=inp, attention_mask=attn,

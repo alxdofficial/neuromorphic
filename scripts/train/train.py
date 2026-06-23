@@ -1450,6 +1450,10 @@ def main():
                     help="slotgraph: disable the MP-read structure = plain prepend of the id-tagged slots "
                          "('id-tagged ICAE'; true pure-ICAE = the icae_baseline variant). "
                          "Ablation: does the message-passing read add anything over id-tagged slots?")
+    ap.add_argument("--slotgraph-no-id", action="store_true",
+                    help="slotgraph: drop the FIXED orthonormal id_embed from the slots (and routing-head "
+                         "input) = pure-ICAE-via-same-code. Pair with --slotgraph-no-structure to isolate "
+                         "the id-tag contribution: id-on vs id-off, both flat. Does the free id tagging beat ICAE?")
     ap.add_argument("--graph-encoder-lora-rank", type=int, default=0,
                     help="graph: LoRA-adapt the encoder forward like the baselines (0=frozen tap). "
                          "Evens the encoder footing (the graph historically read a frozen tap).")
@@ -1814,6 +1818,8 @@ def main():
         print("[graph override] FREE endpoints (no bank/selection)")
     if args.slotgraph_no_structure:
         cfg.slotgraph_use_structure = False
+    if args.slotgraph_no_id:
+        cfg.slotgraph_use_id = False
         print("[slotgraph override] structure OFF = plain prepend of id-tagged slots (id-tagged ICAE; "
               "true pure-ICAE is the icae_baseline variant)")
     cfg.task_mode = args.task        # accurate ckpt metadata (dispatch still keys on this)
