@@ -1,16 +1,17 @@
-"""biomem smoke — verify the gated fast-Hebbian grid in the REAL mixed bf16 path on REAL data.
+"""biomem smoke — verify the CHUNK-PARALLEL gated-delta grid in the REAL mixed bf16 path on REAL data.
 
-biomem is the fast-weights arm (memory = per-example fast edges W, written by a gated delta rule,
-read query-conditioned via a decoder-layer hook — NO prepend). This checks, in the actual path:
+biomem v3: memory = per-example fast edges W in n_pairs STACKED synaptic column-layers, written by a
+chunk-parallel gated-delta scan (fla) with a learned per-neuron threshold between layers; read by PREPEND
+(M seeds propagate through W → prepend; the LM's attention addresses them; refreshed per decoder layer).
+This checks, in the actual path:
 
-  - matched param count (cohort ~6.9M) + capacity (W = 2 * C * K^2 floats / example = the read budget)
-  - both compute paths finite: mae → masked_reconstruction; babi → generic compute_loss
-  - the conditioned-read hook is exercised (loss goes through write → finalize(stash W) → read-fuse)
-  - gradient reaches EVERY component — esp. the WRITE side (in_proj/regulator/cond/eta/leak): the
-    prepend read propagates the M seeds through W(write), so write-grad starvation (the wall that
-    killed prior arms) would show as a starved write side here. The read is non-plastic (recall by
-    propagation, no edge update) and prepended; the LM's attention does the addressing.
-  - write canaries: edge_absmean, edge/state saturation, leak, eta
+  - matched param count (cohort ~6.9M) + read budget (M*d = 32*576); W is uncounted per-example state
+  - all 4 mixed tasks finite: mae → masked_reconstruction; babi/cont/condrecon → generic compute_loss
+  - the chunk scan + prepend + per-layer refresh run end-to-end (forward finite, mem_effrank not collapsed)
+  - gradient reaches EVERY component — esp. the WRITE side (in_proj/V_w/beta/decay_proj/theta): the read
+    propagates the seeds through W(write), so write-grad starvation (the wall that killed prior arms)
+    would show as a starved write side here.
+  - canaries: edge_absmean, decay (mean α), beta (mean write rate), surprise (mean −logp/lnV), mem_effrank
 """
 from __future__ import annotations
 import sys
@@ -32,9 +33,8 @@ DEV = "cuda"
 # component-name → prefixes. WRITE = write-side (must NOT be starved); READ = prepend-read side.
 GROUPS = {
     "WRITE in_proj":   ("encoder.in_proj",),
-    "WRITE regulator": ("encoder.regulator",),
-    "WRITE cond":      ("encoder.cond",),
-    "WRITE eta_raw":   ("encoder.eta_raw",),
+    "WRITE V_w":       ("encoder.V_w",),
+    "WRITE beta":      ("encoder.beta_",),
     "WRITE decay_proj":("encoder.decay_proj",),
     "WRITE theta":     ("encoder.theta",),
     "READ seeds":      ("encoder.read_seeds",),
@@ -77,7 +77,7 @@ def main():
     tot = sum(p.numel() for p in m.parameters() if p.requires_grad)
     Wfloats = enc.n_pairs * cfg.biomem_n_cols * cfg.biomem_k * cfg.biomem_k
     print(f"\n{'='*74}\nbiomem smoke (matched mixed config, REAL bf16 path)\n{'='*74}")
-    print(f"params = {tot:,} ({tot/1e6:.2f}M)   | cohort target ≈ icae 6.93M  read_mode={enc.read_mode}")
+    print(f"params = {tot:,} ({tot/1e6:.2f}M)   | cohort target ≈ icae 6.93M  (chunk-parallel, n_pairs={enc.n_pairs})")
     print(f"read budget = M*d = {enc.M}*{cfg.d_llama} = {enc.M * cfg.d_llama:,} floats (prepend; matched to cohort)")
     print(f"internal state W = n_pairs*C*K^2 = {enc.n_pairs}*{cfg.biomem_n_cols}*{cfg.biomem_k}^2 "
           f"= {Wfloats:,} floats/example (the MECHANISM — uncounted, like a KV cache)")
@@ -105,9 +105,8 @@ def main():
               f"finite={bool(torch.isfinite(mem).all())}  mem_effrank={float(aux.get('biomem_mem_effrank', 0)):.2f}/{cfg.d_llama}")
         print(f"  edges finite = {bool(torch.isfinite(enc._read_W).all())}  "
               f"edge_absmean={float(aux['biomem_edge_absmean']):.4f}  "
-              f"edge_satfrac={float(aux['biomem_edge_satfrac']):.3f}  "
-              f"state_satfrac={float(aux['biomem_state_satfrac']):.3f}")
-        print(f"  decay(mean α)={float(aux['biomem_decay']):.4f}  eta={float(aux['biomem_eta']):.4f}  "
+              f"W shape={tuple(enc._read_W.shape)}")
+        print(f"  decay(mean α)={float(aux['biomem_decay']):.4f}  beta(mean)={float(aux['biomem_beta']):.4f}  "
               f"surprise(mean −logp/lnV)={float(aux['biomem_surprise']):.4f}")
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             out = (m.compute_masked_reconstruction_loss(b)

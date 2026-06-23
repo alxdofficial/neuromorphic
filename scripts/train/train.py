@@ -1344,6 +1344,7 @@ def main():
     # still selectable via explicit --variants for reproduction, out of the default.
     ap.add_argument("--variants", nargs="+", default=[
         "slotgraph_baseline",         # emergent-topology slot memory (supersedes graph_baseline)
+        "biomem_baseline",            # chunk-parallel gated-delta synaptic-grid (fast-weights arm)
         "icae_baseline",              # ICAE (ICLR'24)
         "ccm_baseline",               # CCM (ICLR'24)
         "autocompressor_baseline",    # AutoCompressor/RMT-style recurrent summary

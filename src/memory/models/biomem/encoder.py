@@ -1,61 +1,37 @@
-"""biomem — a gated fast-Hebbian cortical-column grid memory encoder.
+"""biomem — a chunk-parallel gated-delta cortical-column grid memory encoder.
 
-THE BET: memory lives in synaptic STATE (scalar fast edge weights W in [-1,1]
-updated by a *gated DELTA rule* per input token), NOT in learned weights. Read and
-write are both signal propagation through a small grid. The LEARNED objects are all
-small: a shared plasticity-regulator MLP, per-(column,layer-pair) conditioning
-vectors, the input-dependent decay projection + base-write-rate scalar, the readout
-MLP, the read seeds + per-layer-refresh projection, and the per-neuron thresholds
-theta (random INIT, then learned — at K=16 the reservoir keep-fixed argument fails).
+THE BET: memory lives in synaptic STATE (fast edge weights W per column), updated by a *gated
+DELTA rule*, NOT in learned weights. Read and write are signal propagation through a small grid.
 
-Spirit of fast-weights (Ba et al. 2016), DeltaNet / delta-rule fast weights, and
-neuromodulated / differentiable plasticity / Backpropamine (Miconi et al. 2018).
+v3 (chunkwise): the write is a STACK of linear Gated-DeltaNet column-layers, each a CHUNK-PARALLEL
+scan over the token sequence (fla.chunk_gated_delta_rule), with a pointwise nonlinearity BETWEEN
+layers. This deletes the O(T) per-token Python sweep (≈98% of the old wall-clock) — depth (n_pairs)
+stays sequential (2 short steps), the long token axis is parallel. Per column-layer l:
+    u^0   = in_proj(LM_final_hidden).view(C,K)            # input to layer 0
+    k = q = u^l                                            # key/query = layer input (L2-normed in kernel)
+    v     = u^l · V_w[l]                                   # per-column value projection (input-derived)
+    β     = sigmoid(u^l·βw[l] + βb[l] + βs[l]·surprise)    # input-derived write rate (the gate)
+    α     = sigmoid(decay_proj([h_t; surprise]))           # input-derived per-(layer,column) decay ∈(0,1)
+    o, W_l = chunk_gated_delta_rule(q,k,v, g=log α, β)      # W_t = α_t W_{t-1}(I−β_t k k^T)+β_t v k^T
+    u^{l+1} = hardtanh(o − θ_l)                            # NONLINEARITY between layers + the compounding
+The COMPOUNDING (variant A): layer l's input is layer l−1's memory readout, so deeper layers reason
+over what the shallower memory holds — and since layer l's key derives from W_{l-1} (precomputed,
+not its own W_l), each layer's scan stays linear/chunkable while the address stays memory-aware
+across depth. Keys/values are input-derived (NOT the W-propagated state), which is what makes the
+recurrence linear; the nonlinearity that gives expressivity lives on the short depth axis.
 
-Substrate
----------
-  * neuron state s in [-1,1] (hardtanh); fast edge weight w in [-1,1] (signed).
-  * a column = K-wide x H-deep; consecutive layers fully connected (K^2 edges per
-    layer-pair). #cols C * K = d_llama (=576) so the token embedding reshapes into
-    the input layer for free (C=9, K=64). Scale via #cols; keep K small.
+Lineage: fast weights (Schmidhuber 1992; Ba 2016), DeltaNet / fast-weight programmers (Schlag 2021),
+Gated DeltaNet (Yang & Hatamizadeh 2025), neuromodulated plasticity / Backpropamine (Miconi 2018/19).
 
-Dynamics (one token = one feed-forward sweep; memory lives in the edges). At
-layer-pair l, state s in (B,C,K), fast edges W in (B,C,K,K):
-    inp   = einsum('bcij,bci->bcj', W, s) / sqrt(K)          # fan-in normalized read
-    s_out = hardtanh(inp - theta_l)                          # target post-activity (theta LEARNED)
-    dW    = einsum('bci,bcj->bcij', s, s_out - inp)/sqrt(K)  # error-correcting DELTA write
-    g     = tanh(Regulator([dW, s_pre, s_out, cond_l]))      # plasticity gate [-1,1]
-    W     = clamp(alpha * W + (g + eta0) * dW, -1, 1)        # #2 alpha = sigmoid(decay_proj(h)) per-column decay
-    s     = s_out
+LEARNED objects (all small): in_proj, per-(layer,column) value projection V_w, the input-derived
+write-rate gate (βw/βb/βs), the input-dependent decay projection, the per-neuron thresholds theta
+(random INIT, then learned), the readout MLP + boundary norm, the read seeds + per-layer-refresh
+projection. The frozen LM's next-token SURPRISE feeds the gate + decay.
 
-The `/sqrt(K)` (fan-in normalization) keeps `inp` O(1) so hardtanh stays in its
-gradient-carrying band; the delta error `(s_out - inp)` (vs raw co-activation) writes
-only the residual → far less interference (the DeltaNet lesson, and the rule the
-STAGE-0 binding probe validated); `eta0` is a learnable base write-rate so the
-write-side (in_proj/cond) receives gradient even when the gate g≈0 (the cold-start
-fix). The sweep runs in fp32 (autocast disabled) — edge precision is load-bearing.
-
-Write/Read (both = propagation)
--------------------------------
-  * WRITE: stream the passage; each token sweeps forward, edges accumulate via the
-    gated delta rule. Padded tokens leave their row's edges bit-identical. The write
-    ingests the frozen LM's FINAL hidden (deepest, already-integrated representation —
-    intermediate layers add nothing over it, so the write is single-layer).
-  * READ — two modes (cfg.biomem_read_mode):
-      - "prepend" (v2 DEFAULT): M learned SEED probes propagate (read-only, NO edge
-        update) through the WRITTEN edges; a per-slot learned readout turns each seed's
-        final grid activity into one d_llama token → M tokens PREPENDED. The frozen LM's
-        OWN attention does the addressing (the endogenous reader — prepend beats every
-        hand-built read). Recall is still propagation through the synapses; only the
-        DELIVERY changed. No cross-slot pooling (M independent seed-readouts) → slot
-        addressing survives to the decoder; the per-slot D_grid→d readout is a within-slot
-        projection, not a count-reducing pool.
-      - "conditioned" (legacy): the decoder's tap-layer hidden is the query; the recall
-        delta is fused (gated) back into the residual stream. NO prepend.
-  * edges RESET to zero each example (per-passage fast memory). The read is non-plastic
-    (pure propagation, no dW) in BOTH modes → reads never corrupt the written memory.
-
-Engineering: the per-token write sweep is gradient-CHECKPOINTED (recompute in
-backward); leak/eta are passed positionally so their gradient survives checkpointing.
+READ (prepend): M learned seeds propagate (read-only, q^T W per layer, NO edge update) through the
+written W → per-slot readout → _NormMatch → PREPEND M tokens; the LM's own attention does the
+addressing. Refreshed at every decoder layer with the attention-mixed slot hiddens (zero-init gate).
+W resets to 0 each example. The grid runs in fp32 (edge precision is load-bearing).
 """
 from __future__ import annotations
 
@@ -63,8 +39,9 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.utils.checkpoint
 from torch import Tensor
+
+from fla.ops.gated_delta_rule import chunk_gated_delta_rule
 
 from ...common import _NormMatch
 from ...config import ReprConfig
@@ -74,277 +51,169 @@ def _hardtanh(x: Tensor) -> Tensor:
     return torch.clamp(x, -1.0, 1.0)
 
 
-class _Regulator(nn.Module):
-    """Shared per-edge plasticity regulator: g_ij = tanh(MLP([dW, s_pre, s_post, cond, surprise])).
-
-    Vectorized over the full (B,C,K,K) edge tensor of one layer-pair. Output in [-1,1]:
-    apply (g~1) / freeze (g~0) / reverse (g~-1). Soft tanh gate → fully differentiable. The frozen
-    LM's per-token surprise (−log p of the next token) is a broadcast scalar input → the gate can
-    write HARDER on surprising (informative) tokens, the Titans surprise→write mechanism for free.
-    """
-
-    def __init__(self, d_cond: int, hidden: int):
-        super().__init__()
-        d_in = 4 + d_cond                              # [dW_ij, s_pre_i, s_post_j, surprise, cond]
-        self.fc1 = nn.Linear(d_in, hidden)
-        self.fc2 = nn.Linear(hidden, hidden)
-        self.fc3 = nn.Linear(hidden, 1)
-        self.act = nn.GELU()
-        # 1/sqrt(fan_in) output init (NOT the old 0.1× near-zero): the gate starts at a
-        # usable scale so it learns the gating policy quickly. The cold-start (write
-        # happening at all so the write-side gets gradient) is now handled by the
-        # learnable base write-rate eta0, not by a tiny gate init.
-        nn.init.normal_(self.fc3.weight, std=1.0 / math.sqrt(hidden))
-        nn.init.zeros_(self.fc3.bias)
-
-    def forward(self, dW: Tensor, s_pre: Tensor, s_post: Tensor, cond: Tensor,
-                surprise: Tensor) -> Tensor:
-        B, C, K, _ = dW.shape
-        feat = torch.cat([
-            dW.unsqueeze(-1),                                   # [B,C,K,K,1]
-            s_pre[:, :, :, None, None].expand(B, C, K, K, 1),   # pre on dim i
-            s_post[:, :, None, :, None].expand(B, C, K, K, 1),  # post on dim j
-            surprise[:, None, None, None, None].expand(B, C, K, K, 1),  # LM next-token surprise (per example)
-            cond[None, :, None, None, :].expand(B, C, K, K, cond.shape[-1]),
-        ], dim=-1)
-        h = self.act(self.fc1(feat))
-        h = self.act(self.fc2(h))
-        return torch.tanh(self.fc3(h).squeeze(-1))             # [B,C,K,K] in [-1,1]
-
-
 class BioMemEncoder(nn.Module):
-    """Gated fast-Hebbian (delta-rule) grid memory encoder.
+    """Chunk-parallel gated-delta grid memory encoder with a prepend read.
 
-    Interface: init_streaming_state / streaming_write (accumulate the passage into the
-    fast edges — NO backbone forward) / finalize_memory. Read modes (cfg.biomem_read_mode):
-      - "prepend" (default): finalize propagates M learned seeds through the edges and
-        returns M prepend tokens [B,M,d_llama]; the LM's attention reads them (is_conditioned_read=False).
-      - "conditioned" (legacy): finalize returns an EMPTY prepend + stashes the edges; the
-        harness calls `conditioned_read` from a decoder-layer hook (is_conditioned_read=True).
+    Interface: init_streaming_state / streaming_write (accumulate the passage into the per-layer fast
+    edges W via a chunk-parallel scan) / finalize_memory (propagate seeds → M prepend tokens). The read
+    is a prepend (is_conditioned_read=False); the per-layer refresh re-reads W in the decoder hook.
     """
 
     ingest_lm_final_hidden = True         # WRITE ingests the frozen LM's final hidden, not raw embeds
+    is_conditioned_read = False           # prepend read (the LM's attention addresses the M slots)
 
     def __init__(self, cfg: ReprConfig):
         super().__init__()
         self.cfg = cfg
         C, K, H = cfg.biomem_n_cols, cfg.biomem_k, cfg.biomem_depth_h
-        # D_grid = C*K is DECOUPLED from d_llama: in_proj (d_llama→D_grid) projects the LM hidden
-        # into grid space, the per-slot readout (D_grid→d_llama) projects back. The grid's binding
-        # capacity (K²/column) is no longer hostage to the LM's hidden size. (C*K==d_llama is still
-        # the cheap default that makes the projections square.)
         self.C, self.K, self.H = C, K, H
-        self.n_pairs = H - 1                                    # fast-edge layer-pairs
-        self.d_grid = C * K                                     # grid activity dim (= d_llama while coupled)
+        self.n_pairs = H - 1                                    # fast-edge column-layers (DeltaNet stack)
+        self.d_grid = C * K                                     # grid activity dim
         self.d_llama = cfg.d_llama
-        self.grad_checkpoint = bool(cfg.biomem_grad_checkpoint)
-        self.read_tap_layer = int(cfg.biomem_read_tap_layer)
-        self.read_mode = str(getattr(cfg, "biomem_read_mode", "prepend"))
         self.M = int(getattr(cfg, "biomem_n_slots", 32))       # # read seeds = # prepend tokens
-        self.is_conditioned_read = (self.read_mode == "conditioned")   # instance attr (set by mode)
-        self.wants_prepend_refresh = False                     # set True by the prepend branch below
-        self.wants_surprise = bool(getattr(cfg, "biomem_use_surprise", True))   # model.py computes & feeds it
-        self._read_W = None                                    # stashed each finalize
-        self.register_buffer("_sat_last", torch.zeros(()), persistent=False)
-        self.register_buffer("_decay_last", torch.zeros(()), persistent=False)   # mean α canary
-        self.register_buffer("_surprise_last", torch.zeros(()), persistent=False)  # mean LM surprise canary
+        self.scale = K ** -0.5                                  # DeltaNet readout scale (o = scale·qᵀW)
+        self.read_tap_layer = int(cfg.biomem_read_tap_layer)
+        self.wants_surprise = bool(getattr(cfg, "biomem_use_surprise", True))
+        self.per_layer_refresh = bool(getattr(cfg, "biomem_per_layer_refresh", True))
+        self.wants_prepend_refresh = self.per_layer_refresh
+        self._read_W = None                                    # [B,n_pairs,C,K,K] stashed each finalize
+        for c in ("_decay_last", "_surprise_last", "_beta_last", "_edge_last"):
+            self.register_buffer(c, torch.zeros(()), persistent=False)
 
-        # ── learned objects (all small) ──────────────────────────────────────
-        self.in_proj = nn.Linear(cfg.d_llama, self.d_grid)     # token embed -> grid input
-        d_cond = cfg.biomem_d_cond
-        self.cond = nn.Parameter(torch.randn(self.n_pairs, C, d_cond) / math.sqrt(d_cond))
-        self.regulator = _Regulator(d_cond, cfg.biomem_reg_hidden)
-        # #2 INPUT-DEPENDENT decay (Gated DeltaNet / Mamba2): per-column retention α_t = sigmoid(decay_proj(h_t))
-        # ∈ (0,1) replaces the old constant scalar leak. W ← α_t·W + (g+eta0)·dW. Zero-init weight + a bias
-        # at logit(decay_init) ⇒ α starts uniform ≈ decay_init (= the old constant-decay behavior) then LEARNS
-        # input-dependence (α→0 clears at context boundaries; α→1 retains). Input = [h_t ; surprise_t].
-        self.decay_proj = nn.Linear(cfg.d_llama + 1, C)
+        # ── write projections (per-(layer,column); input-derived → linear/chunkable scan) ──
+        self.in_proj = nn.Linear(cfg.d_llama, self.d_grid)            # LM hidden → layer-0 grid input
+        self.V_w = nn.Parameter(torch.randn(self.n_pairs, C, K, K) / math.sqrt(K))   # per-col value proj
+        self.beta_w = nn.Parameter(torch.zeros(self.n_pairs, C, K))   # write-rate gate (zero → β starts 0.5)
+        self.beta_b = nn.Parameter(torch.zeros(self.n_pairs, C))
+        self.beta_s = nn.Parameter(torch.zeros(self.n_pairs, C))      # surprise → write-rate weight
+        # input-dependent per-(layer,column) decay α = sigmoid(decay_proj([h_t; surprise])); zero weight +
+        # logit(decay_init) bias ⇒ α starts uniform ≈ decay_init, then LEARNS input-dependence.
+        self.decay_proj = nn.Linear(cfg.d_llama + 1, self.n_pairs * C)
         nn.init.zeros_(self.decay_proj.weight)
         d0 = float(cfg.biomem_decay_init)
-        nn.init.constant_(self.decay_proj.bias, math.log(d0 / (1 - d0)))   # logit(decay_init)
-        eta0 = float(cfg.biomem_base_write_rate_init)
-        self.eta_raw = nn.Parameter(torch.tensor(math.log(math.expm1(eta0))))  # softplus⁻¹(eta0)
-        # readout: per-slot grid activity (d_grid) -> one recall token (d_llama).
+        nn.init.constant_(self.decay_proj.bias, math.log(d0 / (1 - d0)))
+        # LEARNED per-neuron thresholds (random init); the between-layer nonlinearity is hardtanh(o − θ).
+        self.theta = nn.Parameter(cfg.biomem_theta_scale * torch.randn(self.n_pairs, C, K))
+
+        # ── read (prepend) ──
+        self.read_seeds = nn.Parameter(torch.randn(self.M, C, K))     # cold read probes
         ro_h = cfg.biomem_readout_hidden
         self.readout = nn.Sequential(
             nn.Linear(self.d_grid, ro_h), nn.GELU(), nn.Linear(ro_h, cfg.d_llama))
+        self.out_norm = _NormMatch(cfg.d_llama)                       # prepend tokens → embedding-norm region
+        if self.per_layer_refresh:
+            self.read_in = nn.Linear(cfg.d_llama, self.d_grid)        # slot hidden → grid (refresh query)
+            self.refresh_gate = nn.Parameter(torch.zeros(()))         # ReZero: refresh is a no-op at step 0
 
-        if self.read_mode == "prepend":
-            # M learned SEED probes [M,C,K] (the COLD read inputs, before any decoder mixing).
-            # Unit-std init keeps hardtanh(seed) in its gradient-carrying band; distinct rows →
-            # seeds probe different aspects of W.
-            self.read_seeds = nn.Parameter(torch.randn(self.M, C, K))
-            # boundary scaling: put the M prepend tokens in Llama's embedding-norm region
-            # (else they are attention distractors — the prepend-baseline failure _NormMatch fixes).
-            self.out_norm = _NormMatch(cfg.d_llama)
-            # per-layer refresh: re-read W using the current (attention-mixed) slot hidden. read_in
-            # maps a d_llama slot hidden into grid space (d→D_grid); refresh_gate is ZERO-INIT (ReZero)
-            # so the refresh is a no-op at step 0 (the initial prepend already feeds the write-side
-            # gradient, so zero-init here is safe — no starvation) and ramps in as it learns.
-            self.per_layer_refresh = bool(getattr(cfg, "biomem_per_layer_refresh", True))
-            self.wants_prepend_refresh = self.per_layer_refresh
-            if self.per_layer_refresh:
-                self.read_in = nn.Linear(cfg.d_llama, self.d_grid)
-                self.refresh_gate = nn.Parameter(torch.zeros(()))
-        elif self.read_mode == "conditioned":
-            # query-conditioned read projections: query_proj maps the decoder hidden into the grid;
-            # fuse_proj maps the recall back into the residual; read_gate is SMALL but NONZERO so the
-            # read is gentle at step 0 AND the write-side gets gradient from step 1 (cold-start; a
-            # zero-init fuse would re-create the write-grad starvation we fought all along).
-            self.read_query_proj = nn.Linear(cfg.d_llama, self.d_grid)
-            self.read_fuse_proj = nn.Linear(cfg.d_llama, cfg.d_llama)
-            self.read_gate = nn.Parameter(torch.tensor(0.1))
-        else:
-            raise ValueError(f"biomem_read_mode must be 'prepend' or 'conditioned', got {self.read_mode!r}")
-        # #4 LEARNED per-neuron thresholds theta [n_pairs, C, K] (random init, then trained). At K=16 the
-        # reservoir "keep-fixed" argument doesn't hold (it needs a large overcomplete reservoir); with full
-        # BPTT available, fixing theta is unjustified + seed-sensitive, so we learn it (cheap: C·K·n_pairs params).
-        self.theta = nn.Parameter(cfg.biomem_theta_scale * torch.randn(self.n_pairs, C, K))
-
-        _read = (f"PREPEND {self.M} seeds (LM attention reads"
-                 + (", per-layer refresh" if getattr(self, "per_layer_refresh", False) else "") + ")"
-                 if self.read_mode == "prepend"
-                 else f"query-conditioned read @ tap L{self.read_tap_layer}")
-        print(f"[biomem] gated fast-Hebbian (delta-rule) grid: C={C} x K={K} x H={H} "
-              f"({self.n_pairs} edge layer-pairs, {C * self.n_pairs * K * K:,} fast "
-              f"edges/example), d_grid={self.d_grid}, read={_read}, "
-              f"d_cond={d_cond}, reg_h={cfg.biomem_reg_hidden}, readout_h={ro_h}, "
-              f"checkpoint={self.grad_checkpoint}")
-
-    @property
-    def eta(self) -> Tensor:
-        return F.softplus(self.eta_raw)                        # base write-rate > 0
+        print(f"[biomem] chunk-parallel gated-delta grid: C={C}×K={K}×H={H} "
+              f"({self.n_pairs} column-layers, {C*self.n_pairs*K*K:,} fast edges/example), d_grid={self.d_grid}, "
+              f"PREPEND {self.M} seeds"
+              + (", per-layer refresh" if self.per_layer_refresh else "")
+              + f", surprise={self.wants_surprise}, readout_h={ro_h} (fla chunk scan)")
 
     def train(self, mode: bool = True):
         super().train(mode)
         return self
 
-    # ── write sweep: one feed-forward pass, updating the edges (gated delta rule) ──
-    def _sweep(self, x0: Tensor, W: Tensor, alpha: Tensor, eta: Tensor, surprise: Tensor):
-        """x0: [B,C,K] input activity; W: [B,n_pairs,C,K,K]; alpha: [B,C] per-column retention ∈ (0,1);
-        surprise: [B] the frozen LM's next-token surprise for this token. Returns (s_final, W_out)."""
-        invK = self.K ** -0.5
-        a = alpha.unsqueeze(-1).unsqueeze(-1)                   # [B,C,1,1] broadcast over the K×K edges
-        s = _hardtanh(x0)
-        new_W = []
-        for l in range(self.n_pairs):
-            Wl = W[:, l]                                        # [B,C,K,K]
-            # NB: keys are NOT L2-normalized — the hardtanh state already bounds them to [-1,1]^K, and
-            # unit-normalizing drops the propagated signal below the learned theta threshold → theta-dominated
-            # collapse (the DeltaNet key-norm recipe assumes a LINEAR recurrence, not our thresholded grid).
-            inp = torch.einsum("bcij,bci->bcj", Wl, s) * invK  # fan-in normalized read
-            s_out = _hardtanh(inp - self.theta[l])             # target post-activity
-            # DELTA rule (error-correcting): write the residual (target − current), fan-in scaled.
-            dW = torch.einsum("bci,bcj->bcij", s, s_out - inp) * invK
-            g = self.regulator(dW, s, s_out, self.cond[l], surprise)   # [B,C,K,K] in [-1,1]; surprise→write
-            # #2 input-dependent per-column decay α replaces the constant leak: W ← α·W + (g+eta)·dW.
-            Wl = torch.clamp(a * Wl + (g + eta) * dW, -1.0, 1.0)
-            new_W.append(Wl)
-            s = s_out
-        self._sat_last = (s.detach().abs() > 0.99).float().mean()   # state-sat canary
-        return s, torch.stack(new_W, dim=1)
-
     def init_streaming_state(self, batch_size: int, device, dtype):
         del dtype
         W = torch.zeros(batch_size, self.n_pairs, self.C, self.K, self.K,
                         device=device, dtype=torch.float32)
-        return {"W": W, "device": device, "n_written": 0}
+        return {"W": W, "n_written": 0}
 
     def streaming_write(self, state, token_embeds, attention_mask=None, chunk_offset=0,
                         surprise=None, **extra):
-        """Stream the passage into the fast edges (one gated-delta sweep per token). `surprise` [B,W] is
-        the frozen LM's per-token next-token prediction error (∈~[0,1]); feeds the write gate + decay."""
+        """Stream the passage into the per-layer fast edges via a CHUNK-PARALLEL gated-delta scan
+        (one scan per column-layer, nonlinearity between). `surprise` [B,W] is the frozen LM's
+        per-token prediction error; feeds the write-rate gate + decay. Carries W across windows."""
         del chunk_offset, extra
         B, Wlen = token_embeds.shape[:2]
         if attention_mask is None:
             attention_mask = torch.ones(B, Wlen, device=token_embeds.device, dtype=torch.bool)
         mask = attention_mask.float()                          # [B,W]
-        if surprise is None:                                  # standalone path (no LM logits) → no surprise
+        if surprise is None:
             surprise = token_embeds.new_zeros(B, Wlen)
-        # edge precision is load-bearing → run the grid in fp32 (autocast disabled).
         with torch.autocast(device_type="cuda", enabled=False):
             tok = token_embeds.float()
             sur = surprise.float()                             # [B,W]
-            x = self.in_proj(tok)                              # [B,W,d_grid]
-            x = x.view(B, Wlen, self.C, self.K)
-            x = x * mask.view(B, Wlen, 1, 1)                   # mask padded tokens to 0 (no nan)
-            alpha = torch.sigmoid(self.decay_proj(                          # [B,W,C] per-column retention
-                torch.cat([tok, sur.unsqueeze(-1)], dim=-1)))              # decay sees [h_t ; surprise_t]
-            eta = self.eta.float()
-            W = state["W"].float()
-            for t in range(Wlen):
-                x_t, m_t, a_t, sur_t = x[:, t], mask[:, t], alpha[:, t], sur[:, t]
-                if self.grad_checkpoint and self.training and torch.is_grad_enabled():
-                    def _step(_xt, _W, _a, _eta, _su):
-                        return self._sweep(_xt, _W, _a, _eta, _su)[1]
-                    W_new = torch.utils.checkpoint.checkpoint(
-                        _step, x_t, W, a_t, eta, sur_t, use_reentrant=False)
-                else:
-                    _, W_new = self._sweep(x_t, W, a_t, eta, sur_t)
-                # per-row delta: a padded row (m_t=0) is left bit-identical.
-                W = W + m_t.view(B, 1, 1, 1, 1) * (W_new - W)
-            self._decay_last = ((alpha * mask.unsqueeze(-1)).sum()
-                                / mask.sum().clamp_min(1.0) / self.C).detach()   # mean α canary
-            self._surprise_last = ((sur * mask).sum() / mask.sum().clamp_min(1.0)).detach()  # mean surprise
+            u = (self.in_proj(tok).view(B, Wlen, self.C, self.K)
+                 * mask.view(B, Wlen, 1, 1))                   # [B,W,C,K] layer-0 input (padded→0)
+            alpha = torch.sigmoid(self.decay_proj(            # [B,W,n_pairs,C] per-(layer,col) retention
+                torch.cat([tok, sur.unsqueeze(-1)], dim=-1))).view(B, Wlen, self.n_pairs, self.C)
+            W_in = state["W"].float()
+            new_W, beta_means = [], []
+            for l in range(self.n_pairs):
+                v = torch.einsum("btck,ckv->btcv", u, self.V_w[l])               # per-col value
+                beta = torch.sigmoid(
+                    torch.einsum("btck,ck->btc", u, self.beta_w[l]) + self.beta_b[l]
+                    + self.beta_s[l] * sur.unsqueeze(-1)) * mask.unsqueeze(-1)    # [B,W,C] write rate (pad→0)
+                g = torch.log(alpha[:, :, l].clamp_min(1e-6)) * mask.unsqueeze(-1)  # log-decay (pad→0=no decay)
+                o, W_l = chunk_gated_delta_rule(
+                    q=u.contiguous(), k=u.contiguous(), v=v.contiguous(),
+                    g=g.contiguous(), beta=beta.contiguous(),
+                    initial_state=W_in[:, l].contiguous(), output_final_state=True,
+                    use_qk_l2norm_in_kernel=True, scale=self.scale)
+                new_W.append(W_l)
+                beta_means.append((beta.sum() / mask.sum().clamp_min(1.0) / self.C))
+                u = _hardtanh(o - self.theta[l])              # nonlinearity + compounding → next layer input
+            W = torch.stack(new_W, dim=1)                     # [B,n_pairs,C,K,K]
+            with torch.no_grad():
+                self._decay_last = (alpha.mean(2) * mask.unsqueeze(-1)).sum() / mask.sum().clamp_min(1.0) / self.C
+                self._surprise_last = (sur * mask).sum() / mask.sum().clamp_min(1.0)
+                self._beta_last = torch.stack(beta_means).mean()
+                self._edge_last = W.abs().mean()
         state["W"] = W
         state["n_written"] = state.get("n_written", 0) + Wlen
         return state, {}
 
     def _propagate_read(self, x_grid: Tensor, W: Tensor) -> Tensor:
-        """Shared read core (read-only, fp32): propagate a grid-space query [B,M,C,K] through the
-        WRITTEN edges (NO edge update → reads never corrupt memory), per-slot readout → M tokens
-        [B,M,d_llama] at Llama's embedding norm. Recall = propagation through the synapses."""
+        """Read core (read-only): propagate a grid-space query [B,M,C,K] through the written edges via
+        the SAME readout convention as the write (o = scale·qᵀW per column, L2-normed query), with
+        hardtanh(o−θ) between layers → M tokens [B,M,d_llama] at Llama's embedding norm. NO W update."""
         Bn, Mn = x_grid.shape[:2]
-        invK = self.K ** -0.5
-        s = _hardtanh(x_grid)
+        s = x_grid
         for l in range(self.n_pairs):
-            inp = torch.einsum("bcij,bmci->bmcj", W[:, l].float(), s) * invK   # (no key-norm: see _sweep)
-            s = _hardtanh(inp - self.theta[l])                 # theta[l] [C,K] broadcasts
-        r = self.readout(s.reshape(Bn, Mn, self.d_grid))       # [B,M,d_llama]
-        return self.out_norm(r)                                # embedding-norm region (no distractors)
+            q = F.normalize(s, dim=-1, eps=1e-6)              # match the write key's in-kernel L2-norm
+            r = self.scale * torch.einsum("bmck,bckv->bmcv", q, W[:, l].float())   # qᵀ W_l per column
+            # RESIDUAL read (GCNII-style anti-over-smoothing): re-add the running query so the M seeds stay
+            # DISTINCT through the deep (n_pairs) propagation. Without it the readout r (~0.04) sits below the
+            # threshold θ (~0.1) → hardtanh(r−θ)≈hardtanh(−θ) for every seed → rank collapse (mem_effrank 2.5
+            # → 28 with the residual). The write needs no such fix — its per-token inputs are already diverse.
+            s = s + _hardtanh(r - self.theta[l])
+        return self.out_norm(self.readout(s.reshape(Bn, Mn, self.d_grid)))
 
     def _read_prepend(self, W: Tensor) -> Tensor:
         """Initial PREPEND read: the COLD learned seeds (pre-decoder-mixing) propagate through W."""
         B = W.shape[0]
         with torch.autocast(device_type="cuda", enabled=False):
-            x = self.read_seeds.unsqueeze(0).expand(B, self.M, self.C, self.K)   # [B,M,C,K]
+            x = self.read_seeds.unsqueeze(0).expand(B, self.M, self.C, self.K)
             return self._propagate_read(x, W.float())
 
     def refresh_prepend(self, slot_h: Tensor) -> Tensor:
         """Per-layer REFRESH (read-only): re-read W with the CURRENT slot hiddens (attention-mixed →
-        query-aware + each slot has seen the others → dedup). slot_h [B,M,d_llama] → read_in → grid →
-        propagate W → readout → out_norm; gated by the zero-init refresh_gate (no-op at step 0). Returns
-        a delta [B,M,d_llama] to ADD to the prepend positions. Reads the stashed (SHUF-rolled) self._read_W."""
+        query-aware + cross-slot dedup). slot_h [B,M,d_llama] → read_in → grid → propagate → out_norm,
+        gated by the zero-init refresh_gate (no-op at step 0). Returns a delta to ADD to the prepend."""
         W = self._read_W
         assert W is not None, "refresh_prepend called before finalize_memory stashed W"
         B, M, _ = slot_h.shape
         with torch.autocast(device_type="cuda", enabled=False):
-            x = self.read_in(slot_h.float()).view(B, M, self.C, self.K)   # d_llama → grid space
-            recall = self._propagate_read(x, W.float())                   # [B,M,d_llama]
-            delta = self.refresh_gate * recall
+            x = self.read_in(slot_h.float()).view(B, M, self.C, self.K)
+            delta = self.refresh_gate * self._propagate_read(x, W.float())
         return delta.to(slot_h.dtype)
 
     def finalize_memory(self, state):
-        """prepend mode: propagate seeds → M prepend tokens. conditioned mode: stash edges,
-        return an EMPTY prepend (the read happens later in the decoder hook)."""
+        """Propagate the seeds through the written per-layer edges → M prepend tokens [B,M,d_llama]."""
         W = state["W"]                                         # [B,n_pairs,C,K,K]
         self._read_W = W
-        if self.read_mode == "prepend":
-            memory = self._read_prepend(W).to(W.dtype)         # [B,M,d_llama]
-        else:
-            memory = W.new_zeros(W.shape[0], 0, self.d_llama)  # no prepend (conditioned read)
+        memory = self._read_prepend(W).to(W.dtype)            # [B,M,d_llama]
         with torch.no_grad():
             aux = {
-                "biomem_edge_absmean": W.abs().mean(),
-                "biomem_edge_satfrac": (W.abs() > 0.99).float().mean(),
-                "biomem_state_satfrac": self._sat_last,
-                "biomem_decay": self._decay_last,             # mean per-column retention α (was constant leak)
-                "biomem_surprise": self._surprise_last,       # mean LM next-token surprise (write-time signal)
-                "biomem_eta": self.eta,
+                "biomem_edge_absmean": self._edge_last,
+                "biomem_decay": self._decay_last,             # mean per-(layer,col) retention α
+                "biomem_beta": self._beta_last,               # mean write rate (the gate)
+                "biomem_surprise": self._surprise_last,       # mean LM next-token surprise
+                "biomem_mem_effrank": self._participation_ratio(memory.reshape(-1, memory.shape[-1])),
             }
-            if self.read_mode == "prepend":
-                m = memory.reshape(-1, memory.shape[-1])
-                aux["biomem_mem_effrank"] = self._participation_ratio(m)
         return memory, aux
 
     @staticmethod
@@ -356,37 +225,15 @@ class BioMemEncoder(nn.Module):
         xc = x - x.mean(0, keepdim=True); C = xc.t() @ xc
         return torch.diagonal(C).sum() ** 2 / (C * C).sum().clamp_min(1e-12)
 
-    def conditioned_read(self, h: Tensor) -> Tensor:
-        """Query-conditioned READ. h: [B,T,d_llama] decoder hidden at the tap layer.
-        Propagate each position's hidden through the FROZEN written edges (W shared per
-        example across its T positions) and return a recall delta [B,T,d_llama] to fuse
-        back into the residual stream (zero-init → 0 at step 0)."""
-        W = self._read_W
-        assert W is not None, "conditioned_read called before finalize_memory stashed W"
-        B, T, _ = h.shape
-        invK = self.K ** -0.5
-        with torch.autocast(device_type="cuda", enabled=False):
-            x0 = self.read_query_proj(h.float())               # [B,T,d_llama]
-            s = _hardtanh(x0.view(B, T, self.C, self.K))       # [B,T,C,K]
-            for l in range(self.n_pairs):
-                inp = torch.einsum("bcij,btci->btcj", W[:, l], s) * invK
-                s = _hardtanh(inp - self.theta[l])             # theta[l] [C,K] broadcasts
-            r = self.readout(s.reshape(B, T, self.d_grid))     # [B,T,d_llama]
-            delta = self.read_gate * self.read_fuse_proj(r)    # small-init gate → gentle, nonzero
-        return delta.to(h.dtype)
-
-    # ── conditioned-read interface (shared hook in model.py) ──
+    # ── prepend SHUF/OFF interface (shared hooks in model.py) ──
     def has_read_state(self) -> bool:
         return self._read_W is not None
 
-    def roll_read_state(self):                                 # SHUF control: wrong-example edges
+    def roll_read_state(self):                                 # SHUF: refresh reads wrong-example edges
         self._read_W = torch.roll(self._read_W, shifts=1, dims=0)
 
     def forward(self, token_embeds, attention_mask=None, mask_positions=None):
-        """Standalone path (write + finalize). The real read is query-conditioned via the
-        decoder hook; this returns the empty prepend + aux (and stashes W)."""
         del mask_positions
-        st = self.init_streaming_state(token_embeds.shape[0], token_embeds.device,
-                                       token_embeds.dtype)
+        st = self.init_streaming_state(token_embeds.shape[0], token_embeds.device, token_embeds.dtype)
         st, _ = self.streaming_write(st, token_embeds, attention_mask)
         return self.finalize_memory(st)

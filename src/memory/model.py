@@ -889,6 +889,13 @@ class ReprLearningModel(nn.Module):
         # biomem-prepend per-layer refresh (memory at [0:M] only with no chat scaffold).
         refresh = (self._install_prepend_refresh_hooks(M, 0, zero_memory, shuffle_memory)
                    if self.chat_template is None else [])
+        if (self.chat_template is not None and not zero_memory
+                and getattr(self.encoder, "wants_prepend_refresh", False)
+                and not getattr(self, "_warned_refresh_suppressed", False)):
+            print("[WARN] biomem per-layer refresh SUPPRESSED in the QA path: a chat template is set, "
+                  "so the memory is not at offset 0. The prepend refresh (a core part of the read) is OFF. "
+                  "Use a no-chat-template backbone (e.g. SmolLM2-135M) for the full biomem read.", flush=True)
+            self._warned_refresh_suppressed = True
 
         try:
             # Selective lm_head: run base model for hidden states, then only

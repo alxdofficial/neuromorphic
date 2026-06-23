@@ -125,14 +125,15 @@ class ReprConfig:
     save_every: int = 5000
 
     # ── biomem (gated fast-Hebbian cortical-column grid; models/biomem/) ─────
-    biomem_n_cols: int = 36            # C — #columns; C*K must == d_llama (36*16=576)
-    biomem_k: int = 16                 # K — column width
-    biomem_depth_h: int = 3            # H — layers per column (H-1=2 fast-edge layer-pairs).
-                                       # C=36,K=16,H=3 → W = 2*36*16^2 = 18,432 floats = EXACT
-                                       # raw-float match to the baselines' 32-token memory-state
-                                       # (n_pairs*K=32; trades column width/depth to hit parity).
-    biomem_read_mode: str = "prepend"  # "prepend" (v2: M learned seeds → propagate W → prepend, LM
-                                       # attention reads) | "conditioned" (legacy: tap-layer fuse read)
+    biomem_n_cols: int = 36            # C — #columns (= attention heads); C*K = d_grid = 576
+    biomem_k: int = 16                 # K — column width (per-column fast-weight head_dim)
+    biomem_depth_h: int = 5            # H — layers per column → H-1=4 STACKED synaptic fast-weight layers
+                                       # (the deep all-synaptic column is what makes this biomem and not a
+                                       # 1-layer DeltaNet — info flows through 4 fast-weight layers with a
+                                       # learned per-neuron threshold between each). W = n_pairs*C*K² floats/
+                                       # example is per-example transient state (UNCOUNTED, like a KV cache);
+                                       # the read budget (M*d=32*576) is what's matched to the baselines.
+    biomem_read_mode: str = "prepend"  # (retained for config compat; the encoder is prepend-only now)
     biomem_use_surprise: bool = True   # feed the frozen LM's per-token next-token prediction error
                                        # (−log p, a free pretrained surprise signal) into the write gate +
                                        # input-dependent decay (surprising token → write harder / retain).
@@ -143,8 +144,8 @@ class ReprConfig:
     biomem_n_slots: int = 32           # M — # learned read seeds = # prepend memory tokens (32×576 read budget)
     biomem_d_cond: int = 48            # per-(col,layer-pair) conditioning vector width
     biomem_reg_hidden: int = 64        # plasticity-regulator MLP hidden width (per-edge; keep narrow)
-    biomem_readout_hidden: int = 4600  # readout MLP hidden width (param-matched ~6.9M; trimmed to offset
-                                       # the per-layer-refresh read_in projection — keeps prepend mode at ~icae)
+    biomem_readout_hidden: int = 4500  # readout MLP hidden width (param-matched ~6.9M to the cohort;
+                                       # trimmed to offset the deeper-column + refresh projections)
     biomem_decay_init: float = 0.99    # init per-column retention α (input-dependent decay = sigmoid(decay_proj);
                                        # zero-init weight ⇒ α starts uniform ≈ this, then LEARNS input-dependence)
     biomem_base_write_rate_init: float = 0.1  # eta0 — learnable base write-rate (softplus); >0 so the
