@@ -142,10 +142,11 @@ class ReprConfig:
     biomem_reg_hidden: int = 64        # plasticity-regulator MLP hidden width (per-edge; keep narrow)
     biomem_readout_hidden: int = 4600  # readout MLP hidden width (param-matched ~6.9M; trimmed to offset
                                        # the per-layer-refresh read_in projection — keeps prepend mode at ~icae)
-    biomem_leak_init: float = 0.1      # initial leak lambda (learned, sigmoid-parameterized)
+    biomem_decay_init: float = 0.99    # init per-column retention α (input-dependent decay = sigmoid(decay_proj);
+                                       # zero-init weight ⇒ α starts uniform ≈ this, then LEARNS input-dependence)
     biomem_base_write_rate_init: float = 0.1  # eta0 — learnable base write-rate (softplus); >0 so the
                                        # write-side gets gradient even when the gate g≈0 (cold-start fix)
-    biomem_theta_scale: float = 0.1    # std of the random-fixed per-neuron threshold theta
+    biomem_theta_scale: float = 0.1    # std of the per-neuron threshold theta (random INIT; now learned)
     biomem_read_tap_layer: int = 15    # (conditioned mode only) decoder layer whose hidden seeds the read
     biomem_grad_checkpoint: bool = True  # checkpoint the per-token sweep (essential for BPTT memory)
 

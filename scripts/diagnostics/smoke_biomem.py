@@ -35,7 +35,8 @@ GROUPS = {
     "WRITE regulator": ("encoder.regulator",),
     "WRITE cond":      ("encoder.cond",),
     "WRITE eta_raw":   ("encoder.eta_raw",),
-    "WRITE leak_raw":  ("encoder.leak_raw",),
+    "WRITE decay_proj":("encoder.decay_proj",),
+    "WRITE theta":     ("encoder.theta",),
     "READ seeds":      ("encoder.read_seeds",),
     "READ readout":    ("encoder.readout",),
     "READ out_norm":   ("encoder.out_norm",),
@@ -105,7 +106,7 @@ def main():
               f"edge_absmean={float(aux['biomem_edge_absmean']):.4f}  "
               f"edge_satfrac={float(aux['biomem_edge_satfrac']):.3f}  "
               f"state_satfrac={float(aux['biomem_state_satfrac']):.3f}")
-        print(f"  leak={float(aux['biomem_leak']):.4f}  eta={float(aux['biomem_eta']):.4f}")
+        print(f"  decay(mean α)={float(aux['biomem_decay']):.4f}  eta={float(aux['biomem_eta']):.4f}")
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             out = (m.compute_masked_reconstruction_loss(b)
                    if MIXED_TASK_MODE[t] == "masked_reconstruction"

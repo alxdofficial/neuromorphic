@@ -2,10 +2,11 @@
 
 THE BET: memory lives in synaptic STATE (scalar fast edge weights W in [-1,1]
 updated by a *gated DELTA rule* per input token), NOT in learned weights. Read and
-write are both signal propagation through a small grid. The only LEARNED objects are
+write are both signal propagation through a small grid. The LEARNED objects are all
 small: a shared plasticity-regulator MLP, per-(column,layer-pair) conditioning
-vectors, the leak + base-write-rate scalars, the readout MLP, and the read-side
-query/fuse projections. theta (per-neuron thresholds) are RANDOM-FIXED.
+vectors, the input-dependent decay projection + base-write-rate scalar, the readout
+MLP, the read seeds + per-layer-refresh projection, and the per-neuron thresholds
+theta (random INIT, then learned — at K=16 the reservoir keep-fixed argument fails).
 
 Spirit of fast-weights (Ba et al. 2016), DeltaNet / delta-rule fast weights, and
 neuromodulated / differentiable plasticity / Backpropamine (Miconi et al. 2018).
@@ -19,11 +20,11 @@ Substrate
 
 Dynamics (one token = one feed-forward sweep; memory lives in the edges). At
 layer-pair l, state s in (B,C,K), fast edges W in (B,C,K,K):
-    inp   = einsum('bcij,bci->bcj', W, s) / sqrt(K)          # fan-in normalized
-    s_out = hardtanh(inp - theta_l)                          # target post-activity
-    dW    = einsum('bci,bcj->bcij', s, s_out - inp)/sqrt(K) - leak*W   # DELTA + leak
-    g     = tanh(Regulator([dW, s_pre, s_post, cond_l]))     # plasticity gate [-1,1]
-    W     = clamp(W + (g + eta0) * dW, -1, 1)                # eta0 = base write rate
+    inp   = einsum('bcij,bci->bcj', W, s) / sqrt(K)          # fan-in normalized read
+    s_out = hardtanh(inp - theta_l)                          # target post-activity (theta LEARNED)
+    dW    = einsum('bci,bcj->bcij', s, s_out - inp)/sqrt(K)  # error-correcting DELTA write
+    g     = tanh(Regulator([dW, s_pre, s_out, cond_l]))      # plasticity gate [-1,1]
+    W     = clamp(alpha * W + (g + eta0) * dW, -1, 1)        # #2 alpha = sigmoid(decay_proj(h)) per-column decay
     s     = s_out
 
 The `/sqrt(K)` (fan-in normalization) keeps `inp` O(1) so hardtanh stays in its
@@ -140,15 +141,21 @@ class BioMemEncoder(nn.Module):
         self.wants_prepend_refresh = False                     # set True by the prepend branch below
         self._read_W = None                                    # stashed each finalize
         self.register_buffer("_sat_last", torch.zeros(()), persistent=False)
+        self.register_buffer("_decay_last", torch.zeros(()), persistent=False)   # mean α canary
 
         # ── learned objects (all small) ──────────────────────────────────────
         self.in_proj = nn.Linear(cfg.d_llama, self.d_grid)     # token embed -> grid input
         d_cond = cfg.biomem_d_cond
         self.cond = nn.Parameter(torch.randn(self.n_pairs, C, d_cond) / math.sqrt(d_cond))
         self.regulator = _Regulator(d_cond, cfg.biomem_reg_hidden)
-        # leak lambda in (0,1) via sigmoid; base write-rate eta0 > 0 via softplus.
-        leak0 = float(cfg.biomem_leak_init)
-        self.leak_raw = nn.Parameter(torch.tensor(math.log(leak0 / (1 - leak0))))
+        # #2 INPUT-DEPENDENT decay (Gated DeltaNet / Mamba2): per-column retention α_t = sigmoid(decay_proj(h_t))
+        # ∈ (0,1) replaces the old constant scalar leak. W ← α_t·W + (g+eta0)·dW. Zero-init weight + a bias
+        # at logit(decay_init) ⇒ α starts uniform ≈ decay_init (= the old constant-decay behavior) then LEARNS
+        # input-dependence (α→0 clears at context boundaries; α→1 retains within a passage).
+        self.decay_proj = nn.Linear(cfg.d_llama, C)
+        nn.init.zeros_(self.decay_proj.weight)
+        d0 = float(cfg.biomem_decay_init)
+        nn.init.constant_(self.decay_proj.bias, math.log(d0 / (1 - d0)))   # logit(decay_init)
         eta0 = float(cfg.biomem_base_write_rate_init)
         self.eta_raw = nn.Parameter(torch.tensor(math.log(math.expm1(eta0))))  # softplus⁻¹(eta0)
         # readout: per-slot grid activity (d_grid) -> one recall token (d_llama).
@@ -183,9 +190,10 @@ class BioMemEncoder(nn.Module):
             self.read_gate = nn.Parameter(torch.tensor(0.1))
         else:
             raise ValueError(f"biomem_read_mode must be 'prepend' or 'conditioned', got {self.read_mode!r}")
-        # random-FIXED per-neuron thresholds theta [n_pairs, C, K] (fp32 buffer).
-        self.register_buffer(
-            "theta", cfg.biomem_theta_scale * torch.randn(self.n_pairs, C, K))
+        # #4 LEARNED per-neuron thresholds theta [n_pairs, C, K] (random init, then trained). At K=16 the
+        # reservoir "keep-fixed" argument doesn't hold (it needs a large overcomplete reservoir); with full
+        # BPTT available, fixing theta is unjustified + seed-sensitive, so we learn it (cheap: C·K·n_pairs params).
+        self.theta = nn.Parameter(cfg.biomem_theta_scale * torch.randn(self.n_pairs, C, K))
 
         _read = (f"PREPEND {self.M} seeds (LM attention reads"
                  + (", per-layer refresh" if getattr(self, "per_layer_refresh", False) else "") + ")"
@@ -198,10 +206,6 @@ class BioMemEncoder(nn.Module):
               f"checkpoint={self.grad_checkpoint}")
 
     @property
-    def leak(self) -> Tensor:
-        return torch.sigmoid(self.leak_raw)
-
-    @property
     def eta(self) -> Tensor:
         return F.softplus(self.eta_raw)                        # base write-rate > 0
 
@@ -210,19 +214,25 @@ class BioMemEncoder(nn.Module):
         return self
 
     # ── write sweep: one feed-forward pass, updating the edges (gated delta rule) ──
-    def _sweep(self, x0: Tensor, W: Tensor, leak: Tensor, eta: Tensor):
-        """x0: [B,C,K] input activity; W: [B,n_pairs,C,K,K]. Returns (s_final, W_out)."""
+    def _sweep(self, x0: Tensor, W: Tensor, alpha: Tensor, eta: Tensor):
+        """x0: [B,C,K] input activity; W: [B,n_pairs,C,K,K]; alpha: [B,C] per-column retention ∈ (0,1).
+        Returns (s_final, W_out). #1 L2-normalized key + #2 input-dependent decay."""
         invK = self.K ** -0.5
+        a = alpha.unsqueeze(-1).unsqueeze(-1)                   # [B,C,1,1] broadcast over the K×K edges
         s = _hardtanh(x0)
         new_W = []
         for l in range(self.n_pairs):
             Wl = W[:, l]                                        # [B,C,K,K]
-            inp = torch.einsum("bcij,bci->bcj", Wl, s) * invK  # fan-in normalized
+            # NB: keys are NOT L2-normalized — the hardtanh state already bounds them to [-1,1]^K, and
+            # unit-normalizing drops the propagated signal below the learned theta threshold → theta-dominated
+            # collapse (the DeltaNet key-norm recipe assumes a LINEAR recurrence, not our thresholded grid).
+            inp = torch.einsum("bcij,bci->bcj", Wl, s) * invK  # fan-in normalized read
             s_out = _hardtanh(inp - self.theta[l])             # target post-activity
-            # DELTA rule: write the residual error (target − current), fan-in scaled.
-            dW = torch.einsum("bci,bcj->bcij", s, s_out - inp) * invK - leak * Wl
+            # DELTA rule (error-correcting): write the residual (target − current), fan-in scaled.
+            dW = torch.einsum("bci,bcj->bcij", s, s_out - inp) * invK
             g = self.regulator(dW, s, s_out, self.cond[l])     # [B,C,K,K] in [-1,1]
-            Wl = torch.clamp(Wl + (g + eta) * dW, -1.0, 1.0)   # gate + base write-rate
+            # #2 input-dependent per-column decay α replaces the constant leak: W ← α·W + (g+eta)·dW.
+            Wl = torch.clamp(a * Wl + (g + eta) * dW, -1.0, 1.0)
             new_W.append(Wl)
             s = s_out
         self._sat_last = (s.detach().abs() > 0.99).float().mean()   # state-sat canary
@@ -244,22 +254,26 @@ class BioMemEncoder(nn.Module):
         mask = attention_mask.float()                          # [B,W]
         # edge precision is load-bearing → run the grid in fp32 (autocast disabled).
         with torch.autocast(device_type="cuda", enabled=False):
-            x = self.in_proj(token_embeds.float())             # [B,W,d_llama]
+            tok = token_embeds.float()
+            x = self.in_proj(tok)                              # [B,W,d_grid]
             x = x.view(B, Wlen, self.C, self.K)
             x = x * mask.view(B, Wlen, 1, 1)                   # mask padded tokens to 0 (no nan)
-            leak, eta = self.leak.float(), self.eta.float()
+            alpha = torch.sigmoid(self.decay_proj(tok))        # [B,W,C] per-column retention ∈ (0,1)
+            eta = self.eta.float()
             W = state["W"].float()
             for t in range(Wlen):
-                x_t, m_t = x[:, t], mask[:, t]
+                x_t, m_t, a_t = x[:, t], mask[:, t], alpha[:, t]
                 if self.grad_checkpoint and self.training and torch.is_grad_enabled():
-                    def _step(_xt, _W, _leak, _eta):
-                        return self._sweep(_xt, _W, _leak, _eta)[1]
+                    def _step(_xt, _W, _a, _eta):
+                        return self._sweep(_xt, _W, _a, _eta)[1]
                     W_new = torch.utils.checkpoint.checkpoint(
-                        _step, x_t, W, leak, eta, use_reentrant=False)
+                        _step, x_t, W, a_t, eta, use_reentrant=False)
                 else:
-                    _, W_new = self._sweep(x_t, W, leak, eta)
+                    _, W_new = self._sweep(x_t, W, a_t, eta)
                 # per-row delta: a padded row (m_t=0) is left bit-identical.
                 W = W + m_t.view(B, 1, 1, 1, 1) * (W_new - W)
+            self._decay_last = ((alpha * mask.unsqueeze(-1)).sum()
+                                / mask.sum().clamp_min(1.0) / self.C).detach()   # mean α canary
         state["W"] = W
         state["n_written"] = state.get("n_written", 0) + Wlen
         return state, {}
@@ -272,7 +286,7 @@ class BioMemEncoder(nn.Module):
         invK = self.K ** -0.5
         s = _hardtanh(x_grid)
         for l in range(self.n_pairs):
-            inp = torch.einsum("bcij,bmci->bmcj", W[:, l].float(), s) * invK
+            inp = torch.einsum("bcij,bmci->bmcj", W[:, l].float(), s) * invK   # (no key-norm: see _sweep)
             s = _hardtanh(inp - self.theta[l])                 # theta[l] [C,K] broadcasts
         r = self.readout(s.reshape(Bn, Mn, self.d_grid))       # [B,M,d_llama]
         return self.out_norm(r)                                # embedding-norm region (no distractors)
@@ -312,7 +326,7 @@ class BioMemEncoder(nn.Module):
                 "biomem_edge_absmean": W.abs().mean(),
                 "biomem_edge_satfrac": (W.abs() > 0.99).float().mean(),
                 "biomem_state_satfrac": self._sat_last,
-                "biomem_leak": self.leak,
+                "biomem_decay": self._decay_last,             # mean per-column retention α (was constant leak)
                 "biomem_eta": self.eta,
             }
             if self.read_mode == "prepend":
