@@ -1136,7 +1136,12 @@ def train_mixed_variant(
         # and is the right fix for a STOCHASTIC mixed-precision NaN (a rare borderline overflow that fires
         # on different steps each run and vanishes under anomaly mode), vs poisoning the model.
         if not (torch.isfinite(gn_mem) and torch.isfinite(gn_lora)):
-            print(f"  [step {step}] non-finite GRADIENT ({float(gn)}, task={task}) — skipping opt.step")
+            bad = [n for n, p in model.named_parameters()
+                   if p.grad is not None and not torch.isfinite(p.grad).all()]
+            short = [n.replace("encoder.", "enc.").replace("decoder.llama", "dec") for n in bad
+                     if "base.model.layers" not in n][:14]   # drop the 60 frozen-base LoRA names
+            print(f"  [step {step}] non-finite GRADIENT (task={task}) — culprit params: {short} "
+                  f"(+{len(bad)-len(short)} more) — skipping opt.step")
             opt.zero_grad(set_to_none=True)
             continue
         opt.step()
@@ -1743,7 +1748,8 @@ def main():
         # TRIMMED to r85 (from icae's r104) to offset the MP params → total ≈ icae's ~6.9M.
         cfg.slotgraph_n_slots = _M
         cfg.slotgraph_n_nodes = _M // 2          # FIXED partition: half nodes, half edges
-        cfg.slotgraph_lora_rank = 85; cfg.slotgraph_lora_alpha = 170   # +MP modules → params ≈ icae
+        cfg.slotgraph_d_key = 64                 # content-addressed routing query/key dim
+        cfg.slotgraph_lora_rank = 82; cfg.slotgraph_lora_alpha = 164   # +MP +query/key heads → params ≈ icae
         # vqicae (icae + VQ-discretized slots): encoder-LoRA r96 + projns + EMA codebook (a buffer,
         # not gradient-trained) → ~7.0M trainable, matched to icae. Large codebook K=8192.
         cfg.vqicae_n_slots = _M

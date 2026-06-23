@@ -33,8 +33,9 @@ DEV = "cuda"
 
 # component-name → (group, prefixes). TOPO = topology-bearing; MP = message-passing read modules.
 GROUPS = {
-    "TOPO src_head":   ("encoder.src_head",),
-    "TOPO dst_head":   ("encoder.dst_head",),
+    "TOPO q_src_head": ("encoder.q_src_head",),
+    "TOPO q_dst_head": ("encoder.q_dst_head",),
+    "TOPO k_head":     ("encoder.k_head",),
     "TOPO log_temp":   ("encoder.log_temp",),
     "MP   msg":        ("encoder.msg",),
     "MP   update":     ("encoder.update",),
@@ -57,7 +58,8 @@ def build(structure=True, seed=0):
     cfg.task_mode = "mixed"
     cfg.use_llama_lora = True; cfg.llama_lora_rank = 16; cfg.llama_lora_alpha = 32
     cfg.slotgraph_n_slots = 32
-    cfg.slotgraph_lora_rank = 85; cfg.slotgraph_lora_alpha = 170
+    cfg.slotgraph_d_key = 64
+    cfg.slotgraph_lora_rank = 82; cfg.slotgraph_lora_alpha = 164
     cfg.slotgraph_use_structure = structure
     m = ReprLearningModel(cfg, variant="slotgraph_baseline", llama_model=None).to(DEV)
     m.train(True)
@@ -137,7 +139,7 @@ def main():
     print(f"\n=== A/B: does the MP read LIFT the endpoint-head gradient? (same seed/data) ===")
     m_off, _, _ = build(structure=False, seed=0)
     backward_once(m_off, to_device(vs["mae"][0], DEV), "mae")
-    for g in ("TOPO src_head", "TOPO dst_head"):
+    for g in ("TOPO q_src_head", "TOPO q_dst_head", "TOPO k_head"):
         off = grad_norm(m_off, GROUPS[g])
         ratio = on[g] / max(off, 1e-12)
         print(f"  {g:16} OFF={off:.3e}  ON={on[g]:.3e}  ×{ratio:.1f}")

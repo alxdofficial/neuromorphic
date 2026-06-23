@@ -168,6 +168,8 @@ class ReprConfig:
                                          # control is the separate icae_baseline variant). The ablation.
     slotgraph_max_hops: int = 5          # cap on the adaptive MP hop count (over-smoothing / compute guard);
                                          # #hops = the predicted graph's DIAMETER (reachability saturation)
+    slotgraph_d_key: int = 64            # query/key dim for content-addressed endpoint routing (edge
+                                         # queries · node keys, then single-step Sinkhorn competition)
 
     # ── vqicae (ICAE with VQ-VAE-discretized slots; models/vqicae/) ──────────
     # ICAE write, then each slot is quantized to its nearest code in a large EMA codebook

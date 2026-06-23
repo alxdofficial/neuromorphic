@@ -31,7 +31,8 @@ def apply_mixed_capacity(cfg):
     cfg.llama_lora_rank = 16; cfg.llama_lora_alpha = 32
     cfg.slotgraph_n_slots = 32
     cfg.slotgraph_n_nodes = 16          # FIXED partition (matches train.py: M//2)
-    cfg.slotgraph_lora_rank = 85; cfg.slotgraph_lora_alpha = 170   # +MP modules → params ≈ icae (matches train.py)
+    cfg.slotgraph_d_key = 64            # content-addressed routing query/key dim (matches train.py)
+    cfg.slotgraph_lora_rank = 82; cfg.slotgraph_lora_alpha = 164   # +MP +query/key heads → params ≈ icae
 
 
 def build(use_structure=True):
@@ -101,7 +102,7 @@ def main():
     with torch.amp.autocast("cuda", dtype=torch.bfloat16):
         out = m.compute_masked_reconstruction_loss(b)
     out["loss"].backward()
-    comps = ["slot_init", "struct_norm", "src_head", "dst_head",
+    comps = ["slot_init", "struct_norm", "q_src_head", "q_dst_head", "k_head",
              "log_temp", "msg", "update", "norm"]
     pd = dict(enc.named_parameters())
     ok = True
