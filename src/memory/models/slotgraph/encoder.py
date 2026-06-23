@@ -147,8 +147,9 @@ class SlotGraphEncoder(nn.Module):
         return logA
 
     def _structure(self, slot_h: Tensor):
-        """Content-addressed endpoints with competition. Returns (src, dst) [B,M,M] hard one-hots (edge
-        rows → node cols) + (soft_src, soft_dst) [B,E,N] per-edge distributions for canaries."""
+        """Content-addressed endpoints with competition + NO self-loops. src is chosen first; dst then
+        forbids the src node (mask it out) so dst≠src always → every edge is a genuine two-node relation.
+        Returns (src, dst) [B,M,M] hard one-hots (edge rows → node cols) + (soft_src,soft_dst) [B,E,N]."""
         B = slot_h.shape[0]
         he = self._head_in(slot_h)                                # [B,M,2d]
         k = self.k_head(he[:, :self.K])                           # [B,N,dk] node keys
@@ -157,16 +158,15 @@ class SlotGraphEncoder(nn.Module):
         scale = 1.0 / math.sqrt(self.d_k)
         temp = self.log_temp.exp().clamp_min(1e-2)
 
-        def _pick(qe):
-            sc = torch.einsum("bed,bnd->ben", qe, k) * scale / temp      # [B,E,N] content match / temp
-            soft = sc.softmax(-1)                                        # [B,E,N] per-edge (pre-competition) dist
-            e_oh = _st_onehot(self._sinkhorn1(sc), 1.0)                  # [B,E,N] one-hot (competition + ST)
-            full = F.pad(e_oh, (0, self.M - self.K))                     # [B,E,M] cols→M (node cols first)
-            full = F.pad(full, (0, 0, self.K, 0))                        # [B,M,M] rows→M (node rows = 0 on top)
-            return full, soft
-        src, soft_src = _pick(q_src)
-        dst, soft_dst = _pick(q_dst)
-        return src, dst, soft_src, soft_dst
+        def _to_full(e_oh):                                        # [B,E,N] → [B,M,M] (edge rows, node cols)
+            return F.pad(F.pad(e_oh, (0, self.M - self.K)), (0, 0, self.K, 0))
+
+        sc_src = torch.einsum("bed,bnd->ben", q_src, k) * scale / temp     # [B,E,N]
+        src_oh = _st_onehot(self._sinkhorn1(sc_src), 1.0)                  # [B,E,N] one-hot src
+        # dst: forbid the src node (detached, finite constant → no self-loops, no 0·inf gradient trap)
+        sc_dst = torch.einsum("bed,bnd->ben", q_dst, k) * scale / temp - 1e4 * src_oh.detach()
+        dst_oh = _st_onehot(self._sinkhorn1(sc_dst), 1.0)                  # [B,E,N] one-hot dst (≠ src)
+        return _to_full(src_oh), _to_full(dst_oh), sc_src.softmax(-1), sc_dst.softmax(-1)
 
     @torch.no_grad()
     def _adaptive_hops(self, src: Tensor, dst: Tensor) -> int:
@@ -215,12 +215,14 @@ class SlotGraphEncoder(nn.Module):
             node_use = (src + dst).sum(dim=(0, 1))[:self.K]        # [N] how many edge-endpoints hit each node
             pu = node_use / node_use.sum().clamp_min(1e-9)
             node_entropy = -(pu.clamp_min(1e-9).log() * pu).sum()  # ↑(→lnK)=spread; ↓=hub-collapse
+            src_pick = src[:, self.K:, :self.K].argmax(-1)         # [B,E] ACTUAL src node per edge (Sinkhorn pick)
+            dst_pick = dst[:, self.K:, :self.K].argmax(-1)         # [B,E] ACTUAL dst node (≠ src by the mask)
             info = {"hops": K,
                     "delta": (1.0 - F.cosine_similarity(pre, memory, dim=-1)).mean(),
                     "src_entropy": _ent(soft_src), "dst_entropy": _ent(soft_dst),
                     "node_entropy": node_entropy, "ent_max": math.log(self.K),
-                    "selfloop": (soft_src.argmax(-1) == soft_dst.argmax(-1)).float().mean(),
-                    "src_arg": soft_src.argmax(-1), "dst_arg": soft_dst.argmax(-1)}
+                    "selfloop": (src_pick == dst_pick).float().mean(),
+                    "src_arg": src_pick, "dst_arg": dst_pick}
         return memory, info
 
     def finalize_memory(self, state):

@@ -23,8 +23,9 @@ DEV = "cuda"
 CKPT = REPO / "outputs/memory/mixed4k_bio_slotgraph_baseline/ckpts/slotgraph_baseline.best.pt"
 
 GROUPS = {
-    "TOPO src_head":  ("encoder.src_head",),
-    "TOPO dst_head":  ("encoder.dst_head",),
+    "TOPO q_src_head": ("encoder.q_src_head",),
+    "TOPO q_dst_head": ("encoder.q_dst_head",),
+    "TOPO k_head":     ("encoder.k_head",),
     "TOPO log_temp":  ("encoder.log_temp",),
     "MP   msg":       ("encoder.msg",),
     "MP   update":    ("encoder.update",),

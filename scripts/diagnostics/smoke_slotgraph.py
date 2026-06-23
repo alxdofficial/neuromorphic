@@ -120,7 +120,7 @@ def main():
                      if "lora" in k.lower() and k.startswith("decoder.") and p.grad is not None)
     print(f"  {'encoder_LoRA':14} grad={g_enc_lora:.2e}")
     print(f"  {'decoder_LoRA':14} grad={g_dec_lora:.2e}")
-    print(f"  >>> src/dst_head grad nonzero ⇒ hard-ST structure selection is trainable (not starved)")
+    print(f"  >>> q_src/q_dst/k_head grad nonzero ⇒ content-addressed routing is trainable (after cold-start)")
     print(f"\n{'ALL components received gradient ✓' if ok else 'SOME COMPONENT STARVED ✗'}")
 
     # ── use_structure=False (pure icae control) ──

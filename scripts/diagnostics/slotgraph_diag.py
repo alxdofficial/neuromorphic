@@ -61,13 +61,18 @@ def structure(enc, ctx, mask):
     with torch.amp.autocast("cuda", dtype=torch.bfloat16):   # no injection hooks (structure is read-only now)
         h = enc.base.model(inputs_embeds=inp, attention_mask=attn, use_cache=False).last_hidden_state
     slot_final = h[:, -M:].float()
-    hhin = enc._head_in(slot_final)                       # [struct_norm(slot) ; scaled id]
-    temp = float(enc.log_temp.exp().clamp_min(1e-2))
+    K = enc.K
     role = enc.role_fixed.unsqueeze(0).expand(B, -1, -1).float()   # FIXED partition (0=node, 1=edge)
-    s_logits, d_logits = enc._endpoint_logits(hhin)      # masked to the fixed node pool (edges→nodes)
-    src = (s_logits / temp).softmax(-1)
-    dst = (d_logits / temp).softmax(-1)
-    return slot_final, role, src, dst
+    # content-addressed routing: edge queries · node keys → single-step Sinkhorn → per-edge node dist,
+    # placed into [B,M,M] (edge rows K:, node cols :K) so downstream entropy/usage/UMAP code is unchanged.
+    he = enc._head_in(slot_final)
+    k = enc.k_head(he[:, :K]); q_src = enc.q_src_head(he[:, K:]); q_dst = enc.q_dst_head(he[:, K:])
+    scale = 1.0 / math.sqrt(enc.d_k); temp = float(enc.log_temp.exp().clamp_min(1e-2))
+    def _soft(qe):
+        sc = torch.einsum("bed,bnd->ben", qe, k) * scale / temp
+        A = enc._sinkhorn1(sc).softmax(-1)               # [B,E,N] per-edge node distribution (post-competition)
+        return torch.nn.functional.pad(torch.nn.functional.pad(A, (0, M - K)), (0, 0, K, 0))  # [B,M,M]
+    return slot_final, role, _soft(q_src), _soft(q_dst)
 
 
 def ent(p, dim=-1):
