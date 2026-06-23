@@ -59,9 +59,9 @@ class ReprLearningModel(nn.Module):
         # gated fast-Hebbian cortical-column grid — memory lives in fast synaptic
         # STATE (fast edges), read+write are signal propagation (models/biomem/).
         "biomem_baseline": BioMemEncoder,
-        # emergent-topology slot memory — ICAE write + a per-LM-layer head that predicts HARD
-        # node/edge role + (for edges) which slot-positions connect, concretized as TokenGT
-        # role/identity embeddings, re-injected each LM layer; prepend read (models/slotgraph/).
+        # fixed-partition graph slot memory — ICAE write + a FIXED node/edge slot partition; each edge
+        # predicts (hard ST) which two node slots it links; read = a multi-hop residual message-passing
+        # GNN over the predicted graph, prepended (models/slotgraph/).
         "slotgraph_baseline": SlotGraphEncoder,
         # ICAE but each slot is a VQ-VAE code from a large codebook (discreteness experiment).
         "vqicae_baseline": VQICAEEncoder,
@@ -321,7 +321,9 @@ class ReprLearningModel(nn.Module):
         # every position's hidden through the frozen written edges and fuses the recall
         # back. REAL = read; OFF (zero_memory) = no read; SHUF = read wrong-example edges.
         hook_handle = self._install_conditioned_read_hook(zero_memory, shuffle_memory, B)
-        # slotgraph: re-inject the structural embed at each LM layer (memory is at positions [0:M]).
+        # per-layer prepend re-injection hook (legacy): a no-op unless an encoder sets
+        # reinforce_prepend_each_layer + emits 'prepend_struct'. The current slotgraph does NEITHER
+        # (its structure lives entirely in the post-LM message-passing read), so this returns [].
         reinforce = self._install_prepend_reinforce_hooks(mem_aux, M, 0, shuffle_memory)
         try:
             base_out = self.decoder.llama.model(

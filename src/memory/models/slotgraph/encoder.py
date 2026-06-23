@@ -93,8 +93,8 @@ class SlotGraphEncoder(nn.Module):
         self.slot_init = nn.Parameter(slot_init)
 
         # FIXED near-orthonormal per-position identity codes (buffer, persistent → distinct + stable)
-        assert self.M <= d, (f"slotgraph needs M ({self.M}) <= d_llama ({d}) for orthonormal id codes; "
-                             f"got M>d → QR would return a [d,d] table, not [M,d].")
+        assert 2 <= self.M <= d, (f"slotgraph needs 2 <= M ({self.M}) <= d_llama ({d}): M≥2 for a valid "
+                                  f"node/edge partition, M≤d for orthonormal id codes (else QR gives [d,d]).")
         gen = torch.Generator().manual_seed(0)
         q = torch.linalg.qr(torch.randn(d, self.M, generator=gen))[0]    # [d,M] orthonormal cols
         self.register_buffer("id_embed", q.t().contiguous(), persistent=True)   # [M,d] unit-norm rows
@@ -240,12 +240,17 @@ class SlotGraphEncoder(nn.Module):
             src_soft = (s_logits / temp).softmax(-1)
             dst_soft = (d_logits / temp).softmax(-1)
 
-            def _ent(p):
-                return (-(p.clamp_min(1e-9).log() * p).sum(-1)).mean()
+            def _ent(p):                                            # per-slot entropy, EDGE slots only
+                return (-(p.clamp_min(1e-9).log() * p).sum(-1))[:, self.K:].mean()
             aux["slotgraph_edge_frac"] = torch.tensor(float(1.0 - self.is_node.mean()), device=emb.device)
             aux["slotgraph_invalid_edge_frac"] = torch.zeros((), device=emb.device)  # 0 by construction
-            aux["slotgraph_src_entropy"] = _ent(src_soft)          # ↓ = confident edges; ↑ = arbitrary
+            # endpoints are masked to the K-node pool → max entropy is ln(K), NOT ln(M). Report both so a
+            # reading near ln(K) is correctly seen as ~uniform-over-nodes (not "sharp").
+            aux["slotgraph_src_entropy"] = _ent(src_soft)          # ↓ = confident edges; →ln(K) = arbitrary
             aux["slotgraph_dst_entropy"] = _ent(dst_soft)
+            aux["slotgraph_endpoint_entropy_max"] = torch.tensor(math.log(self.K), device=emb.device)
+            aux["slotgraph_selfloop_frac"] = (                     # edges with src==dst (degenerate)
+                (src_soft.argmax(-1) == dst_soft.argmax(-1)).float()[:, self.K:].mean())
             aux["slotgraph_temp"] = temp.detach()
             aux["slotgraph_mem_effrank"] = torch.tensor(
                 _participation_ratio(memory.reshape(-1, memory.shape[-1])), device=emb.device)

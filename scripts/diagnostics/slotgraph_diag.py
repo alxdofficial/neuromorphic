@@ -78,7 +78,7 @@ def main():
     print(f"loading {CKPT.name} ...")
     m, cfg, tok = load_model()
     enc = m.encoder; M = enc.M
-    lnM = math.log(M)
+    lnM = math.log(enc.K)   # endpoints are masked to the K-node pool → max entropy is ln(K), not ln(M)
     vs = make_mixed_val_sets(["babi"], tok, cfg, 8, ctx_len=1024, m_slots=32,
                              mae_src_tok="meta-llama/Llama-3.2-1B",
                              babi_tasks=(1, 2, 3, 7, 8, 11, 12, 13, 14), predict_len=64)["babi"]
@@ -129,7 +129,7 @@ def main():
     print(f"\n{'='*64}\nslotgraph structure diagnostics (bAbI, {len(edge_frac)} examples)\n{'='*64}")
     print(f"  edge_frac:        mean={edge_frac.mean():.3f}  (fraction of slots that are edges)")
     print(f"  role entropy:     mean={role_ent_all.mean():.3f} / max ln2={math.log(2):.3f}")
-    print(f"  endpoint entropy: mean={edge_ent.mean():.3f} / max lnM={lnM:.3f}  "
+    print(f"  endpoint entropy: mean={edge_ent.mean():.3f} / max lnK(={enc.K})={lnM:.3f}  "
           f"({100*edge_ent.mean()/lnM:.0f}% of max → {'SMEARED/near-random' if edge_ent.mean()>0.8*lnM else 'has structure'})")
     print(f"  node-target usage: {n_used}/{M} slots ever targeted; top-2 capture {top2_frac*100:.0f}% of endpoints "
           f"({'COLLAPSED' if top2_frac>0.5 else 'spread'})")
@@ -165,7 +165,7 @@ def main():
     # ── PLOT 2: histogram panel ──
     fig, axs = plt.subplots(2, 2, figsize=(12, 9))
     axs[0, 0].hist(edge_frac, bins=20, color="slateblue"); axs[0, 0].set_title("edge fraction per example"); axs[0, 0].set_xlabel("frac slots = edge")
-    axs[0, 1].hist(edge_ent, bins=30, color="crimson"); axs[0, 1].axvline(lnM, color="k", ls="--", label=f"max ln{M}={lnM:.2f}")
+    axs[0, 1].hist(edge_ent, bins=30, color="crimson"); axs[0, 1].axvline(lnM, color="k", ls="--", label=f"max lnK({enc.K})={lnM:.2f}")
     axs[0, 1].set_title("per-edge endpoint entropy (↓=sharp, →max=random)"); axs[0, 1].set_xlabel("entropy"); axs[0, 1].legend()
     if all_tgts.size:
         axs[1, 0].bar(range(M), np.bincount(all_tgts, minlength=M), color="seagreen")

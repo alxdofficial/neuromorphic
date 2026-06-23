@@ -81,7 +81,7 @@ def main():
         print(f"  memory shape={tuple(mem.shape)}")
         print(f"  canaries: edge_frac={float(aux['slotgraph_edge_frac']):.3f}  "
               f"src_ent={float(aux['slotgraph_src_entropy']):.2f}  dst_ent={float(aux['slotgraph_dst_entropy']):.2f}  "
-              f"(max ln32={torch.log(torch.tensor(32.)):.2f})")
+              f"(max=lnK={float(aux['slotgraph_endpoint_entropy_max']):.2f}; →max = ~uniform over nodes)")
         print(f"  temp={float(aux['slotgraph_temp']):.2f}  "
               f"mem_effrank={float(aux['slotgraph_mem_effrank']):.2f}/{cfg.d_llama}")
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):

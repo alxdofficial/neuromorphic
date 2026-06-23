@@ -1115,7 +1115,15 @@ def train_mixed_variant(
             print(f"  [step {step}] non-finite loss = {float(loss.detach())} (task={task}) — skipping batch")
             opt.zero_grad(set_to_none=True)
             continue
-        loss.backward()
+        # Debug: from --anomaly-from onward, run backward under anomaly detection so the FIRST non-finite
+        # gradient halts with a traceback to the exact forward op that produced it (catches backward NaNs
+        # that the forward-loss skip-guard above can't see).
+        import contextlib as _ctxlib
+        _afrom = int(getattr(cfg, "anomaly_from", -1))
+        _anom = (torch.autograd.detect_anomaly()
+                 if (_afrom >= 0 and step >= _afrom) else _ctxlib.nullcontext())
+        with _anom:
+            loss.backward()
         _mem_params = [p for n, p in model.named_parameters()
                        if p.requires_grad and not n.startswith("decoder.llama.")]
         _lora_params = [p for n, p in model.named_parameters()
@@ -1123,6 +1131,14 @@ def train_mixed_variant(
         gn_mem = torch.nn.utils.clip_grad_norm_(_mem_params, cfg.grad_clip)
         gn_lora = torch.nn.utils.clip_grad_norm_(_lora_params, cfg.grad_clip)
         gn = (gn_mem ** 2 + gn_lora ** 2) ** 0.5
+        # Skip the optimizer step on a non-finite GRADIENT (the forward-loss check above misses backward
+        # NaNs). This is the standard bf16/AMP handling — PyTorch's GradScaler skips inf/nan-grad steps —
+        # and is the right fix for a STOCHASTIC mixed-precision NaN (a rare borderline overflow that fires
+        # on different steps each run and vanishes under anomaly mode), vs poisoning the model.
+        if not (torch.isfinite(gn_mem) and torch.isfinite(gn_lora)):
+            print(f"  [step {step}] non-finite GRADIENT ({float(gn)}, task={task}) — skipping opt.step")
+            opt.zero_grad(set_to_none=True)
+            continue
         opt.step()
 
         # Per-step TRAIN row, tagged with the task that produced this batch.
@@ -1422,6 +1438,9 @@ def main():
     ap.add_argument("--graph-entmax-alpha", type=float, default=1.0,
                     help="graph: node-selection sparsity. 1.0 = softmax (dense blend, default); "
                          "1.5 = entmax (sparse, commits to a few nodes); 2.0 = sparsemax.")
+    ap.add_argument("--anomaly-from", type=int, default=-1,
+                    help="debug: from this step on, run loss.backward() under torch.autograd.detect_anomaly "
+                         "so the first non-finite GRADIENT halts with a traceback to the exact forward op.")
     ap.add_argument("--slotgraph-no-structure", action="store_true",
                     help="slotgraph: disable the MP-read structure = plain prepend of the id-tagged slots "
                          "('id-tagged ICAE'; true pure-ICAE = the icae_baseline variant). "
@@ -1793,6 +1812,7 @@ def main():
               "true pure-ICAE is the icae_baseline variant)")
     cfg.task_mode = args.task        # accurate ckpt metadata (dispatch still keys on this)
     cfg.seed = args.seed             # record the actual seed in ckpt metadata
+    cfg.anomaly_from = args.anomaly_from   # debug: backward anomaly detection from this step (-1 = off)
 
     # Auto-pick BABILong config to match chunk_size (audit fix #10).
     if args.babilong_config == "auto":

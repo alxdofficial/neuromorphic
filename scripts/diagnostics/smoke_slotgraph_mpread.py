@@ -116,7 +116,7 @@ def main():
               f"({'INERT (≈0)' if float(aux['slotgraph_mp_delta'])<1e-3 else 'read uses the graph'})")
         print(f"  struct: edge_frac={float(aux['slotgraph_edge_frac']):.3f}  "
               f"invalid_edge_frac={float(aux['slotgraph_invalid_edge_frac']):.3f} (should be ≈0 w/ edges→nodes mask)  "
-              f"src_ent={float(aux['slotgraph_src_entropy']):.2f}/{torch.log(torch.tensor(32.)):.2f}  "
+              f"src_ent={float(aux['slotgraph_src_entropy']):.2f}/{float(aux['slotgraph_endpoint_entropy_max']):.2f} (max=lnK)  "
               f"mem_effrank={float(aux['slotgraph_mem_effrank']):.2f}/{cfg.d_llama}")
 
     # ── 3. per-group gradient norms (real mae backward) ──
