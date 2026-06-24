@@ -89,15 +89,16 @@ class ReprLearningModel(nn.Module):
         self.encoder = self.VARIANTS[variant](cfg)
         self.decoder = FrozenLlamaDecoder(cfg, llama_model=llama_model)
 
-        # soft_pointer_graph reads via the prepend path but (unlike hlvocab and the
-        # ports) has no own base copy at init to size its norm-match from — calibrate
-        # its prepend_norm scale to the decoder's embedding norm here so its memory
-        # tokens start at the backbone's token scale, not the quiet 0.9 default.
-        _ppn = getattr(self.encoder, "prepend_norm", None)
-        if _ppn is not None:
-            with torch.no_grad():
-                _emb = self.decoder.llama.get_input_embeddings().weight.float()
-                _ppn.scale.data.fill_(_emb.norm(dim=-1).mean().item())
+        # soft_pointer_graph / biomem read via the prepend path but (unlike hlvocab, slotgraph and the
+        # ports) have no own base copy at init to size their norm-match from — calibrate the prepend
+        # norm-match scale to the decoder's embedding norm here so the memory tokens start at the
+        # backbone's actual token scale (SmolLM2 ≈ 3.2), not the quiet 0.9 _NormMatch default.
+        for _nm_attr in ("prepend_norm", "out_norm"):
+            _nm = getattr(self.encoder, _nm_attr, None)
+            if _nm is not None and hasattr(_nm, "scale"):
+                with torch.no_grad():
+                    _emb = self.decoder.llama.get_input_embeddings().weight.float()
+                    _nm.scale.data.fill_(_emb.norm(dim=-1).mean().item())
 
         # hlvocab and soft_pointer_graph both read via the PREPEND path (memory
         # tokens prepended to the decode sequence) — no dedicated cross-attn

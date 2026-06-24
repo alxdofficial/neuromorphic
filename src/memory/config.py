@@ -148,6 +148,7 @@ class ReprConfig:
                                        # the synaptic memory W. Parallel (per-channel exp-kernel causal conv).
     biomem_membrane_window: int = 64   # truncation length of the membrane EMA (λ_max^64≈1e-3 → effectively exact)
     biomem_membrane_max_decay: float = 0.9  # cap on the per-neuron leak λ = max·sigmoid(raw) (keeps the window valid)
+    mixed_gate_batches: int = 0        # mixed val: REAL/SHUF/OFF binding gate on the first N batches/task (0=off)
 
     # ── slotgraph (fixed-partition graph slot memory; models/slotgraph/) ──────
     # ICAE write (own frozen base + encoder-LoRA, M slots appended to the passage, run through the

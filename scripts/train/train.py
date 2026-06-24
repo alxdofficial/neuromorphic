@@ -171,7 +171,8 @@ def make_mixed_val_sets(mixed_tasks, tokenizer, cfg, val_batches, *, ctx_len: in
     return sets
 
 
-def run_mixed_val(model, mixed_tasks, val_sets, device, n_batches, window_size) -> dict:
+def run_mixed_val(model, mixed_tasks, val_sets, device, n_batches, window_size,
+                  gate_batches: int = 0) -> dict:
     """Evaluate ALL mixed val sets, switching model.task_mode per task so each
     routes to its own loss path. Returns {task: per-task metric dict}. The
     continuation set additionally reports an early-token loss (mean CE over the
@@ -181,9 +182,9 @@ def run_mixed_val(model, mixed_tasks, val_sets, device, n_batches, window_size) 
     per_task = {}
     for t in mixed_tasks:
         model.task_mode = MIXED_TASK_MODE[t]
-        # gate_batches=0: the REAL/SHUF/OFF controls aren't needed for the
-        # mixed per-task dashboard and triple the eval cost.
-        vm = run_val(model, val_sets[t], device, n_batches, window_size, gate_batches=0)
+        # gate_batches>0 enables the REAL/SHUF/OFF binding gate (example-specificity diagnostic) on the
+        # first `gate_batches` val batches; 0 (default) skips it (it triples eval cost). Set via --mixed-gate-batches.
+        vm = run_val(model, val_sets[t], device, n_batches, window_size, gate_batches=gate_batches)
         if t == "continuation":
             vm["val_cont_early_loss"] = _continuation_early_loss(
                 model, val_sets[t], device, n_batches, window_size)
@@ -1178,7 +1179,8 @@ def train_mixed_variant(
 
         if step > 0 and step % val_every == 0:
             per_task = run_mixed_val(model, mixed_tasks, val_sets, device,
-                                     val_batches, window_size)
+                                     val_batches, window_size,
+                                     gate_batches=int(getattr(cfg, "mixed_gate_batches", 0)))
             # one PER-TASK val row each, tagged with task + step (E/E).
             parts = []
             for t in mixed_tasks:
@@ -1232,7 +1234,8 @@ def train_mixed_variant(
 
     save_checkpoint(model, opt, max(n_steps - 1, 0), ckpt_path,
                     mixed_best=best, mixed_agg_best=agg_best)
-    final = run_mixed_val(model, mixed_tasks, val_sets, device, val_batches, window_size)
+    final = run_mixed_val(model, mixed_tasks, val_sets, device, val_batches, window_size,
+                          gate_batches=int(getattr(cfg, "mixed_gate_batches", 0)))
     for t in mixed_tasks:
         vm = final[t]
         row = {"phase": "val", "step": n_steps, "variant": variant, "task": t,
@@ -1403,6 +1406,9 @@ def main():
                          "condrecon_bio). mae = long-passage contiguous MAE compression; babi = "
                          "relational; continuation = next-token prediction; condrecon_bio = "
                          "biographical key→value closed-book recall. Used only when --task mixed.")
+    ap.add_argument("--mixed-gate-batches", type=int, default=0,
+                    help="mixed val: run the REAL/SHUF/OFF binding gate (example-specificity diagnostic) on "
+                         "the first N val batches per task (0=off; ~triples that task's eval cost). Use e.g. 8.")
     ap.add_argument("--mixed-ctx", type=int, default=1024,
                     help="mixed: uniform context_len/chunk for ALL tasks (default 1024).")
     ap.add_argument("--mixed-M", type=int, default=32,
@@ -1841,6 +1847,7 @@ def main():
     if args.biomem_no_membrane:
         cfg.biomem_membrane = False
         print("[biomem override] membrane OFF = fire on the instantaneous readout, not the leaky-integrated potential")
+    cfg.mixed_gate_batches = int(args.mixed_gate_batches)   # REAL/SHUF/OFF binding gate in mixed val (0=off)
     cfg.task_mode = args.task        # accurate ckpt metadata (dispatch still keys on this)
     cfg.seed = args.seed             # record the actual seed in ckpt metadata
     cfg.anomaly_from = args.anomaly_from   # debug: backward anomaly detection from this step (-1 = off)
