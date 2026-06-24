@@ -106,7 +106,8 @@ MIXED_CONDRECON_BIO_N_FACTS = 3
 
 def make_mixed_train_dataloaders(mixed_tasks, tokenizer, cfg, *, ctx_len: int,
                                  m_slots: int, mae_src_tok: str, babi_tasks,
-                                 predict_len: int, num_workers: int = 1) -> dict:
+                                 predict_len: int, num_workers: int = 1,
+                                 train_seed: int = 42) -> dict:
     """One TRAIN dataloader per mixed task, all on the uniform interface
     (context_len/chunk = ctx_len, M = m_slots). Homogeneous batches; the
     round-robin alternates which loader is pulled each step."""
@@ -116,24 +117,24 @@ def make_mixed_train_dataloaders(mixed_tasks, tokenizer, cfg, *, ctx_len: int,
         if t == "mae":
             dls[t] = make_long_passage_mae_dataloader(
                 tokenizer, batch_size=cfg.batch_size, src_tokenizer_name=mae_src_tok,
-                split="train", ctx_len=ctx_len, m_slots=m_slots, seed=42,
+                split="train", ctx_len=ctx_len, m_slots=m_slots, seed=train_seed,
                 pad_token_id=_pad, num_workers=num_workers)
         elif t == "babi":
             dls[t] = make_babi_dataloader(
                 tokenizer, context_len=ctx_len, batch_size=cfg.batch_size,
-                split="train", seed=42, pad_token_id=_pad, tasks=babi_tasks,
+                split="train", seed=train_seed, pad_token_id=_pad, tasks=babi_tasks,
                 num_workers=num_workers)
         elif t == "continuation":
             dls[t] = make_continuation_dataloader(
                 tokenizer, batch_size=cfg.batch_size, compress_len=ctx_len,
-                predict_len=predict_len, split="train", seed=42, pad_token_id=_pad,
+                predict_len=predict_len, split="train", seed=train_seed, pad_token_id=_pad,
                 objective="continuation", src_tokenizer_name=mae_src_tok,
                 num_workers=num_workers)
         elif t == "condrecon_bio":
             dls[t] = make_conditioned_reconstruction_bio_dataloader(
                 tokenizer, context_len=ctx_len, batch_size=cfg.batch_size,
                 n_pairs=MIXED_CONDRECON_BIO_N_PAIRS, n_query=1, n_facts=MIXED_CONDRECON_BIO_N_FACTS,
-                split="train", world_seed=0, stream_seed=42, pad_token_id=_pad, num_workers=num_workers)
+                split="train", world_seed=0, stream_seed=train_seed, pad_token_id=_pad, num_workers=num_workers)
         else:
             raise ValueError(f"unknown mixed task {t!r} (expected mae/babi/continuation/condrecon_bio)")
     return dls
@@ -996,7 +997,7 @@ def train_mixed_variant(
     val_batches: int, out_dir: Path, window_size: int,
     mixed_tasks: tuple, mixed_ctx: int, mixed_M: int,
     babi_tasks: tuple, predict_len: int, mae_src_tok: str,
-    resume: bool = False,
+    resume: bool = False, train_seed: int = 42,
 ) -> dict:
     """ONE model per architecture, trained on an EQUAL round-robin of mixed_tasks,
     evaluated PER-TASK. Homogeneous batches; tasks alternate step-to-step. Before
@@ -1026,7 +1027,8 @@ def train_mixed_variant(
 
     train_dls = make_mixed_train_dataloaders(
         mixed_tasks, tokenizer, cfg, ctx_len=mixed_ctx, m_slots=mixed_M,
-        mae_src_tok=mae_src_tok, babi_tasks=babi_tasks, predict_len=predict_len)
+        mae_src_tok=mae_src_tok, babi_tasks=babi_tasks, predict_len=predict_len,
+        train_seed=train_seed)
     print(f"  Materializing fixed per-task val sets ({val_batches} batches each)...")
     val_sets = make_mixed_val_sets(
         mixed_tasks, tokenizer, cfg, val_batches, ctx_len=mixed_ctx, m_slots=mixed_M,
@@ -1923,7 +1925,7 @@ def main():
                 mixed_tasks=tuple(args.mixed_tasks), mixed_ctx=args.mixed_ctx,
                 mixed_M=args.mixed_M, babi_tasks=tuple(args.babi_tasks),
                 predict_len=args.predict_len, mae_src_tok=args.src_tokenizer,
-                resume=args.resume,
+                resume=args.resume, train_seed=args.seed,
             )
             summaries.append(s)
     else:
