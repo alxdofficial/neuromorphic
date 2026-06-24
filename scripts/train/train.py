@@ -1191,6 +1191,11 @@ def train_mixed_variant(
                     row["val_babi_em"] = vm["val_babi_em"]
                 if "val_cont_early_loss" in vm:
                     row["val_cont_early_loss"] = vm["val_cont_early_loss"]
+                # REAL/SHUF/OFF binding gate (example-specificity diagnostic; present when gate_batches>0)
+                for _gk in ("val_shuf_minus_real", "val_off_minus_real",
+                            "val_loss_recon_shuf", "val_loss_recon_off"):
+                    if _gk in vm:
+                        row[_gk] = vm[_gk]
                 for _k, _v in vm.items():               # graph read+write collapse canaries
                     if _k.startswith(("val_graph_", "val_biomem_", "val_slotgraph_", "val_vqicae_")):
                         row[_k] = _v
