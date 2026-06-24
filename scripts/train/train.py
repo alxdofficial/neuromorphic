@@ -1147,7 +1147,7 @@ def train_mixed_variant(
         opt.step()
 
         # Per-step TRAIN row, tagged with the task that produced this batch.
-        jsonl_fp.write(json.dumps({
+        train_row = {
             "step": step, "variant": variant, "task": task, "phase": "train",
             "loss": float(out["loss"].detach()),
             "loss_recon": float(out["loss_recon"]),
@@ -1155,7 +1155,16 @@ def train_mixed_variant(
             "grad_norm": float(gn),
             "memory_M": out["memory_shape"][1],
             "lr": lr,
-        }) + "\n")
+        }
+        # arm collapse/health canaries at train frequency (biomem edge/decay/beta/sat/mem_effrank/…, etc.)
+        for _k, _v in out.items():
+            if _v is None or not _k.startswith(("biomem_", "slotgraph_", "vqicae_")):
+                continue
+            if isinstance(_v, (int, float)):
+                train_row[_k] = float(_v)
+            elif torch.is_tensor(_v) and _v.numel() == 1:
+                train_row[_k] = float(_v.detach())
+        jsonl_fp.write(json.dumps(train_row) + "\n")
 
         if step % log_every == 0:
             now = time.time()

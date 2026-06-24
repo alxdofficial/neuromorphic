@@ -85,7 +85,8 @@ class BioMemEncoder(nn.Module):
         self.membrane_window = int(getattr(cfg, "biomem_membrane_window", 64))
         self.membrane_max_decay = float(getattr(cfg, "biomem_membrane_max_decay", 0.9))
         self._read_W = None                                    # [B,n_pairs,C,K,K] stashed each finalize
-        for c in ("_decay_last", "_surprise_last", "_beta_last", "_edge_last", "_mem_decay_last"):
+        self._warned_mw = False                               # one-time multi-window-membrane warning
+        for c in ("_decay_last", "_surprise_last", "_beta_last", "_edge_last", "_mem_decay_last", "_sat_last"):
             self.register_buffer(c, torch.zeros(()), persistent=False)
 
         # ── write projections (per-(layer,column); input-derived → linear/chunkable scan) ──
@@ -114,7 +115,7 @@ class BioMemEncoder(nn.Module):
         self.out_norm = _NormMatch(cfg.d_llama)                       # prepend tokens → embedding-norm region
         if self.per_layer_refresh:
             self.read_in = nn.Linear(cfg.d_llama, self.d_grid)        # slot hidden → grid (refresh query)
-            self.refresh_gate = nn.Parameter(torch.zeros(()))         # ReZero: refresh is a no-op at step 0
+            self.refresh_gate = nn.Parameter(torch.full((), 1e-3))    # ~ReZero (tiny) so read_in learns from step 1
 
         print(f"[biomem] chunk-parallel gated-delta grid: C={C}×K={K}×H={H} "
               f"({self.n_pairs} column-layers, {C*self.n_pairs*K*K:,} fast edges/example), d_grid={self.d_grid}, "
@@ -158,6 +159,12 @@ class BioMemEncoder(nn.Module):
         mask = attention_mask.float()                          # [B,W]
         if surprise is None:
             surprise = token_embeds.new_zeros(B, Wlen)
+        if self.use_membrane and state.get("n_written", 0) > 0 and not self._warned_mw:
+            print("[WARN] biomem membrane resets at streaming-window boundaries: multi-window (ctx>window) "
+                  "gives APPROXIMATE membrane integration (W is exact; the LIF tail is dropped per window). "
+                  "Single-window (ctx==window, the configured case) is exact. Carry membrane state to fix.",
+                  flush=True)
+            self._warned_mw = True
         with torch.autocast(device_type="cuda", enabled=False):
             tok = token_embeds.float()
             sur = surprise.float()                             # [B,W]
@@ -166,7 +173,7 @@ class BioMemEncoder(nn.Module):
             alpha = torch.sigmoid(self.decay_proj(            # [B,W,n_pairs,C] per-(layer,col) retention
                 torch.cat([tok, sur.unsqueeze(-1)], dim=-1))).view(B, Wlen, self.n_pairs, self.C)
             W_in = state["W"].float()
-            new_W, beta_means = [], []
+            new_W, beta_means, sat_means = [], [], []
             for l in range(self.n_pairs):
                 un = F.normalize(u, dim=-1, eps=1e-6)         # per-column pre-norm for the projections
                 v = torch.einsum("btck,ckv->btcv", un, self.V_w[l])             # per-col value
@@ -184,16 +191,20 @@ class BioMemEncoder(nn.Module):
                 # LIF MEMBRANE: the neuron leaky-integrates its input current o over tokens (built-up potential),
                 # then fires hardtanh(m − θ). λ=0 recovers the no-membrane case (fire on o directly).
                 fire_in = self._membrane(o * mask.view(B, Wlen, 1, 1), l) if self.use_membrane else o
+                fire = _hardtanh(fire_in - self.theta[l])     # neuron firing ∈ [-1,1]
+                sat_means.append(((fire.detach().abs() > 0.99).float() * mask.view(B, Wlen, 1, 1)).sum()
+                                 / (mask.sum().clamp_min(1.0) * self.C * self.K))   # firing saturation canary
                 # RESIDUAL compounding (GCNII): the input persists through depth so the deep layers don't
                 # over-smooth below θ to a constant (the write analogue of the read residual — without it the
                 # per-token rank decays 88→1 and the "deep synaptic column" collapses to ~2 effective layers).
-                u = u + _hardtanh(fire_in - self.theta[l])    # next layer reads layer l's memory firing + carries u
+                u = u + fire                                  # next layer reads layer l's memory firing + carries u
             W = torch.stack(new_W, dim=1)                     # [B,n_pairs,C,K,K]
             with torch.no_grad():
                 self._decay_last = (alpha.mean(2) * mask.unsqueeze(-1)).sum() / mask.sum().clamp_min(1.0) / self.C
                 self._surprise_last = (sur * mask).sum() / mask.sum().clamp_min(1.0)
                 self._beta_last = torch.stack(beta_means).mean()
                 self._edge_last = W.abs().mean()
+                self._sat_last = torch.stack(sat_means).mean()   # mean firing saturation (dead/stuck neurons)
                 if self.use_membrane:
                     self._mem_decay_last = (self.membrane_max_decay
                                             * torch.sigmoid(self.mem_decay_raw)).mean()
@@ -248,8 +259,11 @@ class BioMemEncoder(nn.Module):
                 "biomem_beta": self._beta_last,               # mean write rate (the gate)
                 "biomem_mem_decay": self._mem_decay_last,      # mean LIF membrane leak λ
                 "biomem_surprise": self._surprise_last,       # mean LM next-token surprise
+                "biomem_sat": self._sat_last,                 # mean firing saturation (|fire|>0.99 → stuck neurons)
                 "biomem_mem_effrank": self._participation_ratio(memory.reshape(-1, memory.shape[-1])),
             }
+            if self.per_layer_refresh:
+                aux["biomem_refresh_gate"] = self.refresh_gate.detach()   # watch: should stay bounded/small
         return memory, aux
 
     @staticmethod

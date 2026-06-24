@@ -121,11 +121,8 @@ def main():
 
     # ── 3. gradient flow (real mae loss → backward): WRITE side must not be starved ──
     print(f"\n=== gradient flow (real mae loss → backward) ===")
-    # refresh_gate is zero-init (ReZero) → read_in is correctly a no-op at step 0 (it gets gradient
-    # only once the gate ramps off zero). Set the gate nonzero here so the smoke exercises read_in.
-    if getattr(enc, "wants_prepend_refresh", False):
-        enc.refresh_gate.data.fill_(0.1)
-        print("  (refresh_gate set to 0.1 to exercise read_in; default is ReZero 0 → no-op at init)")
+    # refresh_gate now inits to 1e-3 (tiny, ~ReZero) so read_in gets gradient from step 1 at the DEFAULT
+    # init (no override) — the starvation the review flagged is gone; verify it directly below.
     m.zero_grad(set_to_none=True)
     m.task_mode = "masked_reconstruction"
     b = to_device(vs["mae"][0], DEV)
