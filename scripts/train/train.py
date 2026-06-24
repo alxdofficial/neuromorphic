@@ -1825,12 +1825,13 @@ def main():
         print("[graph override] FREE endpoints (no bank/selection)")
     if args.slotgraph_no_structure:
         cfg.slotgraph_use_structure = False
+        print("[slotgraph override] structure OFF = plain prepend of id-tagged slots (id-tagged ICAE; "
+              "true pure-ICAE is the icae_baseline variant)")
     if args.slotgraph_no_id:
         cfg.slotgraph_use_id = False
     if args.biomem_no_membrane:
         cfg.biomem_membrane = False
-        print("[slotgraph override] structure OFF = plain prepend of id-tagged slots (id-tagged ICAE; "
-              "true pure-ICAE is the icae_baseline variant)")
+        print("[biomem override] membrane OFF = fire on the instantaneous readout, not the leaky-integrated potential")
     cfg.task_mode = args.task        # accurate ckpt metadata (dispatch still keys on this)
     cfg.seed = args.seed             # record the actual seed in ckpt metadata
     cfg.anomaly_from = args.anomaly_from   # debug: backward anomaly detection from this step (-1 = off)
