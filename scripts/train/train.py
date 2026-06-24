@@ -1451,6 +1451,9 @@ def main():
                     help="slotgraph: disable the MP-read structure = plain prepend of the id-tagged slots "
                          "('id-tagged ICAE'; true pure-ICAE = the icae_baseline variant). "
                          "Ablation: does the message-passing read add anything over id-tagged slots?")
+    ap.add_argument("--biomem-no-membrane", action="store_true",
+                    help="biomem: disable the LIF membrane (fire on the instantaneous readout, not the "
+                         "leaky-integrated potential). Ablation: does the per-neuron membrane help?")
     ap.add_argument("--slotgraph-no-id", action="store_true",
                     help="slotgraph: drop the FIXED orthonormal id_embed from the slots (and routing-head "
                          "input) = pure-ICAE-via-same-code. Pair with --slotgraph-no-structure to isolate "
@@ -1824,6 +1827,8 @@ def main():
         cfg.slotgraph_use_structure = False
     if args.slotgraph_no_id:
         cfg.slotgraph_use_id = False
+    if args.biomem_no_membrane:
+        cfg.biomem_membrane = False
         print("[slotgraph override] structure OFF = plain prepend of id-tagged slots (id-tagged ICAE; "
               "true pure-ICAE is the icae_baseline variant)")
     cfg.task_mode = args.task        # accurate ckpt metadata (dispatch still keys on this)

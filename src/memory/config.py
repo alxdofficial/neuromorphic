@@ -142,6 +142,12 @@ class ReprConfig:
     biomem_decay_init: float = 0.99    # init per-(layer,col) retention α (input-dependent decay = sigmoid(decay_proj);
                                        # zero-init weight ⇒ α starts uniform ≈ this, then LEARNS input-dependence)
     biomem_theta_scale: float = 0.1    # std of the per-neuron threshold theta (random INIT; learned)
+    biomem_membrane: bool = True       # LIF membrane: each neuron leaky-integrates its input current o over
+                                       # tokens (m_t = λ·m_{t-1}+o_t) and fires hardtanh(m−θ) — a per-neuron
+                                       # ACTIVITY memory (built-up potential = dynamic threshold), complementing
+                                       # the synaptic memory W. Parallel (per-channel exp-kernel causal conv).
+    biomem_membrane_window: int = 64   # truncation length of the membrane EMA (λ_max^64≈1e-3 → effectively exact)
+    biomem_membrane_max_decay: float = 0.9  # cap on the per-neuron leak λ = max·sigmoid(raw) (keeps the window valid)
 
     # ── slotgraph (fixed-partition graph slot memory; models/slotgraph/) ──────
     # ICAE write (own frozen base + encoder-LoRA, M slots appended to the passage, run through the

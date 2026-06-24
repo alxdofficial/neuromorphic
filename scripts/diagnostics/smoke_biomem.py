@@ -37,6 +37,7 @@ GROUPS = {
     "WRITE beta":      ("encoder.beta_",),
     "WRITE decay_proj":("encoder.decay_proj",),
     "WRITE theta":     ("encoder.theta",),
+    "WRITE mem_decay": ("encoder.mem_decay_raw",),
     "READ seeds":      ("encoder.read_seeds",),
     "READ readout":    ("encoder.readout",),
     "READ out_norm":   ("encoder.out_norm",),
@@ -107,6 +108,7 @@ def main():
               f"edge_absmean={float(aux['biomem_edge_absmean']):.4f}  "
               f"W shape={tuple(enc._read_W.shape)}")
         print(f"  decay(mean α)={float(aux['biomem_decay']):.4f}  beta(mean)={float(aux['biomem_beta']):.4f}  "
+              f"membrane(mean λ)={float(aux.get('biomem_mem_decay', 0)):.4f}  "
               f"surprise(mean −logp/lnV)={float(aux['biomem_surprise']):.4f}")
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             out = (m.compute_masked_reconstruction_loss(b)

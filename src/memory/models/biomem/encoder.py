@@ -81,8 +81,11 @@ class BioMemEncoder(nn.Module):
         self.wants_surprise = bool(getattr(cfg, "biomem_use_surprise", True))
         self.per_layer_refresh = bool(getattr(cfg, "biomem_per_layer_refresh", True))
         self.wants_prepend_refresh = self.per_layer_refresh
+        self.use_membrane = bool(getattr(cfg, "biomem_membrane", True))
+        self.membrane_window = int(getattr(cfg, "biomem_membrane_window", 64))
+        self.membrane_max_decay = float(getattr(cfg, "biomem_membrane_max_decay", 0.9))
         self._read_W = None                                    # [B,n_pairs,C,K,K] stashed each finalize
-        for c in ("_decay_last", "_surprise_last", "_beta_last", "_edge_last"):
+        for c in ("_decay_last", "_surprise_last", "_beta_last", "_edge_last", "_mem_decay_last"):
             self.register_buffer(c, torch.zeros(()), persistent=False)
 
         # ── write projections (per-(layer,column); input-derived → linear/chunkable scan) ──
@@ -97,8 +100,11 @@ class BioMemEncoder(nn.Module):
         nn.init.zeros_(self.decay_proj.weight)
         d0 = float(cfg.biomem_decay_init)
         nn.init.constant_(self.decay_proj.bias, math.log(d0 / (1 - d0)))
-        # LEARNED per-neuron thresholds (random init); the between-layer nonlinearity is hardtanh(o − θ).
+        # LEARNED per-neuron thresholds (random init); the between-layer nonlinearity is hardtanh(m − θ).
         self.theta = nn.Parameter(cfg.biomem_theta_scale * torch.randn(self.n_pairs, C, K))
+        # LIF membrane: per-neuron leak λ = max_decay·sigmoid(raw) ∈ (0,max); zero-init raw → λ≈max/2.
+        if self.use_membrane:
+            self.mem_decay_raw = nn.Parameter(torch.zeros(self.n_pairs, C, K))
 
         # ── read (prepend) ──
         self.read_seeds = nn.Parameter(torch.randn(self.M, C, K))     # cold read probes
@@ -119,6 +125,20 @@ class BioMemEncoder(nn.Module):
     def train(self, mode: bool = True):
         super().train(mode)
         return self
+
+    def _membrane(self, o: Tensor, l: int) -> Tensor:
+        """LIF membrane for column-layer l: per-neuron leaky integration of the input current o over tokens,
+        m_t = λ·m_{t-1} + o_t (λ = max_decay·sigmoid(raw), per-neuron). Computed in PARALLEL as a per-channel
+        causal exp-kernel depthwise conv (matches the sequential EMA to fp32; truncated at membrane_window,
+        λ^W≈1e-3). Returns m [B,T,C,K] — the built-up potential the neuron fires on (hardtanh(m−θ))."""
+        B, T, C, K = o.shape
+        lam = self.membrane_max_decay * torch.sigmoid(self.mem_decay_raw[l])     # [C,K] leak ∈ (0,max)
+        Lk = min(self.membrane_window, T)
+        exps = torch.arange(Lk - 1, -1, -1, device=o.device, dtype=lam.dtype)    # [Lk]
+        kern = (lam.reshape(C * K, 1) ** exps.reshape(1, Lk)).unsqueeze(1)       # [C*K,1,Lk] kernel[j]=λ^(Lk-1-j)
+        x = F.pad(o.reshape(B, T, C * K).transpose(1, 2), (Lk - 1, 0))           # [B,C*K,T] causal left-pad
+        m = F.conv1d(x, kern, groups=C * K).transpose(1, 2)                      # [B,T,C*K]
+        return m.reshape(B, T, C, K)
 
     def init_streaming_state(self, batch_size: int, device, dtype):
         del dtype
@@ -161,16 +181,22 @@ class BioMemEncoder(nn.Module):
                     use_qk_l2norm_in_kernel=True, scale=self.scale)
                 new_W.append(W_l)
                 beta_means.append((beta.sum() / mask.sum().clamp_min(1.0) / self.C))
+                # LIF MEMBRANE: the neuron leaky-integrates its input current o over tokens (built-up potential),
+                # then fires hardtanh(m − θ). λ=0 recovers the no-membrane case (fire on o directly).
+                fire_in = self._membrane(o * mask.view(B, Wlen, 1, 1), l) if self.use_membrane else o
                 # RESIDUAL compounding (GCNII): the input persists through depth so the deep layers don't
                 # over-smooth below θ to a constant (the write analogue of the read residual — without it the
                 # per-token rank decays 88→1 and the "deep synaptic column" collapses to ~2 effective layers).
-                u = u + _hardtanh(o - self.theta[l])          # next layer reads layer l's memory readout + carries u
+                u = u + _hardtanh(fire_in - self.theta[l])    # next layer reads layer l's memory firing + carries u
             W = torch.stack(new_W, dim=1)                     # [B,n_pairs,C,K,K]
             with torch.no_grad():
                 self._decay_last = (alpha.mean(2) * mask.unsqueeze(-1)).sum() / mask.sum().clamp_min(1.0) / self.C
                 self._surprise_last = (sur * mask).sum() / mask.sum().clamp_min(1.0)
                 self._beta_last = torch.stack(beta_means).mean()
                 self._edge_last = W.abs().mean()
+                if self.use_membrane:
+                    self._mem_decay_last = (self.membrane_max_decay
+                                            * torch.sigmoid(self.mem_decay_raw)).mean()
         state["W"] = W
         state["n_written"] = state.get("n_written", 0) + Wlen
         return state, {}
@@ -220,6 +246,7 @@ class BioMemEncoder(nn.Module):
                 "biomem_edge_absmean": self._edge_last,
                 "biomem_decay": self._decay_last,             # mean per-(layer,col) retention α
                 "biomem_beta": self._beta_last,               # mean write rate (the gate)
+                "biomem_mem_decay": self._mem_decay_last,      # mean LIF membrane leak λ
                 "biomem_surprise": self._surprise_last,       # mean LM next-token surprise
                 "biomem_mem_effrank": self._participation_ratio(memory.reshape(-1, memory.shape[-1])),
             }
