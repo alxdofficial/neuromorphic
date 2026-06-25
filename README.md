@@ -1,36 +1,29 @@
-# Trajectory-Memory LM
+# Memory-Compression LM
 
-A Llama-3.2-1B backbone with a side-car concept-trajectory memory.
-
-The model wraps a frozen Llama with a manifold of N concepts. Every
-256-token window: read J parallel trajectories from the manifold using
-the previous window's tokens as a query, predict the window's tokens
-with Llama (cross-attending to the read trajectories), then write J
-trajectories back to persistently mutate concept states.
-
-See **[`docs/plan_trajectory_memory.md`](docs/plan_trajectory_memory.md)**
-for the full design, implementation plan, training waves, and efficiency
-analysis.
+A research project on always-on implicit memory for a frozen LM. An encoder compresses a 1024-token context into M=32 memory tokens (32:1 ratio), trained on a mixed 4-task objective (mae / babi / continuation / condrecon_bio) with a frozen SmolLM2-135M backbone (d=576). The goal is to evaluate whether structured or biologically-inspired encoders outperform flat published compressors at the same parameter count.
 
 ## Layout
 
 ```
-src/trajectory_memory/    — core architecture (manifold, read/write modules,
-                            IntegratedLM, TBPTT) plus data/ + training/ subpackages
-src/pretrained/           — reused Llama host adapters + MemInjectLayer
-tests/                    — unit + smoke tests for the trajectory modules
-scripts/                  — entry points (training/, data/, bench/, diagnostics/)
-                            see scripts/README.md
-docs/                     — design, plan, eval, bench results, research backlog
+src/memory/          — core package: model.py (VARIANTS registry), models/<name>/
+                       for each encoder, data loaders, trainer utilities
+scripts/train/       — train.py: single harness for every variant + task
+scripts/diagnostics/ — cohort evaluation, slotgraph attribution/metrics/probes,
+                       mixed band+gate eval, dashboards
+docs/                — cohort results, model attribution reports, design notes
 ```
 
-## Tests
+## Train
 
 ```bash
-pytest tests/test_trajectory_memory_*.py
+.venv/bin/python scripts/train/train.py --task mixed
 ```
 
-## History
+Default variants: `slotgraph_baseline biomem_baseline icae_baseline ccm_baseline autocompressor_baseline beacon_baseline`.
 
-The earlier per-token `graph_walker` lineage is archived under the
-`abandoned/graph-walker` branch.
+## Results
+
+Results live in `docs/`:
+- **`cohort_results.md`** — head-to-head table across all variants (REAL loss + babi EM).
+- **`slotgraph_attribution.md`** — 2×2 attribution study isolating message-passing vs id-tags.
+- **`slotgraph_metrics.md`** — standing instrument panel for slotgraph structure canaries.

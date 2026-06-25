@@ -10,9 +10,11 @@ model is its code under `src/memory/models/<name>/`.
   frozen LM (± LoRA), read their hiddens; prepend M memory tokens.
 - **biomem** — gated fast-Hebbian cortical-column grid: memory lives in fast synaptic state
   (chunk-parallel gated-delta write over a C×K×H column/neuron/layer grid, LIF membrane, prepend read).
-  The current primary arm. Design rationale: `biomem_chunkwise_plan.md`.
-- **slotgraph** — ICAE write + a fixed node/edge partition + hard endpoint prediction, read by a
-  message-passing GNN over the predicted graph. The graph arm.
+  Design rationale: `biomem_chunkwise_plan.md`.
+- **slotgraph** — ICAE write + a fixed node/edge partition + message-passing read over the predicted
+  graph. The graph arm. In the current cohort slotgraph leads biomem (slotgraph ahead on mae +
+  continuation; biomem hits the membership wall and does not beat the published compressors).
+- **vqicae** — VQ-discretized ICAE; a discreteness probe.
 - **vanilla_llama / vanilla_full_context** — loss floor (no memory) / ceiling (full context).
 
 All cohort comparisons must be **same-code, same-config** — cross-era numbers are invalid.
@@ -21,6 +23,10 @@ All cohort comparisons must be **same-code, same-config** — cross-era numbers 
 - **`cohort_results.md`** — the current head-to-head table (REAL loss + babi EM, the OFF/SHUF binding
   gate, and the exact-match babi_em binding test), aggregated mean ± std across seeds. Regenerate with
   `scripts/diagnostics/cohort_results.py`.
+- **`slotgraph_attribution.md`** — 2×2 attribution study isolating the contribution of message-passing
+  vs id-tags to slotgraph's reconstruction performance.
+- **`slotgraph_metrics.md`** — standing instrument panel: structure canaries (edge-frac, src/dst entropy,
+  mem_effrank) logged per checkpoint; regenerate with `scripts/diagnostics/slotgraph_metrics.py`.
 - **`biomem_chunkwise_plan.md`** — biomem design rationale (chunk-parallel synaptic write, deep columns).
 - **`mamba_two_lenses_memory.md`** — research note: Mamba/linear-attention lenses on compress-and-recall.
 

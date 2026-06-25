@@ -73,6 +73,8 @@ class SlotGraphEncoder(nn.Module):
         self.use_structure = bool(getattr(cfg, "slotgraph_use_structure", True))
         self.use_id = bool(getattr(cfg, "slotgraph_use_id", True))   # False ⇒ pure-ICAE-via-same-code (id ablation)
         self.max_hops = int(getattr(cfg, "slotgraph_max_hops", 5))
+        self.trace = False           # diagnostics: when True, _trace captures write/read internals
+        self._trace: dict = {}
 
         # slot content seeds (appended to the passage, icae-style: centered in Llama's token region)
         embed = base.get_input_embeddings()
@@ -200,6 +202,8 @@ class SlotGraphEncoder(nn.Module):
         pre = self.norm(slot_final)                               # plain read (for the inert-MP canary)
 
         h = slot_final
+        if self.trace:
+            self._trace = {"hop_h": [h.detach().float().cpu()], "u_mag": [], "u_sat": []}
         for _ in range(K):
             h_src = torch.einsum("bmn,bnd->bmd", src, h)          # source-endpoint node state per edge
             h_dst = torch.einsum("bmn,bnd->bmd", dst, h)          # dst-endpoint node state per edge
@@ -209,6 +213,10 @@ class SlotGraphEncoder(nn.Module):
                    + torch.einsum("bmn,bmd->bnd", src, m_to_src)) / deg.unsqueeze(-1)
             u = self.update(agg).clamp(-1.0, 1.0)                  # bounded delta (no norm → safe backward)
             h = h + u * node_recv                                  # residual relay, only node slots update
+            if self.trace:
+                self._trace["hop_h"].append(h.detach().float().cpu())
+                self._trace["u_mag"].append(float(u.abs().mean()))
+                self._trace["u_sat"].append(float((u.abs() >= 0.999).float().mean()))
         memory = self.norm(h)
 
         # ── canaries (detached) ──
@@ -220,6 +228,11 @@ class SlotGraphEncoder(nn.Module):
             node_entropy = -(pu.clamp_min(1e-9).log() * pu).sum()  # ↑(→lnK)=spread; ↓=hub-collapse
             src_pick = src[:, self.K:, :self.K].argmax(-1)         # [B,E] ACTUAL src node per edge (Sinkhorn pick)
             dst_pick = dst[:, self.K:, :self.K].argmax(-1)         # [B,E] ACTUAL dst node (≠ src by the mask)
+            if self.trace:
+                self._trace.update(
+                    slot_final=slot_final.detach().float().cpu(), memory=memory.detach().float().cpu(),
+                    src_pick=src_pick.cpu(), dst_pick=dst_pick.cpu(),
+                    soft_src=soft_src.detach().float().cpu(), soft_dst=soft_dst.detach().float().cpu())
             info = {"hops": K,
                     "delta": (1.0 - F.cosine_similarity(pre, memory, dim=-1)).mean(),
                     "src_entropy": _ent(soft_src), "dst_entropy": _ent(soft_dst),
@@ -237,15 +250,21 @@ class SlotGraphEncoder(nn.Module):
         slots0 = slots0.to(emb.dtype)
         inp = torch.cat([emb, slots0], dim=1)                       # [B,T+M,d]
         attn = torch.cat([mask, torch.ones(B, self.M, device=mask.device, dtype=mask.dtype)], dim=1).long()
-        h = self.base.model(inputs_embeds=inp, attention_mask=attn,
-                            use_cache=False).last_hidden_state       # bf16 LM forward, no KV cache
+        out_lm = self.base.model(inputs_embeds=inp, attention_mask=attn,
+                                 use_cache=False, output_hidden_states=self.trace)  # bf16 LM forward
+        h = out_lm.last_hidden_state
         slot_final = h[:, -self.M:]                                 # [B,M,d]
+        # per-layer slot hiddens (diagnostics): write-side depth trajectory
+        layer_slots = ([hs[:, -self.M:].detach().float().cpu() for hs in out_lm.hidden_states]
+                       if self.trace and out_lm.hidden_states is not None else None)
         mp_info = None
         if self.use_structure:
             with torch.autocast("cuda", enabled=False):            # structure + read in FP32 (small + sensitive)
                 memory, mp_info = self._mp_read(slot_final.float())
         else:
             memory = self.norm(slot_final.float())                 # plain prepend (id-tagged ICAE control)
+        if self.trace and layer_slots is not None:
+            self._trace["layer_slots"] = layer_slots               # added AFTER _mp_read (which resets _trace)
 
         aux = {}
         with torch.no_grad():

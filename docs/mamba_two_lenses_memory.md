@@ -11,7 +11,7 @@ The memory has to do two things that pull against each other:
 - **Compress** — summarize a window into far fewer units than there are tokens (the thesis: a structured/compositional memory beats a flat bank at the same size).
 - **Retrieve verbatim** — recover a *specific* stored item (a fact, a relation, a value) on demand, not just "the gist."
 
-Our diagnosis this cycle is that the current encoders do the first but not the second — they keep **gist** (which entities are present) but not **bindings** (which key went with which value). Empirically: with a *ground-truth* memory the read head learns to 1.0 in ~250 steps, but with any of our 5 real encoders it sits at **chance**, with `REAL ≈ SHUF` (scrambling the memory doesn't change the answer) — i.e. the memory is not being *used*. The harness, optimizer, precision, and read head were all ruled out; the failure is the **write**.
+Our diagnosis at the time of writing was that the then-current encoders did the first but not the second — keeping **gist** (which entities are present) but not **bindings** (which key paired with which value). Empirically in that earlier cohort: with a *ground-truth* memory the read head learned to 1.0 in ~250 steps, but with the encoders under test it sat at **chance**, `REAL ≈ SHUF`. The harness, optimizer, precision, and read head were all ruled out; the failure was the **write**. *Note: the current cohort (icae, slotgraph, autocompressor, ccm) does bind on reconstruction tasks (SHUF−REAL ≈ 0.3–0.5 on mae/continuation); this paragraph reflects the earlier hlvocab/soft-pointer graph era.*
 
 Mamba / linear attention is the cleanest model to dissect *why*, because the **same equations** can be read two completely different ways.
 
@@ -81,10 +81,10 @@ Reading Mamba as a memory gives a requirements list for **any** mechanism (ours 
 | **Mamba / DeltaNet** | ✅ | ✅ (outer product) | ✅ (delta) | ⚠️ keys are *contextualized* | a query that reaches its keys (in-stream native read, or a co-trained external query) — it **is** the reference |
 | **VQ / DKVB** | ✅ | code = address | partial | ✅ a code book is a ready-made *shared* address space | **hard snap** (not soft routing) + anti-collapse |
 | **Slot Attention** | ✅ | ❌ update is an **average** | ❌ | ❌ keys == values | replace the averaging update with a binding write — it stops being slot attention |
-| **Our graph** | ✅ | ❌ **pools twice** (window→slot cross-attn; soft-pointer endpoint materialization) | ❌ gated blend | ❌ soft-pointer address | replace the two *averages* with *binds*, and the blend with an error-correcting write |
+| **hlvocab / soft-pointer graph** *(retired)* | ✅ | ❌ **pools twice** (window→slot cross-attn; soft-pointer endpoint materialization) | ❌ gated blend | ❌ soft-pointer address | replace the two *averages* with *binds*, and the blend with an error-correcting write |
 
 ---
 
 ## One-line takeaway
 
-**Mamba is, simultaneously, a fixed-size scan (efficiency) and an associative key–value store (memory).** Read as a memory, it spells out exactly what *any* compress-and-recall mechanism must do: **install the binding in the write — not recover it from a pool — correct errors so writes don't smear, and give keys distinct addresses the reader can reach**, with verbatim capacity capped at the state dimension. Our encoders compress but **average where they should bind**. That single substitution — *blend → bind*, plus an error-correcting write — is what would turn a gist-summarizer into a verbatim-retrievable memory **while keeping the compression**.
+**Mamba is, simultaneously, a fixed-size scan (efficiency) and an associative key–value store (memory).** Read as a memory, it spells out exactly what *any* compress-and-recall mechanism must do: **install the binding in the write — not recover it from a pool — correct errors so writes don't smear, and give keys distinct addresses the reader can reach**, with verbatim capacity capped at the state dimension. The retired hlvocab/soft-pointer graph encoders compressed but **averaged where they should have bound**. That single substitution — *blend → bind*, plus an error-correcting write — is what would turn a gist-summarizer into a verbatim-retrievable memory **while keeping the compression**.

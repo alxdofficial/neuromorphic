@@ -12,29 +12,41 @@ python scripts/<subdir>/<script>.py [args]
 
 | Subdir         | What's inside |
 | -------------- | ------------- |
-| `train/`       | `train.py` — the single training harness for every variant + task (the active task is `--task masked_reconstruction`). |
-| `diagnostics/` | Smoke tests, the floor/ceiling band scan, and the hierarchical-learned-vocab debug sweeps. |
-| `data_gen/`    | Synthetic data generation for the (dormant, kept) composite-QA + conditioned-reconstruction-bio universe (biographical worldspec, task generators). Imported by `src/memory/data_qa.py`, `data_conditioned_reconstruction_bio.py`, `conditioned_reconstruction_bio_templates.py`. |
+| `train/`       | `train.py` — the single training harness for every variant + task (default `--task mixed`). |
+| `diagnostics/` | Cohort evaluation, slotgraph attribution/metrics/probes, band+gate eval, dashboards. |
+| `data_gen/`    | Synthetic data generation for the composite-QA + conditioned-reconstruction-bio universe (biographical worldspec, task generators). Imported by `src/memory/data_qa.py`, `data_conditioned_reconstruction_bio.py`, `conditioned_reconstruction_bio_templates.py`. |
 
-## diagnostics/ quick reference (the active compression line)
+## diagnostics/ quick reference
+
 ```bash
-python scripts/diagnostics/mae_smoke.py            # pre-flight: all variants construct/train/grad-flow on masked_reconstruction
-python scripts/diagnostics/mae_band_scan.py        # the floor(no-mem) / ceiling(full-ctx) band
-python scripts/diagnostics/hlvocab_diag.py         # hlvocab: load a ckpt, gradient/routing/collapse sweep
-python scripts/diagnostics/hlvocab_graph_diag.py   # hlvocab v2 graph: fresh-init gradient + selection health sweep
-python scripts/diagnostics/hlvocab_eff_rank.py     # hlvocab: per-slot value / memory effective-rank probe
+python scripts/diagnostics/cohort_results.py          # build docs/cohort_results.md from run JSONLs + checkpoints
+python scripts/diagnostics/slotgraph_metrics.py       # standing instrument panel → docs/slotgraph_metrics.md
+python scripts/diagnostics/slotgraph_attribution.py   # 2×2 attribution (MP vs id-tags) → docs/slotgraph_attribution.md
+python scripts/diagnostics/slotgraph_ablation_probe.py
+python scripts/diagnostics/slotgraph_diag.py
+python scripts/diagnostics/slotgraph_gradflow.py
+python scripts/diagnostics/slotgraph_rank_probe.py
+python scripts/diagnostics/slotgraph_topology_probe.py
+python scripts/diagnostics/mixed_band_gate_eval.py    # REAL/SHUF/OFF band + binding gate over the cohort
+python scripts/diagnostics/mixed_dashboard.py         # per-task training/val dashboard from run JSONLs
+python scripts/diagnostics/biomem_stage0_probe.py
+python scripts/diagnostics/smoke_biomem.py
+python scripts/diagnostics/smoke_slotgraph.py
+python scripts/diagnostics/smoke_slotgraph_mpread.py
+python scripts/diagnostics/debug_sweep_new_models.py
 python scripts/diagnostics/analyze_sentence_lengths.py
 ```
 
 ## train/
+
 ```bash
-python scripts/train/train.py --task masked_reconstruction --backbone HuggingFaceTB/SmolLM2-135M \
-    --variants hlvocab_baseline icae_baseline ccm_baseline autocompressor_baseline beacon_baseline \
-    --steps 4000 --warmup 200 --val-every 500 --batch-size 16 --out-tag <tag>
+.venv/bin/python scripts/train/train.py --task mixed \
+    --variants slotgraph_baseline biomem_baseline icae_baseline ccm_baseline \
+               autocompressor_baseline beacon_baseline \
+    --steps 8000 --warmup 500 --val-every 500 --batch-size 8
 ```
 
 ## Where things live
-- Current model design: [`docs/compression_model_design.md`](../docs/compression_model_design.md)
-- Objective + baseline band + results: [`docs/compression_objective.md`](../docs/compression_objective.md)
+
 - Models (one self-contained folder each): `src/memory/models/`
-- Retired lineages (graph_v5–v8, operator-v9, v2.1, QA/EMAT eras): `docs/archive/`
+- Results and design notes: `docs/` (see `docs/README.md`)
