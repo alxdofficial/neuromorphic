@@ -62,6 +62,18 @@ METRICS = [
     ("selfloop",     "SELECT", "task", "self-loop frac",
      "edges pointing a node to itself (should be 0 by construction)",
      "fraction of edges with src == dst", "zero"),
+    ("router_id_frac","SELECT","task", "router id-vs-content",
+     "fraction of routing key/query magnitude from the FIXED id-stream vs input-dependent content — high = id drowns content (a cause of input-blindness)",
+     "‖id-projection‖/(‖content‖+‖id‖) through the node-key + edge-query heads, mean", "down"),
+    ("key_inputdep", "SELECT", "task", "routing-key input-dependence",
+     "do the per-node routing keys vary across inputs, BEFORE the argmax (separates 'keys are fixed' from 'argmax kills variation')",
+     "mean over nodes of the participation ratio of the node key across samples", "up"),
+    ("sel_margin",   "SELECT", "task", "selection margin",
+     "gap between the top-1 and top-2 endpoint probability (≈0 = fragile near-tie)",
+     "mean over edges of (p_top1 − p_top2) of the soft endpoint distribution", "up"),
+    ("temp",         "SELECT", "task", "routing temperature",
+     "softmax temperature; tiny → argmax saturates and input-gradient dies",
+     "exp(log_temp)", "ctx"),
     ("mp_delta",     "MP-READ","task", "mp_delta",
      "how much the message-passing read changes the output vs a plain prepend",
      "1 − cos(slot_final, memory), mean over slots", "ctx"),
@@ -129,6 +141,16 @@ def trace_pass(m, batches):
     sf = torch.cat(SF); mem = torch.cat(MEM); src = torch.cat(SRC); dst = torch.cat(DST); soft = torch.cat(SOFT)
     N, M, d = sf.shape; E = src.shape[1]; eye = torch.eye(M).bool()
     cos = F.cosine_similarity(sf.unsqueeze(2), sf.unsqueeze(1), dim=-1)
+    # router input decomposition: input-dependent content vs FIXED-id contribution to keys/queries
+    enc = m.encoder; sf_g = sf.to(DEV)
+    content = enc.struct_norm(sf_g).float(); id_stream = (enc.id_head_scale * enc.id_embed).float()
+    def _decomp(head, sl):
+        W = head.weight.float(); c = content[:, sl] @ W[:, :d].t(); i = id_stream[sl] @ W[:, d:].t()
+        frac = float(i.norm(dim=-1).mean() / (c.norm(dim=-1).mean() + i.norm(dim=-1).mean() + 1e-9))
+        return frac, (c + i.unsqueeze(0))
+    k_frac, key_full = _decomp(enc.k_head, slice(0, K))
+    q_frac, _ = _decomp(enc.q_src_head, slice(K, M))
+    top2 = soft.topk(2, dim=-1).values
     # per-node usage matrix [N,K] → histogram + cross-sample variance
     usage = torch.stack([torch.bincount(src[i], minlength=K).float() + torch.bincount(dst[i], minlength=K).float()
                          for i in range(N)])
@@ -147,6 +169,10 @@ def trace_pass(m, batches):
         "selfloop": float((src == dst).float().mean()),
         "mp_delta": float((1 - F.cosine_similarity(sf.reshape(-1, d), mem.reshape(-1, d), dim=-1)).mean()),
         "mem_rank": statistics.mean(effrank(mem[i]) for i in range(N)),
+        "router_id_frac": (k_frac + q_frac) / 2,
+        "key_inputdep": statistics.mean(effrank(key_full[:, j, :].cpu()) for j in range(K)),
+        "sel_margin": float((top2[..., 0] - top2[..., 1]).mean()),
+        "temp": float(enc.log_temp.exp()),
     }
     layer_rank, layer_cos = {}, {}
     for li, chunks in LAYER.items():

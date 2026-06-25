@@ -283,6 +283,11 @@ class SlotGraphEncoder(nn.Module):
                 aux["slotgraph_mp_delta"] = mp_info["delta"]
                 aux["slotgraph_src"] = mp_info["src_arg"]
                 aux["slotgraph_dst"] = mp_info["dst_arg"]
+                # within-batch cross-input routing diversity (scalar → logs every train step):
+                # entropy of each edge's src pick ACROSS the B examples; ↑ = routing responds to input.
+                _pe = F.one_hot(mp_info["src_arg"], self.K).float().mean(0)        # [E,K] pick freq over batch
+                aux["slotgraph_routing_diversity"] = (
+                    (-(_pe.clamp_min(1e-9).log() * _pe).sum(-1)).mean() / math.log(self.K))
         return memory, aux
 
     def forward(self, token_embeds, attention_mask=None, mask_positions=None):

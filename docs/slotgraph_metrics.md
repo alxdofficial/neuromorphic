@@ -15,6 +15,10 @@ baseline: n=3 seeds. Every selection under two lenses — **decisiveness** (shar
 | SELECT per-node cross-sample variance | ↑ | 0.010±0.003 | 0.005±0.000 |
 | SELECT edge distinctness | ↑ | 0.858±0.045 | 0.914±0.091 |
 | SELECT self-loop frac | →0 | 0.000 | 0.000 |
+| SELECT router id-vs-content | ↓ | 0.533±0.018 | 0.546±0.055 |
+| SELECT routing-key input-dependence | ↑ | 14.881±2.374 | 6.339±2.467 |
+| SELECT selection margin | ↑ | 0.562±0.120 | 0.500±0.222 |
+| SELECT routing temperature | · | 0.997±0.003 | 0.997±0.003 |
 | MP-READ mp_delta | · | 0.152±0.042 | 0.154±0.051 |
 | OUTPUT memory rank | ↑ | 3.022±0.586 | 2.871±1.229 |
 
@@ -22,8 +26,8 @@ baseline: n=3 seeds. Every selection under two lenses — **decisiveness** (shar
 | metric | dir | value |
 |---|---|---|
 | babi exact-match | ↑ | 0.328±0.162 |
-| mae loss | ↓ | 6.530±0.026 |
-| mae SHUF−REAL | ↑ | 0.453±0.031 |
+| mae loss | ↓ | 6.530±0.006 |
+| mae SHUF−REAL | ↑ | 0.427±0.034 |
 | continuation loss | ↓ | 3.321±0.004 |
 | continuation SHUF−REAL | ↑ | 0.484±0.025 |
 
@@ -52,6 +56,10 @@ baseline: n=3 seeds. Every selection under two lenses — **decisiveness** (shar
 | SELECT per-node cross-sample variance | do individual nodes swing in usage with the input (input-selective) vs fixed roles | per node, std across samples of its per-sample usage fraction; mean over nodes | ↑ |
 | SELECT edge distinctness | fraction of edges with a distinct (src,dst) pair within an input | mean over samples of #unique (src,dst) / E | ↑ |
 | SELECT self-loop frac | edges pointing a node to itself (should be 0 by construction) | fraction of edges with src == dst | →0 |
+| SELECT router id-vs-content | fraction of routing key/query magnitude from the FIXED id-stream vs input-dependent content — high = id drowns content (a cause of input-blindness) | ‖id-projection‖/(‖content‖+‖id‖) through the node-key + edge-query heads, mean | ↓ |
+| SELECT routing-key input-dependence | do the per-node routing keys vary across inputs, BEFORE the argmax (separates 'keys are fixed' from 'argmax kills variation') | mean over nodes of the participation ratio of the node key across samples | ↑ |
+| SELECT selection margin | gap between the top-1 and top-2 endpoint probability (≈0 = fragile near-tie) | mean over edges of (p_top1 − p_top2) of the soft endpoint distribution | ↑ |
+| SELECT routing temperature | softmax temperature; tiny → argmax saturates and input-gradient dies | exp(log_temp) | · |
 | MP-READ mp_delta | how much the message-passing read changes the output vs a plain prepend | 1 − cos(slot_final, memory), mean over slots | · |
 | OUTPUT memory rank | distinct directions in the prepended memory (compare to WRITE slot rank) | participation ratio of the final memory over the M slots, per example, mean | ↑ |
 | PERF babi exact-match | babi answer accuracy | exact-match over babi val | ↑ |
