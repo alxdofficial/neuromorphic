@@ -331,6 +331,7 @@ class ReprLearningModel(nn.Module):
         reinforce = self._install_prepend_reinforce_hooks(mem_aux, M, 0, shuffle_memory)
         # biomem-prepend: re-read W at every layer with the current slot hiddens (no-op for others).
         refresh = self._install_prepend_refresh_hooks(M, 0, zero_memory, shuffle_memory)
+        graph_x = self._install_graph_xattn_hooks(mem_aux, zero_memory, shuffle_memory, B)
         try:
             base_out = self.decoder.llama.model(
                 inputs_embeds=full, attention_mask=attn, use_cache=False)
@@ -340,6 +341,8 @@ class ReprLearningModel(nn.Module):
             for hh in reinforce:
                 hh.remove()
             for hh in refresh:
+                hh.remove()
+            for hh in graph_x:
                 hh.remove()
         span_hidden = base_out.last_hidden_state[:, M:]                 # [B,T,d]
 
@@ -518,6 +521,39 @@ class ReprLearningModel(nn.Module):
             return args, kw
         return [layer.register_forward_pre_hook(_hook, with_kwargs=True)
                 for layer in self.decoder.llama.model.layers]
+
+    def _install_graph_xattn_hooks(self, mem_aux, zero_memory: bool, shuffle_memory: bool, B=None):
+        """slotgraph v2: per-layer GATED CROSS-ATTENTION read over the frozen graph G (no prepend).
+        A forward-pre-hook on each decoder layer adds the gated cross-attn delta (h += xattn(h, G)).
+        OFF (zero_memory) → no read (no hooks). SHUF → roll G by 1 (read the WRONG example's graph).
+        Node-dropout (anti-bypass): a per-batch KV mask drops a fraction of NODE units (edges kept)."""
+        enc = self.encoder
+        if not getattr(enc, "wants_graph_xattn", False) or zero_memory:
+            return []
+        G = (mem_aux or {}).get("graph_G")
+        if G is None:
+            return []
+        if shuffle_memory:
+            if B is not None and B <= 1:
+                raise ValueError("shuffle_memory (SHUF) needs batch size > 1 (roll-by-1 is a no-op).")
+            G = torch.roll(G, shifts=1, dims=0)
+        keep = enc.node_keep_mask(G.shape[0], G.device, self.training)        # [B, N+E] bool
+        every = max(1, int(getattr(enc, "xattn_every", 1)))
+        def _mk(xattn):
+            def _hook(module, args, kwargs):
+                h = args[0] if args else kwargs.get("hidden_states")
+                if h is None:
+                    return None
+                new = h + xattn(h, G, keep)
+                if args:
+                    return (new,) + tuple(args[1:]), kwargs
+                kw = dict(kwargs); kw["hidden_states"] = new
+                return args, kw
+            return _hook
+        layers = self.decoder.llama.model.layers
+        hooked = [i for i in range(len(layers)) if i % every == 0]            # read_xattn[j] ↔ hooked layer
+        return [layers[li].register_forward_pre_hook(_mk(enc.read_xattn[j]), with_kwargs=True)
+                for j, li in enumerate(hooked)]
 
     def _encode_for_memory(self, ctx_embeds, ctx_mask):
         """What the memory WRITE ingests. Arms that set `ingest_lm_final_hidden` (biomem,
@@ -890,6 +926,7 @@ class ReprLearningModel(nn.Module):
         # biomem-prepend per-layer refresh (memory at [0:M] only with no chat scaffold).
         refresh = (self._install_prepend_refresh_hooks(M, 0, zero_memory, shuffle_memory)
                    if self.chat_template is None else [])
+        graph_x = self._install_graph_xattn_hooks(finalize_aux, zero_memory, shuffle_memory, B)
         if (self.chat_template is not None and not zero_memory
                 and getattr(self.encoder, "wants_prepend_refresh", False)
                 and not getattr(self, "_warned_refresh_suppressed", False)):
@@ -919,6 +956,8 @@ class ReprLearningModel(nn.Module):
             for hh in reinforce:
                 hh.remove()
             for hh in refresh:
+                hh.remove()
+            for hh in graph_x:
                 hh.remove()
             # MT-faithful: always clear the kNN datastore so the shared decoder
             # Llama is left in OFF/vanilla state for the next variant or call.

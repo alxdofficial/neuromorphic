@@ -1101,6 +1101,13 @@ def train_mixed_variant(
         if len(rotation) < 24:
             rotation.append(task)
         model.task_mode = MIXED_TASK_MODE[task]       # per-batch dispatch (E/D)
+        # slotgraph v2 node-dropout curriculum: cosine-decay p_max → 0 over anneal_frac of training
+        # (anti-bypass; per-batch random node drop applied inside the read). No-op for other arms.
+        if getattr(model.encoder, "wants_graph_xattn", False):
+            _pmax = cfg.slotgraph_node_drop_max
+            _w = max(1, int(cfg.slotgraph_node_drop_anneal_frac * n_steps))
+            model.encoder.node_drop_p = (0.5 * _pmax * (1 + math.cos(math.pi * step / _w))
+                                         if (step < _w and _pmax > 0) else 0.0)
         batch = next_batch(task)
 
         lr = lr_at_step(step, n_steps, cfg.learning_rate, cfg.warmup_steps)
@@ -1252,6 +1259,10 @@ def train_mixed_variant(
             row["val_babi_em"] = vm["val_babi_em"]
         if "val_cont_early_loss" in vm:
             row["val_cont_early_loss"] = vm["val_cont_early_loss"]
+        for _gk in ("val_shuf_minus_real", "val_off_minus_real",   # gate on the FINAL row too (was dropped)
+                    "val_loss_recon_shuf", "val_loss_recon_off"):
+            if _gk in vm:
+                row[_gk] = vm[_gk]
         for _k, _v in vm.items():                       # graph/biomem/slotgraph/arrival collapse canaries
             if _k.startswith(("val_graph_", "val_biomem_", "val_slotgraph_", "val_vqicae_")):
                 row[_k] = _v
@@ -1470,9 +1481,13 @@ def main():
                     help="debug: from this step on, run loss.backward() under torch.autograd.detect_anomaly "
                          "so the first non-finite GRADIENT halts with a traceback to the exact forward op.")
     ap.add_argument("--slotgraph-no-structure", action="store_true",
-                    help="slotgraph: disable the MP-read structure = plain prepend of the id-tagged slots "
-                         "('id-tagged ICAE'; true pure-ICAE = the icae_baseline variant). "
-                         "Ablation: does the message-passing read add anything over id-tagged slots?")
+                    help="slotgraph v2: disable the graph (no endpoint prediction / edge-id re-injection) "
+                         "= read all units as a flat set. Ablation: does the graph structure help?")
+    ap.add_argument("--sg-node-drop-max", type=float, default=None,
+                    help="slotgraph v2: p_max for the node-dropout anti-bypass curriculum (cosine-annealed "
+                         "to 0). Overrides the config default; 0 disables node-dropout.")
+    ap.add_argument("--sg-adaptive-drop", action="store_true",
+                    help="slotgraph v2: panel-driven (edge-usage) node-drop schedule instead of cosine decay.")
     ap.add_argument("--biomem-no-membrane", action="store_true",
                     help="biomem: disable the LIF membrane (fire on the instantaneous readout, not the "
                          "leaky-integrated potential). Ablation: does the per-neuron membrane help?")
@@ -1773,13 +1788,16 @@ def main():
         from src.memory.common import beacon_wrap_layers as _bwlm
         _nlayersm = _ACLM.from_pretrained(cfg.llama_model).num_hidden_layers
         cfg.beacon_wrap_layers = _bwlm(_nlayersm, 11)
-        # slotgraph (icae-write + fixed partition + RMSNorm-bounded MP read): own frozen base +
-        # encoder-LoRA + endpoint heads + the MP read modules (msg/update ≈1.0M). Encoder-LoRA rank
-        # TRIMMED to r85 (from icae's r104) to offset the MP params → total ≈ icae's ~6.9M.
-        cfg.slotgraph_n_slots = _M
-        cfg.slotgraph_n_nodes = _M // 2          # FIXED partition: half nodes, half edges
-        cfg.slotgraph_d_key = 64                 # content-addressed routing query/key dim
-        cfg.slotgraph_lora_rank = 82; cfg.slotgraph_lora_alpha = 164   # +MP +query/key heads → params ≈ icae
+        # slotgraph v2 (graph-as-language; docs/slotgraph_redesign.md): own frozen base + encoder-LoRA +
+        # a small d_node graph-transformer + per-layer gated cross-attn READ modules (~2.5M). Memory is
+        # float-matched to the baselines (n_nodes+n_edges)*d_node ~= 32*576. Encoder-LoRA bumped to
+        # ~param-match icae's ~6.9M despite the read params (relax-able; capability test).
+        cfg.slotgraph_d_node = 64
+        cfg.slotgraph_n_nodes = 144; cfg.slotgraph_n_edges = 144      # (144+144)*64 = 18432 floats
+        cfg.slotgraph_enc_layers = 4
+        cfg.slotgraph_d_key = 32; cfg.slotgraph_xattn_heads = 4
+        cfg.slotgraph_lora_rank = 56; cfg.slotgraph_lora_alpha = 112   # +read+GT → total ≈ icae ~6.9M
+        cfg.slotgraph_n_slots = 0                                      # v2 does NOT prepend (read = cross-attn)
         # vqicae (icae + VQ-discretized slots): encoder-LoRA r96 + projns + EMA codebook (a buffer,
         # not gradient-trained) → ~7.0M trainable, matched to icae. Large codebook K=8192.
         cfg.vqicae_n_slots = _M
@@ -1847,8 +1865,12 @@ def main():
         print("[graph override] FREE endpoints (no bank/selection)")
     if args.slotgraph_no_structure:
         cfg.slotgraph_use_structure = False
-        print("[slotgraph override] structure OFF = plain prepend of id-tagged slots (id-tagged ICAE; "
-              "true pure-ICAE is the icae_baseline variant)")
+        print("[slotgraph override] structure OFF = read all units as a flat set (no graph)")
+    if args.sg_node_drop_max is not None:
+        cfg.slotgraph_node_drop_max = float(args.sg_node_drop_max)
+        print(f"[slotgraph override] node-drop p_max = {cfg.slotgraph_node_drop_max}")
+    if args.sg_adaptive_drop:
+        print("[slotgraph] --sg-adaptive-drop NOT YET IMPLEMENTED; using the cosine node-drop schedule")
     if args.slotgraph_no_id:
         cfg.slotgraph_use_id = False
     if args.biomem_no_membrane:

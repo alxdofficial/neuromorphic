@@ -1,27 +1,23 @@
-"""slotgraph — fixed-partition graph slot memory (ICAE write + multi-hop message-passing read).
+"""slotgraph v2 — graph-as-language. See docs/slotgraph_redesign.md.
 
-Architecture: start from the proven binder — ICAE (own frozen base + encoder-LoRA, M learnable slots
-APPENDED to the passage, run through the LM's OWN layers) — and read the slots out through a graph.
+The memory is a graph-structured *utterance* in an invented vocabulary: many small (d_node) node/edge
+latents wired into a graph, that re-describes the passage.
 
-  • FIXED partition: slots 0..K-1 are NODES, slots K..M-1 are EDGES (role by position, not predicted).
-  • CONTENT-ADDRESSED routing with COMPETITION: each edge emits src/dst QUERIES; each node emits a KEY
-    (from [node content ; orthonormal id] → distinct keys even if contents collapse). Endpoints are
-    chosen by query·key match — NOT a position-classifier — and a single-step Sinkhorn (row-norm over
-    nodes + column-norm over edges) makes edges COMPETE for nodes so they spread instead of hub-collapsing.
-    Straight-through argmax per edge → a hard node→node edge. Scores are only over the node pool, so
-    edges→nodes holds by construction (no masked-softmax sentinel).
-  • READ = a multi-hop residual message-passing GNN over the predicted graph: each node relays its own
-    state + edge-routed neighbour messages; output is still M vectors (same prepend budget as icae).
-    use_structure=False ⇒ plain prepend of the id-tagged slots (id-tagged ICAE control).
+WRITE (encoder):
+  • the frozen LM (encoder-LoRA) PERCEIVES the passage → contextual features H_ctx [B,T,d_llama];
+  • a small d_node graph-transformer (enc_layers) holds N node + E edge latents, and per layer:
+    cross-attends to H_ctx (gather observation) → self-attends (mix) → predicts each edge's src/dst
+    endpoints (content-addressed: edge queries · node keys → log-Sinkhorn competition →
+    straight-through argmax, no self-loops) → re-injects the endpoint-derived edge id
+    (combine(id_src,id_dst)) so the next layer sees the current graph (the structure-feedback loop).
+  • output G = [B, N+E, d_node] (the graph) + the final endpoints + canaries. NO prepend memory.
 
-MAGNITUDE / GRADIENT POLICY (no free-floating scale coefficients, no gates; everything measured/bounded):
-  1. The structure + read run in FP32 (the LM stays bf16). They are small (M=32 slots) and the sensitive
-     part numerically; fp32 removes the stochastic bf16 backward-overflow that poisoned training.
-  2. Competition is a single Sinkhorn step in LOG-space (logsumexp, no divide → no 1/‖·‖ singularity).
-  3. The MP read's per-node update is bounded by an ELEMENTWISE clamp to [-1,1] (no norm/division → clean
-     0/1 backward), so h ≤ ‖slot_final‖ + K·√d with no gate; mean (degree-normalized) aggregation.
-  4. The only boundary scaling is the MEASURED rescale of the output to the LM embedding norm (_NormMatch);
-     head inputs are balanced to √d (id_head_scale). Cold-start = zero-init update (step-0 read = plain read).
+READ (decoder): per-layer bottleneck GATED CROSS-ATTENTION over the FROZEN G (`GatedGraphXAttn`),
+installed as forward-pre-hooks on the decoder layers by model.py. Node-dropout (anti-bypass) is a KV
+mask on the node entries (edges kept), applied by model.py. No prepend, no message-passing read.
+
+Ablations: use_structure=False ⇒ flat set (no endpoint prediction / edge-id re-injection);
+use_id=False ⇒ drop the learned id embeddings.
 """
 from __future__ import annotations
 
@@ -31,12 +27,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-from ...common import _NormMatch
 from ...config import ReprConfig
 
 
 def _participation_ratio(x: Tensor) -> float:
-    """Effective rank via (tr C)²/‖C‖_F² (no eigendecomp; autocast-safe). PR≈1 ⇒ rank-1 collapse."""
     x = x.detach().float()
     if x.shape[0] < 2:
         return 0.0
@@ -45,15 +39,134 @@ def _participation_ratio(x: Tensor) -> float:
 
 
 def _st_onehot(logits: Tensor, temp: float) -> Tensor:
-    """Straight-through hard selection: one-hot(argmax) forward, softmax(logits/temp) gradient backward."""
+    """Straight-through: one-hot(argmax) forward, softmax(logits/temp) gradient backward."""
     soft = (logits / temp).softmax(-1)
     idx = soft.argmax(-1, keepdim=True)
     hard = torch.zeros_like(soft).scatter_(-1, idx, 1.0)
     return hard + (soft - soft.detach())
 
 
+def _sinkhorn1(scores: Tensor) -> Tensor:
+    """One log-space Sinkhorn step: row-normalize over nodes (each edge commits) then column-normalize
+    over edges (competition — a node demanded by many edges is pushed down). scores [B,E,N]."""
+    logA = scores - torch.logsumexp(scores, dim=-1, keepdim=True)
+    logA = logA - torch.logsumexp(logA, dim=-2, keepdim=True)
+    return logA
+
+
+class GatedGraphXAttn(nn.Module):
+    """Bottleneck gated cross-attention: a decoder hidden [B,S,d] reads the graph G [B,U,dn].
+    Attends IN the small graph space (down-project query d→dn, attend over G, up-project dn→d). The
+    tanh gate is init 0 → cold-start no-op (read starts as pure LM). Returns the gated delta to ADD."""
+
+    def __init__(self, d: int, dn: int, n_heads: int):
+        super().__init__()
+        assert dn % n_heads == 0, f"d_node {dn} must be divisible by xattn_heads {n_heads}"
+        self.dn, self.h, self.hd = dn, n_heads, dn // n_heads
+        self.q = nn.Linear(d, dn, bias=False)     # decoder hidden → graph space (down)
+        self.k = nn.Linear(dn, dn, bias=False)
+        self.v = nn.Linear(dn, dn, bias=False)
+        self.o = nn.Linear(dn, d, bias=False)     # back up to d_llama
+        # Small POSITIVE gate init (not 0): a pure-0 Flamingo gate deadlocks here because our graph G is
+        # random at init (not a pretrained encoder), so the gate gradient never opens it and the encoder
+        # stays gradient-starved. tanh(0.1)≈0.1 gives the encoder real gradient from step 1 (weak read,
+        # minimal LM perturbation) → encoder improves → read becomes useful → gate can grow. Breaks the
+        # chicken-and-egg. OFF (zero_memory) at eval still measures the no-read baseline.
+        self.gate = nn.Parameter(torch.full((1,), 0.1))
+
+    def forward(self, h: Tensor, G: Tensor, kv_keep: Tensor | None = None) -> Tensor:
+        # h [B,S,d], G [B,U,dn], kv_keep [B,U] bool (True = attendable; None = all)
+        B, S, _ = h.shape; U = G.shape[1]
+        hf = h.float()
+        q = self.q(hf).view(B, S, self.h, self.hd).transpose(1, 2)        # [B,h,S,hd]
+        k = self.k(G).view(B, U, self.h, self.hd).transpose(1, 2)         # [B,h,U,hd]
+        v = self.v(G).view(B, U, self.h, self.hd).transpose(1, 2)
+        attn_mask = None
+        if kv_keep is not None:
+            attn_mask = torch.zeros(B, 1, 1, U, device=h.device, dtype=torch.float32)
+            attn_mask = attn_mask.masked_fill(~kv_keep.view(B, 1, 1, U), float("-inf"))
+        o = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)   # [B,h,S,hd]
+        o = o.transpose(1, 2).reshape(B, S, self.dn)
+        return (torch.tanh(self.gate) * self.o(o)).to(h.dtype)            # gated delta in d_llama
+
+
+class _GTLayer(nn.Module):
+    """One graph-transformer layer (in d_node): cross-attn to passage → self-attn → (edges) predict
+    endpoints + re-inject endpoint-derived id → FFN. Pre-norm residuals."""
+
+    def __init__(self, cfg: ReprConfig, dn: int, N: int, E: int):
+        super().__init__()
+        self.N, self.E, self.dn = N, E, dn
+        self.d_key = cfg.slotgraph_d_key
+        self.use_structure = bool(getattr(cfg, "slotgraph_use_structure", True))
+        self.use_id = bool(getattr(cfg, "slotgraph_use_id", True))
+        h = 4
+        self.n1 = nn.LayerNorm(dn); self.cq = nn.Linear(dn, dn); self.ck = nn.Linear(dn, dn)
+        self.cv = nn.Linear(dn, dn); self.co = nn.Linear(dn, dn)
+        self.n2 = nn.LayerNorm(dn); self.sq = nn.Linear(dn, dn); self.sk = nn.Linear(dn, dn)
+        self.sv = nn.Linear(dn, dn); self.so = nn.Linear(dn, dn)
+        self.heads = h
+        self.n3 = nn.LayerNorm(dn); self.ff = nn.Sequential(nn.Linear(dn, 4 * dn), nn.GELU(), nn.Linear(4 * dn, dn))
+        # structure heads (edges → src/dst queries; nodes → keys)
+        self.ns = nn.LayerNorm(dn)
+        self.q_src = nn.Linear(dn, self.d_key); self.q_dst = nn.Linear(dn, self.d_key)
+        self.k_node = nn.Linear(dn, self.d_key)
+        self.log_temp = nn.Parameter(torch.tensor(math.log(float(cfg.slotgraph_temp_init))))
+        self.edge_combine = nn.Linear(2 * dn, dn)   # endpoint-derived edge id from [id_src ; id_dst]
+
+    def _mha(self, q, k, v, qh, kh, vh, oh, kv_mask=None):
+        B, S, _ = q.shape; U = k.shape[1]
+        Q = qh(q).view(B, S, self.heads, -1).transpose(1, 2)
+        K = kh(k).view(B, U, self.heads, -1).transpose(1, 2)
+        V = vh(v).view(B, U, self.heads, -1).transpose(1, 2)
+        am = None
+        if kv_mask is not None:
+            am = torch.zeros(B, 1, 1, U, device=q.device, dtype=torch.float32).masked_fill(
+                ~kv_mask.view(B, 1, 1, U), float("-inf"))
+        o = F.scaled_dot_product_attention(Q, K, V, attn_mask=am).transpose(1, 2).reshape(B, S, -1)
+        return oh(o)
+
+    def _structure(self, G):
+        """Predict each edge's src/dst over the node pool. Returns hard src,dst [B,E,N] + softs + picks.
+        Keys/queries read the ids via content (ids are already added into G upstream)."""
+        gn = self.ns(G)
+        nodes = gn[:, :self.N]; edges = gn[:, self.N:]
+        k = self.k_node(nodes)                                   # [B,N,dk]
+        qs = self.q_src(edges); qd = self.q_dst(edges)           # [B,E,dk]
+        scale = 1.0 / math.sqrt(self.d_key); temp = self.log_temp.exp().clamp_min(1e-2)
+        sc_src = torch.einsum("bed,bnd->ben", qs, k) * scale / temp
+        ls = _sinkhorn1(sc_src); src = _st_onehot(ls, 1.0)       # [B,E,N]
+        sc_dst = torch.einsum("bed,bnd->ben", qd, k) * scale / temp - 1e4 * src.detach()
+        ld = _sinkhorn1(sc_dst); dst = _st_onehot(ld, 1.0)
+        # telemetry = the POST-Sinkhorn routing distribution (the competition-adjusted one the ST pick
+        # uses), not the raw pre-competition softmax.
+        return src, dst, ls.softmax(-1), ld.softmax(-1)
+
+    def forward(self, G, ctx, ctx_keep, node_id):
+        # cross-attn: graph units query the passage features
+        G = G + self.co(self._mha(self.n1(G), ctx, ctx, self.cq, self.ck, self.cv, lambda x: x, ctx_keep))
+        # self-attn: units mix
+        gn = self.n2(G)
+        G = G + self.so(self._mha(gn, gn, gn, self.sq, self.sk, self.sv, lambda x: x))
+        src = dst = soft_s = soft_d = None
+        if self.use_structure:
+            src, dst, soft_s, soft_d = self._structure(G)
+            if self.use_id:
+                # endpoint-derived edge id: gather node ids by the materialized endpoints
+                id_src = torch.einsum("ben,nd->bed", src, node_id)   # [B,E,dn]
+                id_dst = torch.einsum("ben,nd->bed", dst, node_id)
+                edge_id = self.edge_combine(torch.cat([id_src, id_dst], dim=-1))
+                G = torch.cat([G[:, :self.N], G[:, self.N:] + edge_id], dim=1)
+        G = G + self.ff(self.n3(G))
+        return G, src, dst, soft_s, soft_d
+
+
 class SlotGraphEncoder(nn.Module):
-    is_conditioned_read = False              # READ = PREPEND the M slots' (message-passed) final hiddens
+    is_conditioned_read = False          # not the biomem query-conditioned read
+    wants_surprise = False
+    wants_prepend_refresh = False
+    reinforce_prepend_each_layer = False
+    wants_graph_xattn = True             # NEW: model.py installs per-layer gated cross-attn read hooks
 
     def __init__(self, cfg: ReprConfig):
         super().__init__()
@@ -62,68 +175,60 @@ class SlotGraphEncoder(nn.Module):
         base, _ = load_frozen_llama(cfg.llama_model)
         for p in base.parameters():
             p.requires_grad_(False)
-        n_wrapped = apply_lora_to_llama(
-            base, rank=cfg.slotgraph_lora_rank, alpha=cfg.slotgraph_lora_alpha,
-            target_names=tuple(cfg.llama_lora_target_names))
+        n_wrapped = apply_lora_to_llama(base, rank=cfg.slotgraph_lora_rank, alpha=cfg.slotgraph_lora_alpha,
+                                        target_names=tuple(cfg.llama_lora_target_names))
         self.base = base
         d = cfg.d_llama
-        self.M = cfg.slotgraph_n_slots
-        self.d = d
-        self.K = max(1, min(int(getattr(cfg, "slotgraph_n_nodes", self.M // 2)), self.M - 1))  # node slots 0..K-1
-        self.use_structure = bool(getattr(cfg, "slotgraph_use_structure", True))
-        self.use_id = bool(getattr(cfg, "slotgraph_use_id", True))   # False ⇒ pure-ICAE-via-same-code (id ablation)
-        self.max_hops = int(getattr(cfg, "slotgraph_max_hops", 5))
-        self.trace = False           # diagnostics: when True, _trace captures write/read internals
-        self._trace: dict = {}
+        dn = int(cfg.slotgraph_d_node)
+        self.d, self.dn = d, dn
+        self.N = int(cfg.slotgraph_n_nodes); self.E = int(cfg.slotgraph_n_edges)
+        self.M = self.N + self.E
+        self.use_structure = bool(cfg.slotgraph_use_structure)
+        self.use_id = bool(cfg.slotgraph_use_id)
+        self.xattn_every = int(cfg.slotgraph_xattn_every)
+        self.node_drop_p = 0.0           # set by the trainer each step (annealed node-dropout)
+        self.read_ablate = None          # diagnostics: None | "edges" | "nodes" (read ablation gate)
 
-        # slot content seeds (appended to the passage, icae-style: centered in Llama's token region)
-        embed = base.get_input_embeddings()
+        emb = base.get_input_embeddings()
         with torch.no_grad():
-            mean_vec = embed.weight.float().mean(0)
-            emb_std = embed.weight.float().std().item()
-        slot_init = mean_vec.view(1, d).repeat(self.M, 1) + emb_std * torch.randn(self.M, d)
-        self.slot_init = nn.Parameter(slot_init)
+            emb_std = emb.weight.float().std().item()
+        # small-unit seeds + learned ids + learned role
+        self.slot_init = nn.Parameter(emb_std * torch.randn(self.M, dn) * 0.1)
+        self.node_id = nn.Parameter(torch.randn(self.N, dn) / math.sqrt(dn))   # learned node ids
+        self.id_scale = nn.Parameter(torch.tensor(1.0))                         # learnable, modest (NOT √d)
+        # GCNII initial-residual weight (anti-over-smoothing): each GT layer mixes back the distinct-id
+        # init G0, anchoring per-unit identity so the full 288×288 self-attn can't smooth units together.
+        # sigmoid(-1.7)≈0.15 init (GCNII default α~0.1); learnable. This is the design's "re-inject id/role
+        # each layer" made principled. Without it, pairwise cosine climbs to ~0.95 and the read can't
+        # discriminate units.
+        self.gcnii_alpha = nn.Parameter(torch.tensor(-1.7))
+        self.role_embed = nn.Parameter(torch.randn(2, dn) / math.sqrt(dn))      # node / edge role
+        is_node = torch.zeros(self.M, dtype=torch.bool); is_node[:self.N] = True
+        self.register_buffer("is_node", is_node, persistent=False)
 
-        # FIXED near-orthonormal per-position identity codes (buffer → distinct + reload-stable)
-        assert 2 <= self.M <= d, (f"slotgraph needs 2 <= M ({self.M}) <= d_llama ({d}): M≥2 for a valid "
-                                  f"node/edge partition, M≤d for orthonormal id codes.")
-        gen = torch.Generator().manual_seed(0)
-        q = torch.linalg.qr(torch.randn(d, self.M, generator=gen))[0]    # [d,M] orthonormal cols
-        self.register_buffer("id_embed", q.t().contiguous(), persistent=True)   # [M,d] unit-norm rows
-        is_node = torch.zeros(self.M); is_node[:self.K] = 1.0
-        self.register_buffer("is_node", is_node, persistent=False)              # [M] 1=node, 0=edge
-        role_fixed = torch.zeros(self.M, 2); role_fixed[:self.K, 0] = 1.0; role_fixed[self.K:, 1] = 1.0
-        self.register_buffer("role_fixed", role_fixed, persistent=False)        # [M,2] (canaries/viz)
+        # passage perception → graph space
+        self.ctx_proj = nn.Linear(d, dn)
+        self.in_norm = nn.LayerNorm(dn)
+        self.gt_layers = nn.ModuleList([_GTLayer(cfg, dn, self.N, self.E) for _ in range(int(cfg.slotgraph_enc_layers))])
+        self.out_norm = nn.LayerNorm(dn)
 
-        # content-addressed routing heads: edge→query, node→key (input = [struct_norm(slot) ; √d·id])
-        self.struct_norm = nn.LayerNorm(d)
-        self.id_head_scale = math.sqrt(d)
-        self.d_k = int(getattr(cfg, "slotgraph_d_key", 64))
-        self.q_src_head = nn.Linear(2 * d, self.d_k)   # edge → src query
-        self.q_dst_head = nn.Linear(2 * d, self.d_k)   # edge → dst query
-        self.k_head = nn.Linear(2 * d, self.d_k)       # node → key
-        self.log_temp = nn.Parameter(torch.tensor(math.log(float(cfg.slotgraph_temp_init))))
-
-        # ── multi-hop message-passing READ ──────────────────────────────────
-        self.msg = nn.Linear(2 * d, d, bias=False)   # [source node ; edge content] → message
-        self.update = nn.Linear(d, d, bias=False)    # summed incoming → node-state delta
-        nn.init.zeros_(self.update.weight)           # zero-init ⇒ step-0 read = plain read (cold-start)
-
-        self.norm = _NormMatch(d)
-        with torch.no_grad():
-            self.norm.scale.data.fill_(embed.weight.float().norm(dim=-1).mean().item())
-        print(f"[slotgraph] icae-write + FIXED partition ({self.K} nodes / {self.M - self.K} edges) + "
-              f"content-addressed routing (d_k={self.d_k}, Sinkhorn competition) + fp32 MP read "
-              f"(≤{self.max_hops} hops), encoder-LoRA r{cfg.slotgraph_lora_rank} ({n_wrapped} layers), "
-              f"use_structure={self.use_structure}, use_id={self.use_id}")
+        # decoder read: one gated cross-attn per decoder layer (owned here so params are trainable;
+        # applied to the decoder's layers via hooks in model.py)
+        n_dec_layers = base.config.num_hidden_layers
+        self._hook_layers = list(range(0, n_dec_layers, self.xattn_every))   # decoder layers that get a read
+        self.read_xattn = nn.ModuleList([GatedGraphXAttn(d, dn, cfg.slotgraph_xattn_heads)
+                                         for _ in self._hook_layers])         # one per HOOKED layer (no dead modules)
+        print(f"[slotgraph v2] {self.N} nodes + {self.E} edges @ d_node={dn} (graph-utterance); "
+              f"{int(cfg.slotgraph_enc_layers)}-layer GT encoder, per-layer gated cross-attn read "
+              f"({n_dec_layers} dec layers, every {self.xattn_every}), encoder-LoRA r{cfg.slotgraph_lora_rank} "
+              f"({n_wrapped} layers), use_structure={self.use_structure}, use_id={self.use_id}")
 
     def train(self, mode: bool = True):
         super().train(mode); self.base.train(False); return self
 
-    # ── streaming: accumulate the passage embeds (icae pattern) ──
+    # ── streaming: accumulate passage embeds (icae pattern) ──
     def init_streaming_state(self, batch_size, device, dtype):
-        d = self.cfg.d_llama
-        return {"emb": torch.zeros(batch_size, 0, d, device=device, dtype=dtype),
+        return {"emb": torch.zeros(batch_size, 0, self.d, device=device, dtype=dtype),
                 "mask": torch.zeros(batch_size, 0, device=device, dtype=torch.bool)}
 
     def streaming_write(self, state, token_embeds, attention_mask=None, chunk_offset=0, **extra):
@@ -133,161 +238,34 @@ class SlotGraphEncoder(nn.Module):
         return {"emb": torch.cat([state["emb"], token_embeds], dim=1),
                 "mask": torch.cat([state["mask"], attention_mask.bool()], dim=1)}, {}
 
-    def _head_in(self, slot_h: Tensor) -> Tensor:
-        """Routing-head input = [struct_norm(slot) ; √d·id] (both streams at the measured √d scale).
-        id ablation (use_id=False): zero the id stream so endpoints are chosen on content alone."""
-        id_stream = self.id_head_scale * self.id_embed.unsqueeze(0).expand(slot_h.shape[0], -1, -1)
-        if not self.use_id:
-            id_stream = torch.zeros_like(id_stream)
-        return torch.cat([self.struct_norm(slot_h), id_stream], dim=-1)                       # [B,M,2d]
-
-    @staticmethod
-    def _sinkhorn1(scores: Tensor) -> Tensor:
-        """One Sinkhorn step in LOG-space (logsumexp, no divide → no 1/‖·‖ singularity): row-normalize
-        over nodes (each edge commits) then column-normalize over edges (the COMPETITION — a node demanded
-        by many edges is pushed down, so edges spread). scores [B,E,N] → balanced log-assignment [B,E,N].
-        Single step (not iterated): discourages hubs without forcing a permutation (right for E≈N)."""
-        logA = scores - torch.logsumexp(scores, dim=-1, keepdim=True)     # row: per edge over nodes
-        logA = logA - torch.logsumexp(logA, dim=-2, keepdim=True)         # col: per node over edges (competition)
-        return logA
-
-    def _structure(self, slot_h: Tensor):
-        """Content-addressed endpoints with competition + NO self-loops. src is chosen first; dst then
-        forbids the src node (mask it out) so dst≠src always → every edge is a genuine two-node relation.
-        Returns (src, dst) [B,M,M] hard one-hots (edge rows → node cols) + (soft_src,soft_dst) [B,E,N]."""
-        B = slot_h.shape[0]
-        he = self._head_in(slot_h)                                # [B,M,2d]
-        k = self.k_head(he[:, :self.K])                           # [B,N,dk] node keys
-        q_src = self.q_src_head(he[:, self.K:])                   # [B,E,dk] edge src-query
-        q_dst = self.q_dst_head(he[:, self.K:])                   # [B,E,dk] edge dst-query
-        scale = 1.0 / math.sqrt(self.d_k)
-        temp = self.log_temp.exp().clamp_min(1e-2)
-
-        def _to_full(e_oh):                                        # [B,E,N] → [B,M,M] (edge rows, node cols)
-            return F.pad(F.pad(e_oh, (0, self.M - self.K)), (0, 0, self.K, 0))
-
-        sc_src = torch.einsum("bed,bnd->ben", q_src, k) * scale / temp     # [B,E,N]
-        src_oh = _st_onehot(self._sinkhorn1(sc_src), 1.0)                  # [B,E,N] one-hot src
-        # dst: forbid the src node (detached, finite constant → no self-loops, no 0·inf gradient trap)
-        sc_dst = torch.einsum("bed,bnd->ben", q_dst, k) * scale / temp - 1e4 * src_oh.detach()
-        dst_oh = _st_onehot(self._sinkhorn1(sc_dst), 1.0)                  # [B,E,N] one-hot dst (≠ src)
-        return _to_full(src_oh), _to_full(dst_oh), sc_src.softmax(-1), sc_dst.softmax(-1)
-
-    @torch.no_grad()
-    def _adaptive_hops(self, src: Tensor, dst: Tensor) -> int:
-        """#hops = the predicted graph's DIAMETER (reachability saturation), max over batch, capped."""
-        M, B = self.M, src.shape[0]
-        eh = (1.0 - self.is_node).view(1, M).expand(B, M)          # [B,M] edge indicator
-        sh = (src > 0).float(); dh = (dst > 0).float()
-        A = torch.einsum("bm,bmi,bmj->bij", eh, sh, dh)           # [B,M,M] directed adjacency
-        eye = torch.eye(M, device=src.device, dtype=A.dtype).unsqueeze(0)
-        A = ((A + A.transpose(1, 2)) > 0).float()                  # symmetric, binary
-        reach = ((A + eye) > 0).float()
-        K = 1
-        for k in range(2, self.max_hops + 1):
-            nxt = ((reach @ (A + eye)) > 0).float()
-            if torch.equal(nxt, reach):
-                break
-            reach = nxt; K = k
-        return max(1, min(K, self.max_hops))
-
-    def _mp_read(self, slot_final: Tensor):
-        """Multi-hop residual message-passing read (fp32). Returns (memory, info-with-canaries)."""
-        src, dst, soft_src, soft_dst = self._structure(slot_final)
-        edge_w = (1.0 - self.is_node).view(1, self.M, 1)          # [1,M,1] edge slots emit
-        node_recv = self.is_node.view(1, self.M, 1)              # [1,M,1] node slots receive
-        K = self._adaptive_hops(src, dst)
-        deg = torch.einsum("bmn,bm->bn", (src + dst).detach(),
-                           (1.0 - self.is_node).view(1, self.M).expand(src.shape[0], -1)).clamp(min=1.0)
-        pre = self.norm(slot_final)                               # plain read (for the inert-MP canary)
-
-        h = slot_final
-        if self.trace:
-            self._trace = {"hop_h": [h.detach().float().cpu()], "u_mag": [], "u_sat": []}
-        for _ in range(K):
-            h_src = torch.einsum("bmn,bnd->bmd", src, h)          # source-endpoint node state per edge
-            h_dst = torch.einsum("bmn,bnd->bmd", dst, h)          # dst-endpoint node state per edge
-            m_to_dst = self.msg(torch.cat([h_src, h], -1)) * edge_w
-            m_to_src = self.msg(torch.cat([h_dst, h], -1)) * edge_w
-            agg = (torch.einsum("bmn,bmd->bnd", dst, m_to_dst)       # mean-aggregate at endpoint nodes
-                   + torch.einsum("bmn,bmd->bnd", src, m_to_src)) / deg.unsqueeze(-1)
-            u = self.update(agg).clamp(-1.0, 1.0)                  # bounded delta (no norm → safe backward)
-            h = h + u * node_recv                                  # residual relay, only node slots update
-            if self.trace:
-                self._trace["hop_h"].append(h.detach().float().cpu())
-                self._trace["u_mag"].append(float(u.abs().mean()))
-                self._trace["u_sat"].append(float((u.abs() >= 0.999).float().mean()))
-        memory = self.norm(h)
-
-        # ── canaries (detached) ──
-        with torch.no_grad():
-            def _ent(p):                                           # per-edge confidence (↓=sharp)
-                return (-(p.clamp_min(1e-9).log() * p).sum(-1)).mean()
-            node_use = (src + dst).sum(dim=(0, 1))[:self.K]        # [N] how many edge-endpoints hit each node
-            pu = node_use / node_use.sum().clamp_min(1e-9)
-            node_entropy = -(pu.clamp_min(1e-9).log() * pu).sum()  # ↑(→lnK)=spread; ↓=hub-collapse
-            src_pick = src[:, self.K:, :self.K].argmax(-1)         # [B,E] ACTUAL src node per edge (Sinkhorn pick)
-            dst_pick = dst[:, self.K:, :self.K].argmax(-1)         # [B,E] ACTUAL dst node (≠ src by the mask)
-            if self.trace:
-                self._trace.update(
-                    slot_final=slot_final.detach().float().cpu(), memory=memory.detach().float().cpu(),
-                    src_pick=src_pick.cpu(), dst_pick=dst_pick.cpu(),
-                    soft_src=soft_src.detach().float().cpu(), soft_dst=soft_dst.detach().float().cpu())
-            info = {"hops": K,
-                    "delta": (1.0 - F.cosine_similarity(pre, memory, dim=-1)).mean(),
-                    "src_entropy": _ent(soft_src), "dst_entropy": _ent(soft_dst),
-                    "node_entropy": node_entropy, "ent_max": math.log(self.K),
-                    "selfloop": (src_pick == dst_pick).float().mean(),
-                    "src_arg": src_pick, "dst_arg": dst_pick}
-        return memory, info
+    def _init_graph(self, B):
+        G = self.slot_init.unsqueeze(0).expand(B, -1, -1).clone()              # [B,M,dn]
+        G = G + self.role_embed[self.is_node.long()].unsqueeze(0)             # role (0/1 → embed)
+        if self.use_id:
+            id_full = torch.zeros(self.M, self.dn, device=G.device, dtype=G.dtype)
+            id_full[:self.N] = self.node_id
+            G = G + self.id_scale * id_full.unsqueeze(0)                      # node ids (edges start id-less)
+        return G
 
     def finalize_memory(self, state):
-        emb, mask = state["emb"], state["mask"]                    # [B,T,d], [B,T]
-        B, _T, d = emb.shape
-        slots0 = self.slot_init.unsqueeze(0).expand(B, self.M, d)    # content seed
-        if self.use_id:
-            slots0 = slots0 + self.id_embed.unsqueeze(0)             # + fixed identity (ablatable)
-        slots0 = slots0.to(emb.dtype)
-        inp = torch.cat([emb, slots0], dim=1)                       # [B,T+M,d]
-        attn = torch.cat([mask, torch.ones(B, self.M, device=mask.device, dtype=mask.dtype)], dim=1).long()
-        out_lm = self.base.model(inputs_embeds=inp, attention_mask=attn,
-                                 use_cache=False, output_hidden_states=self.trace)  # bf16 LM forward
-        h = out_lm.last_hidden_state
-        slot_final = h[:, -self.M:]                                 # [B,M,d]
-        # per-layer slot hiddens (diagnostics): write-side depth trajectory
-        layer_slots = ([hs[:, -self.M:].detach().float().cpu() for hs in out_lm.hidden_states]
-                       if self.trace and out_lm.hidden_states is not None else None)
-        mp_info = None
-        if self.use_structure:
-            with torch.autocast("cuda", enabled=False):            # structure + read in FP32 (small + sensitive)
-                memory, mp_info = self._mp_read(slot_final.float())
-        else:
-            memory = self.norm(slot_final.float())                 # plain prepend (id-tagged ICAE control)
-        if self.trace and layer_slots is not None:
-            self._trace["layer_slots"] = layer_slots               # added AFTER _mp_read (which resets _trace)
-
-        aux = {}
-        with torch.no_grad():
-            aux["slotgraph_edge_frac"] = torch.tensor(float(1.0 - self.is_node.mean()), device=emb.device)
-            aux["slotgraph_mem_effrank"] = torch.tensor(
-                _participation_ratio(memory.reshape(-1, memory.shape[-1])), device=emb.device)
-            aux["slotgraph_role"] = self.role_fixed[:, 1].long().unsqueeze(0).expand(B, -1)   # [B,M] 0 node 1 edge
-            if mp_info is not None:
-                aux["slotgraph_invalid_edge_frac"] = torch.zeros((), device=emb.device)  # 0 by construction
-                aux["slotgraph_src_entropy"] = mp_info["src_entropy"]
-                aux["slotgraph_dst_entropy"] = mp_info["dst_entropy"]
-                aux["slotgraph_endpoint_entropy_max"] = torch.tensor(mp_info["ent_max"], device=emb.device)
-                aux["slotgraph_node_entropy"] = mp_info["node_entropy"]   # ↑(→lnK)=edges spread; ↓=hub
-                aux["slotgraph_selfloop_frac"] = mp_info["selfloop"]
-                aux["slotgraph_mp_hops"] = torch.tensor(float(mp_info["hops"]), device=emb.device)
-                aux["slotgraph_mp_delta"] = mp_info["delta"]
-                aux["slotgraph_src"] = mp_info["src_arg"]
-                aux["slotgraph_dst"] = mp_info["dst_arg"]
-                # within-batch cross-input routing diversity (scalar → logs every train step):
-                # entropy of each edge's src pick ACROSS the B examples; ↑ = routing responds to input.
-                _pe = F.one_hot(mp_info["src_arg"], self.K).float().mean(0)        # [E,K] pick freq over batch
-                aux["slotgraph_routing_diversity"] = (
-                    (-(_pe.clamp_min(1e-9).log() * _pe).sum(-1)).mean() / math.log(self.K))
+        emb, mask = state["emb"], state["mask"]                               # [B,T,d], [B,T]
+        B = emb.shape[0]
+        attn = mask.long()
+        # perceive with the frozen LM (encoder-LoRA, bf16)
+        H = self.base.model(inputs_embeds=emb, attention_mask=attn, use_cache=False).last_hidden_state
+        with torch.autocast("cuda", enabled=False):                          # graph in fp32 (small + sensitive)
+            ctx = self.in_norm(self.ctx_proj(H.float()))                     # [B,T,dn]
+            G0 = self._init_graph(B).float()                                 # the distinct-id init (anchor)
+            G = G0
+            alpha = torch.sigmoid(self.gcnii_alpha)                          # GCNII initial-residual weight
+            src = dst = soft_s = soft_d = None
+            for layer in self.gt_layers:
+                G, src, dst, soft_s, soft_d = layer(G, ctx, mask.bool(), self.node_id.float())
+                G = (1.0 - alpha) * G + alpha * G0                           # anchor identity each layer (anti-over-smoothing)
+            G = self.out_norm(G)
+        memory = emb.new_zeros(B, 0, self.d)                                  # NO prepend; read = cross-attn
+        aux = self._canaries(G, src, dst, soft_s, soft_d, emb.device)
+        aux["graph_G"] = G                                                    # consumed by the read hooks
         return memory, aux
 
     def forward(self, token_embeds, attention_mask=None, mask_positions=None):
@@ -295,3 +273,46 @@ class SlotGraphEncoder(nn.Module):
         st = self.init_streaming_state(token_embeds.shape[0], token_embeds.device, token_embeds.dtype)
         st, _ = self.streaming_write(st, token_embeds, attention_mask)
         return self.finalize_memory(st)
+
+    # ── read KV-keep mask: ablation gate (edges/nodes off) OR node-dropout curriculum ──
+    def node_keep_mask(self, B, device, training: bool):
+        keep = torch.ones(B, self.M, dtype=torch.bool, device=device)
+        if self.read_ablate == "edges":          # diagnostics: read NODES only (the edges-off gate)
+            keep[:, self.N:] = False
+            return keep
+        if self.read_ablate == "nodes":          # diagnostics: read EDGES only
+            keep[:, :self.N] = False
+            return keep
+        if training and self.node_drop_p > 0.0 and self.use_structure:        # anti-bypass curriculum
+            drop = torch.rand(self.N, device=device) < self.node_drop_p       # per-batch (shared across B)
+            keep[:, :self.N] = keep[:, :self.N] & (~drop).view(1, self.N)
+        return keep
+
+    @torch.no_grad()
+    def _canaries(self, G, src, dst, soft_s, soft_d, device):
+        aux = {}
+        aux["slotgraph_mem_effrank"] = torch.tensor(
+            _participation_ratio(G.reshape(-1, G.shape[-1])), device=device)
+        aux["slotgraph_edge_frac"] = torch.tensor(float(self.E) / self.M, device=device)
+        # mean read gate (tanh) across decoder layers — watch the cross-attn bootstrap open over training
+        aux["slotgraph_read_gate"] = torch.stack([x.gate for x in self.read_xattn]).detach().tanh().mean()
+        if src is not None:
+            N = self.N
+            sp = src.argmax(-1); dp = dst.argmax(-1)                          # [B,E]
+            aux["slotgraph_src"] = sp; aux["slotgraph_dst"] = dp
+            aux["slotgraph_selfloop_frac"] = (sp == dp).float().mean()
+            # within-batch cross-input routing diversity (THE topology signal): per edge, entropy of its
+            # src pick across the B examples / ln N. ↑ over training ⇒ the graph responds to the input.
+            if sp.shape[0] > 1:
+                oh = F.one_hot(sp, N).float().mean(0)                         # [E,N] src-pick freq over batch
+                aux["slotgraph_routing_diversity"] = (
+                    -(oh.clamp_min(1e-9).log() * oh).sum(-1)).mean() / math.log(N)
+            def _ent(p):
+                return (-(p.clamp_min(1e-9).log() * p).sum(-1)).mean()
+            aux["slotgraph_src_entropy"] = _ent(soft_s); aux["slotgraph_dst_entropy"] = _ent(soft_d)
+            aux["slotgraph_endpoint_entropy_max"] = torch.tensor(math.log(N), device=device)
+            use = torch.bincount(torch.cat([sp.reshape(-1), dp.reshape(-1)]), minlength=N).float()
+            pu = use / use.sum().clamp_min(1e-9)
+            aux["slotgraph_node_entropy"] = -(pu.clamp_min(1e-9).log() * pu).sum()
+            aux["slotgraph_id_scale"] = self.id_scale.detach()
+        return aux

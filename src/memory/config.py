@@ -150,36 +150,32 @@ class ReprConfig:
     biomem_membrane_max_decay: float = 0.9  # cap on the per-neuron leak λ = max·sigmoid(raw) (keeps the window valid)
     mixed_gate_batches: int = 0        # mixed val: REAL/SHUF/OFF binding gate on the first N batches/task (0=off)
 
-    # ── slotgraph (fixed-partition graph slot memory; models/slotgraph/) ──────
-    # ICAE write (own frozen base + encoder-LoRA, M slots appended to the passage, run through the
-    # LM's OWN layers) with a FIXED node/edge partition (slots 0..K-1 nodes, K..M-1 edges; see
-    # slotgraph_n_nodes). Each EDGE slot predicts HARD (straight-through) which two NODE slots it links
-    # (masked to the node pool → every edge is node→node). READ = a multi-hop residual message-passing
-    # GNN over the predicted graph (node state RMSNorm-bounded each hop, ungated; zero-init update for a
-    # plain-read cold-start), so the prepended memory is a FUNCTION of the topology and the endpoint
-    # heads get real loss gradient. use_structure=False ⇒ plain prepend (id-tagged ICAE control).
-    # Magnitudes: bounded internally by RMSNorm + one measured output rescale to the embedding norm;
-    # no scale coefficients/gates, no per-layer injection (see the encoder MAGNITUDE/GRADIENT POLICY).
-    slotgraph_n_slots: int = 32          # M — slots = PREPEND tokens (matches baselines' M=32)
-    slotgraph_n_nodes: int = 16          # K — slots 0..K-1 are NODES, K..M-1 are EDGES (FIXED partition).
-                                         # Role is assigned by position, NOT predicted: "which slot is a
-                                         # node" is then 100%-reliable from step 0 (a noisy role head made
-                                         # the edges→nodes mask unreliable for most of training). Edges
-                                         # always point into the fixed node pool. TokenGT-style: types are
-                                         # GIVEN; only the connectivity (endpoints) + content are learned.
-    slotgraph_lora_rank: int = 32        # encoder-LoRA rank (mixed block sets ~85 to match icae+MP params)
-    slotgraph_lora_alpha: int = 64
+    # ── slotgraph v2 (graph-as-language; models/slotgraph/) — see docs/slotgraph_redesign.md ──
+    # Memory = many small node/edge latents (an invented graph-vocabulary "utterance"). ENCODER: the
+    # frozen LM perceives the passage → features; a small (d_node) graph-transformer cross-attends to
+    # them, self-mixes, and PER LAYER predicts edge endpoints (Sinkhorn + straight-through) and
+    # re-injects endpoint-derived edge ids (the structure-feedback loop). DECODER: frozen LM + per-layer
+    # bottleneck GATED CROSS-ATTENTION over the frozen graph (no prepend, no message-passing read).
+    # Anti-bypass: per-batch random node-dropout (keep edges), cosine-annealed to 0. Float-matched to
+    # the baselines' 32x576 memory: (n_nodes+n_edges)*d_node ~= 18432.
+    slotgraph_d_node: int = 64           # small-unit latent dim — forces composition (no node carries the answer)
+    slotgraph_n_nodes: int = 144         # node latents (units 0..N-1); learned id per node
+    slotgraph_n_edges: int = 144         # edge latents (units N..N+E-1); edge id = combine(id_src, id_dst)
+    slotgraph_enc_layers: int = 4        # graph-transformer depth (perceive + mix + materialize, per layer)
+    slotgraph_d_key: int = 32            # endpoint-routing query/key dim (edge queries · node keys → Sinkhorn)
     slotgraph_temp_init: float = 1.0     # straight-through surrogate temperature (gradient sharpness)
-    slotgraph_use_structure: bool = True # False ⇒ plain prepend of the id-tagged slots = "id-tagged ICAE"
-                                         # (slots still carry the fixed id tags; the TRUE pure-ICAE
-                                         # control is the separate icae_baseline variant). The ablation.
-    slotgraph_use_id: bool = True        # False ⇒ drop the fixed orthonormal id_embed from the slots (and
-                                         # routing-head input) ⇒ pure-ICAE-via-same-code. The id-tag ablation:
-                                         # does the FREE (0-param buffer) identity tagging beat plain ICAE?
-    slotgraph_max_hops: int = 5          # cap on the adaptive MP hop count (over-smoothing / compute guard);
-                                         # #hops = the predicted graph's DIAMETER (reachability saturation)
-    slotgraph_d_key: int = 64            # query/key dim for content-addressed endpoint routing (edge
-                                         # queries · node keys, then single-step Sinkhorn competition)
+    slotgraph_xattn_every: int = 1       # decoder cross-attn cadence (1 = every layer; >1 thins to every-k)
+    slotgraph_xattn_heads: int = 4       # heads in the bottleneck gated cross-attn (attends in d_node space)
+    slotgraph_node_drop_max: float = 0.5         # p_max for the node-dropout anti-bypass curriculum
+    slotgraph_node_drop_anneal_frac: float = 0.5 # fraction of training over which p cosine-decays to 0
+    slotgraph_node_drop_adaptive: bool = False   # panel-driven (edge-usage) schedule; else cosine decay
+    slotgraph_lora_rank: int = 32        # enc+dec LoRA rank (mixed block sets it to ~param-match icae)
+    slotgraph_lora_alpha: int = 64
+    slotgraph_use_structure: bool = True # ablation: False ⇒ no graph (read all units as a flat set; no edge
+                                         # materialization / endpoint ids) = "many small flat slots" control
+    slotgraph_use_id: bool = True        # ablation: False ⇒ drop the learned id embeddings
+    slotgraph_n_slots: int = 0           # retired (v2 does NOT prepend; the read is cross-attn). Kept = 0
+                                         # for compatibility with the capacity block / shared plumbing.
 
     # ── vqicae (ICAE with VQ-VAE-discretized slots; models/vqicae/) ──────────
     # ICAE write, then each slot is quantized to its nearest code in a large EMA codebook
