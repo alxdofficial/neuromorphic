@@ -33,7 +33,7 @@ def apply_mixed_capacity(cfg):
     cfg.slotgraph_d_node = 64
     cfg.slotgraph_n_nodes = 144; cfg.slotgraph_n_edges = 144     # (N+E)*64 = 18432 floats
     cfg.slotgraph_enc_layers = 4
-    cfg.slotgraph_d_key = 32; cfg.slotgraph_xattn_heads = 4
+    cfg.slotgraph_xattn_heads = 4
     cfg.slotgraph_lora_rank = 56; cfg.slotgraph_lora_alpha = 112  # encoder LoRA (matches train.py capacity)
 
 

@@ -38,20 +38,13 @@ def _participation_ratio(x: Tensor) -> float:
     return float((torch.diagonal(C).sum() ** 2 / (C * C).sum().clamp_min(1e-12)).item())
 
 
-def _st_onehot(logits: Tensor, temp: float) -> Tensor:
-    """Straight-through: one-hot(argmax) forward, softmax(logits/temp) gradient backward."""
-    soft = (logits / temp).softmax(-1)
+def _hard_onehot(logits: Tensor) -> Tensor:
+    """Deterministic straight-through one-hot(argmax): hard forward, softmax backward. The EVAL select
+    (no Gumbel noise) — measures what the learned logits actually pick."""
+    soft = logits.softmax(-1)
     idx = soft.argmax(-1, keepdim=True)
     hard = torch.zeros_like(soft).scatter_(-1, idx, 1.0)
     return hard + (soft - soft.detach())
-
-
-def _sinkhorn1(scores: Tensor) -> Tensor:
-    """One log-space Sinkhorn step: row-normalize over nodes (each edge commits) then column-normalize
-    over edges (competition — a node demanded by many edges is pushed down). scores [B,E,N]."""
-    logA = scores - torch.logsumexp(scores, dim=-1, keepdim=True)
-    logA = logA - torch.logsumexp(logA, dim=-2, keepdim=True)
-    return logA
 
 
 class GatedGraphXAttn(nn.Module):
@@ -97,7 +90,7 @@ class _GTLayer(nn.Module):
     def __init__(self, cfg: ReprConfig, dn: int, N: int, E: int):
         super().__init__()
         self.N, self.E, self.dn = N, E, dn
-        self.d_key = cfg.slotgraph_d_key
+        self.d_key = dn                  # routing query/key live in the FULL node dim (no down-projection)
         self.use_structure = bool(getattr(cfg, "slotgraph_use_structure", True))
         self.use_id = bool(getattr(cfg, "slotgraph_use_id", True))
         h = 4
@@ -111,7 +104,6 @@ class _GTLayer(nn.Module):
         self.ns = nn.LayerNorm(dn)
         self.q_src = nn.Linear(dn, self.d_key); self.q_dst = nn.Linear(dn, self.d_key)
         self.k_node = nn.Linear(dn, self.d_key)
-        self.log_temp = nn.Parameter(torch.tensor(math.log(float(cfg.slotgraph_temp_init))))
         self.edge_combine = nn.Linear(2 * dn, dn)   # endpoint-derived edge id from [id_src ; id_dst]
 
     def _mha(self, q, k, v, qh, kh, vh, oh, kv_mask=None):
@@ -126,23 +118,27 @@ class _GTLayer(nn.Module):
         o = F.scaled_dot_product_attention(Q, K, V, attn_mask=am).transpose(1, 2).reshape(B, S, -1)
         return oh(o)
 
-    def _structure(self, G):
-        """Predict each edge's src/dst over the node pool. Returns hard src,dst [B,E,N] + softs + picks.
-        Keys/queries read the ids via content (ids are already added into G upstream)."""
+    def _structure(self, G, tau: float):
+        """Predict each edge's src/dst over the node pool by CONTENT-addressed selection: edge queries ·
+        node-latent keys (both in d_node space) → Gumbel straight-through (train) / hard argmax (eval).
+        No Sinkhorn: endpoint reuse is allowed (a node may be a hub of many edges); a doubly-stochastic
+        constraint would forbid that AND flatten the gradient at uniform init. Gumbel noise breaks the
+        uniform-init symmetry (the dead zone of plain ST-argmax). Returns hard src,dst [B,E,N] + the raw
+        (noise-free) routing softmaxes for telemetry — their entropy reflects true logit sharpness."""
         gn = self.ns(G)
         nodes = gn[:, :self.N]; edges = gn[:, self.N:]
-        k = self.k_node(nodes)                                   # [B,N,dk]
-        qs = self.q_src(edges); qd = self.q_dst(edges)           # [B,E,dk]
-        scale = 1.0 / math.sqrt(self.d_key); temp = self.log_temp.exp().clamp_min(1e-2)
-        sc_src = torch.einsum("bed,bnd->ben", qs, k) * scale / temp
-        ls = _sinkhorn1(sc_src); src = _st_onehot(ls, 1.0)       # [B,E,N]
-        sc_dst = torch.einsum("bed,bnd->ben", qd, k) * scale / temp - 1e4 * src.detach()
-        ld = _sinkhorn1(sc_dst); dst = _st_onehot(ld, 1.0)
-        # telemetry = the POST-Sinkhorn routing distribution (the competition-adjusted one the ST pick
-        # uses), not the raw pre-competition softmax.
-        return src, dst, ls.softmax(-1), ld.softmax(-1)
+        k = self.k_node(nodes)                                   # [B,N,d_key=d_node]
+        qs = self.q_src(edges); qd = self.q_dst(edges)           # [B,E,d_key=d_node]
+        scale = 1.0 / math.sqrt(self.d_key)
+        sc_src = torch.einsum("bed,bnd->ben", qs, k) * scale     # [B,E,N] endpoint logits
+        src = (F.gumbel_softmax(sc_src, tau=tau, hard=True, dim=-1) if self.training
+               else _hard_onehot(sc_src))
+        sc_dst = torch.einsum("bed,bnd->ben", qd, k) * scale - 1e4 * src.detach()   # forbid self-loops
+        dst = (F.gumbel_softmax(sc_dst, tau=tau, hard=True, dim=-1) if self.training
+               else _hard_onehot(sc_dst))
+        return src, dst, sc_src.softmax(-1), sc_dst.softmax(-1)
 
-    def forward(self, G, ctx, ctx_keep, node_id):
+    def forward(self, G, ctx, ctx_keep, node_id, tau):
         # cross-attn: graph units query the passage features
         G = G + self.co(self._mha(self.n1(G), ctx, ctx, self.cq, self.ck, self.cv, lambda x: x, ctx_keep))
         # self-attn: units mix
@@ -150,7 +146,7 @@ class _GTLayer(nn.Module):
         G = G + self.so(self._mha(gn, gn, gn, self.sq, self.sk, self.sv, lambda x: x))
         src = dst = soft_s = soft_d = None
         if self.use_structure:
-            src, dst, soft_s, soft_d = self._structure(G)
+            src, dst, soft_s, soft_d = self._structure(G, tau)
             if self.use_id:
                 # endpoint-derived edge id: gather node ids by the materialized endpoints
                 id_src = torch.einsum("ben,nd->bed", src, node_id)   # [B,E,dn]
@@ -187,6 +183,7 @@ class SlotGraphEncoder(nn.Module):
         self.use_id = bool(cfg.slotgraph_use_id)
         self.xattn_every = int(cfg.slotgraph_xattn_every)
         self.node_drop_p = 0.0           # set by the trainer each step (annealed node-dropout)
+        self.gumbel_tau = float(cfg.slotgraph_gumbel_tau_start)   # set by the trainer each step (annealed τ)
         self.read_ablate = None          # diagnostics: None | "edges" | "nodes" (read ablation gate)
 
         emb = base.get_input_embeddings()
@@ -260,7 +257,7 @@ class SlotGraphEncoder(nn.Module):
             alpha = torch.sigmoid(self.gcnii_alpha)                          # GCNII initial-residual weight
             src = dst = soft_s = soft_d = None
             for layer in self.gt_layers:
-                G, src, dst, soft_s, soft_d = layer(G, ctx, mask.bool(), self.node_id.float())
+                G, src, dst, soft_s, soft_d = layer(G, ctx, mask.bool(), self.node_id.float(), self.gumbel_tau)
                 G = (1.0 - alpha) * G + alpha * G0                           # anchor identity each layer (anti-over-smoothing)
             G = self.out_norm(G)
         memory = emb.new_zeros(B, 0, self.d)                                  # NO prepend; read = cross-attn
@@ -296,6 +293,8 @@ class SlotGraphEncoder(nn.Module):
         aux["slotgraph_edge_frac"] = torch.tensor(float(self.E) / self.M, device=device)
         # mean read gate (tanh) across decoder layers — watch the cross-attn bootstrap open over training
         aux["slotgraph_read_gate"] = torch.stack([x.gate for x in self.read_xattn]).detach().tanh().mean()
+        aux["slotgraph_gcnii_alpha"] = torch.sigmoid(self.gcnii_alpha).detach()   # ↑→static (frozen G0); ↓→over-smooth
+        aux["slotgraph_gumbel_tau"] = torch.tensor(float(self.gumbel_tau), device=device)
         if src is not None:
             N = self.N
             sp = src.argmax(-1); dp = dst.argmax(-1)                          # [B,E]

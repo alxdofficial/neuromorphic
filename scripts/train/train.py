@@ -1108,6 +1108,11 @@ def train_mixed_variant(
             _w = max(1, int(cfg.slotgraph_node_drop_anneal_frac * n_steps))
             model.encoder.node_drop_p = (0.5 * _pmax * (1 + math.cos(math.pi * step / _w))
                                          if (step < _w and _pmax > 0) else 0.0)
+            # endpoint-selection τ: cosine-anneal the Gumbel-ST temperature start→floor over the FULL run
+            # (warm early ⇒ gradient flows + Gumbel breaks the uniform-init symmetry; sharper backward late)
+            _t0 = cfg.slotgraph_gumbel_tau_start; _tf = cfg.slotgraph_gumbel_tau_floor
+            _frac = min(1.0, step / max(1, n_steps))
+            model.encoder.gumbel_tau = _tf + 0.5 * (_t0 - _tf) * (1 + math.cos(math.pi * _frac))
         batch = next_batch(task)
 
         lr = lr_at_step(step, n_steps, cfg.learning_rate, cfg.warmup_steps)
@@ -1134,6 +1139,28 @@ def train_mixed_variant(
                  if (_afrom >= 0 and step >= _afrom) else _ctxlib.nullcontext())
         with _anom:
             loss.backward()
+        # slotgraph endpoint-selection grad-MAGNITUDE canary — the instrument the prior collapse lacked.
+        # Plain ST-argmax starved q_src/q_dst/k_node ~30,000x vs edge_combine (a self-reinforcing dead
+        # zone); Gumbel-ST should keep them within ~1-2 OOM. Reported as grad/param + the gap to
+        # edge_combine. Computed PRE-clip (raw signal) at log cadence only (the .item() syncs aren't free).
+        _sg_grad = None
+        if (step % log_every == 0 and getattr(model.encoder, "wants_graph_xattn", False)
+                and getattr(model.encoder, "use_structure", False)):
+            _gl = model.encoder.gt_layers
+            def _gp(ps):
+                ps = [p for p in ps if p.grad is not None]
+                nd = sum(p.numel() for p in ps)
+                if nd == 0:
+                    return 0.0
+                gd = sum(p.grad.abs().sum().item() for p in ps) / nd
+                pm = sum(p.detach().abs().sum().item() for p in ps) / nd
+                return gd / max(1e-12, pm)
+            _sel = min(_gp([p for L in _gl for p in L.q_src.parameters()]),
+                       _gp([p for L in _gl for p in L.q_dst.parameters()]),
+                       _gp([p for L in _gl for p in L.k_node.parameters()]))
+            _ec = _gp([p for L in _gl for p in L.edge_combine.parameters()])
+            _sg_grad = {"slotgraph_sel_gradparam": _sel,
+                        "slotgraph_sel_gap": _ec / max(1e-12, _sel)}
         _mem_params = [p for n, p in model.named_parameters()
                        if p.requires_grad and not n.startswith("decoder.llama.")]
         _lora_params = [p for n, p in model.named_parameters()
@@ -1166,6 +1193,8 @@ def train_mixed_variant(
             "memory_M": out["memory_shape"][1],
             "lr": lr,
         }
+        if _sg_grad is not None:
+            train_row.update(_sg_grad)
         # arm collapse/health canaries at train frequency (biomem edge/decay/beta/sat/mem_effrank/…, etc.)
         for _k, _v in out.items():
             if _v is None or not _k.startswith(("biomem_", "slotgraph_", "vqicae_")):
@@ -1180,11 +1209,12 @@ def train_mixed_variant(
             now = time.time()
             sps = (step - last_print_step) / max(now - last_print_time, 1e-9)
             last_print_step, last_print_time = step, now
+            _gg = f"  selgap={_sg_grad['slotgraph_sel_gap']:.0f}x" if _sg_grad else ""
             print(f"  step {step:6d}/{n_steps}  [{task:12}]  "
                   f"recon={float(out['loss_recon']):.4f}  "
                   f"top1={float(out['top1_acc'])*100:5.1f}%  "
                   f"M={out['memory_shape'][1]}  gnorm={float(gn):6.2f}  "
-                  f"lr={lr:.2e}  ({sps:.1f} step/s)", flush=True)
+                  f"lr={lr:.2e}{_gg}  ({sps:.1f} step/s)", flush=True)
 
         if step > 0 and step % val_every == 0:
             per_task = run_mixed_val(model, mixed_tasks, val_sets, device,
@@ -1795,7 +1825,7 @@ def main():
         cfg.slotgraph_d_node = 64
         cfg.slotgraph_n_nodes = 144; cfg.slotgraph_n_edges = 144      # (144+144)*64 = 18432 floats
         cfg.slotgraph_enc_layers = 4
-        cfg.slotgraph_d_key = 32; cfg.slotgraph_xattn_heads = 4
+        cfg.slotgraph_xattn_heads = 4
         cfg.slotgraph_lora_rank = 56; cfg.slotgraph_lora_alpha = 112   # +read+GT → total ≈ icae ~6.9M
         cfg.slotgraph_n_slots = 0                                      # v2 does NOT prepend (read = cross-attn)
         # vqicae (icae + VQ-discretized slots): encoder-LoRA r96 + projns + EMA codebook (a buffer,

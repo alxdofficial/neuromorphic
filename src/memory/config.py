@@ -162,8 +162,9 @@ class ReprConfig:
     slotgraph_n_nodes: int = 144         # node latents (units 0..N-1); learned id per node
     slotgraph_n_edges: int = 144         # edge latents (units N..N+E-1); edge id = combine(id_src, id_dst)
     slotgraph_enc_layers: int = 4        # graph-transformer depth (perceive + mix + materialize, per layer)
-    slotgraph_d_key: int = 32            # endpoint-routing query/key dim (edge queries · node keys → Sinkhorn)
-    slotgraph_temp_init: float = 1.0     # straight-through surrogate temperature (gradient sharpness)
+    # endpoint routing lives in the FULL d_node space (no down-projection); selection = Gumbel-ST (no Sinkhorn)
+    slotgraph_gumbel_tau_start: float = 1.0  # Gumbel-ST temperature at step 0 (warm: gradient flows + explores)
+    slotgraph_gumbel_tau_floor: float = 0.5  # τ floor, cosine-annealed over training (sharper backward late)
     slotgraph_xattn_every: int = 1       # decoder cross-attn cadence (1 = every layer; >1 thins to every-k)
     slotgraph_xattn_heads: int = 4       # heads in the bottleneck gated cross-attn (attends in d_node space)
     slotgraph_node_drop_max: float = 0.5         # p_max for the node-dropout anti-bypass curriculum
