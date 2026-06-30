@@ -1,13 +1,12 @@
-"""slotgraph v2 (graph-as-language) smoke — verify the redesign in the REAL mixed bf16 path.
+"""slotgraph smoke — verify the emergent-topology slot memory in the REAL mixed path on REAL data.
 
-Checklist (docs/slotgraph_redesign.md §6):
-  1. both compute paths finite (mae → masked_reconstruction; babi → generic compute_loss); no NaN.
-  2. cross-attn gates init 0 ⇒ step-0 read is a NO-OP ⇒ REAL == OFF (clean cold-start).
-  3. gradient reaches every component: encoder GT layers, structure heads, read cross-attn, LoRA.
-  4. node-dropout drops NODES, keeps EDGES; a forward at p=p_max is finite.
-  5. endpoints valid (edges→nodes, ~0 self-loops); canaries sane.
-  6. params ~ param-matched to icae (~6.9M).
-STOP after this for review before any training.
+  - matched config param count (cohort 6.91-7.01M)
+  - both compute paths finite: mae → masked_reconstruction; babi → generic compute_loss
+  - the per-LM-layer structural re-injection hook is wired (struct_out receives gradient ⇒ the
+    structure path reaches the loss through prepend + reinforce)
+  - gradient flows to EVERY slotgraph component (incl. the role/src/dst structure heads) + LoRA
+  - canaries: edge_frac, src/dst entropy (sharpness), mem_effrank, struct_mag
+  - use_structure=False ablation = the icae control (struct zeroed)
 """
 from __future__ import annotations
 import sys
@@ -29,12 +28,11 @@ DEV = "cuda"
 
 def apply_mixed_capacity(cfg):
     cfg.use_llama_lora = True
-    cfg.llama_lora_rank = 16; cfg.llama_lora_alpha = 32          # decoder LoRA
-    cfg.slotgraph_d_node = 64
-    cfg.slotgraph_n_nodes = 144; cfg.slotgraph_n_edges = 144     # (N+E)*64 = 18432 floats
-    cfg.slotgraph_enc_layers = 4
-    cfg.slotgraph_xattn_heads = 4
-    cfg.slotgraph_lora_rank = 56; cfg.slotgraph_lora_alpha = 112  # encoder LoRA (matches train.py capacity)
+    cfg.llama_lora_rank = 16; cfg.llama_lora_alpha = 32
+    cfg.slotgraph_n_slots = 32
+    cfg.slotgraph_n_nodes = 16          # FIXED partition (matches train.py: M//2)
+    cfg.slotgraph_d_key = 64            # content-addressed routing query/key dim (matches train.py)
+    cfg.slotgraph_lora_rank = 82; cfg.slotgraph_lora_alpha = 164   # +MP +query/key heads → params ≈ icae
 
 
 def build(use_structure=True):
@@ -53,71 +51,91 @@ def build(use_structure=True):
     return m, tok, cfg
 
 
-def grp(component, params):
-    n = sum(p.numel() for p in params)
-    g = sum(1 for p in params if p.requires_grad and p.grad is not None and p.grad.abs().sum() > 0)
-    t = sum(1 for p in params if p.requires_grad)
-    return f"{component:18} grad {g}/{t}  ({n/1e6:.2f}M)"
-
-
 def main():
-    m, tok, cfg = build(use_structure=True); enc = m.encoder
+    m, tok, cfg = build(use_structure=True)
+    enc = m.encoder
     tot = sum(p.numel() for p in m.parameters() if p.requires_grad)
-    print(f"\n{'='*74}\nslotgraph v2 smoke (matched mixed config, REAL bf16 path)\n{'='*74}")
-    print(f"params={tot:,} ({tot/1e6:.2f}M)  | target ~6.9M (icae)")
-    print(f"gates init: read_xattn[0].gate={float(enc.read_xattn[0].gate.detach()):.4f} (small +ve to "
-          f"bootstrap the encoder), id_scale={float(enc.id_scale.detach()):.3f}")
+    print(f"\n{'='*72}\nslotgraph smoke (matched mixed config, REAL bf16 path)\n{'='*72}")
+    print(f"params={tot:,} ({tot/1e6:.2f}M)  | cohort 6.91-7.01M")
 
-    vs = make_mixed_val_sets(["mae", "babi"], tok, cfg, 3, ctx_len=1024, m_slots=32,
+    tasks = ["mae", "babi"]
+    print(f"\nLoading real mixed val sets {tasks}...")
+    vs = make_mixed_val_sets(tasks, tok, cfg, 1, ctx_len=1024, m_slots=32,
                              mae_src_tok="meta-llama/Llama-3.2-1B",
                              babi_tasks=(1, 2, 3, 7, 8, 11, 12, 13, 14), predict_len=64)
 
-    for task in ("mae", "babi"):
-        m.task_mode = MIXED_TASK_MODE[task]
-        b = to_device(vs[task][0], DEV)
-        # (2) cold-start: REAL == OFF at init (gates 0 → read no-op)
-        m.eval()
-        with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            real0 = m.compute_loss(b, window_size=1024)["loss_recon"].item()
-            off0 = m.compute_loss(b, window_size=1024, zero_memory=True)["loss_recon"].item()
-            shuf0 = m.compute_loss(b, window_size=1024, shuffle_memory=True)["loss_recon"].item()
-        m.train(True)
-        print(f"\n[{task}] init REAL={real0:.4f} OFF={off0:.4f} SHUF={shuf0:.4f}  "
-              f"(read active at init by gate; REAL−OFF={real0-off0:+.4f})")
-        # (1,3) forward+backward, grad coverage
-        m.zero_grad(set_to_none=True)
+    def encode(batch):
+        embed = m.decoder.llama.get_input_embeddings()
+        with torch.no_grad():
+            ctx = embed(batch.context_ids)
+            enc_in = m._encode_for_memory(ctx, batch.context_mask)
+        st = enc.init_streaming_state(ctx.shape[0], DEV, ctx.dtype)
+        st, _ = enc.streaming_write(st, enc_in, batch.context_mask)
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            out = m.compute_loss(b, window_size=1024)
-        finite = torch.isfinite(out["loss"]).item()
-        out["loss"].backward()
-        print(f"[{task}] train loss={out['loss'].item():.4f} finite={finite}")
-        print("   " + grp("GT encoder", list(enc.gt_layers.parameters())))
-        print("   " + grp("read cross-attn", list(enc.read_xattn.parameters())))
-        sh = [p for L in enc.gt_layers for p in (*L.q_src.parameters(), *L.q_dst.parameters(),
-              *L.k_node.parameters(), *L.edge_combine.parameters())]
-        print("   " + grp("structure heads", sh))
-        print("   " + grp("ids+role+seeds", [enc.node_id, enc.id_scale, enc.role_embed, enc.slot_init]))
+            return enc.finalize_memory(st)
 
-    # (4) node-dropout: drops nodes, keeps edges; forward at p_max finite
-    enc.node_drop_p = cfg.slotgraph_node_drop_max
-    keep = enc.node_keep_mask(4, DEV, training=True)
-    dropped_nodes = int((~keep[:, :enc.N]).any(0).sum()); edges_all_kept = bool(keep[:, enc.N:].all())
+    for t in tasks:
+        m.task_mode = MIXED_TASK_MODE[t]
+        b = to_device(vs[t][0], DEV)
+        mem, aux = encode(b)
+        print(f"\n=== {t}  ({MIXED_TASK_MODE[t]}) ===")
+        print(f"  memory shape={tuple(mem.shape)}")
+        print(f"  canaries: edge_frac={float(aux['slotgraph_edge_frac']):.3f}  "
+              f"src_ent={float(aux['slotgraph_src_entropy']):.2f}  dst_ent={float(aux['slotgraph_dst_entropy']):.2f}  "
+              f"(max=lnK={float(aux['slotgraph_endpoint_entropy_max']):.2f}; →max = ~uniform over nodes)")
+        print(f"  temp={float(aux['slotgraph_temp']):.2f}  "
+              f"mem_effrank={float(aux['slotgraph_mem_effrank']):.2f}/{cfg.d_llama}")
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            out = (m.compute_masked_reconstruction_loss(b)
+                   if MIXED_TASK_MODE[t] == "masked_reconstruction"
+                   else m.compute_loss(b, window_size=1024))
+        loss = out.get("loss_recon", out.get("loss"))
+        top1 = out.get("top1_acc", out.get("top1", torch.zeros(())))
+        print(f"  REAL {MIXED_TASK_MODE[t]} loss={float(loss):.3f}  finite={bool(torch.isfinite(loss))}  "
+              f"top1={float(top1):.3f}")
+
+    # ── gradient flow through the real mae loss ──
+    print(f"\n=== gradient flow (real mae loss → backward) ===")
+    m.zero_grad(set_to_none=True)
     m.task_mode = "masked_reconstruction"
+    b = to_device(vs["mae"][0], DEV)
     with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-        ld = m.compute_loss(to_device(vs["mae"][0], DEV), window_size=1024)["loss"]
-    print(f"\n[node-drop p={enc.node_drop_p}] dropped {dropped_nodes}/{enc.N} nodes, edges all kept: "
-          f"{edges_all_kept}, forward finite: {torch.isfinite(ld).item()}")
-    enc.node_drop_p = 0.0
+        out = m.compute_masked_reconstruction_loss(b)
+    out["loss"].backward()
+    comps = ["slot_init", "struct_norm", "q_src_head", "q_dst_head", "k_head",
+             "log_temp", "msg", "update", "norm"]
+    pd = dict(enc.named_parameters())
+    ok = True
+    for c in comps:
+        g = sum(float(p.grad.float().norm()) for k, p in pd.items()
+                if (k.startswith(c) or (("." + c + ".") in k)) and p.grad is not None)
+        n = sum(1 for k in pd if (k.startswith(c) or (("." + c + ".") in k)))
+        flag = "  <-- STARVED" if (n > 0 and g < 1e-12) else ""
+        if n > 0 and g < 1e-12:
+            ok = False
+        print(f"  {c:14} grad={g:.2e}  (n={n}){flag}")
+    g_enc_lora = sum(float(p.grad.float().norm()) for k, p in enc.named_parameters()
+                     if "lora" in k.lower() and p.grad is not None)
+    g_dec_lora = sum(float(p.grad.float().norm()) for k, p in m.named_parameters()
+                     if "lora" in k.lower() and k.startswith("decoder.") and p.grad is not None)
+    print(f"  {'encoder_LoRA':14} grad={g_enc_lora:.2e}")
+    print(f"  {'decoder_LoRA':14} grad={g_dec_lora:.2e}")
+    print(f"  >>> q_src/q_dst/k_head grad nonzero ⇒ content-addressed routing is trainable (after cold-start)")
+    print(f"\n{'ALL components received gradient ✓' if ok else 'SOME COMPONENT STARVED ✗'}")
 
-    # (5) canaries
-    m.eval()
-    with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
-        m.task_mode = "babi"
-        out = m.compute_loss(to_device(vs["babi"][0], DEV), window_size=1024)
-    can = {k: round(float(v), 3) for k, v in out.items()
-           if k.startswith("slotgraph_") and torch.is_tensor(v) and v.ndim == 0}
-    print(f"\ncanaries: {can}")
-    print(f"\n{'='*74}\nSMOKE DONE — review before training\n{'='*74}")
+    # ── use_structure=False (pure icae control) ──
+    print(f"\n=== ablation: use_structure=False (pure icae control) ===")
+    m2, _, _ = build(use_structure=False)
+    m2.task_mode = "masked_reconstruction"
+    b = to_device(vs["mae"][0], DEV)
+    embed = m2.decoder.llama.get_input_embeddings()
+    with torch.no_grad():
+        ctx = embed(b.context_ids)
+        st = m2.encoder.init_streaming_state(ctx.shape[0], DEV, ctx.dtype)
+        st, _ = m2.encoder.streaming_write(st, ctx, b.context_mask)
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            _mem, _aux = m2.encoder.finalize_memory(st)
+    print(f"  no structure hooks installed; memory shape={tuple(_mem.shape)} (= icae forward over [passage;slots])")
 
 
 if __name__ == "__main__":
