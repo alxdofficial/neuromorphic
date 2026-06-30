@@ -150,26 +150,32 @@ class ReprConfig:
     biomem_membrane_max_decay: float = 0.9  # cap on the per-neuron leak λ = max·sigmoid(raw) (keeps the window valid)
     mixed_gate_batches: int = 0        # mixed val: REAL/SHUF/OFF binding gate on the first N batches/task (0=off)
 
-    # ── slotgraph v2 (graph-as-language; models/slotgraph/) — see docs/slotgraph_redesign.md ──
-    # Memory = many small node/edge latents (an invented graph-vocabulary "utterance"). ENCODER: the
-    # frozen LM perceives the passage → features; a small (d_node) graph-transformer cross-attends to
-    # them, self-mixes, and PER LAYER predicts edge endpoints (Sinkhorn + straight-through) and
-    # re-injects endpoint-derived edge ids (the structure-feedback loop). DECODER: frozen LM + per-layer
-    # bottleneck GATED CROSS-ATTENTION over the frozen graph (no prepend, no message-passing read).
-    # Anti-bypass: per-batch random node-dropout (keep edges), cosine-annealed to 0. Float-matched to
-    # the baselines' 32x576 memory: (n_nodes+n_edges)*d_node ~= 18432.
+    # ── slotgraph v3.1 (graph memory with load-bearing binding) — see docs/slotgraph_v3_design.md ──
+    # Memory = a learned VOCABULARY of N concept-nodes (fixed key + base meaning + bounded delta) wired
+    # by E edges (writable state + a hard-selected src/dst pair). ENCODER: the frozen LM perceives the
+    # passage; per write-layer, (A) soft per-node meaning-tweak (delta toward a head-proposed target),
+    # then (B) edge delta + HARD Gumbel-ST endpoint selection over the fixed node keys. DECODER: frozen
+    # LM + per-layer gated cross-attn over EDGES-ONLY bound triples (concat[state, val_src, val_dst]).
+    # Float-matched to the baselines' 32x576 memory: (n_nodes+n_edges)*d_node ~= 18432.
     slotgraph_d_node: int = 64           # small-unit latent dim — forces composition (no node carries the answer)
-    slotgraph_n_nodes: int = 144         # node latents (units 0..N-1); learned id per node
-    slotgraph_n_edges: int = 144         # edge latents (units N..N+E-1); edge id = combine(id_src, id_dst)
-    slotgraph_enc_layers: int = 4        # graph-transformer depth (perceive + mix + materialize, per layer)
-    # endpoint routing lives in the FULL d_node space (no down-projection); selection = Gumbel-ST (no Sinkhorn)
-    slotgraph_gumbel_tau_start: float = 1.0  # Gumbel-ST temperature at step 0 (warm: gradient flows + explores)
-    slotgraph_gumbel_tau_floor: float = 0.5  # τ floor, cosine-annealed over training (sharper backward late)
+    slotgraph_n_nodes: int = 144         # vocabulary size (concept-nodes); fixed key + writable meaning
+    slotgraph_n_edges: int = 144         # edge latents; each binds a hard-selected (src,dst) node pair
+    slotgraph_enc_layers: int = 4        # write depth (per layer: node meaning-tweak → edge select)
+    # endpoint selection: L2-normed cosine · learnable temp → Gumbel-ST. τ is FIXED (not annealed): the
+    # hard-forward argmax is τ-invariant, so τ only shapes the backward softmax; keep it moderate so
+    # non-selected nodes get undiluted gradient (annealing τ→0 re-concentrates gradient = the dead zone).
+    slotgraph_gumbel_tau_start: float = 1.0  # FIXED Gumbel-ST temperature (backward softness)
+    slotgraph_gumbel_tau_floor: float = 0.5  # unused (kept for compat; no τ anneal in v3.x)
+    # endpoint selection is BALANCED via Gumbel-Sinkhorn (Mena 2018): alternating row(edge)/col(node)
+    # log-normalization caps how many edges can claim one node → breaks the rich-get-richer hub-collapse
+    # (the sgv3op/sgv3comp failure: 144 edges → ~4 nodes). FEW iters = a gentle de-hub nudge, not rigid
+    # 1-1 matching (a concept-node legitimately appears in several edges); SwAV uses 3.
+    slotgraph_sinkhorn_iters: int = 3
     slotgraph_xattn_every: int = 1       # decoder cross-attn cadence (1 = every layer; >1 thins to every-k)
     slotgraph_xattn_heads: int = 4       # heads in the bottleneck gated cross-attn (attends in d_node space)
-    slotgraph_node_drop_max: float = 0.5         # p_max for the node-dropout anti-bypass curriculum
-    slotgraph_node_drop_anneal_frac: float = 0.5 # fraction of training over which p cosine-decays to 0
-    slotgraph_node_drop_adaptive: bool = False   # panel-driven (edge-usage) schedule; else cosine decay
+    slotgraph_node_drop_max: float = 0.5         # unused in v3.x (read is edges-only; no node-dropout)
+    slotgraph_node_drop_anneal_frac: float = 0.5 # unused in v3.x
+    slotgraph_node_drop_adaptive: bool = False   # unused in v3.x
     slotgraph_lora_rank: int = 32        # enc+dec LoRA rank (mixed block sets it to ~param-match icae)
     slotgraph_lora_alpha: int = 64
     slotgraph_use_structure: bool = True # ablation: False ⇒ no graph (read all units as a flat set; no edge

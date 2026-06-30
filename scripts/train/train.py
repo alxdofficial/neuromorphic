@@ -233,6 +233,10 @@ def run_val(model, val_set, device, n_batches: int, window_size: int,
     full extra encode+decode (3× cost). SHUF is skipped for a B==1 batch.
     """
     model.train(False)
+    # slotgraph depth-trace: per-write-layer canaries (val-only — adds a materialize/layer; off in train)
+    _enc = getattr(model, "encoder", None)
+    if _enc is not None and hasattr(_enc, "collect_layer_metrics"):
+        _enc.collect_layer_metrics = True
     losses, accs, per_fam_stats = [], [], {}
     babi_em_hits, babi_em_n = 0.0, 0   # bAbI exact-match (teacher-forced answer span)
     # REAL/SHUF/OFF binding gate, accumulated over the first gate_batches.
@@ -312,6 +316,8 @@ def run_val(model, val_set, device, n_batches: int, window_size: int,
                     babi_em_hits += float(em)
                     babi_em_n += 1
     model.train(True)
+    if _enc is not None and hasattr(_enc, "collect_layer_metrics"):
+        _enc.collect_layer_metrics = False   # keep training fast (no per-layer materialize)
     # Restore training RNG state so eval doesn't perturb the training stream.
     torch.set_rng_state(rng_state)
     if cuda_rng_state is not None:
@@ -1101,18 +1107,9 @@ def train_mixed_variant(
         if len(rotation) < 24:
             rotation.append(task)
         model.task_mode = MIXED_TASK_MODE[task]       # per-batch dispatch (E/D)
-        # slotgraph v2 node-dropout curriculum: cosine-decay p_max → 0 over anneal_frac of training
-        # (anti-bypass; per-batch random node drop applied inside the read). No-op for other arms.
-        if getattr(model.encoder, "wants_graph_xattn", False):
-            _pmax = cfg.slotgraph_node_drop_max
-            _w = max(1, int(cfg.slotgraph_node_drop_anneal_frac * n_steps))
-            model.encoder.node_drop_p = (0.5 * _pmax * (1 + math.cos(math.pi * step / _w))
-                                         if (step < _w and _pmax > 0) else 0.0)
-            # endpoint-selection τ: cosine-anneal the Gumbel-ST temperature start→floor over the FULL run
-            # (warm early ⇒ gradient flows + Gumbel breaks the uniform-init symmetry; sharper backward late)
-            _t0 = cfg.slotgraph_gumbel_tau_start; _tf = cfg.slotgraph_gumbel_tau_floor
-            _frac = min(1.0, step / max(1, n_steps))
-            model.encoder.gumbel_tau = _tf + 0.5 * (_t0 - _tf) * (1 + math.cos(math.pi * _frac))
+        # slotgraph v3.1: Gumbel-ST τ is FIXED (set from config in the encoder; the hard-forward argmax
+        # is τ-invariant, so annealing only sharpens the backward = re-concentrates gradient). No node-
+        # dropout schedule (the read is edges-only). Nothing to schedule here.
         batch = next_batch(task)
 
         lr = lr_at_step(step, n_steps, cfg.learning_rate, cfg.warmup_steps)
@@ -1140,9 +1137,9 @@ def train_mixed_variant(
         with _anom:
             loss.backward()
         # slotgraph endpoint-selection grad-MAGNITUDE canary — the instrument the prior collapse lacked.
-        # Plain ST-argmax starved q_src/q_dst/k_node ~30,000x vs edge_combine (a self-reinforcing dead
-        # zone); Gumbel-ST should keep them within ~1-2 OOM. Reported as grad/param + the gap to
-        # edge_combine. Computed PRE-clip (raw signal) at log cadence only (the .item() syncs aren't free).
+        # v2 ST-argmax starved the selection heads ~30,000x vs the content head (a self-reinforcing dead
+        # zone). v3.1's load-bearing read + L2-norm/temp should keep them within ~1-2 OOM of the edge
+        # content head (headB). Reported as grad/param + the gap. PRE-clip, at log cadence only.
         _sg_grad = None
         if (step % log_every == 0 and getattr(model.encoder, "wants_graph_xattn", False)
                 and getattr(model.encoder, "use_structure", False)):
@@ -1155,10 +1152,11 @@ def train_mixed_variant(
                 gd = sum(p.grad.abs().sum().item() for p in ps) / nd
                 pm = sum(p.detach().abs().sum().item() for p in ps) / nd
                 return gd / max(1e-12, pm)
-            _sel = min(_gp([p for L in _gl for p in L.q_src.parameters()]),
-                       _gp([p for L in _gl for p in L.q_dst.parameters()]),
-                       _gp([p for L in _gl for p in L.k_node.parameters()]))
-            _ec = _gp([p for L in _gl for p in L.edge_combine.parameters()])
+            # report the LAST layer's selection — it alone sets the read topology (the read gathers the
+            # final-layer onehots), so aggregating all 4 layers could mask last-layer starvation.
+            _last = _gl[-1]
+            _sel = min(_gp(list(_last.q_src.parameters())), _gp(list(_last.q_dst.parameters())))
+            _ec = _gp([p for L in _gl for p in L.headB.parameters()])
             _sg_grad = {"slotgraph_sel_gradparam": _sel,
                         "slotgraph_sel_gap": _ec / max(1e-12, _sel)}
         _mem_params = [p for n, p in model.named_parameters()
@@ -1838,7 +1836,7 @@ def main():
         cfg.biomem_n_slots = _M
         print(f"[capacity] mixed: FIXED M={_M}, beacon_ratio={cfg.beacon_ratio} (ctx "
               f"{args.mixed_ctx}:M = {args.mixed_ctx // _M}:1); baselines icae r104 / "
-              f"ccm r52 / ac r52 / beacon 11L / slotgraph r85+MP-read / "
+              f"ccm r52 / ac r52 / beacon 11L / slotgraph r56 (v3.1 edges-only read) / "
               f"vqicae r100+K{cfg.vqicae_codebook_size} (param-matched ~6.9-7.0M).")
         if cfg.d_llama != 576 and not args.allow_unmatched_backbone:
             raise SystemExit(
@@ -1898,7 +1896,8 @@ def main():
         print("[slotgraph override] structure OFF = read all units as a flat set (no graph)")
     if args.sg_node_drop_max is not None:
         cfg.slotgraph_node_drop_max = float(args.sg_node_drop_max)
-        print(f"[slotgraph override] node-drop p_max = {cfg.slotgraph_node_drop_max}")
+        print(f"[slotgraph override] node-drop p_max = {cfg.slotgraph_node_drop_max} "
+              f"(INERT in v3.1 — the read is edges-only, no node-dropout)")
     if args.sg_adaptive_drop:
         print("[slotgraph] --sg-adaptive-drop NOT YET IMPLEMENTED; using the cosine node-drop schedule")
     if args.slotgraph_no_id:
@@ -1907,6 +1906,9 @@ def main():
         cfg.biomem_membrane = False
         print("[biomem override] membrane OFF = fire on the instantaneous readout, not the leaky-integrated potential")
     cfg.mixed_gate_batches = int(args.mixed_gate_batches)   # REAL/SHUF/OFF binding gate in mixed val (0=off)
+    if cfg.task_mode == "mixed" and cfg.mixed_gate_batches == 0 and "slotgraph_baseline" in (args.variants or []):
+        print("[WARN] slotgraph in the cohort but --mixed-gate-batches=0 → SHUF−REAL (the decisive "
+              "binding metric) will NOT be measured. Pass --mixed-gate-batches 8 to record it.")
     cfg.task_mode = args.task        # accurate ckpt metadata (dispatch still keys on this)
     cfg.seed = args.seed             # record the actual seed in ckpt metadata
     cfg.anomaly_from = args.anomaly_from   # debug: backward anomaly detection from this step (-1 = off)

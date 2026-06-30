@@ -523,10 +523,10 @@ class ReprLearningModel(nn.Module):
                 for layer in self.decoder.llama.model.layers]
 
     def _install_graph_xattn_hooks(self, mem_aux, zero_memory: bool, shuffle_memory: bool, B=None):
-        """slotgraph v2: per-layer GATED CROSS-ATTENTION read over the frozen graph G (no prepend).
-        A forward-pre-hook on each decoder layer adds the gated cross-attn delta (h += xattn(h, G)).
-        OFF (zero_memory) → no read (no hooks). SHUF → roll G by 1 (read the WRONG example's graph).
-        Node-dropout (anti-bypass): a per-batch KV mask drops a fraction of NODE units (edges kept)."""
+        """slotgraph v3.1: per-layer GATED CROSS-ATTENTION read over the frozen graph tokens G (no
+        prepend). G is edges-only bound triples (or the node-set under use_structure=False). A
+        forward-pre-hook on each decoder layer adds the gated cross-attn delta (h += xattn(h, G)).
+        OFF (zero_memory) → no read (no hooks). SHUF → roll G by 1 (read the WRONG example's graph)."""
         enc = self.encoder
         if not getattr(enc, "wants_graph_xattn", False) or zero_memory:
             return []
@@ -537,7 +537,7 @@ class ReprLearningModel(nn.Module):
             if B is not None and B <= 1:
                 raise ValueError("shuffle_memory (SHUF) needs batch size > 1 (roll-by-1 is a no-op).")
             G = torch.roll(G, shifts=1, dims=0)
-        keep = enc.node_keep_mask(G.shape[0], G.device, self.training)        # [B, N+E] bool
+        keep = enc.node_keep_mask(G.shape[0], G.device, self.training)        # [B, E] (or [B, N] flat) — matches G's U dim
         every = max(1, int(getattr(enc, "xattn_every", 1)))
         def _mk(xattn):
             def _hook(module, args, kwargs):

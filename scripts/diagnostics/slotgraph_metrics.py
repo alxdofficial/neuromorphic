@@ -1,358 +1,186 @@
-"""slotgraph instrument panel + reporting standard.
+"""slotgraph v3.1 instrument panel — measure the model on ALL metrics in one run.
 
-Run after every fix/training run to get a comparable table. Every metric is
-defined ONCE in METRICS (label / meaning / how-measured / good-direction); that
-registry drives both the table and the glossary, so a report is always
-self-documenting. Compare two designs with --vs.
+Builds the model (optionally from --ckpt), runs mae+babi forwards in the REAL bf16 path, and prints
+organized, self-documenting panels. Run pre-train (untrained sanity) and post-train (--ckpt) to compare.
 
-Single run:   .venv/bin/python scripts/diagnostics/slotgraph_metrics.py --prefix valrun_slotgraph --label baseline
-Compare two:  .venv/bin/python scripts/diagnostics/slotgraph_metrics.py --prefix valrun_slotgraph --vs valrun_myfix \
-                  --label baseline --vs-label myfix
+  SUBSTRATE — vocab/edge/key/read-token eff-rank + norms: is the memory SPREAD, not collapsed? (v2 → ~2)
+  ROUTING   — selection decisiveness, cross-input diversity (THE topology signal), node usage, self-loops
+  CONNECTEDNESS — avg node degree / n_components / nodes_used: do clauses link into ONE graph, or stay a
+              bag of separate dyads? (the "clauses connect, not separate" acceptance criterion)
+  WRITE     — learned bounded delta rates (β), read gate
+  GRADIENT  — LAST-layer selection grad/param vs content head (the v2 dead-zone canary; v2 was ~30,000×)
+  READ      — read-xattn attention sharpness over the 144 graph tokens (binding=sharp vs pooling=diffuse)
 
-Lenses (the recurring question for every selection):
-  • decisiveness — sharp given ONE input?           (↑ good)
-  • cross-input diversity — responds to the input?  (↑ good = the topology signal)
+  (binding — SHUF−REAL / OFF−REAL — is read from the TRAINING jsonl, not here: this panel's compute_loss
+   doesn't replicate the training eval's QA loss, so its loss-diffs are unreliable. This panel is structure-only.)
 
-Writes docs/slotgraph_metrics.md (single) or docs/slotgraph_compare.md (--vs).
+Usage:
+  .venv/bin/python scripts/diagnostics/slotgraph_metrics.py
+  .venv/bin/python scripts/diagnostics/slotgraph_metrics.py --ckpt outputs/memory/slotgraph_baseline.best.pt
 """
-import sys, os, glob, math, statistics, dataclasses, argparse
+import sys, os, math, argparse
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 import torch
-import torch.nn.functional as F
-from pathlib import Path
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, AutoConfig
 from src.memory.config import ReprConfig
 from src.memory.model import ReprLearningModel
+from src.memory.common import resolve_special_ids
 from scripts.train.train import make_mixed_val_sets, to_device, MIXED_TASK_MODE
 
+BACKBONE = "HuggingFaceTB/SmolLM2-135M"
 DEV = "cuda"
-ROOT = "outputs/memory"
 TASKS = ("mae", "babi")
 
-# ── metric registry: the single source of truth for table + glossary ──────────
-# key, stage, scope ('task'|'perf'), label, meaning, how, dir ('up'|'down'|'zero'|'ctx')
-METRICS = [
-    ("w_slot_rank",  "WRITE",  "task", "slot rank",
-     "distinct directions among the 32 slots within one input",
-     "participation ratio of slot_final (final-layer slot hiddens) over the M slots, per example, mean", "up"),
-    ("w_input_dep",  "WRITE",  "task", "per-slot rank across inputs",
-     "how much each slot position varies with the input (write input-dependence)",
-     "mean over slot positions of the participation ratio of slot_final[:,pos] across samples", "up"),
-    ("w_redund",     "WRITE",  "task", "inter-slot cosine",
-     "redundancy among the slots (1 = identical)",
-     "mean pairwise cosine of the M slot vectors, per example, mean", "down"),
-    ("sel_conf",     "SELECT", "task", "endpoint decisiveness",
-     "how peaked each edge's endpoint choice is given one input (1 = one-hot)",
-     "1 − normalized entropy of the soft endpoint distribution, mean over edges", "up"),
-    ("sel_div",      "SELECT", "task", "endpoint cross-input diversity",
-     "does an edge pick different nodes for different inputs — THE topology signal",
-     "mean over edges of the normalized entropy of its argmax node pick across samples", "up"),
-    ("coverage",     "SELECT", "task", "node coverage",
-     "fraction of nodes used as an endpoint somewhere in the batch",
-     "fraction of K nodes selected ≥1 time (pooled over samples)", "up"),
-    ("usage_ent",    "SELECT", "task", "node-usage entropy",
-     "balance of pooled node usage (1 = uniform, 0 = one hub)",
-     "normalized entropy of pooled endpoint counts over the K nodes", "up"),
-    ("node_select",  "SELECT", "task", "per-node cross-sample variance",
-     "do individual nodes swing in usage with the input (input-selective) vs fixed roles",
-     "per node, std across samples of its per-sample usage fraction; mean over nodes", "up"),
-    ("edge_distinct","SELECT", "task", "edge distinctness",
-     "fraction of edges with a distinct (src,dst) pair within an input",
-     "mean over samples of #unique (src,dst) / E", "up"),
-    ("selfloop",     "SELECT", "task", "self-loop frac",
-     "edges pointing a node to itself (should be 0 by construction)",
-     "fraction of edges with src == dst", "zero"),
-    ("router_id_frac","SELECT","task", "router id-vs-content",
-     "fraction of routing key/query magnitude from the FIXED id-stream vs input-dependent content — high = id drowns content (a cause of input-blindness)",
-     "‖id-projection‖/(‖content‖+‖id‖) through the node-key + edge-query heads, mean", "down"),
-    ("key_inputdep", "SELECT", "task", "routing-key input-dependence",
-     "do the per-node routing keys vary across inputs, BEFORE the argmax (separates 'keys are fixed' from 'argmax kills variation')",
-     "mean over nodes of the participation ratio of the node key across samples", "up"),
-    ("sel_margin",   "SELECT", "task", "selection margin",
-     "gap between the top-1 and top-2 endpoint probability (≈0 = fragile near-tie)",
-     "mean over edges of (p_top1 − p_top2) of the soft endpoint distribution", "up"),
-    ("temp",         "SELECT", "task", "routing temperature",
-     "softmax temperature; tiny → argmax saturates and input-gradient dies",
-     "exp(log_temp)", "ctx"),
-    ("mp_delta",     "MP-READ","task", "mp_delta",
-     "how much the message-passing read changes the output vs a plain prepend",
-     "1 − cos(slot_final, memory), mean over slots", "ctx"),
-    ("mem_rank",     "OUTPUT", "task", "memory rank",
-     "distinct directions in the prepended memory (compare to WRITE slot rank)",
-     "participation ratio of the final memory over the M slots, per example, mean", "up"),
-    ("babi_em",          "PERF", "perf", "babi exact-match",
-     "babi answer accuracy", "exact-match over babi val", "up"),
-    ("mae_loss",         "PERF", "perf", "mae loss",
-     "masked-reconstruction loss", "recon CE on mae val", "down"),
-    ("mae_shuf_real",    "PERF", "perf", "mae SHUF−REAL",
-     "example-specificity on mae (reliable)", "loss(shuffled memory) − loss(real)", "up"),
-    ("continuation_loss","PERF", "perf", "continuation loss",
-     "next-token loss", "recon CE on continuation val", "down"),
-    ("continuation_shuf_real","PERF","perf","continuation SHUF−REAL",
-     "example-specificity on continuation (reliable)", "loss(shuffled) − loss(real)", "up"),
-]
-DIR_SYM = {"up": "↑", "down": "↓", "zero": "→0", "ctx": "·"}
+# glossary: key → (panel, label, one-line meaning, good-direction)
+GLOSS = {
+    "node_effrank":  ("SUBSTRATE", "vocab eff-rank /N", "distinct node meanings (v2 collapsed to ~2)", "up"),
+    "edge_effrank":  ("SUBSTRATE", "edge eff-rank /E", "distinct edge states", "up"),
+    "key_effrank":   ("SUBSTRATE", "key eff-rank /N", "spread of the fixed selection addresses", "up"),
+    "mem_effrank":   ("SUBSTRATE", "read-token eff-rank /E", "distinct READ tokens the LM sees", "up"),
+    "node_norm":     ("SUBSTRATE", "node norm", "post-delta-norm magnitude (~sqrt(dn)=8, stable)", "ctx"),
+    "edge_norm":     ("SUBSTRATE", "edge norm", "post-delta-norm magnitude (~sqrt(dn)=8, stable)", "ctx"),
+    "src_entropy":   ("ROUTING",   "src entropy", "decisiveness of src pick (down=sharper; max ln144=4.97)", "down"),
+    "dst_entropy":   ("ROUTING",   "dst entropy", "decisiveness of dst pick (down=sharper)", "down"),
+    "routing_diversity": ("ROUTING", "cross-input diversity", "edges pick diff nodes per input — topology signal", "up"),
+    "node_entropy":  ("ROUTING",   "node-usage entropy", "balance of node usage (up=spread, down=hub)", "up"),
+    "selfloop_frac": ("ROUTING",   "self-loop frac", "edges with src==dst (should be ~0; masked)", "zero"),
+    "sel_scale":     ("ROUTING",   "sel temperature", "learned cosine->logit scale (init sqrt(dk)=8)", "ctx"),
+    "beta_node":     ("WRITE",     "beta node", "learned bounded node-meaning delta rate (continuity)", "ctx"),
+    "beta_edge":     ("WRITE",     "beta edge", "learned bounded edge-state delta rate", "ctx"),
+    "read_gate":     ("WRITE",     "read gate", "mean tanh gate of the per-layer read (bootstraps from 0.1)", "ctx"),
+    "avg_degree":    ("CONNECTEDNESS", "avg node degree", "edges per used node (>1 = reuse = clauses connect)", "up"),
+    "n_components":  ("CONNECTEDNESS", "connected components", "1-few = ONE graph; ~E = a bag of separate clauses", "down"),
+    "nodes_used":    ("CONNECTEDNESS", "nodes used", "distinct endpoint nodes (lower vs 2E=288 ⇒ more reuse)", "ctx"),
+    "sel_gradparam": ("GRADIENT",  "last-layer sel grad/param", "selection-head grad mag (v2 starved to ~1e-5)", "up"),
+    "sel_gap":       ("GRADIENT",  "sel-gap (content/sel)", "content-head / selection-head grad (v2 ~30,000x)", "down"),
+    "read_entropy":  ("READ",      "read attn entropy", "read-xattn spread over 144 tokens (down=sharper=binding)", "down"),
+    "read_maxw":     ("READ",      "read attn max-weight", "peak read attention weight (up=sharper)", "up"),
+}
 
 
-def seed_dir(prefix, variant, s):
-    return f"{prefix}_{variant}" if s == 42 else f"{prefix}_s{s}_{variant}"
-
-
-def load(d):
-    sd = torch.load(sorted(glob.glob(f"{ROOT}/{d}/ckpts/*.pt"))[-1], map_location="cpu", weights_only=False)
-    cd = sd["metadata"]["cfg_dict"]; valid = {f.name for f in dataclasses.fields(ReprConfig)}
-    cfg = ReprConfig(**{k: v for k, v in cd.items() if k in valid})
+def build(ckpt=None):
+    cfg = ReprConfig(use_llama_lora=True, batch_size=8)
+    bc = AutoConfig.from_pretrained(BACKBONE)
+    cfg.llama_model = BACKBONE; cfg.d_llama = bc.hidden_size; cfg.llama_vocab_size = bc.vocab_size
+    tok = AutoTokenizer.from_pretrained(BACKBONE)
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
+    cfg.pad_token_id, cfg.sep_token_id = resolve_special_ids(tok)
+    cfg.task_mode = "mixed"
+    cfg.llama_lora_rank = 16; cfg.llama_lora_alpha = 32
+    cfg.slotgraph_d_node = 64; cfg.slotgraph_n_nodes = 144; cfg.slotgraph_n_edges = 144
+    cfg.slotgraph_enc_layers = 4; cfg.slotgraph_xattn_heads = 4
+    cfg.slotgraph_lora_rank = 56; cfg.slotgraph_lora_alpha = 112
     m = ReprLearningModel(cfg, variant="slotgraph_baseline", llama_model=None).to(DEV)
-    m.load_state_dict(sd["model_state_dict"], strict=False); m.eval()
-    return m, cfg
+    if ckpt:
+        sd = torch.load(ckpt, map_location=DEV)
+        state = sd
+        if isinstance(sd, dict):
+            for k in ("model_state_dict", "model", "state_dict"):
+                if k in sd:
+                    state = sd[k]; break
+        miss, unexp = m.load_state_dict(state, strict=False)
+        print(f"loaded {ckpt}: {len(miss)} missing, {len(unexp)} unexpected keys")
+    return m, tok, cfg
 
 
-def effrank(X):
-    X = X.float()
-    if X.shape[0] < 2:
-        return 0.0
-    Xc = X - X.mean(0, keepdim=True); C = Xc.t() @ Xc
-    return float(C.trace() ** 2 / (C * C).sum().clamp_min(1e-12))
-
-
-def ent_norm(counts, K):
-    p = counts.float() / counts.sum().clamp_min(1e-9); p = p[p > 0]
-    return float(-(p * p.log()).sum() / math.log(K)) if K > 1 else 0.0
-
-
-def trace_pass(m, batches):
-    """Return per-task scalar metrics + trajectories (layer/hop/node) for one task's batches."""
-    m.encoder.use_structure = True; m.encoder.trace = True
-    embed = m.decoder.llama.get_input_embeddings(); K = m.encoder.K
-    SF, MEM, SRC, DST, SOFT = [], [], [], [], []
-    hop, LAYER, u_mag, u_sat = {}, {}, {}, {}
+def read_sharpness(m, enc, b):
+    cap = {}
+    mid = len(enc.read_xattn) // 2
+    def hook(mod, args):
+        cap["h"] = args[0].detach(); cap["G"] = args[1].detach()
+    hd = enc.read_xattn[mid].register_forward_pre_hook(hook)
+    m.eval()
     with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
-        for b in batches:
-            b = to_device(b, DEV)
-            m.encoder(m._encode_for_memory(embed(b.context_ids), b.context_mask), b.context_mask)
-            t = m.encoder._trace
-            SF.append(t["slot_final"]); MEM.append(t["memory"]); SRC.append(t["src_pick"])
-            DST.append(t["dst_pick"]); SOFT.append(t["soft_src"])
-            for hi, h in enumerate(t["hop_h"]):
-                hop.setdefault(hi, []).append(statistics.mean(effrank(h[bi]) for bi in range(h.shape[0])))
-            for li, ls in enumerate(t.get("layer_slots", [])):
-                LAYER.setdefault(li, []).append(ls)
-    m.encoder.trace = False
-    sf = torch.cat(SF); mem = torch.cat(MEM); src = torch.cat(SRC); dst = torch.cat(DST); soft = torch.cat(SOFT)
-    N, M, d = sf.shape; E = src.shape[1]; eye = torch.eye(M).bool()
-    cos = F.cosine_similarity(sf.unsqueeze(2), sf.unsqueeze(1), dim=-1)
-    # router input decomposition: input-dependent content vs FIXED-id contribution to keys/queries
-    enc = m.encoder; sf_g = sf.to(DEV)
+        m.compute_loss(b, window_size=1024)
+    hd.remove()
+    if "h" not in cap:
+        return None, None
+    xa = enc.read_xattn[mid]
     with torch.no_grad():
-        content = enc.struct_norm(sf_g).float()
-    content = content.detach(); id_stream = (enc.id_head_scale * enc.id_embed).detach().float()
-    def _decomp(head, sl):
-        W = head.weight.detach().float(); c = content[:, sl] @ W[:, :d].t(); i = id_stream[sl] @ W[:, d:].t()
-        frac = float(i.norm(dim=-1).mean() / (c.norm(dim=-1).mean() + i.norm(dim=-1).mean() + 1e-9))
-        return frac, (c + i.unsqueeze(0))
-    k_frac, key_full = _decomp(enc.k_head, slice(0, K))
-    q_frac, _ = _decomp(enc.q_src_head, slice(K, M))
-    top2 = soft.topk(2, dim=-1).values
-    # per-node usage matrix [N,K] → histogram + cross-sample variance
-    usage = torch.stack([torch.bincount(src[i], minlength=K).float() + torch.bincount(dst[i], minlength=K).float()
-                         for i in range(N)])
-    usage = usage / usage.sum(1, keepdim=True).clamp_min(1)
-    allpick = torch.cat([src.reshape(-1), dst.reshape(-1)])
-    sc = {
-        "w_slot_rank": statistics.mean(effrank(sf[i]) for i in range(N)),
-        "w_input_dep": statistics.mean(effrank(sf[:, p, :]) for p in range(M)),
-        "w_redund": float(cos[:, ~eye].mean()),
-        "sel_conf": 1.0 - float((-(soft.clamp_min(1e-9).log() * soft).sum(-1) / math.log(K)).mean()),
-        "sel_div": statistics.mean(ent_norm(torch.bincount(src[:, e], minlength=K), K) for e in range(E)),
-        "coverage": float((torch.bincount(allpick, minlength=K) > 0).float().mean()),
-        "usage_ent": ent_norm(torch.bincount(allpick, minlength=K), K),
-        "node_select": float(usage.std(0).mean()),
-        "edge_distinct": statistics.mean(len({(int(src[i, e]), int(dst[i, e])) for e in range(E)}) / E for i in range(N)),
-        "selfloop": float((src == dst).float().mean()),
-        "mp_delta": float((1 - F.cosine_similarity(sf.reshape(-1, d), mem.reshape(-1, d), dim=-1)).mean()),
-        "mem_rank": statistics.mean(effrank(mem[i]) for i in range(N)),
-        "router_id_frac": (k_frac + q_frac) / 2,
-        "key_inputdep": statistics.mean(effrank(key_full[:, j, :].cpu()) for j in range(K)),
-        "sel_margin": float((top2[..., 0] - top2[..., 1]).mean()),
-        "temp": float(enc.log_temp.exp()),
-    }
-    layer_rank, layer_cos = {}, {}
-    for li, chunks in LAYER.items():
-        Lt = torch.cat(chunks)
-        layer_rank[li] = statistics.mean(effrank(Lt[i]) for i in range(Lt.shape[0]))
-        lc = F.cosine_similarity(Lt.unsqueeze(2), Lt.unsqueeze(1), dim=-1)
-        layer_cos[li] = float(lc[:, ~eye].mean())
-    traj = {"hop_rank": {hi: statistics.mean(v) for hi, v in hop.items()},
-            "layer_rank": layer_rank, "layer_cos": layer_cos,
-            "node_hist": sorted(usage.mean(0).tolist(), reverse=True)}
-    return sc, traj
+        h = cap["h"].float(); G = cap["G"].float()
+        B, S, _ = h.shape; U = G.shape[1]
+        q = xa.q(h).view(B, S, xa.h, xa.hd).transpose(1, 2)
+        k = xa.k(G).view(B, U, xa.h, xa.hd).transpose(1, 2)
+        p = ((q @ k.transpose(-1, -2)) / math.sqrt(xa.hd)).softmax(-1)    # [B,h,S,U]
+        ent = float((-(p.clamp_min(1e-9).log() * p).sum(-1)).mean() / math.log(U))
+        return ent, float(p.max(-1).values.mean())
 
 
-def perf_pass(m, vs):
-    out = {}
-    def run(fam, shuf):
-        m.task_mode = MIXED_TASK_MODE[fam]; m.encoder.use_structure = True
-        ls, eh, en = [], 0, 0
-        with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            for b in vs[fam]:
-                b = to_device(b, DEV); o = m.compute_loss(b, window_size=1024, shuffle_memory=shuf)
-                ls.append(o["loss_recon"].item())
-                if fam == "babi":
-                    for f, e in zip(b.task_family, o["per_example_em"].tolist()):
-                        if f == "babi":
-                            eh += e; en += 1
-        return statistics.mean(ls), (eh / en if en else None)
-    out["babi_em"] = run("babi", False)[1]
-    for fam in ("mae", "continuation"):
-        r, _ = run(fam, False); s, _ = run(fam, True)
-        out[f"{fam}_loss"] = r; out[f"{fam}_shuf_real"] = s - r
-    return out
+def measure_task(m, enc, b):
+    # NOTE: binding (SHUF-REAL / OFF-REAL) is read from the TRAINING jsonl, not here — this panel's
+    # compute_loss doesn't replicate the training eval's QA loss exactly, so its loss-diffs are unreliable.
+    # Everything below is model-INTERNAL (structure/connectedness/read) and is reliable.
+    r = {}
+    m.eval()
+    with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
+        real = m.compute_loss(b, window_size=1024)
+    for k in ("node_effrank", "edge_effrank", "key_effrank", "mem_effrank", "node_norm", "edge_norm",
+              "src_entropy", "dst_entropy", "routing_diversity", "node_entropy", "selfloop_frac",
+              "sel_scale", "beta_node", "beta_edge", "read_gate",
+              "avg_degree", "n_components", "nodes_used"):
+        v = real.get(f"slotgraph_{k}")
+        if v is not None:
+            r[k] = float(v)
+    ent, mw = read_sharpness(m, enc, b)
+    if ent is not None:
+        r["read_entropy"] = ent; r["read_maxw"] = mw
+    return r
 
 
-def compute(prefix, seeds, variant="slotgraph_baseline"):
-    seeds = [s for s in seeds if glob.glob(f"{ROOT}/{seed_dir(prefix, variant, s)}/ckpts/*.pt")]
-    sc = {t: {} for t in TASKS}; trj = {t: {"hop_rank": {}, "layer_rank": {}, "layer_cos": {}, "node_hist": []} for t in TASKS}
-    perf = {}
-    tok = vs = None
-    for s in seeds:
-        m, cfg = load(seed_dir(prefix, variant, s))
-        if tok is None:
-            tok = AutoTokenizer.from_pretrained(cfg.llama_model); tok.pad_token = tok.pad_token or tok.eos_token
-            vs = make_mixed_val_sets(["babi", "mae", "continuation"], tok, cfg, 8, ctx_len=1024, m_slots=32,
-                                     mae_src_tok="meta-llama/Llama-3.2-1B",
-                                     babi_tasks=(1, 2, 3, 7, 8, 11, 12, 13, 14), predict_len=64)
-        for t in TASKS:
-            s_sc, s_trj = trace_pass(m, vs[t])
-            for k, v in s_sc.items():
-                sc[t].setdefault(k, []).append(v)
-            for grp in ("hop_rank", "layer_rank", "layer_cos"):
-                for idx, v in s_trj[grp].items():
-                    trj[t][grp].setdefault(idx, []).append(v)
-            trj[t]["node_hist"].append(s_trj["node_hist"])
-        for k, v in perf_pass(m, vs).items():
-            perf.setdefault(k, []).append(v)
-        del m; torch.cuda.empty_cache()
-    # aggregate
-    agg_sc = {t: {k: (statistics.mean(v), statistics.stdev(v) if len(v) > 1 else 0.0) for k, v in sc[t].items()} for t in TASKS}
-    agg_perf = {k: (statistics.mean(v), statistics.stdev(v) if len(v) > 1 else 0.0) for k, v in perf.items() if v and v[0] is not None}
-    agg_trj = {t: {grp: {idx: statistics.mean(v) for idx, v in trj[t][grp].items()} for grp in ("hop_rank", "layer_rank", "layer_cos")} for t in TASKS}
-    for t in TASKS:
-        nh = trj[t]["node_hist"]
-        agg_trj[t]["node_hist"] = [statistics.mean(x) for x in zip(*nh)] if nh else []
-    return {"scalars": agg_sc, "perf": agg_perf, "traj": agg_trj, "n": len(seeds)}
-
-
-def val(R, key, scope, task=None):
-    d = R["perf"] if scope == "perf" else R["scalars"][task]
-    return d.get(key)
-
-
-def spark(d):  # trajectory dict {idx:val} → compact, downsampled to ≤12 points
-    if not d:
-        return "—"
-    xs = [d[i] for i in sorted(d)]
-    if len(xs) > 12:
-        step = math.ceil(len(xs) / 12); xs = xs[::step] + [d[max(d)]]
-    return " ".join(f"{x:.1f}" for x in xs)
-
-
-def fmt(v):
-    return "—" if v is None else (f"{v[0]:.3f}±{v[1]:.3f}" if v[1] else f"{v[0]:.3f}")
-
-
-def verdict(a, b, d):
-    if a is None or b is None:
-        return "—"
-    delta = b[0] - a[0]
-    if d in ("up", "down", "zero"):
-        good = delta > 0 if d == "up" else delta < 0 if d == "down" else abs(b[0]) <= abs(a[0])
-        return f"{delta:+.3f} {'✓' if good else '✗'}"
-    return f"{delta:+.3f}"
-
-
-def render(RA, RB, labA, labB):
-    cmp = RB is not None
-    L = [f"# slotgraph metrics — {'`'+labA+'` vs `'+labB+'`' if cmp else '`'+labA+'`'}"]
-    L.append(f"\n{labA}: n={RA['n']} seeds" + (f" · {labB}: n={RB['n']} seeds" if cmp else "") +
-             ". Auto-generated by `scripts/diagnostics/slotgraph_metrics.py` — re-run after each fix; "
-             "compare two designs with `--vs`. Values are mean±std over seeds.\n")
-    L.append("## How to read this report\n")
-    L.append("The model is a pipeline: **WRITE** (the 32 slots come out of the frozen LM) → "
-             "**SELECT** (content-addressed routing picks each edge's node endpoints → a graph) → "
-             "**MP-READ** (multi-hop message passing over that graph) → **OUTPUT** (the prepended memory + task perf). "
-             "Each stage's metrics tell us if that stage is healthy.\n")
-    L.append("Every *selection* is judged under two lenses:\n"
-             "- **decisiveness** — is the choice sharp given ONE input? (↑ good)\n"
-             "- **cross-input diversity** — does the choice CHANGE with the input? (↑ good — this is the topology signal; "
-             "a selection that's decisive but not diverse is a fixed wiring)\n")
-    L.append("Good-direction symbols: **↑** higher is better · **↓** lower is better · **→0** should be ~0 · "
-             "**·** context (no fixed target). In compare mode each cell is `A→B Δ` with **✓** (moved the good way) / "
-             "**✗** (moved the wrong way). The **depth profile** traces effective rank per LM layer (write) then per MP hop "
-             "(read) — where rank collapses. The **node histogram** shows per-node usage over samples (flat = fixed roles, "
-             "peaked = a hub). Full definitions are in the glossary at the bottom.\n")
-    stages = ["WRITE", "SELECT", "MP-READ", "OUTPUT"]
-    L.append("## Structural metrics (per task: mae / babi)")
-    head = "| metric | dir | "
-    head += ("mae A→B | babi A→B |" if cmp else "mae | babi |")
-    L.append(head); L.append("|" + "---|" * (4 if cmp else 4))
-    for key, stage, scope, label, *_rest, d in [(m[0], m[1], m[2], m[3], m[4], m[5], m[6]) for m in METRICS]:
-        if scope != "task" or stage not in stages:
-            continue
-        a_m, a_b = val(RA, key, scope, "mae"), val(RA, key, scope, "babi")
-        if cmp:
-            b_m, b_b = val(RB, key, scope, "mae"), val(RB, key, scope, "babi")
-            L.append(f"| {stage} {label} | {DIR_SYM[d]} | {fmt(a_m)}→{fmt(b_m)} {verdict(a_m,b_m,d)} "
-                     f"| {fmt(a_b)}→{fmt(b_b)} {verdict(a_b,b_b,d)} |")
-        else:
-            L.append(f"| {stage} {label} | {DIR_SYM[d]} | {fmt(a_m)} | {fmt(a_b)} |")
-    L.append("\n## Performance")
-    L.append("| metric | dir | " + ("A→B |" if cmp else "value |")); L.append("|---|---|---|")
-    for key, stage, scope, label, *_rest, d in [(m[0], m[1], m[2], m[3], m[4], m[5], m[6]) for m in METRICS]:
-        if scope != "perf":
-            continue
-        a = val(RA, key, scope)
-        if cmp:
-            b = val(RB, key, scope); L.append(f"| {label} | {DIR_SYM[d]} | {fmt(a)}→{fmt(b)} {verdict(a,b,d)} |")
-        else:
-            L.append(f"| {label} | {DIR_SYM[d]} | {fmt(a)} |")
-    # trajectories
-    L.append("\n## Depth profile (effective rank: write per LM-layer, then read per MP-hop)")
-    for t in TASKS:
-        L.append(f"- **{t}** write-layer rank: {spark(RA['traj'][t]['layer_rank'])}"
-                 + (f"   ‖ {labB}: {spark(RB['traj'][t]['layer_rank'])}" if cmp else ""))
-        L.append(f"  - read-hop rank:   {spark(RA['traj'][t]['hop_rank'])}"
-                 + (f"   ‖ {labB}: {spark(RB['traj'][t]['hop_rank'])}" if cmp else ""))
-        L.append(f"  - write-layer inter-slot cosine: {spark(RA['traj'][t]['layer_cos'])}"
-                 + (f"   ‖ {labB}: {spark(RB['traj'][t]['layer_cos'])}" if cmp else ""))
-    L.append("\n## Node usage histogram over samples (sorted desc; flat = fixed roles, peaked = hub)")
-    for t in TASKS:
-        nh = RA["traj"][t]["node_hist"]
-        L.append(f"- **{t}** {labA}: " + " ".join(f"{x:.2f}" for x in nh))
-        if cmp:
-            L.append(f"  {labB}: " + " ".join(f"{x:.2f}" for x in RB['traj'][t]['node_hist']))
-    # glossary
-    L.append("\n## Metric glossary (what / how / good direction)")
-    L.append("| metric | means | how measured | good |"); L.append("|---|---|---|---|")
-    for key, stage, scope, label, meaning, how, d in METRICS:
-        L.append(f"| {stage} {label} | {meaning} | {how} | {DIR_SYM[d]} |")
-    return "\n".join(L)
+def grad_canary(m, enc, b, task):
+    m.train(True); m.task_mode = MIXED_TASK_MODE[task]
+    m.zero_grad(set_to_none=True)
+    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+        out = m.compute_loss(b, window_size=1024)
+    out["loss"].backward()
+    def gp(ps):
+        ps = [p for p in ps if p.grad is not None]
+        nd = sum(p.numel() for p in ps) or 1
+        gd = sum(p.grad.abs().sum().item() for p in ps) / nd
+        pm = sum(p.detach().abs().sum().item() for p in ps) / nd
+        return gd / max(1e-12, pm)
+    last = enc.gt_layers[-1]
+    sel = min(gp(list(last.q_src.parameters())), gp(list(last.q_dst.parameters())))
+    ec = gp([p for L in enc.gt_layers for p in L.headB.parameters()])
+    m.zero_grad(set_to_none=True)
+    return {"sel_gradparam": sel, "sel_gap": ec / max(1e-12, sel)}
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--prefix", default="valrun_slotgraph")
-    ap.add_argument("--vs", default=None)
-    ap.add_argument("--label", default=None)
-    ap.add_argument("--vs-label", default=None)
-    ap.add_argument("--seeds", type=int, nargs="+", default=[42, 1, 2])
+    ap.add_argument("--ckpt", default=None)
     args = ap.parse_args()
-    labA = args.label or args.prefix
-    RA = compute(args.prefix, args.seeds)
-    RB = compute(args.vs, args.seeds) if args.vs else None
-    labB = args.vs_label or args.vs
-    md = render(RA, RB, labA, labB)
-    out = Path("docs/slotgraph_compare.md" if args.vs else "docs/slotgraph_metrics.md")
-    out.write_text(md); print(f"wrote {out}\n"); print(md)
+    m, tok, cfg = build(args.ckpt); enc = m.encoder
+    tot = sum(p.numel() for p in m.parameters() if p.requires_grad)
+    state = "trained ckpt" if args.ckpt else "UNTRAINED (init sanity)"
+    print(f"\n{'='*86}\nslotgraph v3.1 instrument panel — {state}  ({tot/1e6:.2f}M trainable)\n{'='*86}")
+    vs = make_mixed_val_sets(list(TASKS), tok, cfg, 8, ctx_len=1024, m_slots=32,
+                             mae_src_tok="meta-llama/Llama-3.2-1B",
+                             babi_tasks=(1, 2, 3, 7, 8, 11, 12, 13, 14), predict_len=64)
+    data = {}
+    for task in TASKS:
+        b = to_device(vs[task][0], DEV)
+        r = measure_task(m, enc, b)
+        r.update(grad_canary(m, enc, b, task))
+        data[task] = r
+
+    for panel in ("SUBSTRATE", "ROUTING", "CONNECTEDNESS", "WRITE", "GRADIENT", "READ"):
+        keys = [k for k, g in GLOSS.items() if g[0] == panel]
+        print(f"\n-- {panel} " + "-" * (80 - len(panel)))
+        print(f"  {'metric':26}{'meaning':44}{'mae':>8}{'babi':>8}")
+        for k in keys:
+            _, label, meaning, _ = GLOSS[k]
+            def fmt(x):
+                return "   --  " if x is None else f"{x:8.3f}"
+            print(f"  {label:26}{meaning[:42]:44}{fmt(data['mae'].get(k))}{fmt(data['babi'].get(k))}")
+
+    print("\n-- HOW TO READ " + "-" * 71)
+    print("  no collapse       -> eff-ranks stay high (v2 collapsed to ~2)")
+    print("  clauses connect   -> avg degree > 1 AND n_components << E (else a bag of separate clauses)")
+    print("  selection sharp   -> src/dst entropy FALLING toward 0; sel-gap << 100x (v2 ~30,000x)")
+    print("  binding (SHUF-REAL) is in the TRAINING jsonl, not here — this panel is structure-only.")
+    print(f"{'='*86}\n")
 
 
 if __name__ == "__main__":

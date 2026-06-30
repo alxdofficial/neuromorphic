@@ -65,8 +65,9 @@ def main():
     tot = sum(p.numel() for p in m.parameters() if p.requires_grad)
     print(f"\n{'='*74}\nslotgraph v2 smoke (matched mixed config, REAL bf16 path)\n{'='*74}")
     print(f"params={tot:,} ({tot/1e6:.2f}M)  | target ~6.9M (icae)")
-    print(f"gates init: read_xattn[0].gate={float(enc.read_xattn[0].gate.detach()):.4f} (small +ve to "
-          f"bootstrap the encoder), id_scale={float(enc.id_scale.detach()):.3f}")
+    print(f"gates init: read_xattn[0].gate={float(enc.read_xattn[0].gate.detach()):.4f} (small +ve), "
+          f"beta_node={float(torch.sigmoid(enc.gt_layers[0].beta_node)):.3f} "
+          f"sel_scale={float(enc.gt_layers[0].sel_scale):.2f}")
 
     vs = make_mixed_val_sets(["mae", "babi"], tok, cfg, 3, ctx_len=1024, m_slots=32,
                              mae_src_tok="meta-llama/Llama-3.2-1B",
@@ -93,21 +94,17 @@ def main():
         print(f"[{task}] train loss={out['loss'].item():.4f} finite={finite}")
         print("   " + grp("GT encoder", list(enc.gt_layers.parameters())))
         print("   " + grp("read cross-attn", list(enc.read_xattn.parameters())))
-        sh = [p for L in enc.gt_layers for p in (*L.q_src.parameters(), *L.q_dst.parameters(),
-              *L.k_node.parameters(), *L.edge_combine.parameters())]
-        print("   " + grp("structure heads", sh))
-        print("   " + grp("ids+role+seeds", [enc.node_id, enc.id_scale, enc.role_embed, enc.slot_init]))
+        sh = [p for L in enc.gt_layers for p in (*L.q_src.parameters(), *L.q_dst.parameters())] + [enc.node_key]
+        print("   " + grp("selection heads", sh))
+        print("   " + grp("vocab substrate", [enc.node_key, enc.node_val_base, enc.edge_state_base, enc.role]))
 
-    # (4) node-dropout: drops nodes, keeps edges; forward at p_max finite
-    enc.node_drop_p = cfg.slotgraph_node_drop_max
-    keep = enc.node_keep_mask(4, DEV, training=True)
-    dropped_nodes = int((~keep[:, :enc.N]).any(0).sum()); edges_all_kept = bool(keep[:, enc.N:].all())
+    # (4) read tokens are edges-only bound triples; keep mask shape [B,E]; forward finite
+    keep = enc.node_keep_mask(4, DEV, training=False)
     m.task_mode = "masked_reconstruction"
     with torch.amp.autocast("cuda", dtype=torch.bfloat16):
         ld = m.compute_loss(to_device(vs["mae"][0], DEV), window_size=1024)["loss"]
-    print(f"\n[node-drop p={enc.node_drop_p}] dropped {dropped_nodes}/{enc.N} nodes, edges all kept: "
-          f"{edges_all_kept}, forward finite: {torch.isfinite(ld).item()}")
-    enc.node_drop_p = 0.0
+    print(f"\n[read] keep mask {tuple(keep.shape)} (edges-only U={enc.E}), forward finite: "
+          f"{torch.isfinite(ld).item()}")
 
     # (5) canaries
     m.eval()
