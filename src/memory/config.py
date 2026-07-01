@@ -181,6 +181,22 @@ class ReprConfig:
     slotgraph_d_key: int = 64            # query/key dim for content-addressed endpoint routing (edge
                                          # queries · node keys, then single-step Sinkhorn competition)
 
+    # ── slotgraph2 (per-layer graph-transformer over ICAE-encoded input; PREPEND read; models/slotgraph2/) ─
+    # Intermediate between simple slotgraph (ICAE one-shot) and the chain-furl idea. Fixed partition
+    # (K nodes + M-K edges) at d=d_llama; per streaming window the frozen LM encodes the window, then
+    # L graph-transformer layers rewrite the graph state (ADDITIVE-residual node/edge latents + per-layer
+    # SOFT destination "paintbrush" vs learnable node-id keys, source fixed to the home node). Persists
+    # across windows; prepend the M graph tokens.
+    slotgraph2_n_slots: int = 32         # M = prepend budget (matches baselines' M=32)
+    slotgraph2_n_nodes: int = 16         # K node slots; M-K edge slots (fixed partition)
+    slotgraph2_n_layers: int = 4         # graph-transformer layers per write window
+    slotgraph2_window: int = 256         # streaming window size (input tokens per write step)
+    slotgraph2_d_key: int = 64           # endpoint query/key dim (edge queries · node-id keys)
+    slotgraph2_heads: int = 4            # attention heads in the graph-transformer layer
+    slotgraph2_recurrent: bool = False   # True ⇒ ONE shared layer applied L× (param-light; ~matches budget)
+    slotgraph2_lora_rank: int = 32       # encoder-LoRA rank (frozen-LM input encoder)
+    slotgraph2_lora_alpha: int = 64
+
     # ── vqicae (ICAE with VQ-VAE-discretized slots; models/vqicae/) ──────────
     # ICAE write, then each slot is quantized to its nearest code in a large EMA codebook
     # (straight-through + commitment loss + dead-code reinit). Tests discreteness of the memory.

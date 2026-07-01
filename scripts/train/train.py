@@ -282,7 +282,7 @@ def run_val(model, val_set, device, n_batches: int, window_size: int,
                 continue
             sink = last_graph_eval if k.startswith("graph_") else (
                 last_biomem_eval if k.startswith("biomem_") else (
-                last_slotgraph_eval if k.startswith("slotgraph_") else (
+                last_slotgraph_eval if k.startswith(("slotgraph_", "slotgraph2_")) else (
                 last_vqicae_eval if k.startswith("vqicae_") else None)))
             if sink is None:
                 continue
@@ -1161,7 +1161,7 @@ def train_mixed_variant(
         }
         # arm collapse/health canaries at train frequency (biomem edge/decay/beta/sat/mem_effrank/…, etc.)
         for _k, _v in out.items():
-            if _v is None or not _k.startswith(("biomem_", "slotgraph_", "vqicae_")):
+            if _v is None or not _k.startswith(("biomem_", "slotgraph_", "slotgraph2_", "vqicae_")):
                 continue
             if isinstance(_v, (int, float)):
                 train_row[_k] = float(_v)
@@ -1780,6 +1780,14 @@ def main():
         cfg.slotgraph_n_nodes = _M // 2          # FIXED partition: half nodes, half edges
         cfg.slotgraph_d_key = 64                 # content-addressed routing query/key dim
         cfg.slotgraph_lora_rank = 82; cfg.slotgraph_lora_alpha = 164   # +MP +query/key heads → params ≈ icae
+        # slotgraph2 (per-layer graph transformer; soft-dst paintbrush; PREPEND read). Run as a BINDING
+        # PROBE, NOT a param-matched cohort entry: recurrent=False → 4 distinct d=576 layers ≈ 24M (~3.4×
+        # the ~7M cohort). Justified because the probe question — does routing_diversity lift / SHUF−REAL
+        # go positive — is param-ORTHOGONAL; do NOT draw a "structure beats flat at fixed params" claim from
+        # its babi-EM. For the matched comparison set cfg.slotgraph2_recurrent=True (ONE shared ~6M layer ×L).
+        cfg.slotgraph2_n_slots = _M
+        cfg.slotgraph2_n_nodes = _M // 2          # fixed partition: half nodes, half edges
+        cfg.slotgraph2_d_key = 64
         # vqicae (icae + VQ-discretized slots): encoder-LoRA r96 + projns + EMA codebook (a buffer,
         # not gradient-trained) → ~7.0M trainable, matched to icae. Large codebook K=8192.
         cfg.vqicae_n_slots = _M
@@ -1791,7 +1799,8 @@ def main():
         print(f"[capacity] mixed: FIXED M={_M}, beacon_ratio={cfg.beacon_ratio} (ctx "
               f"{args.mixed_ctx}:M = {args.mixed_ctx // _M}:1); baselines icae r104 / "
               f"ccm r52 / ac r52 / beacon 11L / slotgraph r85+MP-read / "
-              f"vqicae r100+K{cfg.vqicae_codebook_size} (param-matched ~6.9-7.0M).")
+              f"vqicae r100+K{cfg.vqicae_codebook_size} (param-matched ~6.9-7.0M). "
+              f"slotgraph2 = {'~6M recurrent (matched)' if cfg.slotgraph2_recurrent else '~24M/4-distinct-layer BINDING PROBE (UNMATCHED — no fixed-param claim)'}.")
         if cfg.d_llama != 576 and not args.allow_unmatched_backbone:
             raise SystemExit(
                 f"mixed param-matched ranks are calibrated for SmolLM2-135M (d=576); "

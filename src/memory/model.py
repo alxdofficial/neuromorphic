@@ -21,6 +21,7 @@ from .models.ccm import CCMBaselineEncoder
 from .models.icae import ICAEBaselineEncoder
 from .models.biomem import BioMemEncoder
 from .models.slotgraph import SlotGraphEncoder
+from .models.slotgraph2 import SlotGraph2Encoder
 from .models.vqicae import VQICAEEncoder
 from .models.vanilla import FullContextEncoder, NullEncoder
 from .decoder import FrozenLlamaDecoder, disable_lora
@@ -64,6 +65,10 @@ class ReprLearningModel(nn.Module):
         # predicts (hard ST) which two node slots it links; read = a multi-hop residual message-passing
         # GNN over the predicted graph, prepended (models/slotgraph/).
         "slotgraph_baseline": SlotGraphEncoder,
+        # per-layer graph-transformer memory: fixed node/edge partition at d_llama; per streaming window,
+        # L layers rewrite the graph (additive-residual latents + per-layer SOFT dst paintbrush, source
+        # fixed to the home node); prepend the M graph tokens (models/slotgraph2/).
+        "slotgraph2_baseline": SlotGraph2Encoder,
         # ICAE but each slot is a VQ-VAE code from a large codebook (discreteness experiment).
         "vqicae_baseline": VQICAEEncoder,
         "vanilla_llama": NullEncoder,         # loss floor — Llama with no memory
@@ -251,7 +256,7 @@ class ReprLearningModel(nn.Module):
     # slicing applies to these; vanillas pass through at M=0 / M=T).
     _MASKED_RECON_COMPRESSORS = ("icae_baseline", "ccm_baseline",
                         "autocompressor_baseline", "beacon_baseline",
-                        "slotgraph_baseline", "vqicae_baseline")
+                        "slotgraph_baseline", "slotgraph2_baseline", "vqicae_baseline")
 
     def compute_masked_reconstruction_loss(
         self,
@@ -1101,7 +1106,8 @@ class ReprLearningModel(nn.Module):
         # MAE (the masked-recon path merges these at its own return; the generic path must too
         # or babi/continuation drop them).
         for _k, _v in (finalize_aux or {}).items():
-            if not (_k.startswith("biomem_") or _k.startswith("slotgraph_") or _k.startswith("vqicae_")):
+            if not (_k.startswith("biomem_") or _k.startswith("slotgraph_")
+                    or _k.startswith("slotgraph2_") or _k.startswith("vqicae_")):
                 continue
             if torch.is_tensor(_v) and _v.numel() == 1:
                 out[_k] = _v.detach()
