@@ -282,7 +282,7 @@ def run_val(model, val_set, device, n_batches: int, window_size: int,
                 continue
             sink = last_graph_eval if k.startswith("graph_") else (
                 last_biomem_eval if k.startswith("biomem_") else (
-                last_slotgraph_eval if k.startswith(("slotgraph_", "slotgraph2_")) else (
+                last_slotgraph_eval if k.startswith(("slotgraph_", "slotgraph2_", "slotgraph3_")) else (
                 last_vqicae_eval if k.startswith("vqicae_") else None)))
             if sink is None:
                 continue
@@ -1161,7 +1161,7 @@ def train_mixed_variant(
         }
         # arm collapse/health canaries at train frequency (biomem edge/decay/beta/sat/mem_effrank/…, etc.)
         for _k, _v in out.items():
-            if _v is None or not _k.startswith(("biomem_", "slotgraph_", "slotgraph2_", "vqicae_")):
+            if _v is None or not _k.startswith(("biomem_", "slotgraph_", "slotgraph2_", "slotgraph3_", "vqicae_")):
                 continue
             if isinstance(_v, (int, float)):
                 train_row[_k] = float(_v)
@@ -1199,8 +1199,8 @@ def train_mixed_variant(
                     if _gk in vm:
                         row[_gk] = vm[_gk]
                 for _k, _v in vm.items():               # graph read+write collapse canaries
-                    if _k.startswith(("val_graph_", "val_biomem_", "val_slotgraph_", "val_vqicae_")):
-                        row[_k] = _v
+                    if _k.startswith(("val_graph_", "val_biomem_", "val_slotgraph", "val_vqicae_")):
+                        row[_k] = _v                       # "val_slotgraph" (no trailing _) catches slotgraph/2/3
                 # per-task best on val_loss
                 if vm["val_loss_recon"] < best[t]["metric"]:
                     best[t]["metric"] = vm["val_loss_recon"]
@@ -1253,8 +1253,8 @@ def train_mixed_variant(
         if "val_cont_early_loss" in vm:
             row["val_cont_early_loss"] = vm["val_cont_early_loss"]
         for _k, _v in vm.items():                       # graph/biomem/slotgraph/arrival collapse canaries
-            if _k.startswith(("val_graph_", "val_biomem_", "val_slotgraph_", "val_vqicae_")):
-                row[_k] = _v
+            if _k.startswith(("val_graph_", "val_biomem_", "val_slotgraph", "val_vqicae_")):
+                row[_k] = _v                             # "val_slotgraph" (no trailing _) catches slotgraph/2/3
         jsonl_fp.write(json.dumps(row) + "\n")
     jsonl_fp.close()
 
@@ -1480,6 +1480,11 @@ def main():
                     help="slotgraph: drop the FIXED orthonormal id_embed from the slots (and routing-head "
                          "input) = pure-ICAE-via-same-code. Pair with --slotgraph-no-structure to isolate "
                          "the id-tag contribution: id-on vs id-off, both flat. Does the free id tagging beat ICAE?")
+    ap.add_argument("--slotgraph3-no-write-expand", action="store_true",
+                    help="slotgraph3: do NOT materialize expanded edge tokens in the WRITE context — write "
+                         "over [window; slots] only, expand edges for the READ prepend ONLY. Ablation: is the "
+                         "graph purely a read-time decode, or does the write need to see the structure? "
+                         "(Strips the write-forward pooling attractor on the routing matrix A.)")
     ap.add_argument("--graph-encoder-lora-rank", type=int, default=0,
                     help="graph: LoRA-adapt the encoder forward like the baselines (0=frozen tap). "
                          "Evens the encoder footing (the graph historically read a frozen tap).")
@@ -1788,6 +1793,13 @@ def main():
         cfg.slotgraph2_n_slots = _M
         cfg.slotgraph2_n_nodes = _M // 2          # fixed partition: half nodes, half edges
         cfg.slotgraph2_d_key = 64
+        # slotgraph3 (compressed-implicit graph, LM-attention write, expanded edge read). MATCHED both ways:
+        # STATE = 2K = 32 latents (= baselines' M=32 memory bottleneck) and ~7.0M trainable (enc-LoRA r56).
+        # The read EXPANDS those 32 latents into K×read_topk = 128 edge tokens — a deterministic re-representation
+        # (fixed routing/φ), NOT extra memory. A:=I control at eval only (set enc.force_identity_A).
+        cfg.slotgraph3_n_nodes = _M // 2          # K = 16 nodes → 2K = 32 stored latents (matched to M)
+        cfg.slotgraph3_read_topk = 8              # expanded read view = 128 edge tokens (re-representation of the 32 latents)
+        cfg.slotgraph3_d_key = 128                # richer routing keys; enc-LoRA r56 (config) → ~7.0M matched trainable
         # vqicae (icae + VQ-discretized slots): encoder-LoRA r96 + projns + EMA codebook (a buffer,
         # not gradient-trained) → ~7.0M trainable, matched to icae. Large codebook K=8192.
         cfg.vqicae_n_slots = _M
@@ -1863,6 +1875,9 @@ def main():
     if args.biomem_no_membrane:
         cfg.biomem_membrane = False
         print("[biomem override] membrane OFF = fire on the instantaneous readout, not the leaky-integrated potential")
+    if args.slotgraph3_no_write_expand:
+        cfg.slotgraph3_write_expand = False
+        print("[slotgraph3 override] write-expand OFF = write over [window; slots] only; graph expanded for the READ prepend only")
     cfg.mixed_gate_batches = int(args.mixed_gate_batches)   # REAL/SHUF/OFF binding gate in mixed val (0=off)
     cfg.task_mode = args.task        # accurate ckpt metadata (dispatch still keys on this)
     cfg.seed = args.seed             # record the actual seed in ckpt metadata

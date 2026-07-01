@@ -196,6 +196,27 @@ class ReprConfig:
     slotgraph2_recurrent: bool = False   # True ⇒ ONE shared layer applied L× (param-light; ~matches budget)
     slotgraph2_lora_rank: int = 32       # encoder-LoRA rank (frozen-LM input encoder)
     slotgraph2_lora_alpha: int = 64
+    # write mixer: "gt" = 4 custom graph-transformer layers off the LM's final hidden (A; expressive but
+    # from-scratch); "lm" = ICAE-style — the graph tokens ride INSIDE the frozen LM's forward per window so
+    # the PRETRAINED attention does the message passing (B; steers the mechanism that empirically binds).
+    slotgraph2_write: str = "lm"
+
+    # ── slotgraph3 (compressed-implicit graph, EXPANDED edge read; models/slotgraph3/) ──────────
+    # State = per node (node_latent, edge_latent) + fixed id, all at d=d_llama. Expand to explicit edge
+    # tokens (sparsemax routing from edge_latents → φ(src,dst,edge) + endpoint ids) DURING the write (so
+    # layers see the structure) and BEFORE the read (prepend top-k edges/node; NO raw slots). d kept = 576.
+    slotgraph3_n_nodes: int = 16         # K nodes; state carries 2K latents
+    slotgraph3_n_layers: int = 4         # write layers per streaming window
+    slotgraph3_window: int = 256         # streaming window size
+    slotgraph3_d_key: int = 128          # routing query/key dim (edge_lat query · edge_lat key)
+    slotgraph3_heads: int = 4            # (unused in LM-write path; kept for config compat)
+    slotgraph3_read_topk: int = 8        # edges kept per node → prepend = K × read_topk tokens (K=16 → 128)
+    slotgraph3_lora_rank: int = 56       # encoder-LoRA rank (write mixer; bumped to reach ~7M matched)
+    slotgraph3_lora_alpha: int = 112
+    slotgraph3_write_expand: bool = True # True: materialize expanded edges in the WRITE context (LM sees
+                                         # structure). False: write over [window; slots] only, expand edges
+                                         # for the READ prepend ONLY — routing gradient comes purely from the
+                                         # binding read (strips the write-forward pooling attractor on A).
 
     # ── vqicae (ICAE with VQ-VAE-discretized slots; models/vqicae/) ──────────
     # ICAE write, then each slot is quantized to its nearest code in a large EMA codebook

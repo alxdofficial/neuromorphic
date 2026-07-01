@@ -22,6 +22,7 @@ from .models.icae import ICAEBaselineEncoder
 from .models.biomem import BioMemEncoder
 from .models.slotgraph import SlotGraphEncoder
 from .models.slotgraph2 import SlotGraph2Encoder
+from .models.slotgraph3 import SlotGraph3Encoder
 from .models.vqicae import VQICAEEncoder
 from .models.vanilla import FullContextEncoder, NullEncoder
 from .decoder import FrozenLlamaDecoder, disable_lora
@@ -69,6 +70,10 @@ class ReprLearningModel(nn.Module):
         # L layers rewrite the graph (additive-residual latents + per-layer SOFT dst paintbrush, source
         # fixed to the home node); prepend the M graph tokens (models/slotgraph2/).
         "slotgraph2_baseline": SlotGraph2Encoder,
+        # compressed-implicit graph: per-node (node_lat, edge_lat) state EXPANDED to explicit edge tokens
+        # (sparsemax routing + φ(src,dst,edge) + endpoint ids) during write AND before read; prepend the
+        # top-k edges/node — no raw slots (models/slotgraph3/).
+        "slotgraph3_baseline": SlotGraph3Encoder,
         # ICAE but each slot is a VQ-VAE code from a large codebook (discreteness experiment).
         "vqicae_baseline": VQICAEEncoder,
         "vanilla_llama": NullEncoder,         # loss floor — Llama with no memory
@@ -256,7 +261,8 @@ class ReprLearningModel(nn.Module):
     # slicing applies to these; vanillas pass through at M=0 / M=T).
     _MASKED_RECON_COMPRESSORS = ("icae_baseline", "ccm_baseline",
                         "autocompressor_baseline", "beacon_baseline",
-                        "slotgraph_baseline", "slotgraph2_baseline", "vqicae_baseline")
+                        "slotgraph_baseline", "slotgraph2_baseline",
+                        "slotgraph3_baseline", "vqicae_baseline")
 
     def compute_masked_reconstruction_loss(
         self,
@@ -293,9 +299,12 @@ class ReprLearningModel(nn.Module):
         memory, mem_aux = self.encoder.finalize_memory(state)          # [B, M, d]
         memory = memory.to(ctx_embeds.dtype)
 
-        # capacity-relative: use the first k slots (prefix/Matryoshka code)
+        # capacity-relative: use the first k slots (prefix/Matryoshka code). GATED on memory already being
+        # the budget size — slotgraph3 emits an EXPANDED read (K·read_topk=128 edge tokens, a re-representation
+        # of its matched 32-latent state), and a naive memory[:, :32] there keeps only nodes 0-3 (node-major
+        # reshape) → guts the MAE read. The Matryoshka slice only applies when M == k (a genuine prefix code).
         k = getattr(batch, "k_slots", None)
-        if k is not None and self.variant in self._MASKED_RECON_COMPRESSORS:
+        if k is not None and self.variant in self._MASKED_RECON_COMPRESSORS and memory.shape[1] == int(k):
             memory = memory[:, :int(k)]
         # memory attention mask: real for compressor slots; context_mask for the
         # full-context ceiling (its M=T memory has padded positions); a per-slot mask
@@ -1107,7 +1116,8 @@ class ReprLearningModel(nn.Module):
         # or babi/continuation drop them).
         for _k, _v in (finalize_aux or {}).items():
             if not (_k.startswith("biomem_") or _k.startswith("slotgraph_")
-                    or _k.startswith("slotgraph2_") or _k.startswith("vqicae_")):
+                    or _k.startswith("slotgraph2_") or _k.startswith("slotgraph3_")
+                    or _k.startswith("vqicae_")):
                 continue
             if torch.is_tensor(_v) and _v.numel() == 1:
                 out[_k] = _v.detach()
