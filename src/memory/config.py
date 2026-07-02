@@ -213,10 +213,43 @@ class ReprConfig:
     slotgraph3_read_topk: int = 8        # edges kept per node → prepend = K × read_topk tokens (K=16 → 128)
     slotgraph3_lora_rank: int = 56       # encoder-LoRA rank (write mixer; bumped to reach ~7M matched)
     slotgraph3_lora_alpha: int = 112
-    slotgraph3_write_expand: bool = True # True: materialize expanded edges in the WRITE context (LM sees
+    slotgraph3_write_expand: bool = True # True: materialize expanded edges in the WRITE context (mixer sees
                                          # structure). False: write over [window; slots] only, expand edges
                                          # for the READ prepend ONLY — routing gradient comes purely from the
                                          # binding read (strips the write-forward pooling attractor on A).
+    slotgraph3_write: str = "lm"         # write mixer: "lm" = frozen SmolLM2 attention + enc-LoRA (pretrained
+                                         # prior, ~7M matched). "custom" = frozen LM encodes the window (no grad)
+                                         # → from-scratch _SG3Blocks mix graph tokens over [hiddens; graph]
+                                         # (position-free) — "does a purpose-built graph mixer beat LM attention?"
+    slotgraph3_gate_ids: bool = False    # soft-id: endpoint labels ride INSIDE the routing weight
+                                         # (E = topv·(φ+ids)+role) → router gets gradient through the id
+                                         # channel; weak edges stop emitting full-loudness labels.
+    slotgraph3_st_leak: bool = False     # straight-through expansion: forward = exact hard top-k tokens
+                                         # (context stays K·topk); backward = soft mixture with leak ε =
+                                         # the router's out-of-top-k sparsemax mass (self-annealing) →
+                                         # dense gradient to unselected edges at ZERO context growth.
+    slotgraph3_edge_budget: int = 0      # >0: GLOBAL edge budget — materialize the strongest E edges of the
+                                         # whole graph (flattened A top-E) instead of top-k per node. Keeps
+                                         # the read at E tokens for ANY node count (per-node top-k would grow
+                                         # K·k); important nodes may hold many edges, irrelevant ones zero.
+                                         # Requires st_leak (backward = global A-mass leak). 0 = per-node.
+    slotgraph3_route_key: str = "edge"   # which latent provides routing q/k: "edge" (v1: edge_lat serves BOTH
+                                         # routing and relation → gradients fight; router-stability pressure
+                                         # drags relation content toward genericity) or "node" (K/V split:
+                                         # route by node CONTENT — input-dependent by construction — and let
+                                         # edge_lat carry pure relation semantics for φ).
+    slotgraph3_write_layers: int = 0     # LM arm depth: 0 = graph tokens ride ALL layers (full ride);
+                                         # N>0 = text runs the frozen prefix alone (no grad), graph tokens
+                                         # splice in for the last N layers (+LoRA there) — depth-matched to
+                                         # the custom arm at N=4, ~2× faster than the full ride.
+    slotgraph3_edge_state: str = "flat"  # "flat": edge_lat_i is ONE shared vector for all of node i's edges
+                                         # (per-dst relation = implicit unbinding φ must learn — no bias for
+                                         # it). "matrix": the SAME 576 floats viewed as a 24×24 associative
+                                         # map M_i; rel(i→j) = M_i·rel_key(node_j) → per-PAIR relation code,
+                                         # structural per-edge specificity (TPR/fast-weights bind-in-write).
+    slotgraph3_custom_layers: int = 4    # custom write: # of from-scratch transformer blocks
+    slotgraph3_custom_dff: int = 1152    # custom write: block FFN hidden (2×d=1152 → ~13M UNMATCHED capacity probe)
+    slotgraph3_custom_heads: int = 9     # custom write: attention heads (d=576 / 9 = head_dim 64)
 
     # ── vqicae (ICAE with VQ-VAE-discretized slots; models/vqicae/) ──────────
     # ICAE write, then each slot is quantized to its nearest code in a large EMA codebook

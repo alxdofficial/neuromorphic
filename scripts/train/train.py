@@ -1485,6 +1485,50 @@ def main():
                          "over [window; slots] only, expand edges for the READ prepend ONLY. Ablation: is the "
                          "graph purely a read-time decode, or does the write need to see the structure? "
                          "(Strips the write-forward pooling attractor on the routing matrix A.)")
+    ap.add_argument("--slotgraph3-write", choices=["lm", "custom"], default=None,
+                    help="slotgraph3 write mixer: 'lm' = frozen SmolLM2 attention + enc-LoRA (pretrained prior, "
+                         "~7M matched); 'custom' = frozen-LM window encode (no grad) → from-scratch graph-mixer "
+                         "blocks over [hiddens; graph] (position-free; text comprehension held constant). Probe: "
+                         "does a purpose-built graph mixer beat LM attention? (default: cfg = lm)")
+    ap.add_argument("--slotgraph3-custom-layers", type=int, default=None,
+                    help="slotgraph3 custom write: number of from-scratch transformer blocks (default cfg=4, "
+                         "d_ff=2×d → ~13M UNMATCHED capacity probe).")
+    ap.add_argument("--slotgraph3-gate-ids", action="store_true",
+                    help="slotgraph3 soft-id: endpoint labels ride INSIDE the routing weight "
+                         "(E = topv·(φ+ids)+role, Switch gate-multiplication) → router gets gradient through "
+                         "the dominant id channel; weak edges stop emitting full-loudness labels.")
+    ap.add_argument("--slotgraph3-read-topk", type=int, default=None,
+                    help="slotgraph3: edges materialized per node (default: mixed-capacity 8). Set 15 (=K-1) "
+                         "for DENSE-FORWARD training: every in-support sparsemax edge is materialized (real "
+                         "gradient to all of them; exact-zero edges auto-masked from attention) — the frozen "
+                         "top-8 boundary disappears and selection self-anneals as sparsemax sharpens.")
+    ap.add_argument("--slotgraph3-st-leak", action="store_true",
+                    help="slotgraph3 STRAIGHT-THROUGH expansion: forward = exact hard top-k edge tokens "
+                         "(context stays K·topk — no K² token growth); backward = soft mixture whose leak = "
+                         "the router's out-of-top-k sparsemax mass (self-annealing 95/5 → 100/0). Dense "
+                         "gradient to unselected destinations at zero context cost (the scalable "
+                         "alternative to --slotgraph3-read-topk 15).")
+    ap.add_argument("--slotgraph3-n-nodes", type=int, default=None,
+                    help="slotgraph3: override node count K (default: mixed-capacity M/2=16). K=128 = the "
+                         "capacity probe (state 2K=256 vectors, UNMATCHED — does binding appear once "
+                         "nodes ≥ entities-per-context?). Pair with --slotgraph3-edge-budget.")
+    ap.add_argument("--slotgraph3-edge-budget", type=int, default=None,
+                    help="slotgraph3: GLOBAL edge budget E — materialize the strongest E edges of the whole "
+                         "graph instead of top-k per node (read stays E tokens for ANY K; hubs allowed). "
+                         "Requires --slotgraph3-st-leak. E=128 keeps today's 128-token read at K=128.")
+    ap.add_argument("--slotgraph3-route-key", choices=["edge", "node"], default=None,
+                    help="slotgraph3: which latent provides routing q/k. 'node' = K/V split (route by node "
+                         "CONTENT, edge_lat freed for pure relation semantics — kills the routing-stability↔"
+                         "relation-content gradient fight on edge_lat). Default cfg: 'edge' (v1).")
+    ap.add_argument("--slotgraph3-write-layers", type=int, default=None,
+                    help="slotgraph3 LM arm depth: 0 = full ride (graph tokens through ALL layers); N>0 = "
+                         "text runs the frozen prefix no-grad, graph tokens splice in for the last N layers "
+                         "(+LoRA). N=4 is depth-matched to the custom arm and ~2× faster than full ride.")
+    ap.add_argument("--slotgraph3-edge-state", choices=["flat", "matrix"], default=None,
+                    help="slotgraph3: 'matrix' = view the SAME per-node edge_lat floats as a 24×24 associative "
+                         "map; rel(i→j) = M_i·rel_key(node_j) → per-PAIR relation codes (structural per-edge "
+                         "specificity; TPR/fast-weights bind-in-write). 'flat' (default) = one shared vector "
+                         "per source (per-dst relation = implicit unbinding φ must learn).")
     ap.add_argument("--graph-encoder-lora-rank", type=int, default=0,
                     help="graph: LoRA-adapt the encoder forward like the baselines (0=frozen tap). "
                          "Evens the encoder footing (the graph historically read a frozen tap).")
@@ -1878,6 +1922,43 @@ def main():
     if args.slotgraph3_no_write_expand:
         cfg.slotgraph3_write_expand = False
         print("[slotgraph3 override] write-expand OFF = write over [window; slots] only; graph expanded for the READ prepend only")
+    if args.slotgraph3_write is not None:
+        cfg.slotgraph3_write = args.slotgraph3_write
+        print(f"[slotgraph3 override] write mixer = {cfg.slotgraph3_write}"
+              + (" (from-scratch blocks, NO frozen prior — UNMATCHED capacity probe)" if cfg.slotgraph3_write == "custom" else ""))
+    if args.slotgraph3_custom_layers is not None:
+        cfg.slotgraph3_custom_layers = int(args.slotgraph3_custom_layers)
+    if args.slotgraph3_gate_ids:
+        cfg.slotgraph3_gate_ids = True
+        print("[slotgraph3 override] gate-ids ON = E = topv·(φ+ids)+role (router gradient through the id channel)")
+    if args.slotgraph3_read_topk is not None:
+        cfg.slotgraph3_read_topk = int(args.slotgraph3_read_topk)
+        print(f"[slotgraph3 override] read_topk = {cfg.slotgraph3_read_topk}"
+              + (" (dense-forward: all in-support edges materialized)" if cfg.slotgraph3_read_topk >= 15 else ""))
+    if args.slotgraph3_st_leak:
+        cfg.slotgraph3_st_leak = True
+        print("[slotgraph3 override] straight-through leak ON = hard top-k forward, A-mass soft backward "
+              "(dense gradient, zero context growth)")
+    if args.slotgraph3_n_nodes is not None:
+        cfg.slotgraph3_n_nodes = int(args.slotgraph3_n_nodes)
+        print(f"[slotgraph3 override] K = {cfg.slotgraph3_n_nodes} nodes (state 2K={2*cfg.slotgraph3_n_nodes} "
+              f"vectors — CAPACITY PROBE, unmatched)")
+    if args.slotgraph3_edge_budget is not None:
+        cfg.slotgraph3_edge_budget = int(args.slotgraph3_edge_budget)
+        print(f"[slotgraph3 override] GLOBAL edge budget = {cfg.slotgraph3_edge_budget} strongest edges "
+              f"(read stays {cfg.slotgraph3_edge_budget} tokens at any K)")
+    if args.slotgraph3_route_key is not None:
+        cfg.slotgraph3_route_key = args.slotgraph3_route_key
+        print(f"[slotgraph3 override] route-by-{cfg.slotgraph3_route_key}"
+              + (" (K/V split: node content addresses, edge_lat = pure relation)" if cfg.slotgraph3_route_key == "node" else ""))
+    if args.slotgraph3_edge_state is not None:
+        cfg.slotgraph3_edge_state = args.slotgraph3_edge_state
+        print(f"[slotgraph3 override] edge_state = {cfg.slotgraph3_edge_state}"
+              + (" (per-PAIR relation codes: rel(i→j) = M_i·rel_key(n_j))" if cfg.slotgraph3_edge_state == "matrix" else ""))
+    if args.slotgraph3_write_layers is not None:
+        cfg.slotgraph3_write_layers = int(args.slotgraph3_write_layers)
+        print(f"[slotgraph3 override] LM write depth = last-{cfg.slotgraph3_write_layers} layers "
+              f"(frozen no-grad text prefix; LoRA trains only in the suffix)")
     cfg.mixed_gate_batches = int(args.mixed_gate_batches)   # REAL/SHUF/OFF binding gate in mixed val (0=off)
     cfg.task_mode = args.task        # accurate ckpt metadata (dispatch still keys on this)
     cfg.seed = args.seed             # record the actual seed in ckpt metadata
