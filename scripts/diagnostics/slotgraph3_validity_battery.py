@@ -43,6 +43,9 @@ def build(write_mode="lm", write_expand=False, edge_state="matrix"):
     cfg.slotgraph3_edge_state = edge_state
     cfg.slotgraph3_write_expand = write_expand
     cfg.slotgraph3_write = write_mode
+    cfg.slotgraph3_read = "edges"    # the battery probes the LEGACY expansion machinery (φ, node_id,
+                                     # id_scale, role) — those exist only in edges mode since the
+                                     # 2026-07-03 conditional-param cleanup (raw default lacks them)
     return SlotGraph3Encoder(cfg).to(DEV)
 
 
@@ -77,11 +80,18 @@ def main():
     check("forward == hard gather", diff < 1e-5, f"max diff {diff:.2e}")
 
     print("2. chunk-checkpoint gradient equivalence")
+    # routing computed ONCE in eval mode and shared by both runs: train mode now adds Gumbel
+    # exploration noise to _route (2026-07-03), so recomputing A per-call would compare grads
+    # through two DIFFERENT wirings — the test isolates checkpointing, so A must be held fixed.
+    enc.eval()
+    with torch.no_grad():
+        A_fixed = enc._route(nl)
+
     def grads(train_mode):
         enc.zero_grad(set_to_none=True)
         enc.train(train_mode)                                   # checkpointing active only in train
         el2 = el.clone().requires_grad_(True)
-        A2 = enc._route(nl)
+        A2 = A_fixed.clone()
         out, *_ = enc._expand_global(nl, el2, nid, id_scale, role, A2)
         torch.manual_seed(7)
         (out.float() * torch.randn_like(out).float()).sum().backward()
@@ -127,8 +137,8 @@ def main():
     mem, aux = encode(enc_c, emb, mask)
     (mem.float() * torch.randn_like(mem).float()).sum().backward()
     g = lambda p: 0.0 if p.grad is None else p.grad.norm().item()
-    ok = torch.isfinite(mem).all().item() and mem.shape == (B, E, d) and g(enc_c.rel_key.weight) > 0 \
-        and g(enc_c.blocks[0].o.weight) > 0
+    ok = torch.isfinite(mem).all().item() and mem.shape == (B, enc_c.M, d) \
+        and g(enc_c.rel_key.weight) > 0 and g(enc_c.blocks[0].o.weight) > 0   # M includes boundary rows
     check("custom full-combo fwd/bwd", ok,
           f"finite mem{tuple(mem.shape)}, rel_key.g={g(enc_c.rel_key.weight):.3f}, blk0.o.g={g(enc_c.blocks[0].o.weight):.3f}")
 

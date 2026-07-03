@@ -53,7 +53,41 @@ class ReprConfig:
     # adds a SHUF-contrastive binding term. Real fields (not dynamic attrs) so
     # dataclasses.asdict(cfg) captures them in checkpoint metadata for drift checks.
     task_mode: str = "qa"
+    ctx_len: int = 1024                  # ACTUAL training context length (set by the trainer from
+                                         # --mixed-ctx / --compress-len). Encoders that scale time
+                                         # constants (e.g. slotgraph3 assoc-write decay half-life =
+                                         # f(ctx_len/window)) derive from THIS, never a literal.
     contrastive_shuf_coef: float = 0.0
+    # objective_mode — the 2026-07-02 objective ladder (the wall is the OBJECTIVE, not the arch):
+    #   "plain":       CE_real only (loss-neutral wrt binding — the historical default).
+    #   "contrastive": CE_real + objective_coef · InfoNCE over the IN-BATCH memory matrix — each
+    #                  example's target must be explained best by its OWN memory vs all B−1 other
+    #                  memories (1 encoder run, B rolled decoder reads via memory_override). Non-
+    #                  saturating multi-negative upgrade of the legacy 1-negative softplus
+    #                  (contrastive_shuf_coef, kept independent for reproducibility; setting both
+    #                  is an error).
+    #   "trajectory":  contrastive + GRPO on the discrete read expansion: sample grpo_samples
+    #                  Gumbel-top-k edge sets from the routing logits, reward = per-example
+    #                  binding advantage (CE_shuf − CE_real, no-grad reads), group-relative
+    #                  advantage × log-prob REINFORCE on the ROUTER ONLY (hybrid: continuous
+    #                  params keep the pathwise InfoNCE gradient; the discrete choice — which has
+    #                  no honest gradient — gets the unbiased estimator).
+    objective_mode: str = "plain"
+    objective_coef: float = 0.5          # weight of the InfoNCE term (contrastive/trajectory)
+    objective_inv_temp: float = 1.0      # inverse temperature on the ROW-STANDARDIZED InfoNCE logits
+                                         # (2026-07-03 audit: raw mean-NLL margins at τ=1 give a near-
+                                         # uniform softmax = dead gradient; logits are standardized per
+                                         # example over rolls first, so 1.0 = unit-σ spread; raise to
+                                         # sharpen — the CLIP/SimCLR regime is effectively 1/τ ≈ 5–10
+                                         # PRE-standardization).
+    grpo_samples: int = 4                # G rollouts per step (trajectory; audit: G≥4 — G=2 is fragile)
+    grpo_coef: float = 1.0               # weight of the REINFORCE policy term, applied to the PER-
+                                         # DECISION-scaled policy loss (logp/n_decisions; constant
+                                         # divisor = pure coefficient, NOT the Dr.GRPO length bias)
+    grpo_entropy_coef: float = 0.01      # entropy BONUS on the router distribution (A3C-standard
+                                         # 0.01): entropy collapse is the documented failure mode of
+                                         # group-relative policy gradients; Gumbel exploration alone
+                                         # dies once logits sharpen.
 
     # ── Decoder LoRA (shared by every variant so the MAE protocol is learnable)
     # Manual LoRA (no `peft`): W + (B @ A)·(alpha/rank); A small-init, B zero-init
@@ -233,20 +267,98 @@ class ReprConfig:
                                          # the read at E tokens for ANY node count (per-node top-k would grow
                                          # K·k); important nodes may hold many edges, irrelevant ones zero.
                                          # Requires st_leak (backward = global A-mass leak). 0 = per-node.
-    slotgraph3_route_key: str = "edge"   # which latent provides routing q/k: "edge" (v1: edge_lat serves BOTH
+    slotgraph3_route_key: str = "node"   # which latent provides routing q/k: "edge" (v1: edge_lat serves BOTH
                                          # routing and relation → gradients fight; router-stability pressure
                                          # drags relation content toward genericity) or "node" (K/V split:
                                          # route by node CONTENT — input-dependent by construction — and let
-                                         # edge_lat carry pure relation semantics for φ).
+                                         # edge_lat carry pure relation semantics). DEFAULT "node" (2026-07-02
+                                         # tokenization-geometry batch: pairs with edge_state="matrix").
     slotgraph3_write_layers: int = 0     # LM arm depth: 0 = graph tokens ride ALL layers (full ride);
                                          # N>0 = text runs the frozen prefix alone (no grad), graph tokens
                                          # splice in for the last N layers (+LoRA there) — depth-matched to
                                          # the custom arm at N=4, ~2× faster than the full ride.
-    slotgraph3_edge_state: str = "flat"  # "flat": edge_lat_i is ONE shared vector for all of node i's edges
-                                         # (per-dst relation = implicit unbinding φ must learn — no bias for
-                                         # it). "matrix": the SAME 576 floats viewed as a 24×24 associative
-                                         # map M_i; rel(i→j) = M_i·rel_key(node_j) → per-PAIR relation code,
-                                         # structural per-edge specificity (TPR/fast-weights bind-in-write).
+    slotgraph3_read: str = "raw"         # "edges" (v1, LEGACY control): prepend φ-SYNTHESIZED edge tokens only
+                                         # (id-SUM + φ — the literature-worst geometry; kept for A/B). "raw"
+                                         # (DEFAULT, 2026-07-02): the literature-verdict read — prepend the
+                                         # node latents THEMSELVES as content tokens + edge POINTER tokens,
+                                         # each formed by CONCAT-then-PROJECT (TokenGT): tok_proj([content ‖
+                                         # id_src ‖ id_dst ‖ type]) → d, ONE shared projection for node and
+                                         # edge tokens so the id subspace lands in the same output directions
+                                         # (attention id-matching by construction). Replaces the 3-way
+                                         # additive superposition (content+id+role at mismatched scales —
+                                         # √3 norm-inflation → attention-sink; frozen LM can't unmix a sum
+                                         # it was never trained to read).
+    uniform_mem_pos: bool = False        # decoder read: give ALL prepended memory tokens the SAME RoPE
+                                         # position (0) so they're an unordered SET, mutually equidistant
+                                         # from text — removes the arbitrary intra-memory ordering + the
+                                         # RoPE distance bias (which memory a text token finds "closer").
+                                         # Text keeps normal relative positions (1..T after the memory slot).
+    rect_prepend_mask: bool = False      # KBLaM-style rectangular decoder mask: memory tokens attend only
+                                         # to THEMSELVES (no memory↔memory mixing/blurring across layers);
+                                         # text attends into memory normally. Applies to the prepend read.
+                                         # (Correct for independent KV facts; WRONG for a graph — see
+                                         # bidir_mem_attn. Kept as a control. Mutually exclusive with it.)
+    bidir_mem_attn: bool = False         # Set-LLM read geometry: the M prepended memory tokens attend to
+                                         # each other BIDIRECTIONALLY (an edge token can see BOTH endpoint
+                                         # node tokens regardless of emission order; composition needs it);
+                                         # text stays causal. Plain-causal-over-a-prepended-SET imposes a
+                                         # spurious order through visibility — the one geometry the set-
+                                         # invariance literature uniformly warns against. Default False
+                                         # (shared decoder path — baselines keep their trained geometry);
+                                         # slotgraph3 runs enable via --bidir-mem-attn.
+    slotgraph3_edge_state: str = "matrix"  # "flat": edge_lat_i is ONE shared vector for all of node i's edges
+                                         # (per-dst relation = implicit unbinding a read must learn — no bias
+                                         # for it). "matrix" (DEFAULT 2026-07-02): the SAME 576 floats viewed
+                                         # as a 24×24 associative map M_i; rel(i→j) = M_i·rel_key(node_j) →
+                                         # per-PAIR relation code, structural per-edge specificity (TPR/
+                                         # fast-weights bind-in-write). Needs square d (576 = 24² ✓).
+    slotgraph3_boundary_tokens: bool = True  # wrap the memory prepend in learned on-manifold <mem_start>/
+                                         # <mem_end> tokens (init mean_embed + emb_std·randn, norm-matched).
+                                         # Every working frozen-LM injection marks the span explicitly
+                                         # (Qwen <|vision_start/end|>, ICAE [AE]/[LM], gist mask-boundary);
+                                         # a sub-scale added role vector does not. M grows by 2.
+    # ── 2026-07-03 write-audit repairs (T1/T2; see research_graph_write_audit) ────────────
+    slotgraph3_route_act: str = "softmax"   # routing activation over destinations. "softmax" (DEFAULT) +
+                                         # train-time Gumbel noise on the logits (parameter-free explora-
+                                         # tion; noise ~ the logit scale at init, signal outgrows it).
+                                         # "sparsemax" (LEGACY): exact zeros = out-of-support edges get
+                                         # EXACTLY zero gradient → support monotonically shrinks (the
+                                         # dead-gradient ratchet behind rdiv pinned-from-step-1).
+    slotgraph3_init_noise: bool = True   # per-FORWARD Gaussian sampling of the initial latents around the
+                                         # learned init (Slot Attention): breaks slot symmetry — identical
+                                         # deterministic slots + shared heads get identical gradients and
+                                         # stay identical forever (effrank 2-4, hub collapse). Learned
+                                         # per-dim σ (init = measured embed std); train-time only.
+    slotgraph3_write_norm_match: bool = True  # scale graph tokens to the TEXT-hidden RMS at the write
+                                         # splice (learned scalar × dynamic text-norm match). Measured
+                                         # 400× mismatch at the last-4 splice (graph 1.6 vs text 641):
+                                         # a slot's residual stream is swamped by attention output after
+                                         # one layer → slot identity erased inside the write.
+    slotgraph3_write_boundary_bidir: bool = True  # write-side dialect harmonization: <mem_start> before
+                                         # the graph block + BIDIRECTIONAL attention among graph tokens
+                                         # in the write mask (matches the read geometry; under causal,
+                                         # expanded edges could never see the node slots at all).
+    slotgraph3_edge_write: str = "assoc"  # EDGE-latent update rule (T3, 2026-07-03). "assoc" (DEFAULT):
+                                         # keyed delta-rule associative write into the persistent 24×24
+                                         # map — M_i ← (1−α)·M_i + g_i·(v − M_i·k)⊗k, where k = the
+                                         # UNIT-normalized routing-weighted partner-key mixture (SAME
+                                         # rel_key as the read → write-address = read-address; unit keys
+                                         # give the exact-overwrite property M'k = v), v = rel_val(edge-
+                                         # slot hidden), α = retention-biased decay (init 1/(2·n_windows)
+                                         # = 1/8: half-life ≈ the full context). Files facts under
+                                         # partner addresses instead of smearing all 576 dims; M_i
+                                         # becomes accumulated WRITE HISTORY — state not derivable from
+                                         # node content (the recomputed-edges-carry-zero-bits fix).
+                                         # "slot" (LEGACY): the T2 gated interpolation via the edge-slot
+                                         # hidden. assoc REQUIRES edge_state="matrix" + write_update=
+                                         # "delta" (fails loudly otherwise).
+    slotgraph3_write_update: str = "delta"  # slot update rule. "delta" (DEFAULT): per-slot CONTENT gate
+                                         # (bias init +1.5 = write-open, Jozefowicz) + slot-attention
+                                         # COMPETITIVE read of the window (softmax over SLOTS, zero-init
+                                         # proj) + gated INTERPOLATION lat += g·(cand − lat) — error-
+                                         # correcting (repeated same-content writes converge instead of
+                                         # accumulating; kills the additive averaging fixed point).
+                                         # "additive" (LEGACY): lat += sigmoid(β)·head(LN(hidden)).
     slotgraph3_custom_layers: int = 4    # custom write: # of from-scratch transformer blocks
     slotgraph3_custom_dff: int = 1152    # custom write: block FFN hidden (2×d=1152 → ~13M UNMATCHED capacity probe)
     slotgraph3_custom_heads: int = 9     # custom write: attention heads (d=576 / 9 = head_dim 64)

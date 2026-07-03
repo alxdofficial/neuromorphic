@@ -271,6 +271,12 @@ class ReprLearningModel(nn.Module):
         zero_memory: bool = False,
         shuffle_memory: bool = False,
         mask_ratio: float = 0.85,
+        memory_override=None,           # (memory, mem_aux): SKIP the encoder, decode with this memory —
+                                        # the objective-mode rolled reads (1 encoder run, B decoder reads)
+        shuffle_roll: int = 1,          # SHUF roll amount (r>0 pairs example i with memory i−r; the
+                                        # in-batch InfoNCE sweeps r=1..B−1 to score ALL negatives)
+        return_memory: bool = False,    # stash the (pre-roll) memory+aux on the out dict (objective modes)
+        encoder_only: bool = False,     # build memory and return WITHOUT decoding (GradCache cut point)
     ) -> dict:
         """True MAE compression objective (docs/compression_objective.md).
 
@@ -291,12 +297,16 @@ class ReprLearningModel(nn.Module):
 
         # ---- 1. encode the span → memory [B, M, d] (single window) ----
         # biomem/arrivalmem ingest the frozen LM's FINAL hidden (not raw embeds); others raw.
-        enc_in = self._encode_for_memory(ctx_embeds, batch.context_mask)
-        surprise = (self._token_surprise(enc_in, getattr(batch, "context_ids", None), batch.context_mask)
-                    if getattr(self.encoder, "wants_surprise", False) else None)
-        state = self.encoder.init_streaming_state(B, device, ctx_embeds.dtype)
-        state, _ = self.encoder.streaming_write(state, enc_in, batch.context_mask, surprise=surprise)
-        memory, mem_aux = self.encoder.finalize_memory(state)          # [B, M, d]
+        if memory_override is not None:
+            memory, mem_aux = memory_override
+            mem_aux = dict(mem_aux)     # SHUF below rolls memory_mask — never mutate the caller's aux
+        else:
+            enc_in = self._encode_for_memory(ctx_embeds, batch.context_mask)
+            surprise = (self._token_surprise(enc_in, getattr(batch, "context_ids", None), batch.context_mask)
+                        if getattr(self.encoder, "wants_surprise", False) else None)
+            state = self.encoder.init_streaming_state(B, device, ctx_embeds.dtype)
+            state, _ = self.encoder.streaming_write(state, enc_in, batch.context_mask, surprise=surprise)
+            memory, mem_aux = self.encoder.finalize_memory(state)      # [B, M, d]
         memory = memory.to(ctx_embeds.dtype)
 
         # capacity-relative: use the first k slots (prefix/Matryoshka code). GATED on memory already being
@@ -316,6 +326,14 @@ class ReprLearningModel(nn.Module):
         else:
             mem_mask = torch.ones(B, memory.shape[1], device=device)
 
+        # GradCache cut point / objective-mode stash: the pre-roll REAL memory
+        if encoder_only or return_memory:
+            _mem_ret = (memory, dict(mem_aux))
+        if encoder_only:
+            z = torch.zeros((), device=device)
+            return {"loss": z, "loss_recon": z, "top1_acc": z, "memory_shape": (B, memory.shape[1]),
+                    "_memory": _mem_ret[0], "_mem_aux": _mem_ret[1]}
+
         # ---- 2. REAL / SHUF / OFF ----
         if zero_memory:
             memory = memory[:, :0]
@@ -323,8 +341,8 @@ class ReprLearningModel(nn.Module):
         elif shuffle_memory:
             if B == 1:   # mirror the QA path: SHUF is a no-op at B==1, fail loudly [merge #6]
                 raise ValueError("shuffle_memory requires batch size > 1 (B==1 would leave REAL memory).")
-            memory = torch.roll(memory, shifts=1, dims=0)
-            mem_mask = torch.roll(mem_mask, shifts=1, dims=0)
+            memory = torch.roll(memory, shifts=int(shuffle_roll), dims=0)
+            mem_mask = torch.roll(mem_mask, shifts=int(shuffle_roll), dims=0)
         M = memory.shape[1]
 
         # ---- 3. masked decoder input ----
@@ -334,6 +352,14 @@ class ReprLearningModel(nn.Module):
         dec_in = torch.where(masked.unsqueeze(-1), mask_vec.view(1, 1, -1), ctx_embeds)
         full = torch.cat([memory, dec_in], dim=1)                      # [B, M+T, d]
         attn = torch.cat([mem_mask, batch.context_mask.float()], dim=1).long()
+        if getattr(self.cfg, "rect_prepend_mask", False) and getattr(self.cfg, "bidir_mem_attn", False):
+            raise ValueError("rect_prepend_mask and bidir_mem_attn are mutually exclusive read geometries")
+        if getattr(self.cfg, "rect_prepend_mask", False) and M > 0:
+            attn = self._rect_prepend_mask(attn, M, full.dtype)        # [B,1,L,L] 4-D additive
+        elif getattr(self.cfg, "bidir_mem_attn", False) and M > 0:
+            attn = self._bidir_prepend_mask(attn, M, full.dtype)       # Set-LLM: bidirectional memory block
+        pos_ids = (self._uniform_mem_position_ids(B, M, full.shape[1], device)
+                   if getattr(self.cfg, "uniform_mem_pos", False) and M > 0 else None)
 
         # biomem: query-conditioned READ — a zero-init pre-hook at the tap layer reads
         # every position's hidden through the frozen written edges and fuses the recall
@@ -347,7 +373,7 @@ class ReprLearningModel(nn.Module):
         refresh = self._install_prepend_refresh_hooks(M, 0, zero_memory, shuffle_memory)
         try:
             base_out = self.decoder.llama.model(
-                inputs_embeds=full, attention_mask=attn, use_cache=False)
+                inputs_embeds=full, attention_mask=attn, position_ids=pos_ids, use_cache=False)
         finally:
             if hook_handle is not None:
                 hook_handle.remove()
@@ -368,15 +394,18 @@ class ReprLearningModel(nn.Module):
         logits = self.decoder.llama.lm_head(sel_hidden).float()        # [N,V]
         per_tok = F.cross_entropy(logits, sel_targets, reduction="none")
         loss_recon = per_tok.mean()
+        # differentiable per-example CE (mean per-token NLL per row) — the objective modes' InfoNCE
+        # logits are built from these across memory rolls; the detached copy keeps telemetry unchanged.
+        rows = loss_mask.nonzero(as_tuple=False)[:, 0]
+        pe_sum = torch.zeros(B, device=device, dtype=per_tok.dtype)
+        pe_cnt = torch.zeros(B, device=device, dtype=per_tok.dtype)
+        pe_sum = pe_sum.scatter_add(0, rows, per_tok)
+        pe_cnt = pe_cnt.scatter_add(0, rows, torch.ones_like(per_tok))
+        loss_per_example = pe_sum / pe_cnt.clamp_min(1.0)              # [B], WITH grad
 
         with torch.no_grad():
             top1 = (logits.argmax(-1) == sel_targets).float().mean()
-            rows = loss_mask.nonzero(as_tuple=False)[:, 0]
-            per_ex = torch.zeros(B, device=device)
-            cnt = torch.zeros(B, device=device)
-            per_ex.scatter_add_(0, rows, per_tok.detach())
-            cnt.scatter_add_(0, rows, torch.ones_like(per_tok))
-            per_ex = per_ex / cnt.clamp_min(1.0)
+            per_ex = loss_per_example.detach()
 
         # keep mask_embed in-graph even when no positions select it
         loss = loss_recon + 0.0 * self.decoder.mask_embed.float().sum()
@@ -392,11 +421,14 @@ class ReprLearningModel(nn.Module):
         out = {
             "loss": loss, "loss_recon": loss_recon.detach(),
             "top1_acc": top1, "per_example_loss": per_ex,
+            "loss_per_example": loss_per_example,          # [B] WITH grad (objective-mode InfoNCE logits)
             "loss_aux": loss_aux.detach() if torch.is_tensor(loss_aux) else torch.zeros((), device=device),
             "n_content_positions": int(loss_mask.sum()),   # masked positions = the CE targets
             "memory_shape": (B, M),                        # (batch, code size) for the logger
             "mae_n_masked": float(loss_mask.sum()), "mae_M": float(M),
         }
+        if return_memory:
+            out["_memory"], out["_mem_aux"] = _mem_ret
         # surface encoder telemetry (hlvocab_* collapse/presence canaries) so the
         # trainer's hlvocab_ glob logs it to JSONL [fix C]. Scalars only.
         for _k, _v in (mem_aux or {}).items():
@@ -444,6 +476,50 @@ class ReprLearningModel(nn.Module):
                 out["graph_mem_effrank"] = _participation_ratio(
                     memory.reshape(-1, memory.shape[-1]))
         return out
+
+    def _rect_prepend_mask(self, attn2d, M, dtype):
+        """KBLaM-style rectangular decoder mask for a memory PREPEND at positions [0:M).
+        Memory tokens attend only to THEMSELVES (diagonal — keeps SDPA rows finite; stops
+        memory↔memory mixing/blurring through the decoder's layers); all later tokens attend
+        causally to every valid position (text→memory retrieval unchanged). attn2d: [B,L]
+        validity (long/bool). Returns a [B,1,L,L] float additive mask (0 / -inf)."""
+        B, L = attn2d.shape
+        valid = attn2d.bool()
+        causal = torch.tril(torch.ones(L, L, device=attn2d.device, dtype=torch.bool))
+        allow = causal.unsqueeze(0) & valid.unsqueeze(1)                 # [B,L,L]
+        if M > 0:
+            allow[:, :M, :] = False                                      # memory rows: self only
+            eye = torch.eye(L, device=attn2d.device, dtype=torch.bool)
+            allow[:, :M, :] |= eye[:M, :].unsqueeze(0)
+        m4 = torch.zeros(B, 1, L, L, device=attn2d.device, dtype=dtype)
+        m4.masked_fill_(~allow.unsqueeze(1), torch.finfo(dtype).min)
+        return m4
+
+    def _bidir_prepend_mask(self, attn2d, M, dtype):
+        """Set-LLM decoder mask for a memory PREPEND at [0:M): the memory block attends to itself
+        BIDIRECTIONALLY (an edge token composes with BOTH its endpoint node tokens regardless of
+        emission order — plain causal lets memory token i see only j<i, imposing a spurious
+        order-through-visibility on an unordered set, the one geometry the set-invariance
+        literature uniformly warns against); text tokens stay causal (they already see all memory —
+        earlier positions). attn2d: [B,L] validity (long/bool). Returns [B,1,L,L] additive mask."""
+        B, L = attn2d.shape
+        valid = attn2d.bool()
+        allow2d = torch.tril(torch.ones(L, L, device=attn2d.device, dtype=torch.bool))
+        if M > 0:
+            allow2d = allow2d.clone()
+            allow2d[:M, :M] = True                                       # memory block: full bidirectional
+        allow = allow2d.unsqueeze(0) & valid.unsqueeze(1)                # [B,L,L]
+        m4 = torch.zeros(B, 1, L, L, device=attn2d.device, dtype=dtype)
+        m4.masked_fill_(~allow.unsqueeze(1), torch.finfo(dtype).min)
+        return m4
+
+    def _uniform_mem_position_ids(self, B, M, L, device):
+        """RoPE position ids for a prepend of M memory tokens + (L-M) text tokens: memory all at
+        position 0 (an unordered SET, mutually equidistant from text — no intra-memory order, no
+        differential distance bias), text at 1..L-M (normal relative structure preserved). [B,L] long."""
+        rest = torch.arange(1, L - M + 1, device=device)
+        pos = torch.cat([torch.zeros(M, device=device, dtype=torch.long), rest], dim=0)
+        return pos.unsqueeze(0).expand(B, -1)
 
     def _install_conditioned_read_hook(self, zero_memory: bool, shuffle_memory: bool, B=None):
         """Query-conditioned READ (biomem): register a pre-hook at the encoder's
@@ -579,6 +655,10 @@ class ReprLearningModel(nn.Module):
         window_size: int = 1024,
         zero_memory: bool = False,
         shuffle_memory: bool = False,
+        memory_override=None,           # (memory, aux): SKIP the encoder, decode with this memory
+        shuffle_roll: int = 1,          # SHUF roll amount (in-batch InfoNCE sweeps r=1..B−1)
+        return_memory: bool = False,    # stash pre-roll memory+aux on the out dict
+        encoder_only: bool = False,     # build memory, return WITHOUT decoding (GradCache cut point)
     ) -> dict:
         """v1h composite-QA loss.
 
@@ -613,7 +693,9 @@ class ReprLearningModel(nn.Module):
         if getattr(self, "task_mode", None) == "masked_reconstruction":
             return self.compute_masked_reconstruction_loss(
                 batch, zero_memory=zero_memory, shuffle_memory=shuffle_memory,
-                mask_ratio=self.cfg.mae_mask_ratio)
+                mask_ratio=self.cfg.mae_mask_ratio,
+                memory_override=memory_override, shuffle_roll=shuffle_roll,
+                return_memory=return_memory, encoder_only=encoder_only)
         device = batch.context_ids.device
         B, T_ctx = batch.context_ids.shape
         T_q = batch.question_ids.shape[1]
@@ -626,45 +708,59 @@ class ReprLearningModel(nn.Module):
             ctx_embeds = embed(batch.context_ids)
             ctx_surprise = None   # was the plastic_baseline neuromod signal (retired)
 
-        # biomem/arrivalmem ingest the frozen LM's FINAL hidden (not raw embeds); others raw.
-        enc_input = self._encode_for_memory(ctx_embeds, batch.context_mask)
-        # biomem next-token SURPRISE (write-time conditioning); None for arms that don't want it.
-        surprise_full = (self._token_surprise(enc_input, getattr(batch, "context_ids", None),
-                                              batch.context_mask)
-                         if getattr(self.encoder, "wants_surprise", False) else None)
+        if memory_override is not None:
+            # objective-mode rolled read: SKIP the encoder entirely — decode with the given memory
+            # (the caller ran the encoder once; SHUF below rolls a COPY of the aux, never the caller's)
+            memory, finalize_aux = memory_override
+            finalize_aux = dict(finalize_aux)
+            n_windows = 0
+        else:
+            # biomem/arrivalmem ingest the frozen LM's FINAL hidden (not raw embeds); others raw.
+            enc_input = self._encode_for_memory(ctx_embeds, batch.context_mask)
+            # biomem next-token SURPRISE (write-time conditioning); None for arms that don't want it.
+            surprise_full = (self._token_surprise(enc_input, getattr(batch, "context_ids", None),
+                                                  batch.context_mask)
+                             if getattr(self.encoder, "wants_surprise", False) else None)
 
-        n_windows = (T_ctx + window_size - 1) // window_size
-        state = self.encoder.init_streaming_state(B, device, ctx_embeds.dtype)
-        # Activation-checkpoint each window during training so we hold ~one
-        # window of encoder activations instead of all n_windows at once (the
-        # chunk=8192 OOM for the windowed encoders flat/continuous/MT). Exact
-        # gradients; recompute in backward. Skipped under no_grad (eval).
-        ckpt_stream = (getattr(self.cfg, "grad_checkpoint_stream", True)
-                       and self.training and torch.is_grad_enabled())
-        del ctx_surprise   # retired surprise/contextualization plumbing
-        for w in range(n_windows):
-            s = w * window_size
-            e = min(s + window_size, T_ctx)
-            win_emb = enc_input[:, s:e, :]
-            win_mask = batch.context_mask[:, s:e]
-            win_sur = surprise_full[:, s:e] if surprise_full is not None else None
-            if ckpt_stream:
-                def _write(st, em, mk, su=win_sur, off=s):
-                    new_st, _ = self.encoder.streaming_write(st, em, mk, chunk_offset=off, surprise=su)
-                    return new_st
-                state = torch.utils.checkpoint.checkpoint(
-                    _write, state, win_emb, win_mask, use_reentrant=False)
-            else:
-                state, _ = self.encoder.streaming_write(
-                    state, win_emb, win_mask, chunk_offset=s, surprise=win_sur)
-        # Hand the question to the encoder (dict-state variants may read it;
-        # NullEncoder (Tensor state) and Mamba (list state) are non-dict — guard).
-        if isinstance(state, dict):
-            state["question_embeds"] = embed(batch.question_ids)
-            state["question_mask"] = batch.question_mask
-        memory, finalize_aux = self.encoder.finalize_memory(state)
+            n_windows = (T_ctx + window_size - 1) // window_size
+            state = self.encoder.init_streaming_state(B, device, ctx_embeds.dtype)
+            # Activation-checkpoint each window during training so we hold ~one
+            # window of encoder activations instead of all n_windows at once (the
+            # chunk=8192 OOM for the windowed encoders flat/continuous/MT). Exact
+            # gradients; recompute in backward. Skipped under no_grad (eval).
+            ckpt_stream = (getattr(self.cfg, "grad_checkpoint_stream", True)
+                           and self.training and torch.is_grad_enabled())
+            del ctx_surprise   # retired surprise/contextualization plumbing
+            for w in range(n_windows):
+                s = w * window_size
+                e = min(s + window_size, T_ctx)
+                win_emb = enc_input[:, s:e, :]
+                win_mask = batch.context_mask[:, s:e]
+                win_sur = surprise_full[:, s:e] if surprise_full is not None else None
+                if ckpt_stream:
+                    def _write(st, em, mk, su=win_sur, off=s):
+                        new_st, _ = self.encoder.streaming_write(st, em, mk, chunk_offset=off, surprise=su)
+                        return new_st
+                    state = torch.utils.checkpoint.checkpoint(
+                        _write, state, win_emb, win_mask, use_reentrant=False)
+                else:
+                    state, _ = self.encoder.streaming_write(
+                        state, win_emb, win_mask, chunk_offset=s, surprise=win_sur)
+            # Hand the question to the encoder (dict-state variants may read it;
+            # NullEncoder (Tensor state) and Mamba (list state) are non-dict — guard).
+            if isinstance(state, dict):
+                state["question_embeds"] = embed(batch.question_ids)
+                state["question_mask"] = batch.question_mask
+            memory, finalize_aux = self.encoder.finalize_memory(state)
         # memory: [B, M, d_llama] or [B, 0, d_llama] for MT/Vanilla/graph
         M = memory.shape[1]
+        # GradCache cut point / objective-mode stash: the pre-roll REAL memory
+        if encoder_only or return_memory:
+            _mem_ret = (memory, dict(finalize_aux))
+        if encoder_only:
+            z = torch.zeros((), device=device)
+            return {"loss": z, "loss_recon": z, "top1_acc": z, "memory_shape": (B, M),
+                    "_memory": _mem_ret[0], "_mem_aux": _mem_ret[1]}
 
         # graph_baseline now PREPENDS its E memory tokens like any compressor (finalize
         # returns [B,E,d_llama]); REAL/OFF/SHUF are handled by the shared prepend logic
@@ -714,13 +810,13 @@ class ReprLearningModel(nn.Module):
         # control gives zero signal). Require batched eval for a valid SHUF.
         if shuffle_memory and not zero_memory and M > 0:
             if B > 1:
-                memory = torch.roll(memory, shifts=1, dims=0)
+                memory = torch.roll(memory, shifts=int(shuffle_roll), dims=0)
                 # Roll the per-slot memory mask in lockstep (vanilla_full_context sets it):
                 # rolling memory but not its mask would pair row i's rolled memory with
                 # row i's ORIGINAL pad mask, contaminating the SHUF control.
                 _mm = finalize_aux.get("memory_mask")
                 if _mm is not None:
-                    finalize_aux["memory_mask"] = torch.roll(_mm, shifts=1, dims=0)
+                    finalize_aux["memory_mask"] = torch.roll(_mm, shifts=int(shuffle_roll), dims=0)
             else:
                 raise ValueError(
                     "shuffle_memory (SHUF control) needs batch size > 1; "
@@ -921,9 +1017,24 @@ class ReprLearningModel(nn.Module):
             # there is no autoregressive decode that reuses KV. Building the
             # cache adds a noticeable per-step cost (esp. for vanilla_full_ctx
             # where T_ctx ~= 8K).
+            _attn_qa = attn_mask_full.to(torch.long)
+            _rect_qa = (getattr(self.cfg, "rect_prepend_mask", False) and M > 0 and not zero_memory
+                        and self.chat_template is None)      # memory sits at [0:M) only without a chat scaffold
+            _bidir_qa = (getattr(self.cfg, "bidir_mem_attn", False) and M > 0 and not zero_memory
+                         and self.chat_template is None)
+            if _rect_qa and _bidir_qa:
+                raise ValueError("rect_prepend_mask and bidir_mem_attn are mutually exclusive read geometries")
+            if _rect_qa:
+                _attn_qa = self._rect_prepend_mask(_attn_qa, M, full_embeds.dtype)
+            elif _bidir_qa:
+                _attn_qa = self._bidir_prepend_mask(_attn_qa, M, full_embeds.dtype)
+            _pos_qa = (self._uniform_mem_position_ids(B, M, T_total, device)
+                       if (getattr(self.cfg, "uniform_mem_pos", False) and M > 0 and not zero_memory
+                           and self.chat_template is None) else None)
             base_out = self.decoder.llama.model(
                 inputs_embeds=full_embeds,
-                attention_mask=attn_mask_full.to(torch.long),
+                attention_mask=_attn_qa,
+                position_ids=_pos_qa,
                 use_cache=False,
             )
             hidden = base_out.last_hidden_state            # [B, T_total, d_llama]
@@ -956,20 +1067,20 @@ class ReprLearningModel(nn.Module):
                 sel_logits.float(), sel_targets, reduction="none",
             )                                              # [N_pred]
             loss_recon = per_token_nll_train.mean()
-            # Per-example CE for telemetry — detached to avoid extra grad path
-            per_example_loss = torch.zeros(B, device=device, dtype=loss_recon.dtype)
-            with torch.no_grad():
-                row_idx = pred_mask.nonzero(as_tuple=False)[:, 0]  # [N_pred]
-                per_token_nll = per_token_nll_train.detach()       # [N_pred]
-                row_sum = torch.zeros(B, device=device, dtype=per_token_nll.dtype)
-                row_cnt = torch.zeros(B, device=device, dtype=per_token_nll.dtype)
-                row_sum.scatter_add_(0, row_idx, per_token_nll)
-                row_cnt.scatter_add_(0, row_idx, torch.ones_like(per_token_nll))
-                per_example_loss = (row_sum / row_cnt.clamp_min(1)).to(loss_recon.dtype)
+            # Per-example CE (mean per-token NLL per row) WITH grad — the objective modes' InfoNCE
+            # logits are built from these across memory rolls; detached copy keeps telemetry unchanged.
+            row_idx = pred_mask.nonzero(as_tuple=False)[:, 0]      # [N_pred]
+            row_sum = torch.zeros(B, device=device, dtype=per_token_nll_train.dtype)
+            row_cnt = torch.zeros(B, device=device, dtype=per_token_nll_train.dtype)
+            row_sum = row_sum.scatter_add(0, row_idx, per_token_nll_train)
+            row_cnt = row_cnt.scatter_add(0, row_idx, torch.ones_like(per_token_nll_train))
+            loss_per_example = (row_sum / row_cnt.clamp_min(1)).to(loss_recon.dtype)   # [B] grad
+            per_example_loss = loss_per_example.detach()
         else:
             loss_recon = (memory.float().sum() * 0.0
                           + self.decoder.mask_embed.float().sum() * 0.0)
-            per_example_loss = torch.zeros(B, device=device, dtype=loss_recon.dtype)
+            loss_per_example = torch.zeros(B, device=device, dtype=loss_recon.dtype) + loss_recon * 0.0
+            per_example_loss = loss_per_example.detach()
 
         # ---- 6. Aux loss aggregation ----
         loss_aux = finalize_aux.get(
@@ -1096,9 +1207,12 @@ class ReprLearningModel(nn.Module):
             "n_content_positions": int(pred_mask.sum().item()),
             "top1_acc": top1_acc.detach(),
             "per_example_loss": per_example_loss,             # [B] for per-family aggregation
+            "loss_per_example": loss_per_example,             # [B] WITH grad (objective-mode InfoNCE logits)
             "per_example_em": per_example_em.detach(),        # [B] teacher-forced exact match (bAbI EM)
             "aux": finalize_aux,
         }
+        if return_memory:
+            out["_memory"], out["_mem_aux"] = _mem_ret
         if splat_telemetry is not None:
             out.update(splat_telemetry)
         if graph_telemetry is not None:

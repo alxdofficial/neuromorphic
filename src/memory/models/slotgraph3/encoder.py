@@ -154,30 +154,129 @@ class SlotGraph3Encoder(nn.Module):
         if self.edge_budget > 0 and not self.st_leak:
             raise ValueError("slotgraph3_edge_budget (global top-E) requires slotgraph3_st_leak "
                              "(the backward for non-materialized edges is the global ST leak)")
-        self.M = self.edge_budget if self.edge_budget > 0 else self.K * self.read_topk   # prepend budget
+        if self.edge_budget == 0 and not (1 <= self.read_topk <= self.K - 1):
+            raise ValueError(f"slotgraph3_read_topk must be in [1, K-1] (K={self.K}, got "
+                             f"{self.read_topk}; self-loops are masked so only K-1 dests exist)")
+        self.read_mode = str(getattr(cfg, "slotgraph3_read", "raw"))
+        self.boundary_tokens = bool(getattr(cfg, "slotgraph3_boundary_tokens", True))
+        n_edge_tok = self.edge_budget if self.edge_budget > 0 else self.K * self.read_topk
+        self.M = (n_edge_tok + (self.K if self.read_mode == "raw" else 0)   # raw: + K node-content tokens
+                  + (2 if self.boundary_tokens else 0))                     # + <mem_start>/<mem_end>
         self.force_identity_A = False                          # eval-only control: A := I (edges decorative)
+        if self.read_mode == "raw":
+            # fixed orthonormal HALF-dim ids: edge pointer = concat[id_src; id_dst] (TokenGT — ordered,
+            # direction-preserving); node token carries [id; id] (a node is potential src AND dst).
+            h = d // 2
+            if self.K > h:
+                raise ValueError(f"raw read needs K ≤ d/2 orthonormal half-ids (K={self.K}, d/2={h})")
+            idh = torch.empty(self.K, h); nn.init.orthogonal_(idh)
+            self.register_buffer("id_half", F.normalize(idh, dim=-1), persistent=True)
+            # concat-then-PROJECT token formation (TokenGT w_in; 2026-07-02 geometry batch):
+            # ONE shared linear over [content(d) ‖ id_a(h) ‖ id_b(h) ‖ type(h)] → d for node AND edge
+            # tokens — the id subspace lands in the SAME output directions for both, so attention can
+            # match an edge's endpoint ids against the node token by construction. Replaces the additive
+            # content+id·scale+role superposition (√3 norm-inflation → attention-sink; a FROZEN LM has
+            # no trained direction to unmix a sum — TokenGT/BERT train theirs in). The projection also
+            # rotates the block-structured concat onto the manifold the frozen attention reads.
+            self.type_embed = nn.Parameter(torch.empty(3, h))   # [node, edge-slot, edge-pointer]
+            nn.init.orthogonal_(self.type_embed)
+            with torch.no_grad():
+                self.type_embed.copy_(F.normalize(self.type_embed, dim=-1))
+            self.tok_proj = nn.Linear(d + 3 * h, d)
 
-        nid = torch.empty(self.K, d); nn.init.orthogonal_(nid)
-        self.node_id = nn.Parameter(F.normalize(nid, dim=-1))
-        self.role = nn.Parameter(torch.randn(3, d) / math.sqrt(d))   # [node-slot, edge-slot, edge-token]
+        if self.read_mode == "edges":
+            # LEGACY edges-mode identity system (raw mode uses id_half/type_embed/tok_proj instead —
+            # creating these unconditionally would be ~9K dead params polluting grad diagnostics).
+            nid = torch.empty(self.K, d); nn.init.orthogonal_(nid)
+            self.node_id = nn.Parameter(F.normalize(nid, dim=-1))
+            self.role = nn.Parameter(torch.randn(3, d) / math.sqrt(d))   # [node-slot, edge-slot, edge-token]
+            # id_scale ~ the LM EMBEDDING row-norm: the additive id tag must sit at the embedding scale
+            # (√d·unit-id ≈ 7-10× the embed norm → coordinate labels drown the content).
+            self.id_scale = nn.Parameter(torch.tensor(emb_norm))
         self.register_buffer("diag_mask", torch.eye(self.K) * -1e9, persistent=False)
-
-        # id_scale ~ the LM EMBEDDING row-norm: graph tokens ride the frozen LM as inputs_embeds, so the id tag
-        # must sit at the embedding scale. (NOT √d — that was slotgraph2's HIDDEN-scale constant; here latents
-        # are embed-scale, and √d·unit-id ≈ 7-10× the embed norm → the LM reads coordinate labels with content drowned.)
-        self.id_scale = nn.Parameter(torch.tensor(emb_norm))
         self.node_lat_init = nn.Parameter(mean_vec.view(1, d).repeat(self.K, 1) + emb_std * torch.randn(self.K, d))
         self.edge_lat_init = nn.Parameter(mean_vec.view(1, d).repeat(self.K, 1) + emb_std * torch.randn(self.K, d))
+        if self.boundary_tokens:
+            # learned <mem_start>/<mem_end> span markers, init ON the embedding distribution
+            # (mean + std·randn, same recipe as the latents) — every working frozen-LM injection
+            # marks its span with explicit tokens (Qwen vision_start/end, ICAE [AE]/[LM]).
+            self.boundary = nn.Parameter(mean_vec.view(1, d).repeat(2, 1) + emb_std * torch.randn(2, d))
         # routing = 2-layer MLPs (the wiring decision is the thesis crux → give it real capacity, not a bare bilinear)
         self.q_route = nn.Sequential(nn.Linear(d, d), nn.GELU(), nn.Linear(d, self.dk))   # source outgoing intent
         self.k_proj = nn.Sequential(nn.Linear(d, d), nn.GELU(), nn.Linear(d, self.dk))    # dest key (input-dependent)
-        self.phi = nn.Sequential(nn.Linear(3 * d, d), nn.GELU(), nn.Linear(d, d))   # (src,dst,edge) → edge content
-        # write heads: frozen-LM slot hiddens → ADDITIVE-residual latent delta (identity gradient highway)
+        if self.read_mode == "edges":                          # raw mode has NO content synthesizer (the
+            self.phi = nn.Sequential(nn.Linear(3 * d, d), nn.GELU(),               # φ/Q-Former lesson)
+                                     nn.Linear(d, d))          # (src,dst,edge) → edge content
+        # ── write-audit repairs (2026-07-03; research_graph_write_audit) ─────────────────
+        self.route_act = str(getattr(cfg, "slotgraph3_route_act", "softmax"))
+        self.init_noise = bool(getattr(cfg, "slotgraph3_init_noise", True))
+        self.write_norm_match = bool(getattr(cfg, "slotgraph3_write_norm_match", True))
+        self.write_bb = bool(getattr(cfg, "slotgraph3_write_boundary_bidir", True))
+        self.write_update = str(getattr(cfg, "slotgraph3_write_update", "delta"))
+        if self.init_noise:
+            # per-forward Gaussian sampling around the learned init (Slot Attention): breaks slot
+            # symmetry — identical deterministic slots + shared heads receive identical gradients
+            # and stay identical forever. σ learned per-dim, init = the measured embedding std.
+            self.node_lat_logsig = nn.Parameter(torch.full((d,), math.log(max(emb_std, 1e-4))))
+            self.edge_lat_logsig = nn.Parameter(torch.full((d,), math.log(max(emb_std, 1e-4))))
+        if self.write_norm_match:
+            # graph tokens are scaled to the TEXT stream's RMS at the insertion depth (learned
+            # scalar × dynamic match). Measured 400× mismatch at the last-4 splice (graph ~1.6 vs
+            # text ~641): attention/MLP outputs are calibrated to the local stream scale, so a
+            # quiet token's residual is swamped after one layer — slot identity erased in the write.
+            self.write_scale = nn.Parameter(torch.tensor(1.0))
+        # T3 edge write (2026-07-03): keyed delta-rule associative write into the persistent map
+        self.edge_write = str(getattr(cfg, "slotgraph3_edge_write", "assoc"))
+        if self.edge_write == "assoc":
+            if self.edge_state != "matrix":
+                raise ValueError("slotgraph3_edge_write='assoc' needs edge_state='matrix' "
+                                 "(the write files into the r×r map the read looks up)")
+            if self.write_update != "delta":
+                raise ValueError("slotgraph3_edge_write='assoc' needs write_update='delta' "
+                                 "(the filed value/gate come from the delta update path)")
+        # write heads: slot hiddens → candidate latent (delta mode: gated INTERPOLATION toward the
+        # candidate; additive mode: LEGACY scalar-gated residual delta). head_edge is skipped in
+        # assoc mode — the edge update is the keyed delta write, not a candidate interpolation.
         self.n_head = nn.LayerNorm(d)
         self.head_node = nn.Linear(d, d)
-        self.head_edge = nn.Linear(d, d)
-        self.beta_node = nn.Parameter(torch.tensor(-1.2))
-        self.beta_edge = nn.Parameter(torch.tensor(-1.2))
+        if self.edge_write != "assoc":
+            self.head_edge = nn.Linear(d, d)
+        if self.write_update == "additive":
+            # LEGACY scalar gates (additive mode only — dead params otherwise). Init +1.5 = write-
+            # OPEN: gates are biased toward the behavior that should be free (Jozefowicz +1 forget-
+            # init); the old −1.2 (gate 0.23) throttled the write 77% and NEVER moved over 4k steps.
+            self.beta_node = nn.Parameter(torch.tensor(1.5))
+            self.beta_edge = nn.Parameter(torch.tensor(1.5))
+        if self.write_update == "delta":
+            # competitive read (Slot Attention): queries = slot hiddens, keys/values = window text
+            # hiddens, softmax over the SLOT axis — slots COMPETE to claim each token (the anti-
+            # duplication mechanism); weighted-mean over tokens. comp_proj ZERO-init: step-0
+            # behavior = slot-hidden-only (zero-init Linear still receives gradient — ReZero-safe).
+            self.comp_q = nn.Linear(d, self.dk)
+            self.comp_k = nn.Linear(d, self.dk)
+            self.comp_v = nn.Linear(d, d)
+            self.comp_proj = nn.Linear(d, d)
+            nn.init.zeros_(self.comp_proj.weight); nn.init.zeros_(self.comp_proj.bias)
+            # per-slot CONTENT-dependent write gate (EntNet-style), bias +1.5 = write-open; weight
+            # zero-init so the gate starts uniform-open and LEARNS to differentiate by content.
+            self.gate_head = nn.Linear(d, 1)
+            nn.init.zeros_(self.gate_head.weight)
+            with torch.no_grad():
+                self.gate_head.bias.fill_(1.5)
+        if self.edge_write == "assoc":
+            # filed VALUE: edge-slot hidden → r-dim relation code (what the read's rel_up lifts back).
+            self.rel_val = nn.Linear(d, self.r)
+            # retention-biased per-slot DECAY: α init = 1/(2·n_windows) → half-life ≈ the full
+            # context (forget-gate wisdom inverted for a decay: bias toward RETAIN). n_windows is
+            # derived from the ACTUAL training context (cfg.ctx_len, set by the trainer) — a
+            # hardcoded 1024 would silently mis-scale the half-life under --mixed-ctx changes.
+            # Weight zero-init: starts uniform, learns content-dependence.
+            n_win = max(1, int(round(int(getattr(cfg, "ctx_len", 1024)) / max(1, self.window))))
+            a0 = 1.0 / (2.0 * n_win)
+            self.decay_head = nn.Linear(d, 1)
+            nn.init.zeros_(self.decay_head.weight)
+            with torch.no_grad():
+                self.decay_head.bias.fill_(math.log(a0 / (1.0 - a0)))
 
         self._trace = None                                     # set to [] to record per-window (node_lat, edge_lat) for grad-credit
         self.norm = _NormMatch(d)
@@ -193,10 +292,22 @@ class SlotGraph3Encoder(nn.Module):
                       f"position-free, zero-init residuals)")
         budget = (f"GLOBAL top-{self.edge_budget} edges" if self.edge_budget > 0
                   else f"top-{self.read_topk}/node = {self.M} tokens")
+        read_desc = (f"RAW read ({self.K} node-content tokens + pointer edges, concat-PROJECT "
+                     f"tok_proj([content‖id_src‖id_dst‖type])→d, no φ)"
+                     if self.read_mode == "raw" else "φ-edge read (LEGACY additive id-sum)")
+        if self.boundary_tokens:
+            read_desc += " + <mem_start>/<mem_end> boundary"
+        upd_desc = ("DELTA write (per-slot content gate b+1.5 · competitive slot-read · gated interpolation)"
+                    if self.write_update == "delta" else "ADDITIVE write (LEGACY scalar gate)")
+        if self.edge_write == "assoc":
+            upd_desc += f"; ASSOC edge write (keyed Δ-rule (v−M·k̂)⊗k̂ into persistent {self.r}×{self.r}, α₀={1.0/(2*max(1,round(1024/max(1,self.window)))):.3f})"
+        fixes = "+".join(s for s, on in (("initnoise", self.init_noise), ("splicescale", self.write_norm_match),
+                                         ("writeBB", self.write_bb)) if on)
         print(f"[slotgraph3] {self.K} nodes (2×{self.K} latents) @ d={d}; {writer} "
               f"({'+edges in context' if self.write_expand else 'slots-only, edges at READ only'}); "
-              f"route-by-{self.route_key}; expand→edges (sparsemax, {budget}"
-              f"{', ST leak' if self.st_leak else ''}); PREPEND read")
+              f"route-by-{self.route_key} ({self.route_act}); expand→edges ({budget}"
+              f"{', ST leak' if self.st_leak else ''}); {upd_desc}; [{fixes}]; "
+              f"{read_desc}; PREPEND ({self.M} tokens)")
 
     def train(self, mode: bool = True):
         super().train(mode)
@@ -218,14 +329,32 @@ class SlotGraph3Encoder(nn.Module):
     def _rel_input(self, er_src, dst_content):
         """φ's relation input for aligned [..., d] src-edge-state / dst-content tensors.
         flat: the shared per-source edge_lat (v1). matrix: per-PAIR retrieval — view the same d floats as
-        an r×r associative map and read it with the destination's key: rel(i→j) = M_i · rel_key(n_j)."""
+        an r×r associative map and read it with the destination's UNIT key: rel(i→j) = M_i · k̂(n_j).
+        The key is L2-normalized so the read address matches the assoc WRITE address exactly (T3:
+        the write files (v − M·k̂)⊗k̂ — with unit keys repeated writes drive M·k̂ → g/(g+α)·v, exact
+        overwrite in the g=1, α=0 limit; an unnormalized read key would rescale retrieval by ‖k‖
+        and break the write↔read pairing)."""
         if self.edge_state != "matrix":
             return er_src
         r = self.r
         Mi = er_src.reshape(*er_src.shape[:-1], r, r)
-        key = self.rel_key(dst_content)                                  # [..., r]
+        key = F.normalize(self.rel_key(dst_content), dim=-1)             # [..., r] unit address
         rel = torch.einsum("...ij,...j->...i", Mi, key)                  # [..., r] pair-specific code
         return self.rel_up(rel)
+
+    def _tok(self, content, id_a, id_b, type_idx, weight=None):
+        """Concat-then-project graph token (raw mode; TokenGT w_in): tok_proj([content ‖ id_a ‖ id_b ‖
+        type]) → d. ONE projection shared by node tokens ([lat ‖ id ‖ id ‖ node-type]) and edge tokens
+        ([rel ‖ id_src ‖ id_dst ‖ edge-type]) so the id subspace lands in the SAME output directions —
+        attention matches an edge's endpoint ids against node tokens by construction. `weight` (routing
+        strength) gates content+ids INSIDE the projection; the type block stays un-gated. Linearity ⇒
+        tok = w·proj([c‖ids‖0]) + proj([0‖0‖0‖type]) — the un-gated type term anchors the token so
+        NormMatch cannot erase the weight signal (same pattern as the old gate_ids anchor)."""
+        t = self.type_embed[type_idx].expand(*content.shape[:-1], -1)
+        if weight is not None:
+            w = weight.unsqueeze(-1)
+            content = w * content; id_a = w * id_a; id_b = w * id_b
+        return self.tok_proj(torch.cat([content, id_a, id_b, t], dim=-1))
 
     # ── expansion: compressed latents → content-addressed sparse wiring A → top-k explicit edge tokens ──
     def _route(self, key_lat):
@@ -235,7 +364,15 @@ class SlotGraph3Encoder(nn.Module):
         k = self.k_proj(key_lat)                                         # [B,K,dk] dest key (input-dependent)
         sc = torch.einsum("bik,bjk->bij", q, k) / math.sqrt(self.dk)     # [B,K,K]
         sc = sc + self.diag_mask.unsqueeze(0)                            # forbid self-loops
-        A = sparsemax(sc)                                                # sparse, per-source over dests
+        if self.route_act == "sparsemax":
+            A = sparsemax(sc)                                            # LEGACY: exact zeros — out-of-support
+        else:                                                            # dests get EXACTLY 0 gradient → the
+            if self.training:                                            # support only shrinks (dead ratchet).
+                # train-time Gumbel noise: parameter-free exploration ~ the logit scale at init;
+                # the learned q/k signal outgrows it (softmax is shift-invariant, mean offset moot)
+                u = torch.rand_like(sc).clamp_(1e-9, 1.0 - 1e-9)
+                sc = sc - torch.log(-torch.log(u))                       # + Gumbel(0,1)
+            A = torch.softmax(sc, dim=-1)
         if self.force_identity_A:
             A = torch.eye(self.K, device=A.device, dtype=A.dtype).unsqueeze(0).expand_as(A)
         return A
@@ -253,6 +390,13 @@ class SlotGraph3Encoder(nn.Module):
         dst = torch.gather(node_lat.unsqueeze(1).expand(B, K, K, d), 2,
                            topi.unsqueeze(-1).expand(B, K, k, d))        # dst content (node topi)
         er = self._rel_input(edge_lat.unsqueeze(2).expand(B, K, k, d), dst)   # source edge state (per-pair if matrix)
+        if self.read_mode == "raw":
+            # POINTER token (concat-project): [rel ‖ id_src ‖ id_dst ‖ edge-type] → d; ordered id slots
+            # (direction survives), routing weight gates content+ids inside the projection, no φ
+            h = d // 2
+            E = self._tok(er, self.id_half.view(1, K, 1, h).expand(B, K, k, h),
+                          self.id_half[topi], 2, weight=topv)
+            return E.reshape(B, K * k, d), (topv > 0).reshape(B, K * k), A, topv
         phi = self.phi(torch.cat([src, dst, er], dim=-1))               # [B,K,k,d]
         id_src = nid.unsqueeze(1).expand(K, k, d).unsqueeze(0)          # [1,K,k,d]
         id_dst = nid[topi]                                              # [B,K,k,d]
@@ -279,12 +423,17 @@ class SlotGraph3Encoder(nn.Module):
         src_f = node_lat.unsqueeze(2).expand(B, K, K, d)
         dst_f = node_lat.unsqueeze(1).expand(B, K, K, d)
         er_f = self._rel_input(edge_lat.unsqueeze(2).expand(B, K, K, d), dst_f)
-        phi_f = self.phi(torch.cat([src_f, dst_f, er_f], dim=-1))       # [B,K,K,d] — all candidate edges
-        lab_f = id_scale * (nid.view(1, K, 1, d) + nid.view(1, 1, K, d))
-        if self.gate_ids:
-            Tf = A.unsqueeze(-1) * (phi_f + lab_f) + role[2]
+        if self.read_mode == "raw":
+            h = d // 2
+            Tf = self._tok(er_f, self.id_half.view(1, K, 1, h).expand(B, K, K, h),
+                           self.id_half.view(1, 1, K, h).expand(B, K, K, h), 2, weight=A)
         else:
-            Tf = A.unsqueeze(-1) * phi_f + lab_f + role[2]
+            phi_f = self.phi(torch.cat([src_f, dst_f, er_f], dim=-1))   # [B,K,K,d] — all candidate edges
+            lab_f = id_scale * (nid.view(1, K, 1, d) + nid.view(1, 1, K, d))
+            if self.gate_ids:
+                Tf = A.unsqueeze(-1) * (phi_f + lab_f) + role[2]
+            else:
+                Tf = A.unsqueeze(-1) * phi_f + lab_f + role[2]
         topv, topi = A.topk(k, dim=-1)                                   # [B,K,k]
         H = torch.gather(Tf, 2, topi.unsqueeze(-1).expand(B, K, k, d))   # hard tokens (the forward)
         sel = torch.zeros_like(A, dtype=torch.bool).scatter_(2, topi, True)
@@ -302,6 +451,8 @@ class SlotGraph3Encoder(nn.Module):
         src = torch.gather(node_lat, 1, src_sel.unsqueeze(-1).expand(B, E, d))
         dst = torch.gather(node_lat, 1, dst_idx.unsqueeze(-1).expand(B, E, d))
         er = self._rel_input(torch.gather(edge_lat, 1, src_sel.unsqueeze(-1).expand(B, E, d)), dst)
+        if self.read_mode == "raw":
+            return self._tok(er, self.id_half[src_sel], self.id_half[dst_idx], 2, weight=A_blk)
         phi = self.phi(torch.cat([src, dst, er], dim=-1))
         lab = id_scale * (nid[src_sel] + nid[dst_idx])
         if self.gate_ids:
@@ -344,11 +495,16 @@ class SlotGraph3Encoder(nn.Module):
                 src_f = nl[:, c0:c1].unsqueeze(2).expand(B, C, K, d)
                 dst_f = nl.unsqueeze(1).expand(B, C, K, d)
                 er_f = self._rel_input(el[:, c0:c1].unsqueeze(2).expand(B, C, K, d), dst_f)
-                phi_f = self.phi(torch.cat([src_f, dst_f, er_f], dim=-1))
-                lab_f = id_scale * (nid[c0:c1].view(1, C, 1, d) + nid.view(1, 1, K, d))
                 Ab = Af[:, c0:c1]
-                Tf = Ab.unsqueeze(-1) * (phi_f + lab_f) + role[2] if self.gate_ids \
-                    else Ab.unsqueeze(-1) * phi_f + lab_f + role[2]
+                if self.read_mode == "raw":
+                    h = d // 2
+                    Tf = self._tok(er_f, self.id_half[c0:c1].view(1, C, 1, h).expand(B, C, K, h),
+                                   self.id_half.view(1, 1, K, h).expand(B, C, K, h), 2, weight=Ab)
+                else:
+                    phi_f = self.phi(torch.cat([src_f, dst_f, er_f], dim=-1))
+                    lab_f = id_scale * (nid[c0:c1].view(1, C, 1, d) + nid.view(1, 1, K, d))
+                    Tf = Ab.unsqueeze(-1) * (phi_f + lab_f) + role[2] if self.gate_ids \
+                        else Ab.unsqueeze(-1) * phi_f + lab_f + role[2]
                 return torch.einsum("bck,bckd->bd", wf[:, c0:c1], Tf)
 
             if self.training and torch.is_grad_enabled():
@@ -388,11 +544,20 @@ class SlotGraph3Encoder(nn.Module):
             cs_t = m.rotary_emb(h, pos_t)
             for lyr in m.layers[:split]:
                 h = lyr(h, attention_mask=mask_t, position_embeddings=cs_t, use_cache=False)
-        # ── suffix: [text hiddens ; graph tokens], causal + keep mask, grad + LoRA ──
+        # ── suffix: [text hiddens ; graph tokens], grad + LoRA. Graph tokens are scale-matched to
+        # the text stream (measured 400× quieter raw — identity swamped after one layer), and with
+        # write_bb the graph block attends to itself BIDIRECTIONALLY (matches the read geometry —
+        # under plain causal the expanded edges could never see the node slots at all). ──
+        if self.write_norm_match:
+            tnorm = ((h.float().norm(dim=-1) * wm).sum(1) / wm.sum(1).clamp_min(1)).detach()  # [B]
+            g_dir = graph_in / graph_in.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+            graph_in = g_dir * (tnorm.view(-1, 1, 1) * self.write_scale)
         h = torch.cat([h.detach(), graph_in.to(h.dtype)], dim=1)
         S = T + G
         keep = torch.cat([wm.bool(), keep_g], dim=1)
         causal = torch.tril(torch.ones(S, S, device=we.device, dtype=torch.bool))
+        if self.write_bb:
+            causal[T:, T:] = True                                        # graph block: full bidirectional
         allow = causal.unsqueeze(0) & keep.unsqueeze(1)
         allow = allow | torch.eye(S, device=we.device, dtype=torch.bool).unsqueeze(0)
         mask4 = torch.zeros(B, 1, S, S, device=we.device, dtype=we.dtype)
@@ -408,7 +573,8 @@ class SlotGraph3Encoder(nn.Module):
                 h = _ckpt.checkpoint(run_layer, h, lyr, use_reentrant=False)
             else:
                 h = run_layer(h, lyr)
-        return m.norm(h)
+        h = m.norm(h)
+        return h, h[:, :T]                                               # (full sequence, text hiddens)
 
     def _custom(self, graph, we, wm, keep_g, active):
         """Custom write mixer: (1) frozen LM contextualizes the window (NO grad, no LoRA) → last-layer hiddens
@@ -426,7 +592,7 @@ class SlotGraph3Encoder(nn.Module):
                 g = _ckpt.checkpoint(blk, g, ctx, keep, use_reentrant=False)
             else:
                 g = blk(g, ctx, keep)
-        return g
+        return g, ctx                                                    # (graph rows, frozen text hiddens)
 
     def finalize_memory(self, state):
         emb, mask = state["emb"], state["mask"]
@@ -435,9 +601,18 @@ class SlotGraph3Encoder(nn.Module):
             raise ValueError("slotgraph3.finalize_memory: empty context (T=0)")
         node_lat = self.node_lat_init.float().unsqueeze(0).expand(B, -1, -1).contiguous()
         edge_lat = self.edge_lat_init.float().unsqueeze(0).expand(B, -1, -1).contiguous()
-        nid = F.normalize(self.node_id.float(), dim=-1)
-        role = self.role.float(); id_scale = self.id_scale.float()
+        if self.init_noise and self.training:
+            # per-forward sampling around the learned init (Slot Attention symmetry breaking):
+            # deterministic identical slots + shared heads receive identical gradients forever.
+            node_lat = node_lat + self.node_lat_logsig.float().exp() * torch.randn_like(node_lat)
+            edge_lat = edge_lat + self.edge_lat_logsig.float().exp() * torch.randn_like(edge_lat)
+        if self.read_mode == "edges":
+            nid = F.normalize(self.node_id.float(), dim=-1)
+            role = self.role.float(); id_scale = self.id_scale.float()
+        else:                                                  # raw: identity lives in id_half/type_embed
+            nid = role = id_scale = None
         K = self.K
+        _assoc_alpha = _assoc_keycos = None                    # assoc-write telemetry (set per window)
         for w in range(0, T, self.window):
             wm = mask[:, w:w + self.window].bool()
             active = wm.any(dim=1)
@@ -445,29 +620,97 @@ class SlotGraph3Encoder(nn.Module):
                 continue
             we = emb[:, w:w + self.window]
             with torch.autocast("cuda", enabled=False):                 # graph tokenization in fp32
-                node_tok = node_lat + id_scale * nid.unsqueeze(0) + role[0]
-                edge_tok = edge_lat + id_scale * nid.unsqueeze(0) + role[1]
+                # raw mode: node/edge SLOTS use the SAME concat-projection + id basis as the pointer
+                # edge tokens and the read node tokens (TokenGT node = [X ‖ P ‖ P ‖ type]) so the write
+                # mixer shares ONE identity system across all graph tokens. edges mode (legacy): the
+                # additive full-d node_id + role superposition.
+                if self.read_mode == "raw":
+                    idh = self.id_half.unsqueeze(0).expand(B, -1, -1)
+                    node_tok = self._tok(node_lat, idh, idh, 0)
+                    edge_tok = self._tok(edge_lat, idh, idh, 1)
+                else:
+                    node_tok = node_lat + id_scale * nid.unsqueeze(0) + role[0]
+                    edge_tok = edge_lat + id_scale * nid.unsqueeze(0) + role[1]
                 if self.write_expand:
-                    E, keep_e, _, _ = self._expand_topk(node_lat, edge_lat, nid, id_scale, role)
+                    E, keep_e, A_w, _ = self._expand_topk(node_lat, edge_lat, nid, id_scale, role)
                     graph_in = torch.cat([E, node_tok, edge_tok], dim=1) # [B, Kk+2K, d] — slots LAST (see edges)
                     keep_g = torch.cat([keep_e, torch.ones(B, 2 * K, device=we.device, dtype=torch.bool)], dim=1)
                 else:                                                    # write over [window; slots] only;
+                    A_w = None                                           # (assoc write recomputes the wiring)
                     graph_in = torch.cat([node_tok, edge_tok], dim=1)    # graph expanded for the READ only
                     keep_g = torch.ones(B, 2 * K, device=we.device, dtype=torch.bool)
+                if self.write_bb and self.boundary_tokens:
+                    # dialect harmonization: mark the text|graph span start in the WRITE too
+                    bs = self.boundary[0].float().view(1, 1, -1).expand(B, 1, -1)
+                    graph_in = torch.cat([bs, graph_in], dim=1)          # slots stay LAST (update read-out)
+                    keep_g = torch.cat([torch.ones(B, 1, device=we.device, dtype=torch.bool), keep_g], dim=1)
             if self.write_mode == "lm" and self.write_layers > 0:        # last-N-layers suffix splice
-                H = self._lm_suffix(we, wm, graph_in, keep_g, active)
+                H, th = self._lm_suffix(we, wm, graph_in, keep_g, active)
             elif self.write_mode == "lm":                                # joint [window; graph] full-ride
+                if self.write_norm_match:                                # here graph joins at the EMBED scale
+                    tn = ((we.float().norm(dim=-1) * wm).sum(1) / wm.sum(1).clamp_min(1)).detach()
+                    graph_in = (graph_in / graph_in.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+                                ) * (tn.view(-1, 1, 1) * self.write_scale)
                 seq = torch.cat([we, graph_in.to(we.dtype)], dim=1)
                 keep = torch.cat([wm, keep_g], dim=1)
                 H = self._lm(seq, keep.long())                           # frozen LM (+LoRA) does the mixing
+                th = H[:, :we.shape[1]]
             else:                                                        # frozen encode → custom graph mixer
-                H = self._custom(graph_in.to(we.dtype), we, wm, keep_g, active)
+                H, th = self._custom(graph_in.to(we.dtype), we, wm, keep_g, active)
             with torch.autocast("cuda", enabled=False):
                 slots = H[:, -2 * K:].float()                            # node-slot + edge-slot hiddens
                 nl0, el0 = node_lat, edge_lat
-                gh = self.n_head(slots); gn, ge = gh[:, :K], gh[:, K:]
-                node_lat = node_lat + torch.sigmoid(self.beta_node) * self.head_node(gn)   # additive highway
-                edge_lat = edge_lat + torch.sigmoid(self.beta_edge) * self.head_edge(ge)
+                if self.write_update == "delta":
+                    # competitive read: slots COMPETE (softmax over the SLOT axis) to claim each window
+                    # token — Slot Attention's anti-duplication mechanism; weighted-mean over tokens.
+                    th_f = th.float()
+                    qs = self.comp_q(slots)                              # [B,2K,dk]
+                    ks = self.comp_k(th_f); vs = self.comp_v(th_f)       # [B,Tw,·]
+                    attn_sl = torch.softmax(torch.einsum("bsd,btd->bst", qs, ks) / math.sqrt(self.dk), dim=1)
+                    attn_sl = attn_sl * wm.unsqueeze(1).float()          # kill pad tokens
+                    wgt = attn_sl / attn_sl.sum(-1, keepdim=True).clamp_min(1e-6)
+                    comp = torch.einsum("bst,btd->bsd", wgt, vs)         # [B,2K,d] per-slot claimed content
+                    gh = self.n_head(slots + self.comp_proj(comp))       # comp_proj zero-init: step-0 = slots-only
+                    g_wr = torch.sigmoid(self.gate_head(gh))             # [B,2K,1] per-slot CONTENT gate (b=+1.5)
+                    cand_n = self.head_node(gh[:, :K])
+                    node_lat = node_lat + g_wr[:, :K] * (cand_n - node_lat)   # gated INTERPOLATION: repeated
+                    if self.edge_write == "assoc":                       # same-content writes CONVERGE
+                        # T3 keyed delta-rule write: file this window's relation UNDER THE PARTNER
+                        # ADDRESS the routing actually selected — the same unit key the read uses.
+                        #   M_i ← (1−α)·M_i + g_i·(v − M_i·k̂)⊗k̂
+                        # outer product = write into k̂'s slice only (no smear across the 576 dims);
+                        # (v − retrieved) = overwrite what that address held (update, don't average);
+                        # M_i persists across windows = state NOT derivable from node content.
+                        if A_w is None:                                  # write_expand=False: wiring not built
+                            A_w = self._route(nl0 if self.route_key == "node" else el0)
+                        kdst = F.normalize(self.rel_key(nl0), dim=-1)    # [B,K,r] partner unit keys (= read's)
+                        v_rel = self.rel_val(gh[:, K:])                  # [B,K,r] the filed relation code
+                        Mi = el0.reshape(B, K, self.r, self.r)
+                        # PER-DESTINATION keyed delta writes: file under EVERY partner address the read
+                        # will query, weighted by the window's wiring (Σ_n A=1 bounds total write mass).
+                        # A single mixture address would mismatch the read: reads query each k̂_n
+                        # individually, so diffuse routing would file facts nobody looks up. [review fix]
+                        #   corr_i = Σ_n A[i,n]·(v_i − M_i·k̂_n) ⊗ k̂_n
+                        # Under repeated writes at a fixed address, retrieval converges to g/(g+α)·v
+                        # (≈0.87·v at init; EXACT overwrite in the g=1, α=0 limit) — the delta form's
+                        # fixed point is v-bounded where an additive write grows without bound.
+                        retr = torch.einsum("birs,bns->binr", Mi, kdst)  # [B,K(i),K(n),r] filed@every addr
+                        alpha = torch.sigmoid(self.decay_head(gh[:, K:]))          # [B,K,1] retention-biased
+                        err = v_rel.unsqueeze(2) - retr                  # [B,K,K,r] correction per address
+                        corr = torch.einsum("bin,binr,bns->birs", A_w, err, kdst)
+                        Mi = Mi * (1.0 - alpha).unsqueeze(-1) + g_wr[:, K:].unsqueeze(-1) * corr
+                        edge_lat = Mi.reshape(B, K, d)
+                        _assoc_alpha = float(alpha.mean())               # telemetry (last window's values)
+                        kk = kdst @ kdst.transpose(1, 2)
+                        _koff = ~torch.eye(K, dtype=torch.bool, device=kk.device)
+                        _assoc_keycos = float(kk[:, _koff].mean())       # address distinctness (↓ = distinct)
+                    else:                                                # LEGACY slot interpolation
+                        cand_e = self.head_edge(gh[:, K:])
+                        edge_lat = edge_lat + g_wr[:, K:] * (cand_e - edge_lat)
+                else:                                                    # LEGACY additive highway
+                    gh = self.n_head(slots); gn, ge = gh[:, :K], gh[:, K:]
+                    node_lat = node_lat + torch.sigmoid(self.beta_node) * self.head_node(gn)
+                    edge_lat = edge_lat + torch.sigmoid(self.beta_edge) * self.head_edge(ge)
                 if not bool(active.all()):                               # freeze rows idle this window
                     a = active[:, None, None]
                     node_lat = torch.where(a, node_lat, nl0)
@@ -477,18 +720,105 @@ class SlotGraph3Encoder(nn.Module):
                     self._trace.append((w // self.window, node_lat, edge_lat))
         with torch.autocast("cuda", enabled=False):
             E, keep_read, A, topv = self._expand_topk(node_lat, edge_lat, nid, id_scale, role)
-            memory = self.norm(E)                                        # [B, K·topk, d] prepend tokens
+            if self.read_mode == "raw":
+                # RAW read: node latents themselves are the content tokens (pretrained-space reps, direct
+                # decoder→latent gradient, no φ bottleneck); E are pointer tokens. Same [id ‖ id] slots as
+                # the pointer edges' [id_src ‖ id_dst] so the decoder matches them by inner product.
+                idh = self.id_half.unsqueeze(0).expand(B, -1, -1)
+                node_read = self._tok(node_lat, idh, idh, 0)
+                E = torch.cat([node_read, E], dim=1)
+                keep_read = torch.cat([torch.ones(B, self.K, dtype=torch.bool, device=E.device),
+                                       keep_read], dim=1)
+            memory = self.norm(E)                                        # [B, M_content, d] prepend tokens
+            if self.boundary_tokens:
+                # learned on-manifold <mem_start>/<mem_end> wrap the span; canaries stay on content rows
+                bnd = self.norm(self.boundary.float()).unsqueeze(0).expand(B, -1, -1)
+                memory_full = torch.cat([bnd[:, :1], memory, bnd[:, 1:]], dim=1)
+            else:
+                memory_full = memory
         aux = self._canaries(memory, node_lat, edge_lat, A, topv, emb.device)
         # mask out topv==0 edge tokens (arise once sparsemax support < read_topk) — else they'd be prepended
         # as full-norm, content-free, arbitrary-destination distractors. Matches the WRITE keep-mask.
-        aux["memory_mask"] = keep_read                                   # [B, K·topk] bool; consumed by model.py prepend/SHUF
-        return memory, aux
+        if self.boundary_tokens:
+            ones = torch.ones(B, 1, dtype=torch.bool, device=memory.device)
+            keep_read = torch.cat([ones, keep_read, ones], dim=1)
+        aux["memory_mask"] = keep_read                                   # [B, M] bool; consumed by model.py prepend/SHUF
+        aux["latents"] = (node_lat, edge_lat)                            # trajectory-mode rollout sampling reads these
+        if self.edge_write == "assoc" and _assoc_alpha is not None:
+            aux["slotgraph3_edge_alpha"] = _assoc_alpha                  # mean decay (retention health)
+            aux["slotgraph3_edge_keycos"] = _assoc_keycos                # write-address diversity (↓ distinct)
+        return memory_full, aux
 
     def forward(self, token_embeds, attention_mask=None, mask_positions=None):
         del mask_positions
         st = self.init_streaming_state(token_embeds.shape[0], token_embeds.device, token_embeds.dtype)
         st, _ = self.streaming_write(st, token_embeds, attention_mask)
         return self.finalize_memory(st)
+
+    def sample_read_expansion(self, node_lat, edge_lat, n_samples):
+        """TRAJECTORY-mode rollouts: sample G read expansions from the routing distribution.
+
+        The discrete read choice (which k dests each source wires to) has no honest gradient —
+        sparsemax+top-k is a biased relaxation and routing_diversity stays pinned (the argmax-starved
+        router). REINFORCE needs SAMPLES: perturb the routing logits with Gumbel noise and take top-k
+        per source (Gumbel-top-k = sampling k without replacement from the Plackett-Luce induced by
+        softmax(sc)). Sampled-edge weights use softmax probs (always >0; sparsemax would zero
+        off-support samples into content-free tokens) — internally consistent across the group, which
+        is all the group-relative advantage needs.
+
+        Returns ([(memory, keep_mask, logprob[B])] × G, router_entropy). logprob = the EXACT
+        Plackett-Luce log-probability of the without-replacement sample: Σ_sources Σ_picks
+        [sc(chosen_r) − logsumexp(sc over the REMAINING set at pick r)]. (2026-07-03 audit fix:
+        the independent-softmax surrogate is NOT the sample's log-prob — the group baseline
+        cancels the common −k·logZ but NOT the sample-dependent remaining-set renormalization,
+        which at k/K≈½ is large and biases the gradient TOWARD hub concentration, the exact
+        pathology being fought. Gumbel-top-k = a partial PL ranking and topk returns picks in
+        PL order — Kool et al. 2019.) router_entropy = mean per-source softmax entropy, grad-
+        capable — the caller's entropy bonus fights collapse (Gumbel noise alone stops exploring
+        once logits sharpen). GRADIENT: logprob/entropy flow to the ROUTER (q_route/k_proj)
+        ONLY — pass latents DETACHED; memories are built under no_grad (scored, not backpropped).
+        """
+        if self.read_mode != "raw":
+            raise ValueError("trajectory sampling is implemented for the raw read")
+        if self.edge_budget != 0:
+            raise ValueError("trajectory sampling uses per-node top-k (set edge_budget=0)")
+        B, K, d = node_lat.shape
+        k = self.read_topk; h = d // 2
+        node_lat = node_lat.float(); edge_lat = edge_lat.float()
+        key_lat = node_lat if self.route_key == "node" else edge_lat
+        q = self.q_route(key_lat); kk = self.k_proj(key_lat)
+        sc = torch.einsum("bik,bjk->bij", q, kk) / math.sqrt(self.dk) + self.diag_mask.unsqueeze(0)
+        p_route = torch.softmax(sc, dim=-1)                              # [B,K,K]
+        entropy = -(p_route.clamp_min(1e-9).log() * p_route).sum(-1).mean()   # grad → router
+        out = []
+        for _ in range(int(n_samples)):
+            u = torch.rand_like(sc).clamp_(1e-9, 1.0 - 1e-9)
+            gumbel = -torch.log(-torch.log(u))
+            topi = (sc.detach() + gumbel).topk(k, dim=-1).indices        # [B,K,k] picks in PL order
+            # exact Plackett-Luce log-prob: per pick, normalize over the REMAINING candidates
+            remain = torch.zeros_like(sc)                                # additive -inf mask of used picks
+            logp = torch.zeros(sc.shape[0], device=sc.device)
+            for rpick in range(k):
+                j_r = topi[..., rpick:rpick + 1]                         # [B,K,1]
+                lse = torch.logsumexp(sc + remain, dim=-1)               # [B,K] remaining-set normalizer
+                logp = logp + (sc.gather(-1, j_r).squeeze(-1) - lse).sum(dim=-1)
+                remain = remain.scatter(-1, j_r, float("-inf"))          # remove the pick
+            with torch.no_grad():
+                w = torch.softmax(sc, dim=-1).gather(-1, topi)           # [B,K,k] sampled-edge weights
+                dst = torch.gather(node_lat.unsqueeze(1).expand(B, K, K, d), 2,
+                                   topi.unsqueeze(-1).expand(B, K, k, d))
+                er = self._rel_input(edge_lat.unsqueeze(2).expand(B, K, k, d), dst)
+                E = self._tok(er, self.id_half.view(1, K, 1, h).expand(B, K, k, h),
+                              self.id_half[topi], 2, weight=w).reshape(B, K * k, d)
+                idh = self.id_half.unsqueeze(0).expand(B, -1, -1)
+                node_read = self._tok(node_lat, idh, idh, 0)
+                mem = self.norm(torch.cat([node_read, E], dim=1))
+                if self.boundary_tokens:
+                    bnd = self.norm(self.boundary.float()).unsqueeze(0).expand(B, -1, -1)
+                    mem = torch.cat([bnd[:, :1], mem, bnd[:, 1:]], dim=1)
+                keep = torch.ones(B, mem.shape[1], dtype=torch.bool, device=mem.device)
+            out.append((mem, keep, logp))
+        return out, entropy
 
     @torch.no_grad()
     def _canaries(self, memory, node_lat, edge_lat, A, topv, device):
@@ -504,8 +834,10 @@ class SlotGraph3Encoder(nn.Module):
                "slotgraph3_edge_effrank": torch.tensor(_participation_ratio(edge_lat.reshape(-1, self.d)), device=device),
                "slotgraph3_node_cos": torch.tensor(_within_cos(node_lat), device=device),
                "slotgraph3_edge_cos": torch.tensor(_within_cos(edge_lat), device=device)}
-        supp = (A > 0).float()
-        aux["slotgraph3_edges_per_node"] = supp.sum(-1).mean()          # sparsemax support (↓ = sharper wiring)
+        # support = mass above uniform (softmax A is dense — (A>0) would read K always; this
+        # threshold reduces to the old sparsemax support when A is sparse)
+        supp = (A > 1.0 / self.K).float()
+        aux["slotgraph3_edges_per_node"] = supp.sum(-1).mean()          # effective support (↓ = sharper wiring)
         if topv.dim() == 2:                                             # global edge budget: [B,E] → captured FRACTION
             aux["slotgraph3_topk_mass"] = (topv.sum(-1) / A.sum((-1, -2)).clamp_min(1e-9)).mean()
         else:

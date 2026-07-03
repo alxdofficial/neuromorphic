@@ -991,6 +991,171 @@ def train_one_variant(
     return summary
 
 
+def _infonce_logits_weights(S, coef, inv_temp=1.0, valid=None):
+    """Row-standardized InfoNCE over the memory-roll score matrix + the analytic dL/dS.
+
+    S[r, i] = CE(target_i | memory_{i−r}); roll 0 = the positive. 2026-07-03 math audit:
+    (a) RAW mean-NLL margins are O(0.1–0.3) — at τ=1 over B=8 the softmax is nearly uniform
+        (p_pos≈0.16 vs chance 0.125) → dead gradient. Fix: per-example STANDARDIZATION over
+        rolls (detached μ_i, σ_i — the stats are normalizers, not optimization targets), then
+        a tunable inverse temperature. z[r,i] = −(S[r,i] − μ_i)/σ_i · inv_temp.
+    (b) valid[r,i]=False excludes FALSE NEGATIVES from example i's denominator (bAbI batch
+        mates sharing the gold answer legitimately explain each other's targets — penalizing
+        them teaches the encoder to make same-answer memories dissimilar, corrupting binding;
+        SupCon same-label-is-not-a-negative rule). Masked entries get z=−inf ⇒ p=0 ⇒ W=0.
+    Returns (nce, W, p) with W[r,i] = δ_{r,0}/B + coef·(δ_{r,0} − p[r,i])·inv_temp/(σ_i·B) —
+    the exact gradient of  mean_i S[0,i] + coef·nce  wrt S under detached stats.
+    """
+    B = S.shape[0]
+    if valid is not None:
+        # standardization stats over VALID entries only (review fix): a masked same-answer false
+        # negative has legitimately LOW CE — including it would drag μ down and inflate σ,
+        # distorting the gradient scale of the entries that remain in the softmax.
+        v = valid.float()
+        n = v.sum(dim=0, keepdim=True).clamp_min(2.0)
+        mu = (S * v).sum(dim=0, keepdim=True) / n
+        sd = (((S - mu) ** 2 * v).sum(dim=0, keepdim=True) / (n - 1.0)).sqrt().clamp_min(1e-4)
+    else:
+        mu = S.mean(dim=0, keepdim=True)
+        sd = S.std(dim=0, keepdim=True).clamp_min(1e-4)
+    z = -(S - mu) / sd * float(inv_temp)
+    if valid is not None:
+        z = z.masked_fill(~valid, float("-inf"))
+    logp = torch.log_softmax(z, dim=0)
+    nce = -logp[0].mean()
+    p = logp.exp()
+    delta = torch.zeros_like(S)
+    delta[0] = 1.0
+    W = delta / B + coef * (delta - p) * (float(inv_temp) / sd) / B
+    return nce, W, p
+
+
+def _same_answer_valid_mask(batch, B, device):
+    """[B_roll, B_ex] bool: False where roll r pairs example i with a memory whose gold answer
+    equals example i's (a false negative — bAbI's tiny answer vocabulary makes these common).
+    None for batches without answers (MAE/continuation passages: false-negative risk ~nil)."""
+    a_ids = getattr(batch, "answer_ids", None)
+    a_cm = getattr(batch, "answer_content_mask", None)
+    if a_ids is None or a_cm is None:
+        return None
+    a_norm = a_ids.masked_fill(~a_cm.bool(), -1)
+    eq = (a_norm.unsqueeze(0) == a_norm.unsqueeze(1)).all(-1)            # [B,B] same-answer
+    idx = torch.arange(B, device=device)
+    j_of = (idx.view(1, B) - idx.view(B, 1)) % B                         # [r,i] → memory's example j
+    valid = ~eq[idx.view(1, B).expand(B, B), j_of]
+    valid[0] = True                                                      # the positive always counts
+    return valid
+
+
+def _grad_cached_objective_step(model, batch, cfg, window_size):
+    """contrastive/trajectory objective step (train_mixed_variant — the trainer that actually
+    runs mixed; the 2026-07-02 lesson: the legacy coef lived only in train_one_variant and was
+    silently ignored here).
+
+    In-batch InfoNCE with a GradCache-style cut at the memory tensor, so peak activations stay
+    at ONE decoder branch + one encoder graph (B+1 live decoder graphs would OOM at BS8):
+      pass 0: encoder ONCE (graph kept; decode skipped).
+      pass 1 (no_grad): decode the B memory rolls → S[r,i] = CE(target_i | memory_{i−r});
+              roll 0 = REAL. InfoNCE = CE over logits −S per example (positive = roll 0).
+      pass 2 (grad, one roll at a time): recompute roll r, backward(Σ_i W[r,i]·CE_r[i]) with
+              W = the ANALYTIC d(CE_real + coef·InfoNCE)/dS — decoder-side grads accumulate
+              directly, memory grads accumulate on a detached leaf; each branch is freed
+              before the next (passes 1/2 share RNG → identical masks → identical S).
+      pass 3: memory.backward(gradient=leaf.grad) — encoder backward ONCE.
+    trajectory mode adds GRPO on the discrete read: G Gumbel-top-k sampled expansions,
+    reward = per-example binding advantage (CE_shuf − CE_shuf-free real, no-grad reads),
+    group-relative advantage × logprob REINFORCE on the ROUTER only (hybrid estimator).
+
+    BACKWARD RUNS INSIDE — the caller must NOT call loss.backward(). Returns
+    (out_real, total_loss_detached, extras_for_the_train_row)."""
+    F = torch.nn.functional
+    _rng = torch.cuda.get_rng_state()
+    B = batch.context_ids.shape[0]
+    coef = float(getattr(cfg, "objective_coef", 0.5))
+    # ── pass 0: encoder only, keep the graph ──
+    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+        enc_out = model.compute_loss(batch, window_size=window_size, encoder_only=True)
+    mem, aux = enc_out["_memory"], enc_out["_mem_aux"]
+    mem_leaf = mem.detach().requires_grad_(True)
+    # ── pass 1: no-grad score matrix S[r, i] ──
+    S_rows = []
+    with torch.no_grad():
+        for r in range(B):
+            torch.cuda.set_rng_state(_rng)
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                o = model.compute_loss(batch, window_size=window_size,
+                                       memory_override=(mem_leaf, aux),
+                                       shuffle_memory=(r > 0), shuffle_roll=r)
+            S_rows.append(o["loss_per_example"].float())
+    S = torch.stack(S_rows, dim=0)                     # [B_roll, B_ex]
+    # NOTE: obj_ce_real is the ROW-mean (each example weighted equally) — the plain mode's
+    # loss_recon is the TOKEN-mean; both are logged (train_row carries out_real's token-mean
+    # loss_recon), so cross-mode comparisons should use loss_recon, not obj_ce_real.
+    ce_real = S[0].mean()
+    with torch.no_grad():
+        valid = _same_answer_valid_mask(batch, B, S.device)
+        nce, W, _p = _infonce_logits_weights(
+            S, coef, inv_temp=float(getattr(cfg, "objective_inv_temp", 1.0)), valid=valid)
+    # ── pass 2: grad, one roll at a time (surrogate = Σ W·CE reproduces the exact gradient) ──
+    out_real = None
+    for r in range(B):
+        torch.cuda.set_rng_state(_rng)
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            o = model.compute_loss(batch, window_size=window_size,
+                                   memory_override=(mem_leaf, aux),
+                                   shuffle_memory=(r > 0), shuffle_roll=r)
+        (W[r].to(o["loss_per_example"].dtype) * o["loss_per_example"]).sum().backward()
+        if r == 0:
+            out_real = {k: v for k, v in o.items() if not torch.is_tensor(v) or not v.requires_grad}
+    # ── pass 3: encoder backward once, through the accumulated memory gradient ──
+    if mem_leaf.grad is not None:
+        mem.backward(gradient=mem_leaf.grad.to(mem.dtype))
+    extras = {"obj_nce": float(nce), "obj_ce_real": float(ce_real)}
+    # ── trajectory: GRPO on the discrete read expansion (router-only REINFORCE) ──
+    if str(getattr(cfg, "objective_mode", "plain")) == "trajectory":
+        lat = aux.get("latents")
+        if lat is None or not hasattr(model.encoder, "sample_read_expansion"):
+            raise ValueError("objective_mode=trajectory needs a slotgraph3 encoder "
+                             "(finalize aux['latents'] + sample_read_expansion)")
+        nl, el = lat
+        rollouts, route_H = model.encoder.sample_read_expansion(
+            nl.detach(), el.detach(), int(getattr(cfg, "grpo_samples", 4)))
+        rewards, logps = [], []
+        for mem_g, keep_g, logp_g in rollouts:
+            aux_g = {"memory_mask": keep_g}
+            with torch.no_grad():
+                torch.cuda.set_rng_state(_rng)
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    o_real = model.compute_loss(batch, window_size=window_size,
+                                                memory_override=(mem_g, aux_g))
+            # reward = −CE_real (2026-07-03 audit: the old CE_shuf−CE_real reward had an
+            # UNBOUNDED poison lever — raise CE_shuf instead of lowering CE_real; the group
+            # baseline already strips per-example difficulty, so the shuf term was redundant
+            # for its purpose. Also halves the reward reads.)
+            rewards.append((-o_real["loss_per_example"]).float())
+            logps.append(logp_g)
+        R = torch.stack(rewards, dim=0)                # [G, B] −CE_real per rollout
+        adv = R - R.mean(dim=0, keepdim=True)          # group baseline = (G−1)/G × RLOO (unbiased dir)
+        # per-DECISION scale: logp sums K×topk ≈ 128 PL terms (summing is the correct joint
+        # log-prob — per-sample averaging would be the Dr.GRPO length bias; dividing by a
+        # CONSTANT is a pure coefficient, direction-identical) so grpo_coef=1.0 stays sane.
+        n_dec = max(1, model.encoder.K * model.encoder.read_topk)
+        pol = -(adv.detach() * torch.stack(logps, dim=0)).mean() / n_dec
+        # entropy BONUS on the router distribution — THE load-bearing regularizer for policy
+        # gradients on latent structure (entropy collapse = the documented GRPO failure mode;
+        # Gumbel noise alone stops exploring once logits sharpen).
+        ent_coef = float(getattr(cfg, "grpo_entropy_coef", 0.01))
+        (float(getattr(cfg, "grpo_coef", 1.0)) * pol - ent_coef * route_H).backward()
+        extras["obj_grpo_policy"] = float(pol)
+        extras["obj_grpo_reward"] = float(R.mean())
+        extras["obj_grpo_reward_std"] = float(R.std())
+        extras["obj_route_entropy"] = float(route_H)
+    total = float(ce_real) + coef * float(nce)
+    out_real["loss"] = torch.tensor(total, device=S.device)        # detached (backward already done)
+    out_real["loss_recon"] = ce_real
+    return out_real, out_real["loss"], extras
+
+
 def train_mixed_variant(
     variant: str, llama, tokenizer, cfg: ReprConfig,
     n_steps: int, log_every: int, val_every: int, save_every: int,
@@ -1095,6 +1260,15 @@ def train_mixed_variant(
             iters[t] = iter(train_dls[t])
             return next(iters[t])
 
+    _mode_banner = str(getattr(cfg, "objective_mode", "plain"))
+    if _mode_banner != "plain" or float(getattr(cfg, "contrastive_shuf_coef", 0.0)) > 0:
+        print(f"[objective] mode={_mode_banner}"
+              + (f"  InfoNCE coef={cfg.objective_coef} ({'in-batch, all B-1 negatives'})" if _mode_banner != 'plain' else "")
+              + (f"  GRPO G={cfg.grpo_samples} coef={cfg.grpo_coef} (router-only REINFORCE)"
+                 if _mode_banner == "trajectory" else "")
+              + (f"  legacy softplus coef={cfg.contrastive_shuf_coef}"
+                 if float(getattr(cfg, 'contrastive_shuf_coef', 0.0)) > 0 else ""),
+              flush=True)
     rotation = []   # diagnostic: the realized task sequence (capped for the smoke print)
     for step in range(start_step, n_steps):
         task = mixed_tasks[step % len(mixed_tasks)]   # equal round-robin
@@ -1109,9 +1283,33 @@ def train_mixed_variant(
 
         batch = to_device(batch, device)
         opt.zero_grad(set_to_none=True)
-        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            out = model.compute_loss(batch, window_size=window_size)
-        loss = out["loss"]
+        _mode = str(getattr(cfg, "objective_mode", "plain"))
+        _legacy_coef = float(getattr(cfg, "contrastive_shuf_coef", 0.0))
+        _obj_extras = {}
+        if _mode in ("contrastive", "trajectory"):
+            # in-batch InfoNCE (+GRPO): backward runs INSIDE (GradCache memory cut) — no
+            # loss.backward() below. Loud by construction: obj_nce is logged every step.
+            out, loss, _obj_extras = _grad_cached_objective_step(model, batch, cfg, window_size)
+            _needs_backward = False
+        elif _legacy_coef > 0:
+            # legacy 1-negative softplus hinge — NOW SUPPORTED HERE (2026-07-02: this trainer
+            # used to silently IGNORE the coef; the "sg3_contrast turning point" never ran).
+            # REAL and SHUF share the mask via RNG restore (mask-difficulty noise cancels).
+            _rng = torch.cuda.get_rng_state()
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                out = model.compute_loss(batch, window_size=window_size)
+            torch.cuda.set_rng_state(_rng)
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                out_shuf = model.compute_loss(batch, window_size=window_size, shuffle_memory=True)
+            contrast = torch.nn.functional.softplus(out["loss"] - out_shuf["loss"])
+            loss = out["loss"] + _legacy_coef * contrast
+            _obj_extras = {"obj_softplus": float(contrast)}
+            _needs_backward = True
+        else:
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                out = model.compute_loss(batch, window_size=window_size)
+            loss = out["loss"]
+            _needs_backward = True
         if not torch.isfinite(loss):
             # Skip a rare non-finite batch instead of dying (grads are still zeroed from above, so the
             # model is NOT poisoned). A SYSTEMATIC divergence would skip every step → visible in the log.
@@ -1126,7 +1324,8 @@ def train_mixed_variant(
         _anom = (torch.autograd.detect_anomaly()
                  if (_afrom >= 0 and step >= _afrom) else _ctxlib.nullcontext())
         with _anom:
-            loss.backward()
+            if _needs_backward:
+                loss.backward()
         _mem_params = [p for n, p in model.named_parameters()
                        if p.requires_grad and not n.startswith("decoder.llama.")]
         _lora_params = [p for n, p in model.named_parameters()
@@ -1156,6 +1355,10 @@ def train_mixed_variant(
             "loss_recon": float(out["loss_recon"]),
             "top1_acc": float(out["top1_acc"]),
             "grad_norm": float(gn),
+            # split norms (review fix): a combined norm hides memory-side gradient starvation —
+            # the #1 historical failure mode — in the trainer the objective modes run in
+            "grad_norm_memory": float(gn_mem),
+            "grad_norm_lora": float(gn_lora),
             "memory_M": out["memory_shape"][1],
             "lr": lr,
         }
@@ -1167,6 +1370,10 @@ def train_mixed_variant(
                 train_row[_k] = float(_v)
             elif torch.is_tensor(_v) and _v.numel() == 1:
                 train_row[_k] = float(_v.detach())
+        # objective-mode telemetry (obj_nce/obj_ce_real/obj_grpo_*/obj_softplus) — logged EVERY step
+        # so a silently-inert objective is impossible to miss (the sg3_contrast lesson).
+        for _k, _v in _obj_extras.items():
+            train_row[_k] = float(_v)
         jsonl_fp.write(json.dumps(train_row) + "\n")
 
         if step % log_every == 0:
@@ -1524,6 +1731,65 @@ def main():
                     help="slotgraph3 LM arm depth: 0 = full ride (graph tokens through ALL layers); N>0 = "
                          "text runs the frozen prefix no-grad, graph tokens splice in for the last N layers "
                          "(+LoRA). N=4 is depth-matched to the custom arm and ~2× faster than full ride.")
+    ap.add_argument("--slotgraph3-read", choices=["edges", "raw"], default=None,
+                    help="slotgraph3 read: 'raw' = prepend node LATENTS as content tokens (pretrained-space, "
+                         "direct decoder→latent gradient, no φ) + edge POINTER tokens (concat [id_src;id_dst] "
+                         "+ relation tag). The literature-verdict read (kills the φ/Q-Former bottleneck, "
+                         "id-sum direction-blindness, and the missing node-token incidence channel). "
+                         "'edges' (default) = v1 φ-synthesized edge tokens.")
+    ap.add_argument("--rect-prepend-mask", action="store_true",
+                    help="KBLaM-style rectangular decoder mask: prepended memory tokens attend only to "
+                         "themselves (no memory↔memory mixing through decoder layers); text attends into "
+                         "memory normally.")
+    ap.add_argument("--bidir-mem-attn", action="store_true",
+                    help="Set-LLM read geometry: the prepended memory block attends to ITSELF "
+                         "bidirectionally (edge tokens compose with both endpoint node tokens regardless "
+                         "of emission order); text stays causal. Mutually exclusive with "
+                         "--rect-prepend-mask.")
+    ap.add_argument("--slotgraph3-no-boundary", action="store_true",
+                    help="slotgraph3: DISABLE the learned <mem_start>/<mem_end> boundary tokens "
+                         "(default ON — explicit span markers, the frozen-LM-injection consensus).")
+    ap.add_argument("--slotgraph3-route-act", choices=["softmax", "sparsemax"], default=None,
+                    help="routing activation over destinations: softmax (+train-time Gumbel noise; default) "
+                         "or sparsemax (LEGACY — exact-zero support = dead-gradient ratchet).")
+    ap.add_argument("--slotgraph3-no-init-noise", action="store_true",
+                    help="DISABLE per-forward Gaussian sampling of the initial latents (slot-symmetry "
+                         "breaking, Slot-Attention style; default ON).")
+    ap.add_argument("--slotgraph3-no-write-norm-match", action="store_true",
+                    help="DISABLE scaling graph tokens to the text-hidden RMS at the write splice "
+                         "(default ON; raw tokens are ~400x quieter than layer-26 hiddens).")
+    ap.add_argument("--slotgraph3-no-write-boundary-bidir", action="store_true",
+                    help="DISABLE the write-side <mem_start> + bidirectional graph block "
+                         "(default ON — matches the read geometry).")
+    ap.add_argument("--slotgraph3-write-update", choices=["delta", "additive"], default=None,
+                    help="slot update rule: delta (per-slot content gate + competitive read + gated "
+                         "interpolation; default) or additive (LEGACY scalar-gated residual).")
+    ap.add_argument("--slotgraph3-edge-write", choices=["assoc", "slot"], default=None,
+                    help="edge-latent update: assoc (keyed delta-rule write into the persistent 24x24 "
+                         "map — files relations under partner-key addresses; default) or slot (LEGACY "
+                         "T2 interpolation). assoc needs edge_state=matrix + write_update=delta.")
+    ap.add_argument("--objective-mode", choices=["plain", "contrastive", "trajectory"], default="plain",
+                    help="training objective (mixed trainer): 'plain' = CE only; 'contrastive' = "
+                         "+ objective_coef × in-batch InfoNCE (each example's memory must explain its "
+                         "own target best vs all B-1 other memories; 1 encoder run + GradCache rolled "
+                         "reads); 'trajectory' = contrastive + GRPO on the sampled discrete read "
+                         "expansion (router-only REINFORCE, reward = binding advantage).")
+    ap.add_argument("--objective-coef", type=float, default=0.5,
+                    help="weight of the InfoNCE term (contrastive/trajectory modes).")
+    ap.add_argument("--grpo-samples", type=int, default=4,
+                    help="trajectory mode: number of Gumbel-top-k read-expansion rollouts per step.")
+    ap.add_argument("--grpo-coef", type=float, default=1.0,
+                    help="trajectory mode: weight of the REINFORCE policy term (per-decision-scaled).")
+    ap.add_argument("--grpo-entropy-coef", type=float, default=0.01,
+                    help="trajectory mode: entropy bonus on the router distribution (fights policy "
+                         "collapse; A3C-standard 0.01).")
+    ap.add_argument("--objective-inv-temp", type=float, default=1.0,
+                    help="inverse temperature on the row-STANDARDIZED InfoNCE logits (1.0 = unit-sigma "
+                         "spread; raise to sharpen).")
+    ap.add_argument("--uniform-mem-pos", action="store_true",
+                    help="decoder read: give ALL prepended memory tokens the same RoPE position (0) so they "
+                         "form an unordered SET equidistant from text (removes intra-memory ordering + RoPE "
+                         "distance bias); text keeps normal positions 1..T.")
     ap.add_argument("--slotgraph3-edge-state", choices=["flat", "matrix"], default=None,
                     help="slotgraph3: 'matrix' = view the SAME per-node edge_lat floats as a 24×24 associative "
                          "map; rel(i→j) = M_i·rel_key(node_j) → per-PAIR relation codes (structural per-edge "
@@ -1837,10 +2103,12 @@ def main():
         cfg.slotgraph2_n_slots = _M
         cfg.slotgraph2_n_nodes = _M // 2          # fixed partition: half nodes, half edges
         cfg.slotgraph2_d_key = 64
-        # slotgraph3 (compressed-implicit graph, LM-attention write, expanded edge read). MATCHED both ways:
-        # STATE = 2K = 32 latents (= baselines' M=32 memory bottleneck) and ~7.0M trainable (enc-LoRA r56).
-        # The read EXPANDS those 32 latents into K×read_topk = 128 edge tokens — a deterministic re-representation
-        # (fixed routing/φ), NOT extra memory. A:=I control at eval only (set enc.force_identity_A).
+        # slotgraph3 (compressed-implicit graph, LM-attention write, expanded edge read). MATCHED on
+        # STATE: 2K = 32 latents (= baselines' M=32 memory bottleneck) and ~7.0M trainable (enc-LoRA r56).
+        # The DECODER INTERFACE is larger than the state: raw read = 16 node tokens + K×read_topk = 128
+        # pointer tokens + 2 boundary = 146 prepend positions (legacy edges read: 128) — a deterministic
+        # re-representation of the 32 stored latents, NOT extra stored memory. Report BOTH numbers when
+        # comparing budgets. A:=I control at eval only (set enc.force_identity_A).
         cfg.slotgraph3_n_nodes = _M // 2          # K = 16 nodes → 2K = 32 stored latents (matched to M)
         cfg.slotgraph3_read_topk = 8              # expanded read view = 128 edge tokens (re-representation of the 32 latents)
         cfg.slotgraph3_d_key = 128                # richer routing keys; enc-LoRA r56 (config) → ~7.0M matched trainable
@@ -1959,8 +2227,81 @@ def main():
         cfg.slotgraph3_write_layers = int(args.slotgraph3_write_layers)
         print(f"[slotgraph3 override] LM write depth = last-{cfg.slotgraph3_write_layers} layers "
               f"(frozen no-grad text prefix; LoRA trains only in the suffix)")
+    if args.slotgraph3_read is not None:
+        cfg.slotgraph3_read = args.slotgraph3_read
+        print(f"[slotgraph3 override] read = {cfg.slotgraph3_read}"
+              + (" (RAW node-content tokens + [id_src;id_dst] pointer edges — no φ)" if cfg.slotgraph3_read == "raw" else ""))
+    if args.rect_prepend_mask:
+        cfg.rect_prepend_mask = True
+        print("[override] rectangular prepend mask ON (memory tokens attend to self only — KBLaM-style)")
+    if args.bidir_mem_attn:
+        if args.rect_prepend_mask:
+            raise SystemExit("--bidir-mem-attn and --rect-prepend-mask are mutually exclusive")
+        cfg.bidir_mem_attn = True
+        print("[override] bidirectional memory-block attention ON (Set-LLM: memory composes, text causal)")
+    if args.slotgraph3_no_boundary:
+        cfg.slotgraph3_boundary_tokens = False
+        print("[slotgraph3 override] boundary tokens OFF (<mem_start>/<mem_end> disabled)")
+    if args.slotgraph3_route_act is not None:
+        cfg.slotgraph3_route_act = args.slotgraph3_route_act
+        print(f"[slotgraph3 override] route activation = {cfg.slotgraph3_route_act}")
+    if args.slotgraph3_no_init_noise:
+        cfg.slotgraph3_init_noise = False
+        print("[slotgraph3 override] init noise OFF (deterministic shared init — LEGACY)")
+    if args.slotgraph3_no_write_norm_match:
+        cfg.slotgraph3_write_norm_match = False
+        print("[slotgraph3 override] write splice norm-match OFF (LEGACY 400x quiet tokens)")
+    if args.slotgraph3_no_write_boundary_bidir:
+        cfg.slotgraph3_write_boundary_bidir = False
+        print("[slotgraph3 override] write boundary+bidir OFF (LEGACY causal-over-graph)")
+    if args.slotgraph3_write_update is not None:
+        cfg.slotgraph3_write_update = args.slotgraph3_write_update
+        print(f"[slotgraph3 override] write update = {cfg.slotgraph3_write_update}")
+    if args.slotgraph3_edge_write is not None:
+        cfg.slotgraph3_edge_write = args.slotgraph3_edge_write
+        print(f"[slotgraph3 override] edge write = {cfg.slotgraph3_edge_write}"
+              + (" (keyed delta-rule assoc write into the persistent 24x24 map)"
+                 if cfg.slotgraph3_edge_write == "assoc" else " (LEGACY slot interpolation)"))
+    cfg.objective_mode = args.objective_mode
+    cfg.objective_coef = float(args.objective_coef)
+    cfg.objective_inv_temp = float(args.objective_inv_temp)
+    cfg.grpo_samples = int(args.grpo_samples)
+    cfg.grpo_coef = float(args.grpo_coef)
+    cfg.grpo_entropy_coef = float(args.grpo_entropy_coef)
+    if args.objective_mode != "plain":
+        if args.task != "mixed":
+            raise SystemExit(f"--objective-mode {args.objective_mode} is implemented in the MIXED trainer "
+                             f"only (got --task {args.task}). The 2026-07-02 lesson: fail loudly rather "
+                             f"than record an inert flag.")
+        if args.contrastive_shuf_coef > 0:
+            raise SystemExit("--objective-mode and --contrastive-shuf-coef are mutually exclusive "
+                             "(the legacy softplus is its own mode; pick one).")
+        if args.batch_size < 2:
+            raise SystemExit(f"--objective-mode {args.objective_mode} needs batch_size >= 2 "
+                             f"(in-batch negatives; got {args.batch_size}).")
+        if set(args.variants) != {"slotgraph3_baseline"}:
+            # fail-fast (review fix): (a) the GradCache surrogate backprops per-example CE only —
+            # variants emitting aux losses (vqicae vq_loss, hlvocab load_balance) would have them
+            # silently INERT (slotgraph3 emits none, by design); (b) trajectory needs the
+            # slotgraph3 sample_read_expansion. Relax deliberately if ever needed.
+            raise SystemExit(f"--objective-mode {args.objective_mode} currently supports "
+                             f"--variants slotgraph3_baseline only (got {args.variants}).")
+        if args.objective_mode == "trajectory":
+            if (args.slotgraph3_read or "raw") != "raw" or (args.slotgraph3_edge_budget or 0) > 0:
+                raise SystemExit("--objective-mode trajectory needs the raw read and per-node top-k "
+                                 "(edge_budget=0) — sample_read_expansion supports only that config.")
+        print(f"[objective override] mode={args.objective_mode} InfoNCE coef={cfg.objective_coef}"
+              + (f" GRPO G={cfg.grpo_samples} coef={cfg.grpo_coef}"
+                 if args.objective_mode == "trajectory" else ""))
+    if args.uniform_mem_pos:
+        cfg.uniform_mem_pos = True
+        print("[override] uniform memory position-ids ON (all memory tokens at RoPE pos 0; text at 1..T)")
     cfg.mixed_gate_batches = int(args.mixed_gate_batches)   # REAL/SHUF/OFF binding gate in mixed val (0=off)
     cfg.task_mode = args.task        # accurate ckpt metadata (dispatch still keys on this)
+    # actual PER-TASK context length — encoder time-constants (assoc-decay half-life) derive from it.
+    # mixed: compress_len := mixed_ctx (set above); qa: the context is CHUNK_SIZE (compress_len would
+    # under-count 8x at the defaults → 8x-too-fast decay); other single tasks: compress_len.
+    cfg.ctx_len = int(args.chunk_size) if args.task == "qa" else int(args.compress_len)
     cfg.seed = args.seed             # record the actual seed in ckpt metadata
     cfg.anomaly_from = args.anomaly_from   # debug: backward anomaly detection from this step (-1 = off)
 
