@@ -1047,6 +1047,20 @@ def _same_answer_valid_mask(batch, B, device):
     return valid
 
 
+def _coding_rate(memory, eps2=0.5):
+    """MCR² coding rate (Yu et al. 2020) of the WITHIN-example memory, averaged over the batch.
+    memory [B,M,d] → per example, unit-norm the M tokens (scale-robust), then
+    R_i = ½·logdet(I_d + (d/(M·eps2))·ZᵀZ). Rank-1 Z → R≈0; full-rank Z → R large. Returned as a
+    scalar to MAXIMIZE (the caller subtracts rank_reward_coef·R from the loss)."""
+    B, M, d = memory.shape
+    Z = memory / memory.norm(dim=-1, keepdim=True).clamp_min(1e-6)      # [B,M,d] unit tokens
+    G = torch.einsum("bmd,bnd->bmn", Z, Z)                              # [B,M,M] Gram (M<d ⇒ cheaper, same logdet)
+    scale = d / (M * eps2)
+    eye = torch.eye(M, device=Z.device, dtype=Z.dtype).unsqueeze(0)
+    R = 0.5 * torch.logdet(eye + scale * G)                            # [B]  logdet(I+αZZᵀ)=logdet(I+αZᵀZ)
+    return R.mean()
+
+
 def _grad_cached_objective_step(model, batch, cfg, window_size):
     """contrastive/trajectory objective step (train_mixed_variant — the trainer that actually
     runs mixed; the 2026-07-02 lesson: the legacy coef lived only in train_one_variant and was
@@ -1306,9 +1320,19 @@ def train_mixed_variant(
             _obj_extras = {"obj_softplus": float(contrast)}
             _needs_backward = True
         else:
+            _rank_c = float(getattr(cfg, "rank_reward_coef", 0.0))
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                out = model.compute_loss(batch, window_size=window_size)
+                out = model.compute_loss(batch, window_size=window_size, return_memory=(_rank_c > 0))
             loss = out["loss"]
+            if _rank_c > 0 and out.get("_memory") is not None:
+                # MCR² coding-rate REWARD on the WITHIN-example memory (2026-07-03 diagnosis fix +
+                # a-vs-d discriminator): maximize R_i = ½·logdet(I + (d/(M·ε²))·ZᵀZ) per example on
+                # unit-normed tokens → charge the objective for rank so the emitted memory can't
+                # collapse to a rank-2 blur. In fp32 (logdet is ill-conditioned under bf16).
+                with torch.amp.autocast("cuda", enabled=False):
+                    _R = _coding_rate(out["_memory"].float(), float(getattr(cfg, "rank_reward_eps", 0.5)))
+                loss = loss - _rank_c * _R
+                _obj_extras = {"obj_rank_R": float(_R.detach())}
             _needs_backward = True
         if not torch.isfinite(loss):
             # Skip a rare non-finite batch instead of dying (grads are still zeroed from above, so the
@@ -1768,6 +1792,12 @@ def main():
                     help="edge-latent update: assoc (keyed delta-rule write into the persistent 24x24 "
                          "map — files relations under partner-key addresses; default) or slot (LEGACY "
                          "T2 interpolation). assoc needs edge_state=matrix + write_update=delta.")
+    ap.add_argument("--slotgraph3-layer-anchor", action="store_true",
+                    help="GCNII-style per-layer id/role RE-INJECTION (the 'simple version'): re-add the "
+                         "node/edge SLOT identity after each write-suffix layer (WRITE) and the edge-token "
+                         "identity before each decoder layer (READ) so the frozen LM's mixing can't smooth "
+                         "the graph tokens together through depth. Requires --slotgraph3-read edges + "
+                         "--slotgraph3-write lm + --slotgraph3-write-layers N>0.")
     ap.add_argument("--objective-mode", choices=["plain", "contrastive", "trajectory"], default="plain",
                     help="training objective (mixed trainer): 'plain' = CE only; 'contrastive' = "
                          "+ objective_coef × in-batch InfoNCE (each example's memory must explain its "
@@ -1786,6 +1816,10 @@ def main():
     ap.add_argument("--objective-inv-temp", type=float, default=1.0,
                     help="inverse temperature on the row-STANDARDIZED InfoNCE logits (1.0 = unit-sigma "
                          "spread; raise to sharpen).")
+    ap.add_argument("--rank-reward-coef", type=float, default=0.0,
+                    help="MCR² coding-rate reward on the within-example memory (plain mode): charges the "
+                         "objective for rank so memory can't collapse to a low-rank blur. Also the "
+                         "(objective vs write-capacity) discriminator. ~0.01-0.1; 0=off.")
     ap.add_argument("--uniform-mem-pos", action="store_true",
                     help="decoder read: give ALL prepended memory tokens the same RoPE position (0) so they "
                          "form an unordered SET equidistant from text (removes intra-memory ordering + RoPE "
@@ -2262,9 +2296,17 @@ def main():
         print(f"[slotgraph3 override] edge write = {cfg.slotgraph3_edge_write}"
               + (" (keyed delta-rule assoc write into the persistent 24x24 map)"
                  if cfg.slotgraph3_edge_write == "assoc" else " (LEGACY slot interpolation)"))
+    if args.slotgraph3_layer_anchor:
+        cfg.slotgraph3_layer_anchor = True
+        print("[slotgraph3 override] per-layer id/role anchor ON = GCNII re-injection each layer "
+              "(WRITE: slot identity in the suffix loop; READ: edge identity before each decoder layer)")
     cfg.objective_mode = args.objective_mode
     cfg.objective_coef = float(args.objective_coef)
     cfg.objective_inv_temp = float(args.objective_inv_temp)
+    cfg.rank_reward_coef = float(args.rank_reward_coef)
+    if args.rank_reward_coef > 0:
+        print(f"[objective] MCR² rank-reward ON, coef={args.rank_reward_coef} (plain mode; charges for "
+              f"within-example memory rank — the a-vs-d diagnosis discriminator)")
     cfg.grpo_samples = int(args.grpo_samples)
     cfg.grpo_coef = float(args.grpo_coef)
     cfg.grpo_entropy_coef = float(args.grpo_entropy_coef)
@@ -2279,13 +2321,20 @@ def main():
         if args.batch_size < 2:
             raise SystemExit(f"--objective-mode {args.objective_mode} needs batch_size >= 2 "
                              f"(in-batch negatives; got {args.batch_size}).")
-        if set(args.variants) != {"slotgraph3_baseline"}:
-            # fail-fast (review fix): (a) the GradCache surrogate backprops per-example CE only —
-            # variants emitting aux losses (vqicae vq_loss, hlvocab load_balance) would have them
-            # silently INERT (slotgraph3 emits none, by design); (b) trajectory needs the
-            # slotgraph3 sample_read_expansion. Relax deliberately if ever needed.
-            raise SystemExit(f"--objective-mode {args.objective_mode} currently supports "
-                             f"--variants slotgraph3_baseline only (got {args.variants}).")
+        # contrastive is objective-level (GradCache over ANY prepend memory) so it runs for the
+        # AUX-LOSS-FREE prepend baselines too — valuable as a watermark CONTROL (if icae-contrastive
+        # also Goodharts SHUF−REAL with flat EM, the watermark is objective-driven, not sg3-specific).
+        # EXCLUDED: vqicae (emits vq_loss → silently inert under the per-example-CE surrogate); hlvocab
+        # (load_balance). trajectory stays sg3-only (needs sample_read_expansion).
+        _OBJ_OK = {"slotgraph3_baseline", "icae_baseline", "ccm_baseline",
+                   "autocompressor_baseline", "beacon_baseline"}
+        if args.objective_mode == "trajectory" and set(args.variants) != {"slotgraph3_baseline"}:
+            raise SystemExit(f"--objective-mode trajectory supports --variants slotgraph3_baseline only "
+                             f"(needs sample_read_expansion); got {args.variants}.")
+        if not set(args.variants).issubset(_OBJ_OK):
+            raise SystemExit(f"--objective-mode supports {sorted(_OBJ_OK)} (aux-loss-free prepend arms); "
+                             f"got {args.variants}. vqicae/hlvocab emit aux losses inert under the "
+                             f"GradCache surrogate — excluded by design.")
         if args.objective_mode == "trajectory":
             if (args.slotgraph3_read or "raw") != "raw" or (args.slotgraph3_edge_budget or 0) > 0:
                 raise SystemExit("--objective-mode trajectory needs the raw read and per-node top-k "

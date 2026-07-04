@@ -72,6 +72,15 @@ class ReprConfig:
     #                  advantage × log-prob REINFORCE on the ROUTER ONLY (hybrid: continuous
     #                  params keep the pathwise InfoNCE gradient; the discrete choice — which has
     #                  no honest gradient — gets the unbiased estimator).
+    # rank_reward (2026-07-03 diagnosis): the emitted per-example memory collapses to ~rank-2 (a blur,
+    # << the ~5-8 entity floor). Plain CE never CHARGES for rank (simplicity bias) → add an MCR²
+    # coding-rate REWARD on the WITHIN-example memory tokens: R_i = ½·logdet(I + (d/(M·ε²))·ZᵀZ) per
+    # example (Yu et al. 2020), maximized. Run on PLAIN CE it is BOTH the fix AND the (a-objective vs
+    # d-write) discriminator: EM↑+rank↑ → write CAN bind, plain just never charged (a); rank↑ but EM
+    # flat → write emits high-rank non-relational content (d). NOTE: bends avoid-aux-losses — justified
+    # as it redefines what the objective charges for (like contrastive), not a regularizer patch.
+    rank_reward_coef: float = 0.0        # weight of −R (0 = off); ~0.01-0.1 range
+    rank_reward_eps: float = 0.5         # MCR² quantization ε² (scale set by unit-normed tokens)
     objective_mode: str = "plain"
     objective_coef: float = 0.5          # weight of the InfoNCE term (contrastive/trajectory)
     objective_inv_temp: float = 1.0      # inverse temperature on the ROW-STANDARDIZED InfoNCE logits
@@ -359,6 +368,21 @@ class ReprConfig:
                                          # correcting (repeated same-content writes converge instead of
                                          # accumulating; kills the additive averaging fixed point).
                                          # "additive" (LEGACY): lat += sigmoid(β)·head(LN(hidden)).
+    slotgraph3_layer_anchor: bool = False  # GCNII-style per-layer id/role RE-INJECTION (the "simple
+                                         # version" ingredient, 2026-07-04). The id/role identity is
+                                         # re-added at EVERY LM layer (not just at tokenization) on both
+                                         # passes: WRITE — the node/edge SLOT identity (id_scale·nid +
+                                         # role) is re-injected (norm-matched to the stream) after each
+                                         # write-suffix layer, so the frozen LM's mixing can't smooth the
+                                         # slots together (the 15→5 depth collapse); READ — the edge-token
+                                         # identity (id_scale·(id_src+id_dst) + role) rides in mem_aux
+                                         # ['prepend_struct'] and model.py re-injects it before every
+                                         # decoder layer (existing reinforce hook). Anchors distinctness
+                                         # THROUGH depth so φ(src,edge,dst) reads distinct endpoints.
+                                         # REQUIRES read='edges' (additive-separable id) + write='lm' +
+                                         # write_layers>0 (the manual suffix loop is where re-injection
+                                         # lives). Learned scalar anchor_gate (init 0.1) scales the
+                                         # re-injected unit-direction. Fails loudly on incompatible config.
     slotgraph3_custom_layers: int = 4    # custom write: # of from-scratch transformer blocks
     slotgraph3_custom_dff: int = 1152    # custom write: block FFN hidden (2×d=1152 → ~13M UNMATCHED capacity probe)
     slotgraph3_custom_heads: int = 9     # custom write: attention heads (d=576 / 9 = head_dim 64)

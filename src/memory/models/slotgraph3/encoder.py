@@ -278,6 +278,24 @@ class SlotGraph3Encoder(nn.Module):
             with torch.no_grad():
                 self.decay_head.bias.fill_(math.log(a0 / (1.0 - a0)))
 
+        # ── per-layer id/role anchor (GCNII initial-residual; 2026-07-04 "simple version") ──
+        # Re-inject the id/role identity at EVERY LM layer (not just at tokenization) so the frozen
+        # LM's mixing cannot smooth the graph tokens together through depth (the 15→5 collapse). WRITE:
+        # done in the _lm_suffix loop below. READ: model.py's reinforce hook re-injects prepend_struct
+        # before each decoder layer. Requires edges-read (additive-separable id) + lm-write + suffix.
+        self.layer_anchor = bool(getattr(cfg, "slotgraph3_layer_anchor", False))
+        self._cur_write_anchor = None                          # per-finalize write-side slot identity anchor
+        if self.layer_anchor:
+            if self.read_mode != "edges":
+                raise ValueError("slotgraph3_layer_anchor needs read='edges' — the re-injected signal is the "
+                                 "additive id_scale·nid + role; 'raw' fuses id into tok_proj (not separable).")
+            if self.write_mode != "lm" or self.write_layers <= 0:
+                raise ValueError("slotgraph3_layer_anchor needs write='lm' + write_layers>0 (the per-layer "
+                                 "WRITE re-injection lives in the _lm_suffix manual loop; full-ride/custom "
+                                 "paths don't loop layers here).")
+            self.reinforce_prepend_each_layer = True            # model.py re-injects prepend_struct each decoder layer
+            self.anchor_gate = nn.Parameter(torch.tensor(0.1))  # learned re-injection strength (unit-dir × gate × stream-norm)
+
         self._trace = None                                     # set to [] to record per-window (node_lat, edge_lat) for grad-credit
         self.norm = _NormMatch(d)
         with torch.no_grad():
@@ -302,7 +320,7 @@ class SlotGraph3Encoder(nn.Module):
         if self.edge_write == "assoc":
             upd_desc += f"; ASSOC edge write (keyed Δ-rule (v−M·k̂)⊗k̂ into persistent {self.r}×{self.r}, α₀={1.0/(2*max(1,round(1024/max(1,self.window)))):.3f})"
         fixes = "+".join(s for s, on in (("initnoise", self.init_noise), ("splicescale", self.write_norm_match),
-                                         ("writeBB", self.write_bb)) if on)
+                                         ("writeBB", self.write_bb), ("layeranchor", self.layer_anchor)) if on)
         print(f"[slotgraph3] {self.K} nodes (2×{self.K} latents) @ d={d}; {writer} "
               f"({'+edges in context' if self.write_expand else 'slots-only, edges at READ only'}); "
               f"route-by-{self.route_key} ({self.route_act}); expand→edges ({budget}"
@@ -382,9 +400,9 @@ class SlotGraph3Encoder(nn.Module):
         B, K, d = node_lat.shape; k = self.read_topk
         A = self._route(node_lat if self.route_key == "node" else edge_lat)   # [B,K,K]
         if self.edge_budget > 0:
-            return self._expand_global(node_lat, edge_lat, nid, id_scale, role, A)
+            return (*self._expand_global(node_lat, edge_lat, nid, id_scale, role, A), None)
         if self.st_leak:
-            return self._expand_st(node_lat, edge_lat, nid, id_scale, role, A)
+            return (*self._expand_st(node_lat, edge_lat, nid, id_scale, role, A), None)
         topv, topi = A.topk(k, dim=-1)                                   # [B,K,k] weights + dst indices
         src = node_lat.unsqueeze(2).expand(B, K, k, d)                   # source content (node i)
         dst = torch.gather(node_lat.unsqueeze(1).expand(B, K, K, d), 2,
@@ -396,11 +414,14 @@ class SlotGraph3Encoder(nn.Module):
             h = d // 2
             E = self._tok(er, self.id_half.view(1, K, 1, h).expand(B, K, k, h),
                           self.id_half[topi], 2, weight=topv)
-            return E.reshape(B, K * k, d), (topv > 0).reshape(B, K * k), A, topv
+            return E.reshape(B, K * k, d), (topv > 0).reshape(B, K * k), A, topv, None
         phi = self.phi(torch.cat([src, dst, er], dim=-1))               # [B,K,k,d]
         id_src = nid.unsqueeze(1).expand(K, k, d).unsqueeze(0)          # [1,K,k,d]
         id_dst = nid[topi]                                              # [B,K,k,d]
         lab = id_scale * (id_src + id_dst)
+        # per-layer anchor = the endpoint-id + edge-role identity (un-gated), re-injected before each
+        # decoder layer so the edge token keeps "which src → which dst" through depth (GCNII).
+        anchor = (lab + role[2]).reshape(B, K * k, d) if self.layer_anchor else None
         if self.gate_ids:
             # soft-id: the endpoint label rides INSIDE the routing weight (Switch gate-multiplication
             # pattern) → the router gets gradient through the dominant id channel of every selected
@@ -409,7 +430,7 @@ class SlotGraph3Encoder(nn.Module):
             E = topv.unsqueeze(-1) * (phi + lab) + role[2]
         else:
             E = topv.unsqueeze(-1) * phi + lab + role[2]
-        return E.reshape(B, K * k, d), (topv > 0).reshape(B, K * k), A, topv
+        return E.reshape(B, K * k, d), (topv > 0).reshape(B, K * k), A, topv, anchor
 
     def _expand_st(self, node_lat, edge_lat, nid, id_scale, role, A):
         """STRAIGHT-THROUGH expansion — dense gradient at sparse token cost. All K×K candidate edge
@@ -573,6 +594,16 @@ class SlotGraph3Encoder(nn.Module):
                 h = _ckpt.checkpoint(run_layer, h, lyr, use_reentrant=False)
             else:
                 h = run_layer(h, lyr)
+            if self._cur_write_anchor is not None:
+                # GCNII per-layer id/role RE-INJECTION on the node/edge SLOT positions (the last 2K):
+                # add the fixed slot identity as a unit-direction scaled to the slot's CURRENT stream
+                # norm × learned gate — re-asserts distinctness the frozen mixing would otherwise wash
+                # out, without imposing a fixed magnitude (dynamic norm-match, same policy as the splice).
+                nsl = 2 * self.K
+                sl = h[:, -nsl:]
+                a = F.normalize(self._cur_write_anchor, dim=-1).to(h.dtype)
+                inj = self.anchor_gate.to(h.dtype) * a * sl.norm(dim=-1, keepdim=True)
+                h = torch.cat([h[:, :-nsl], sl + inj], dim=1)
         h = m.norm(h)
         return h, h[:, :T]                                               # (full sequence, text hiddens)
 
@@ -612,6 +643,14 @@ class SlotGraph3Encoder(nn.Module):
         else:                                                  # raw: identity lives in id_half/type_embed
             nid = role = id_scale = None
         K = self.K
+        if self.layer_anchor:
+            # WRITE-side slot identity (fixed across windows): the node/edge SLOT tokens' additive
+            # id/role tag (= id_scale·nid + role[slot-type]). Re-injected after each write-suffix layer
+            # so the node/edge slot hiddens the update reads out stay mutually distinct through depth.
+            self._cur_write_anchor = torch.cat([id_scale * nid + role[0],
+                                                id_scale * nid + role[1]], dim=0).unsqueeze(0)  # [1,2K,d]
+        else:
+            self._cur_write_anchor = None
         _assoc_alpha = _assoc_keycos = None                    # assoc-write telemetry (set per window)
         for w in range(0, T, self.window):
             wm = mask[:, w:w + self.window].bool()
@@ -619,6 +658,9 @@ class SlotGraph3Encoder(nn.Module):
             if not bool(active.any()):
                 continue
             we = emb[:, w:w + self.window]
+            _stg = getattr(self, "_stage_trace", None)                  # opt-in per-STAGE rank trace (diag)
+            if _stg is not None:
+                _stg.append((w // self.window, "0_node_before", node_lat[:, :K].detach()))
             with torch.autocast("cuda", enabled=False):                 # graph tokenization in fp32
                 # raw mode: node/edge SLOTS use the SAME concat-projection + id basis as the pointer
                 # edge tokens and the read node tokens (TokenGT node = [X ‖ P ‖ P ‖ type]) so the write
@@ -632,7 +674,7 @@ class SlotGraph3Encoder(nn.Module):
                     node_tok = node_lat + id_scale * nid.unsqueeze(0) + role[0]
                     edge_tok = edge_lat + id_scale * nid.unsqueeze(0) + role[1]
                 if self.write_expand:
-                    E, keep_e, A_w, _ = self._expand_topk(node_lat, edge_lat, nid, id_scale, role)
+                    E, keep_e, A_w, _, _ = self._expand_topk(node_lat, edge_lat, nid, id_scale, role)
                     graph_in = torch.cat([E, node_tok, edge_tok], dim=1) # [B, Kk+2K, d] — slots LAST (see edges)
                     keep_g = torch.cat([keep_e, torch.ones(B, 2 * K, device=we.device, dtype=torch.bool)], dim=1)
                 else:                                                    # write over [window; slots] only;
@@ -660,6 +702,8 @@ class SlotGraph3Encoder(nn.Module):
             with torch.autocast("cuda", enabled=False):
                 slots = H[:, -2 * K:].float()                            # node-slot + edge-slot hiddens
                 nl0, el0 = node_lat, edge_lat
+                if _stg is not None:
+                    _stg.append((w // self.window, "1_slots_postLMmix", slots[:, :K].detach()))
                 if self.write_update == "delta":
                     # competitive read: slots COMPETE (softmax over the SLOT axis) to claim each window
                     # token — Slot Attention's anti-duplication mechanism; weighted-mean over tokens.
@@ -672,8 +716,12 @@ class SlotGraph3Encoder(nn.Module):
                     comp = torch.einsum("bst,btd->bsd", wgt, vs)         # [B,2K,d] per-slot claimed content
                     gh = self.n_head(slots + self.comp_proj(comp))       # comp_proj zero-init: step-0 = slots-only
                     g_wr = torch.sigmoid(self.gate_head(gh))             # [B,2K,1] per-slot CONTENT gate (b=+1.5)
+                    if _stg is not None:
+                        _stg.append((w // self.window, "2_gh_postCompRead", gh[:, :K].detach()))
                     cand_n = self.head_node(gh[:, :K])
                     node_lat = node_lat + g_wr[:, :K] * (cand_n - node_lat)   # gated INTERPOLATION: repeated
+                    if _stg is not None:
+                        _stg.append((w // self.window, "3_node_after", node_lat[:, :K].detach()))
                     if self.edge_write == "assoc":                       # same-content writes CONVERGE
                         # T3 keyed delta-rule write: file this window's relation UNDER THE PARTNER
                         # ADDRESS the routing actually selected — the same unit key the read uses.
@@ -719,7 +767,7 @@ class SlotGraph3Encoder(nn.Module):
                     node_lat.retain_grad(); edge_lat.retain_grad()
                     self._trace.append((w // self.window, node_lat, edge_lat))
         with torch.autocast("cuda", enabled=False):
-            E, keep_read, A, topv = self._expand_topk(node_lat, edge_lat, nid, id_scale, role)
+            E, keep_read, A, topv, read_anchor = self._expand_topk(node_lat, edge_lat, nid, id_scale, role)
             if self.read_mode == "raw":
                 # RAW read: node latents themselves are the content tokens (pretrained-space reps, direct
                 # decoder→latent gradient, no φ bottleneck); E are pointer tokens. Same [id ‖ id] slots as
@@ -744,6 +792,17 @@ class SlotGraph3Encoder(nn.Module):
             keep_read = torch.cat([ones, keep_read, ones], dim=1)
         aux["memory_mask"] = keep_read                                   # [B, M] bool; consumed by model.py prepend/SHUF
         aux["latents"] = (node_lat, edge_lat)                            # trajectory-mode rollout sampling reads these
+        if self.layer_anchor and read_anchor is not None:
+            # READ-side per-layer anchor: gate·(endpoint-id + edge-role) for each edge token, laid out
+            # to match memory_full ([<mem_start>; edge tokens; <mem_end>]) — 0 on the boundary rows.
+            # model.py's reinforce hook re-adds this to the M prepend positions before every decoder
+            # layer; gradient flows back through it to node_id/role/id_scale/anchor_gate.
+            ag = self.anchor_gate.float()
+            if self.boundary_tokens:
+                zb = torch.zeros(B, 1, self.d, device=read_anchor.device, dtype=read_anchor.dtype)
+                aux["prepend_struct"] = torch.cat([zb, ag * read_anchor, zb], dim=1)   # [B, M, d]
+            else:
+                aux["prepend_struct"] = ag * read_anchor
         if self.edge_write == "assoc" and _assoc_alpha is not None:
             aux["slotgraph3_edge_alpha"] = _assoc_alpha                  # mean decay (retention health)
             aux["slotgraph3_edge_keycos"] = _assoc_keycos                # write-address diversity (↓ distinct)
@@ -834,6 +893,19 @@ class SlotGraph3Encoder(nn.Module):
                "slotgraph3_edge_effrank": torch.tensor(_participation_ratio(edge_lat.reshape(-1, self.d)), device=device),
                "slotgraph3_node_cos": torch.tensor(_within_cos(node_lat), device=device),
                "slotgraph3_edge_cos": torch.tensor(_within_cos(edge_lat), device=device)}
+        # DECOMPOSE the mem_effrank collapse (2026-07-03): the combined metric over [B·M,d] conflates
+        # two very different failures — a low value can mean "each single memory is a BLUR" (within-
+        # example collapse, the binding-relevant one) OR "all memories share one frame" (cross-example
+        # collapse). Report both so the diagnosis isn't ambiguous:
+        #  - mem_effrank_perex  = mean over examples of PR(one memory [M,d]) — is a SINGLE memory rich?
+        #    (the metric that actually matters for binding: rich content vs rank-1 blur)
+        #  - mem_effrank_cross  = PR of the per-example memory MEANS [B,d] — do examples DIFFER at all?
+        #    (relates to SHUF−REAL; high here + low perex = the low-rank WATERMARK signature)
+        B_ = memory.shape[0]
+        aux["slotgraph3_mem_effrank_perex"] = torch.tensor(
+            sum(_participation_ratio(memory[i]) for i in range(B_)) / max(1, B_), device=device)
+        aux["slotgraph3_mem_effrank_cross"] = torch.tensor(
+            _participation_ratio(memory.mean(dim=1)) if B_ > 1 else 0.0, device=device)
         # support = mass above uniform (softmax A is dense — (A>0) would read K always; this
         # threshold reduces to the old sparsemax support when A is sparse)
         supp = (A > 1.0 / self.K).float()
