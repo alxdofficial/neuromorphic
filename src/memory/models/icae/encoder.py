@@ -12,12 +12,16 @@ from ...config import ReprConfig
 class ICAEBaselineEncoder(nn.Module):
     """ICAE — In-Context Autoencoder (Ge et al., ICLR 2024) as a memory encoder.
 
-    Faithful port of ICAE's compressor to the streaming-encoder interface:
+    Faithful port of ICAE's compressor to the streaming-encoder interface, with an
+    RMT/AutoCompressor recurrence so the memory PERSISTS across streaming windows:
       * the encoder is a FROZEN Llama base + a trainable encoder-LoRA (q/v) +
         M learnable memory-slot embeddings;
-      * passage embeds are accumulated across streaming windows, then the
-        LoRA-Llama runs ONCE over [passage ++ M slots] at finalize;
-      * the final hidden states at the M slot positions become the memory.
+      * per window the LoRA-Llama runs over [prev_memory ++ window ++ M slots] and the
+        M slot hiddens become the new memory — the slots (causal, at the end) attend over
+        BOTH the carried memory and the new tokens, so the frozen LM reconciles old vs new
+        (fixed M slots forever);
+      * window-0 has empty prev_memory → [window ++ slots] = single-shot ICAE, so
+        published-ICAE behavior is exactly the n_windows=1 special case (baseline fidelity).
 
     Weight-share = option (A) (docs/emat_baselines_plan.md): the encoder owns
     its OWN frozen base copy (identical weights to the decoder's frozen base)
@@ -44,9 +48,10 @@ class ICAEBaselineEncoder(nn.Module):
             alpha=cfg.icae_lora_alpha,
             target_names=tuple(cfg.llama_lora_target_names),
         )
-        # Per-layer gradient checkpointing on the encoder base: finalize runs ONE 1B forward
-        # over the whole chunk (T+M ~8320 tokens) -> an uncheckpointed peak OOMs at
-        # chunk=8192/BS>=8. Unconditional (the old grad_checkpoint_llama flag was never set).
+        # HF per-layer checkpointing on the encoder base. Now mostly vestigial: the compress
+        # forward runs per-window inside streaming_write, which the trainer already
+        # activation-checkpoints (grad_checkpoint_stream), and base.training=False makes HF's
+        # own checkpointing inert. Kept as a harmless belt-and-suspenders for any un-wrapped path.
         base.model.gradient_checkpointing_enable(
             gradient_checkpointing_kwargs={"use_reentrant": False})
         self.base = base
@@ -86,47 +91,36 @@ class ICAEBaselineEncoder(nn.Module):
 
     def init_streaming_state(self, batch_size: int, device, dtype):
         d = self.cfg.d_llama
-        return {
-            "emb": torch.zeros(batch_size, 0, d, device=device, dtype=dtype),
-            "mask": torch.zeros(batch_size, 0, device=device, dtype=torch.bool),
-        }
+        # RMT/AutoCompressor-style persistent memory: the M compressed slots carried across
+        # windows. Empty at window 0 so the first window is exactly single-shot ICAE
+        # ([window ++ slots]) → published-ICAE behavior is the n_windows=1 special case.
+        return {"mem": torch.zeros(batch_size, 0, d, device=device, dtype=dtype)}
 
     def streaming_write(self, state, token_embeds, attention_mask=None,
                         chunk_offset=0, **extra):
+        """Recurrent compress (RMT/AutoCompressor idiom over ICAE's op): read fresh memory
+        slots from [prev_memory ++ new_window ++ M slots]. The slots (causal, at the end)
+        attend over BOTH the carried memory and the new window, so the frozen LoRA-LM decides
+        how to reconcile old and new. Fixed M slots forever; window-0 (empty prev) reduces to
+        single-shot ICAE. The trainer activation-checkpoints this call per window, so the heavy
+        base forward stays plain here (matches AutoCompressor)."""
+        del chunk_offset, extra
+        prev = state["mem"]                                  # [B, M, d] (or [B, 0, d] first window)
+        B, W, d = token_embeds.shape
         if attention_mask is None:
-            attention_mask = torch.ones(
-                token_embeds.shape[:2], device=token_embeds.device,
-                dtype=torch.bool)
-        new = {
-            "emb": torch.cat([state["emb"], token_embeds], dim=1),
-            "mask": torch.cat([state["mask"], attention_mask.bool()], dim=1),
-        }
-        return new, {}
+            attention_mask = torch.ones(B, W, device=token_embeds.device, dtype=torch.bool)
+        slots = self.slots.to(token_embeds.dtype).unsqueeze(0).expand(B, self.M, d)
+        inp = torch.cat([prev, token_embeds, slots], dim=1)  # [B, M_prev + W + M, d]
+        _ones = lambda n: torch.ones(B, n, device=attention_mask.device, dtype=torch.long)
+        attn = torch.cat([_ones(prev.shape[1]), attention_mask.long(), _ones(self.M)], dim=1)
+        # Inner LlamaModel → last_hidden_state (skip lm_head). Causal: the slots at the END read
+        # over prev-memory + window. base.training=False → HF per-layer ckpt is inert; the trainer's
+        # per-window activation-checkpoint (grad_checkpoint_stream) covers this whole forward.
+        h = self.base.model(inputs_embeds=inp, attention_mask=attn).last_hidden_state
+        mem = self.norm(h[:, -self.M:, :].float())           # [B, M, d_llama]
+        return {"mem": mem}, {}
 
     def finalize_memory(self, state) -> tuple[Tensor, dict]:
-        emb = state["emb"]                                   # [B, T, d]
-        mask = state["mask"]                                 # [B, T] bool
-        B, T, d = emb.shape
-        slots = self.slots.to(emb.dtype).unsqueeze(0).expand(B, self.M, d)
-        inp = torch.cat([emb, slots], dim=1)                 # [B, T+M, d]
-        slot_mask = torch.ones(B, self.M, device=mask.device, dtype=mask.dtype)
-        attn = torch.cat([mask, slot_mask], dim=1).long()    # HF: 1=attend
-        # Inner LlamaModel → last_hidden_state (skip the lm_head). Causal mask
-        # means the appended slots (at the END) attend over all passage tokens.
-        # ALWAYS activation-checkpoint the heavy 1B base forward under training
-        # (auto-skips under eval no_grad). HF's per-layer ckpt is gated on
-        # base.training=False here, and the trainer only checkpoints
-        # streaming_write (which for ICAE is just a cat), so without this the
-        # whole-passage finalize forward is un-checkpointed and OOMs at chunk
-        # 8192 (dual-review HIGH). No longer gated on the dead grad_checkpoint
-        # _llama flag — the previous gating made it a silent no-op.
-        def _run_base(inp_, attn_):
-            return self.base.model(inputs_embeds=inp_,
-                                   attention_mask=attn_).last_hidden_state
-        if self.training and torch.is_grad_enabled():
-            import torch.utils.checkpoint as _ckpt
-            h = _ckpt.checkpoint(_run_base, inp, attn, use_reentrant=False)
-        else:
-            h = _run_base(inp, attn)                          # [B, T+M, d]
-        mem = self.norm(h[:, -self.M:, :].float())           # [B, M, d_llama]
-        return mem, {}
+        # Memory is already the compressed M slots after the last window's recurrent write
+        # (streaming_write). n_windows >= 1 always, so state["mem"] is [B, M, d].
+        return state["mem"], {}

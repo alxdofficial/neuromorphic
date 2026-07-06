@@ -84,9 +84,12 @@ def build_parser() -> argparse.ArgumentParser:
                          "the first N val batches per task (0=off; ~triples that task's eval cost). Use e.g. 8.")
     ap.add_argument("--mixed-ctx", type=int, default=1024,
                     help="mixed: uniform context_len/chunk for ALL tasks (default 1024).")
-    ap.add_argument("--mixed-M", type=int, default=32,
+    ap.add_argument("--mixed-M", type=int, default=64,
                     help="mixed: uniform memory budget M (slots/edges) for ALL tasks "
-                         "(default 32 → ~32:1 compression at ctx=1024).")
+                         "(default 64 → 16:1 compression at ctx=1024). Raised from 32 for the "
+                         "streaming-write regime: gives binding headroom so a retention failure "
+                         "is a binding failure, not slot-starvation (forgetting pressure comes "
+                         "from distractor load > M, not a tiny M).")
     ap.add_argument("--mae-mask-ratio", type=float, default=0.85,
                     help="mae: fraction of answer tokens replaced by <mask> in the forward.")
     ap.add_argument("--hlvocab-emit", choices=["edge_query", "slotattn"], default="edge_query",
@@ -551,15 +554,16 @@ def args_to_config(args, ap):
         cfg.use_llama_lora = True
         cfg.llama_lora_rank = 16; cfg.llama_lora_alpha = 32
         _M = args.mixed_M                                # FIXED budget (no ceil(chunk/30))
-        # MAE-calibrated, param-matched ranks (verified to hold at M=32 within ~0.1M:
-        # icae 6.01M / ccm 6.01M / ac 6.03M / beacon 6.08M memory; graph ~6.9M (d_graph=256) —
-        # M barely affects params. See scripts/diagnostics/param_count.py.)
+        # MAE-calibrated, param-matched ranks (verified to hold within ~0.1M:
+        # icae 6.01M / ccm 6.01M / ac 6.03M / beacon 6.08M memory; graph ~6.9M (d_graph=256)).
+        # M barely affects params — the M×d slot embeddings (~37K at M=64) are negligible vs the
+        # ~6M LoRA — so these ranks stay matched across the M=32↔64 change. See param_count.py.
         cfg.n_flat_codes = _M
         cfg.icae_n_slots = _M; cfg.icae_lora_rank = 104; cfg.icae_lora_alpha = 208
         cfg.ccm_n_comp = _M; cfg.ccm_lora_rank = 52; cfg.ccm_lora_alpha = 104
         cfg.autocompressor_n_slots = _M
         cfg.autocompressor_lora_rank = 52; cfg.autocompressor_lora_alpha = 104
-        cfg.beacon_ratio = max(1, args.mixed_ctx // _M)  # ratio honors the uniform ctx:M (32:1)
+        cfg.beacon_ratio = max(1, args.mixed_ctx // _M)  # ratio honors the uniform ctx:M (16:1 at M=64)
         from transformers import AutoConfig as _ACLM
         from src.memory.common import beacon_wrap_layers as _bwlm
         _nlayersm = _ACLM.from_pretrained(cfg.llama_model).num_hidden_layers
