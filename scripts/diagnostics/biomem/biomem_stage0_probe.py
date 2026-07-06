@@ -29,7 +29,7 @@ If it can, proceed to the grid.
 """
 from __future__ import annotations
 import sys, os, math, argparse
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
 import torch
 import torch.nn as nn
 import torch.nn.functional as F

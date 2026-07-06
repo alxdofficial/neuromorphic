@@ -12,14 +12,14 @@ Seed-dir convention (matches run_overnight_seeds.sh):
   seed 42 -> "{prefix}_{variant}"        e.g. valrun_memon_biomem_baseline
   seed N  -> "{prefix}_s{N}_{variant}"   e.g. valrun_memon_s1_biomem_baseline
 
-Usage:  .venv/bin/python scripts/diagnostics/cohort_results.py [--no-eval] [--seeds 42 1 2]
+Usage:  .venv/bin/python scripts/diagnostics/cohort/cohort_results.py [--no-eval] [--seeds 42 1 2]
 """
 import sys, os, json, glob, math, dataclasses, argparse
 from pathlib import Path
 
 # Allow `from src...` / `from scripts...` when run as a script file (script dir,
 # not the repo root, is what Python puts on sys.path[0]).
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
 
 TASKS = ["mae", "babi", "continuation", "condrecon_bio"]
 
@@ -75,7 +75,7 @@ def eval_babi_em(d, variant):
     from transformers import AutoTokenizer
     from src.memory.config import ReprConfig
     from src.memory.model import ReprLearningModel
-    from scripts.train.train import make_mixed_val_sets, to_device
+    from src.memory.training import make_mixed_val_sets, to_device
 
     cps = sorted(glob.glob(str(d / "ckpts" / "*.pt")))
     if not cps:

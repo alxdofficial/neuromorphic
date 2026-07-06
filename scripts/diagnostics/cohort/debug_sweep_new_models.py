@@ -6,21 +6,22 @@ For each variant × {mae, babi}:
   - gradient flow: every trainable submodule gets FINITE, NON-zero gradient (no starvation, no
     inf/nan, no absurd magnitude); global grad norm reported.
 
-Usage: python scripts/diagnostics/debug_sweep_new_models.py
+Usage: python scripts/diagnostics/cohort/debug_sweep_new_models.py
 """
 from __future__ import annotations
 import sys
 from pathlib import Path
 import torch
 
-REPO = Path(__file__).resolve().parents[2]
+REPO = Path(__file__).resolve().parents[3]
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 from transformers import AutoTokenizer, AutoConfig
 from src.memory.config import ReprConfig
 from src.memory.model import ReprLearningModel
 from src.memory.common import resolve_special_ids
-from scripts.train.train import make_mixed_val_sets, to_device, MIXED_TASK_MODE
+from src.memory.training import make_mixed_val_sets, to_device
+from src.memory.data.mixes import TASK_MODE
 
 BACKBONE = "HuggingFaceTB/SmolLM2-135M"
 DEV = "cuda"
@@ -78,7 +79,7 @@ def run_variant(variant):
     enc = m.encoder
     ok = True
     for t in tasks:
-        m.task_mode = MIXED_TASK_MODE[t]
+        m.task_mode = TASK_MODE[t]
         b = to_device(vs[t][0], DEV)
         embed = m.decoder.llama.get_input_embeddings()
         with torch.no_grad():
@@ -92,14 +93,14 @@ def run_variant(variant):
         flag = "" if (finite and mx < EXPLODE) else "  <<< BAD"
         if not (finite and mx < EXPLODE):
             ok = False
-        print(f"\n--- {t} ({MIXED_TASK_MODE[t]}) ---")
+        print(f"\n--- {t} ({TASK_MODE[t]}) ---")
         print(f"  memory: finite={finite} |max|={mx:.2f} per-tok-norm={nrm:.2f}{flag}")
         cans = {k: float(v) for k, v in aux.items() if torch.is_tensor(v) and v.numel() == 1}
         print(f"  canaries: " + "  ".join(f"{k.replace('slotgraph_','').replace('vqicae_','')}={v:.3f}"
                                           for k, v in sorted(cans.items())))
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             out = (m.compute_masked_reconstruction_loss(b)
-                   if MIXED_TASK_MODE[t] == "masked_reconstruction"
+                   if TASK_MODE[t] == "masked_reconstruction"
                    else m.compute_loss(b, window_size=1024))
         loss = out["loss"]; recon = out.get("loss_recon", loss)
         lf = bool(torch.isfinite(loss))

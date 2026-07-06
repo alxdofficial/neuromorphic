@@ -29,21 +29,9 @@ from transformers import AutoTokenizer
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from src.memory.data.babi import DEFAULT_TASKS as BABI_DEFAULT_TASKS
-from src.memory.data.mixes import DEFAULT_TRAIN_MIX, TASK_SPEC
 from src.memory.decoder import load_frozen_llama
-from src.memory.training import (
-    train_one_variant, train_mixed_variant, probe_bs,
-    make_mixed_val_sets, run_val, _continuation_early_loss, to_device,
-    _infonce_logits_weights, _same_answer_valid_mask, _grad_cached_objective_step,
-)
+from src.memory.training import train_one_variant, train_mixed_variant, probe_bs
 from scripts.train.cli import build_parser, args_to_config
-
-# back-compat re-exports for diagnostics (removed in Phase 4). Diagnostics still do
-# `from scripts.train.train import <name>` (and a few `from train import <name>` under sys.path
-# hacks); keep every such name resolvable here until those imports are repointed.
-MIXED_TASK_MODE = {n: s.task_mode for n, s in TASK_SPEC.items()}
-MIXED_TASKS_DEFAULT = DEFAULT_TRAIN_MIX
 
 REPO = Path(__file__).resolve().parents[2]
 

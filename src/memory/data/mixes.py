@@ -48,6 +48,11 @@ def task_mode(name: str) -> str:
     return TASK_SPEC[name].task_mode
 
 
+# {task name → model.task_mode}. The flat form the diagnostics want (drop-in for the old
+# scripts/train/train.py ``MIXED_TASK_MODE``).
+TASK_MODE: dict[str, str] = {n: s.task_mode for n, s in TASK_SPEC.items()}
+
+
 # every task must be backed by a real adapter — catch a spec/registry drift at import time.
 _missing = {n: s.adapter for n, s in TASK_SPEC.items() if s.adapter not in REGISTRY}
 assert not _missing, f"TASK_SPEC adapters absent from REGISTRY: {_missing} (have {sorted(REGISTRY)})"

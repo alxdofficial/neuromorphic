@@ -18,14 +18,15 @@ import sys
 from pathlib import Path
 import torch
 
-REPO = Path(__file__).resolve().parents[2]
+REPO = Path(__file__).resolve().parents[3]
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 from transformers import AutoTokenizer, AutoConfig
 from src.memory.config import ReprConfig
 from src.memory.model import ReprLearningModel
 from src.memory.common import resolve_special_ids
-from scripts.train.train import make_mixed_val_sets, to_device, MIXED_TASK_MODE
+from src.memory.training import make_mixed_val_sets, to_device
+from src.memory.data.mixes import TASK_MODE
 
 BACKBONE = "HuggingFaceTB/SmolLM2-135M"
 DEV = "cuda"
@@ -92,7 +93,7 @@ def main():
     # ── 1+2. write canaries + finite forward (standalone write→finalize) ──
     embed = m.decoder.llama.get_input_embeddings()
     for t in tasks:
-        m.task_mode = MIXED_TASK_MODE[t]
+        m.task_mode = TASK_MODE[t]
         b = to_device(vs[t][0], DEV)
         with torch.no_grad():
             ctx = embed(b.context_ids)
@@ -101,7 +102,7 @@ def main():
             st = enc.init_streaming_state(ctx.shape[0], DEV, ctx.dtype)
             st, _ = enc.streaming_write(st, enc_in, b.context_mask, surprise=sur)
             mem, aux = enc.finalize_memory(st)
-        print(f"\n=== {t} ({MIXED_TASK_MODE[t]}) ===")
+        print(f"\n=== {t} ({TASK_MODE[t]}) ===")
         print(f"  prepend mem shape = {tuple(mem.shape)} (M=32 prepend tokens expected) "
               f"finite={bool(torch.isfinite(mem).all())}  mem_effrank={float(aux.get('biomem_mem_effrank', 0)):.2f}/{cfg.d_llama}")
         print(f"  edges finite = {bool(torch.isfinite(enc._read_W).all())}  "
@@ -112,11 +113,11 @@ def main():
               f"surprise(mean −logp/lnV)={float(aux['biomem_surprise']):.4f}")
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             out = (m.compute_masked_reconstruction_loss(b)
-                   if MIXED_TASK_MODE[t] == "masked_reconstruction"
+                   if TASK_MODE[t] == "masked_reconstruction"
                    else m.compute_loss(b, window_size=1024))
         loss = out.get("loss_recon", out.get("loss"))
         top1 = out.get("top1_acc", out.get("top1", torch.zeros(())))
-        print(f"  REAL {MIXED_TASK_MODE[t]} loss={float(loss):.3f}  finite={bool(torch.isfinite(loss))}  "
+        print(f"  REAL {TASK_MODE[t]} loss={float(loss):.3f}  finite={bool(torch.isfinite(loss))}  "
               f"top1={float(top1):.3f}")
 
     # ── 3. gradient flow (real mae loss → backward): WRITE side must not be starved ──

@@ -15,7 +15,7 @@ or a sign bug would live in:
   5  contrastive perturbation probe — nudging the REAL memory toward random noise must RAISE the
      InfoNCE term (its own memory explains its target worse → softmax mass leaks to negatives).
 
-Usage: .venv/bin/python scripts/diagnostics/objective_debug.py
+Usage: .venv/bin/python scripts/diagnostics/objective/objective_debug.py
 """
 from __future__ import annotations
 
@@ -27,10 +27,9 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
-REPO = Path(__file__).resolve().parents[2]
+REPO = Path(__file__).resolve().parents[3]
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
-sys.path.insert(0, str(REPO / "scripts" / "train"))
 
 from src.memory.config import ReprConfig  # noqa: E402
 from src.memory.model import ReprLearningModel  # noqa: E402
@@ -106,7 +105,7 @@ def main():
     check("pass1 == pass2 element-wise (identical masks)", d12 < 2e-3, f"maxΔ={d12:.2e} (bf16)")
 
     print("2. analytic W directions (standardized-logit form)")
-    from train import _infonce_logits_weights, _same_answer_valid_mask  # noqa: E402
+    from src.memory.training import _infonce_logits_weights, _same_answer_valid_mask  # noqa: E402
     nce_t, W, p = _infonce_logits_weights(S1, coef, inv_temp=1.0, valid=None)
     check("W[0,:] > 0 — positive's CE is MINIMIZED", bool((W[0] > 0).all().item()),
           f"min={float(W[0].min()):.4f}")

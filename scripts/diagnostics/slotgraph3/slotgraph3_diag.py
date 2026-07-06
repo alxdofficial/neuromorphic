@@ -16,7 +16,7 @@ Per task (mae = healthy control, babi = the failure, condrecon_bio = known-gamea
                           + per-window latent grads. Is babi's router gradient-starved vs mae?
 
 Usage:
-  python scripts/diagnostics/slotgraph3_diag.py --ckpt outputs/memory/sg3_customx_slotgraph3_baseline/ckpts/slotgraph3_baseline.best.pt
+  python scripts/diagnostics/slotgraph3/slotgraph3_diag.py --ckpt outputs/memory/sg3_customx_slotgraph3_baseline/ckpts/slotgraph3_baseline.best.pt
 """
 from __future__ import annotations
 
@@ -29,7 +29,7 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
-REPO = Path(__file__).resolve().parents[2]
+REPO = Path(__file__).resolve().parents[3]
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
@@ -37,9 +37,9 @@ from transformers import AutoTokenizer
 
 from src.memory.config import ReprConfig
 from src.memory.model import ReprLearningModel
-from scripts.train.train import (
-    make_mixed_val_sets, to_device, MIXED_TASK_MODE, BABI_DEFAULT_TASKS,
-)
+from src.memory.training import make_mixed_val_sets, to_device
+from src.memory.data.mixes import TASK_MODE
+from src.memory.data.babi import DEFAULT_TASKS as BABI_DEFAULT_TASKS
 
 DEV = "cuda"
 TASKS = ["mae", "babi", "condrecon_bio"]
@@ -146,7 +146,7 @@ def main():
     # ── probes A/B/C: eval mode, grad enabled only so the _trace retain_grad hook is legal ──
     print(f"\n{'='*100}\nA/B/C — memory specificity, write-over-time, topology  ({N_BATCHES}×{cfg.batch_size} examples/task)\n{'='*100}")
     for task in TASKS:
-        model.task_mode = MIXED_TASK_MODE[task]
+        model.task_mode = TASK_MODE[task]
         mem_x, mem_er, nlat_x, elat_x = [], [], [], []
         win_rows = {}                                             # w → aggregated stats
         for batch in vs[task]:
@@ -192,7 +192,7 @@ def main():
     hdr = f"{'group':<18}" + "".join(f"{t:>16}" for t in TASKS)
     per_task = {}
     for task in TASKS:
-        model.task_mode = MIXED_TASK_MODE[task]
+        model.task_mode = TASK_MODE[task]
         model.train()
         model.zero_grad(set_to_none=True)
         enc._trace = []

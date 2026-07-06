@@ -12,21 +12,22 @@ docs/slotgraph_diagnostics.md). This script verifies, in the REAL bf16 mixed pat
   5. parameter MOVEMENT over a few Adam steps → do the topology/MP params actually move (not just
      receive a one-shot gradient)?
 
-Usage: python scripts/diagnostics/smoke_slotgraph_mpread.py
+Usage: python scripts/diagnostics/slotgraph/smoke_slotgraph_mpread.py
 """
 from __future__ import annotations
 import sys
 from pathlib import Path
 import torch
 
-REPO = Path(__file__).resolve().parents[2]
+REPO = Path(__file__).resolve().parents[3]
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 from transformers import AutoTokenizer, AutoConfig
 from src.memory.config import ReprConfig
 from src.memory.model import ReprLearningModel
 from src.memory.common import resolve_special_ids
-from scripts.train.train import make_mixed_val_sets, to_device, MIXED_TASK_MODE
+from src.memory.training import make_mixed_val_sets, to_device
+from src.memory.data.mixes import TASK_MODE
 
 BACKBONE = "HuggingFaceTB/SmolLM2-135M"
 DEV = "cuda"
@@ -78,7 +79,7 @@ def grad_norm(m, prefixes):
 
 def backward_once(m, batch, task):
     m.zero_grad(set_to_none=True)
-    m.task_mode = MIXED_TASK_MODE[task]
+    m.task_mode = TASK_MODE[task]
     with torch.amp.autocast("cuda", dtype=torch.bfloat16):
         out = (m.compute_masked_reconstruction_loss(batch) if task == "mae"
                else m.compute_loss(batch, window_size=1024))
@@ -102,7 +103,7 @@ def main():
     # ── 1+2. forward: shape, finiteness, MP canaries ──
     embed = m.decoder.llama.get_input_embeddings()
     for t in ("mae", "babi", "continuation", "condrecon_bio"):
-        m.task_mode = MIXED_TASK_MODE[t]
+        m.task_mode = TASK_MODE[t]
         b = to_device(vs[t][0], DEV)
         with torch.no_grad():
             ctx = embed(b.context_ids)
@@ -110,7 +111,7 @@ def main():
             st, _ = enc.streaming_write(st, ctx, b.context_mask)
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                 mem, aux = enc.finalize_memory(st)
-        print(f"\n=== {t} ({MIXED_TASK_MODE[t]}) ===")
+        print(f"\n=== {t} ({TASK_MODE[t]}) ===")
         print(f"  memory shape = {tuple(mem.shape)}  (M should be 32 — same prepend budget as icae)")
         print(f"  finite = {bool(torch.isfinite(mem).all())}")
         print(f"  MP read: hops={int(aux['slotgraph_mp_hops'])}  "

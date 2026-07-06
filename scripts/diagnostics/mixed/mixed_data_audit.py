@@ -15,7 +15,7 @@ same factory fns with split=train) and checks, per task:
   D. FIREWALLS   train/val disjointness: context-row hash overlap (mae/continuation/babi);
                  condrecon entity-world overlap (val world must be a different entity world).
 
-Usage: python scripts/diagnostics/mixed_data_audit.py
+Usage: python scripts/diagnostics/mixed/mixed_data_audit.py
 """
 from __future__ import annotations
 
@@ -26,14 +26,15 @@ from pathlib import Path
 
 import torch
 
-REPO = Path(__file__).resolve().parents[2]
+REPO = Path(__file__).resolve().parents[3]
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
 from transformers import AutoTokenizer
 
 from src.memory.config import ReprConfig
-from scripts.train.train import make_mixed_val_sets, BABI_DEFAULT_TASKS
+from src.memory.training import make_mixed_val_sets
+from src.memory.data.babi import DEFAULT_TASKS as BABI_DEFAULT_TASKS
 from src.memory.data.mae import make_long_passage_mae_dataloader
 from src.memory.data.babi import make_babi_dataloader
 from src.memory.data.continuation import make_continuation_dataloader

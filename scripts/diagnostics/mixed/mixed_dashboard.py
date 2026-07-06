@@ -3,7 +3,7 @@
 
 Tails a run's jsonl and prints a per-task table line each time a NEW eval step
 lands (i.e. once all per-task val rows for a step are in). Designed for the mixed
-harness (scripts/train/train.py --task mixed), which writes one PER-TASK val row
+harness (scripts/train/, --task mixed), which writes one PER-TASK val row
 per eval, tagged with `task` + `step`:
 
   step  1500 | MAE  loss=4.80 top1=.28 | bAbI EM=41% loss=2.10 | cont early=0.62
@@ -12,9 +12,9 @@ Line-buffered stdout so it works under the Monitor tool / `tail -f`. Pass the
 jsonl path directly, or a run directory (we resolve <dir>/jsonl/*.jsonl, or a
 bare *.jsonl inside it).
 
-  python scripts/diagnostics/mixed_dashboard.py outputs/memory/<tag>_<variant>
-  python scripts/diagnostics/mixed_dashboard.py path/to/<variant>.jsonl
-  python scripts/diagnostics/mixed_dashboard.py <jsonl> --once   # render existing rows then exit
+  python scripts/diagnostics/mixed/mixed_dashboard.py outputs/memory/<tag>_<variant>
+  python scripts/diagnostics/mixed/mixed_dashboard.py path/to/<variant>.jsonl
+  python scripts/diagnostics/mixed/mixed_dashboard.py <jsonl> --once   # render existing rows then exit
 """
 from __future__ import annotations
 

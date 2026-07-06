@@ -12,7 +12,7 @@ Times the REAL training step (bf16 autocast + grad checkpointing + AdamW) for ev
 
 Peak VRAM per cell. Median of 3 timed steps after 2 warmups.
 
-Usage: .venv/bin/python scripts/diagnostics/objective_profile.py
+Usage: .venv/bin/python scripts/diagnostics/objective/objective_profile.py
 """
 from __future__ import annotations
 
@@ -26,14 +26,13 @@ from pathlib import Path
 
 import torch
 
-REPO = Path(__file__).resolve().parents[2]
+REPO = Path(__file__).resolve().parents[3]
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
-sys.path.insert(0, str(REPO / "scripts" / "train"))
 
 from src.memory.config import ReprConfig  # noqa: E402
 from src.memory.model import ReprLearningModel  # noqa: E402
-from train import _grad_cached_objective_step  # noqa: E402
+from src.memory.training import _grad_cached_objective_step  # noqa: E402
 
 DEV = "cuda"
 BACKBONE = "HuggingFaceTB/SmolLM2-135M"

@@ -9,7 +9,7 @@ Run before trusting results from new configs. Checks (GPU, small-B, safe alongsi
   6. save→load round trip             state_dict reload reproduces the memory bit-for-bit
   7. idle-row freeze at K=128         inactive batch rows keep their latents
 
-Usage: python scripts/diagnostics/slotgraph3_validity_battery.py
+Usage: python scripts/diagnostics/slotgraph3/slotgraph3_validity_battery.py
 """
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ from pathlib import Path
 
 import torch
 
-REPO = Path(__file__).resolve().parents[2]
+REPO = Path(__file__).resolve().parents[3]
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 

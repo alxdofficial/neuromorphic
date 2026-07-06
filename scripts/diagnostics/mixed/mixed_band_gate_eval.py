@@ -21,7 +21,7 @@ metadata.cfg_dict (NOT module defaults), so the graph's saved shapes
 scripts rebuilt from defaults → shape-mismatch crash.)
 
 Usage:
-  python scripts/diagnostics/mixed_band_gate_eval.py [--val-batches 32] [--out-tag mixed4k_bio]
+  python scripts/diagnostics/mixed/mixed_band_gate_eval.py [--val-batches 32] [--out-tag mixed4k_bio]
 """
 from __future__ import annotations
 
@@ -32,7 +32,7 @@ from pathlib import Path
 
 import torch
 
-REPO = Path(__file__).resolve().parents[2]
+REPO = Path(__file__).resolve().parents[3]
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
@@ -40,10 +40,9 @@ from transformers import AutoTokenizer
 
 from src.memory.config import ReprConfig
 from src.memory.model import ReprLearningModel
-from scripts.train.train import (
-    make_mixed_val_sets, run_val, _continuation_early_loss,
-    MIXED_TASK_MODE, MIXED_TASKS_DEFAULT, BABI_DEFAULT_TASKS,
-)
+from src.memory.training import make_mixed_val_sets, run_val, _continuation_early_loss
+from src.memory.data.mixes import TASK_MODE, DEFAULT_TRAIN_MIX
+from src.memory.data.babi import DEFAULT_TASKS as BABI_DEFAULT_TASKS
 
 TRAINED_VARIANTS = [
     "icae_baseline", "ccm_baseline", "autocompressor_baseline", "beacon_baseline",
@@ -92,7 +91,7 @@ def _eval_variant(variant, cfg, state_dict, tokenizer, val_sets, tasks,
     out = {}
     n = len(next(iter(val_sets.values())))   # batches per task (uniform)
     for t in tasks:
-        model.task_mode = MIXED_TASK_MODE[t]
+        model.task_mode = TASK_MODE[t]
         gb = n if gate else 0
         vm = run_val(model, val_sets[t], device, n_batches=n,
                      window_size=WINDOW_SIZE, gate_batches=gb)
@@ -123,7 +122,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out-tag", default="mixed4k_bio")
     ap.add_argument("--val-batches", type=int, default=32)
-    ap.add_argument("--tasks", nargs="+", default=list(MIXED_TASKS_DEFAULT))
+    ap.add_argument("--tasks", nargs="+", default=list(DEFAULT_TRAIN_MIX))
     ap.add_argument("--out-json", default=None)
     args = ap.parse_args()
     device = "cuda"

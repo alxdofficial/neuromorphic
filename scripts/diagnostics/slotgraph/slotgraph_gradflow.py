@@ -11,13 +11,14 @@ import sys, dataclasses
 from pathlib import Path
 import torch
 
-REPO = Path(__file__).resolve().parents[2]
+REPO = Path(__file__).resolve().parents[3]
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 from transformers import AutoTokenizer
 from src.memory.config import ReprConfig
 from src.memory.model import ReprLearningModel
-from scripts.train.train import make_mixed_val_sets, to_device, MIXED_TASK_MODE
+from src.memory.training import make_mixed_val_sets, to_device
+from src.memory.data.mixes import TASK_MODE
 
 DEV = "cuda"
 CKPT = REPO / "outputs/memory/mixed4k_bio_slotgraph_baseline/ckpts/slotgraph_baseline.best.pt"
@@ -59,7 +60,7 @@ def main():
 
     acc = {g: 0.0 for g in GROUPS}; nb = 0
     for t in ("mae", "babi"):
-        m.task_mode = MIXED_TASK_MODE[t]
+        m.task_mode = TASK_MODE[t]
         for b in vs[t]:
             b = to_device(b, DEV)
             m.zero_grad(set_to_none=True)

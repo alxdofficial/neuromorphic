@@ -10,7 +10,7 @@ learned per-slot structure (node/edge role + edge endpoints + soft distributions
 Verdict heuristic: edges are "sharp/real" if endpoint entropy ≪ ln(M) and node-usage is spread;
 "smeared/collapsed" if entropy ≈ ln(M) (near-uniform = effectively random edges).
 
-Usage: python scripts/diagnostics/slotgraph_diag.py
+Usage: python scripts/diagnostics/slotgraph/slotgraph_diag.py
 """
 from __future__ import annotations
 import sys, math, dataclasses
@@ -22,13 +22,13 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-REPO = Path(__file__).resolve().parents[2]
+REPO = Path(__file__).resolve().parents[3]
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 from transformers import AutoTokenizer
 from src.memory.config import ReprConfig
 from src.memory.model import ReprLearningModel
-from scripts.train.train import make_mixed_val_sets, to_device
+from src.memory.training import make_mixed_val_sets, to_device
 
 DEV = "cuda"
 CKPT = REPO / "outputs/memory/mixed4k_bio_slotgraph_baseline/ckpts/slotgraph_baseline.best.pt"

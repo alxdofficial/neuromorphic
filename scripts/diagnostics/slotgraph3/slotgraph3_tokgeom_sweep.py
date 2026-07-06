@@ -19,7 +19,7 @@ Checks:
  11  custom arm builds + MAE fwd/bwd finite
  12  edges legacy mode builds + fwd finite (backcompat)
 
-Usage: .venv/bin/python scripts/diagnostics/slotgraph3_tokgeom_sweep.py
+Usage: .venv/bin/python scripts/diagnostics/slotgraph3/slotgraph3_tokgeom_sweep.py
 """
 from __future__ import annotations
 
@@ -31,7 +31,7 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
-REPO = Path(__file__).resolve().parents[2]
+REPO = Path(__file__).resolve().parents[3]
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
@@ -212,8 +212,7 @@ def main():
 
     # ── 9: GradCache exactness ──────────────────────────────────────────────────
     print("9. GradCache exactness (analytic-W vs naive autograd)")
-    sys.path.insert(0, str(REPO / "scripts" / "train"))
-    from train import _grad_cached_objective_step  # noqa: E402
+    from src.memory.training import _grad_cached_objective_step  # noqa: E402
     small = mae_batch(B=3, T=64, seed=7)
     model.task_mode = "masked_reconstruction"
     model.cfg.objective_mode = "contrastive"
