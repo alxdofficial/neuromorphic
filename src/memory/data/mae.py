@@ -11,6 +11,9 @@ Emits the QABatch contract so the existing reconstruction (AE) path consumes it
 directly; adds `k_slots` (the per-example code size) for capacity-relative models
 and a future true-MAE forward. AE here = teacher-forced reconstruct-the-pair;
 true MAE (mask-infill, non-teacher-forced) is a separate decode path (TODO).
+
+Data: `data/fineweb_edu/{train,val}.parquet` (+ `cache/`); ingest =
+`scripts/data_build/ingest/fineweb.py` (TODO). See DATASETS.md.
 """
 from __future__ import annotations
 

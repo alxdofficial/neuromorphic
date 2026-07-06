@@ -25,6 +25,9 @@ supporting facts intact at the front. This (a) matches the input length of the
 other objectives and (b) turns every example into a retrieve-among-noise read.
 
   python -m src.memory.data.babi        # smoke: render a few examples, check ctx len
+
+Data/build: HF `Muennighoff/babi` (1k), auto-downloaded; 10k ingest =
+`scripts/data_build/ingest/babi_10k.py` (TODO). See DATASETS.md.
 """
 from __future__ import annotations
 

@@ -19,6 +19,9 @@ Emits the per-sample dict that `data_qa.collate_qa` consumes → reuses the whol
 `compute_loss` path + REAL/SHUF/OFF gate unchanged; only the data differs.
 
   python -m src.memory.data.continuation     # smoke: print a rendered example
+
+Data: `data/fineweb_edu/{train,val}.parquet` (shares `mae`'s `cache/`); ingest =
+`scripts/data_build/ingest/fineweb.py` (TODO). See DATASETS.md.
 """
 from __future__ import annotations
 

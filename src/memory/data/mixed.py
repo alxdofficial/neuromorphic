@@ -2,6 +2,9 @@
 
 Weighted union of several readers, emitting exactly one example per `__next__`.
 This is the QA-mix used by the trainer's val loader and multi-source runs.
+
+Composes the readers in this package (`common.QADataset` + hotpot/narrativeqa/
+musique/babilong); see each reader module and DATASETS.md for their data.
 """
 from __future__ import annotations
 

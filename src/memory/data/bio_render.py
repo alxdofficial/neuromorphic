@@ -17,6 +17,9 @@ Strict conditioned-reconstruction discipline (so SHUF is a hard control):
 This is **not** QA: there is no question/answer pair, no reasoning — the value
 is the entity's facts stated verbatim, to be reproduced from memory conditioned
 on the key. Reuses only the biographical world/pools (no QA generators).
+
+Runtime render templates for `bio.py`; world/pools come from
+`scripts/data_build/generate/bio/`. See DATASETS.md.
 """
 from __future__ import annotations
 

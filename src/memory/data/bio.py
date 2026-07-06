@@ -14,6 +14,9 @@ key/value *content* differs from ``data_conditioned_reconstruction.py``.
 
 Train/val disjointness: train and val build worlds from different ``world_seed``
 values → entirely different entity names/attrs (entity-level firewall).
+
+Generator: ``scripts/data_build/generate/bio/`` (``build_scenario``); render
+templates in ``bio_render.py``; composite store: ``data/bio/``. See DATASETS.md.
 """
 from __future__ import annotations
 
