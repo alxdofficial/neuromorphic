@@ -29,11 +29,12 @@ from transformers import AutoTokenizer
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from src.memory.config import ReprConfig
-from src.memory.data_qa import make_qa_dataloader, make_mixed_qa_dataloader, collate_qa
-from src.memory.data_continuation import make_continuation_dataloader
-from src.memory.data_conditioned_reconstruction_bio import make_conditioned_reconstruction_bio_dataloader
-from src.memory.data_babi import make_babi_dataloader, DEFAULT_TASKS as BABI_DEFAULT_TASKS
-from src.memory.data_masked_reconstruction import make_long_passage_mae_dataloader
+from src.memory.data.common import make_qa_dataloader, collate_qa
+from src.memory.data.mixed import make_mixed_qa_dataloader
+from src.memory.data.continuation import make_continuation_dataloader
+from src.memory.data.bio import make_conditioned_reconstruction_bio_dataloader
+from src.memory.data.babi import make_babi_dataloader, DEFAULT_TASKS as BABI_DEFAULT_TASKS
+from src.memory.data.mae import make_long_passage_mae_dataloader
 from src.memory.decoder import load_frozen_llama
 from src.memory.model import ReprLearningModel
 
@@ -1517,7 +1518,7 @@ def probe_bs(variants, llama, tokenizer, cfg, args):
     run, so the reported max-BS is directly usable as that arm's --batch-size."""
     import time
     from dataclasses import replace as _dc_replace
-    from src.memory.data_conditioned_reconstruction_bio import ConditionedReconstructionBioDataset
+    from src.memory.data.bio import ConditionedReconstructionBioDataset
     device = "cuda"
     _pad = cfg.pad_token_id if cfg.pad_token_id is not None else 128_001
     ds = ConditionedReconstructionBioDataset(tokenizer, context_len=args.chunk_size, n_pairs=args.cond_recon_n_pairs,

@@ -18,7 +18,7 @@ tokens genuinely depend on the compressed context.
 Emits the per-sample dict that `data_qa.collate_qa` consumes → reuses the whole
 `compute_loss` path + REAL/SHUF/OFF gate unchanged; only the data differs.
 
-  python -m src.memory.data_continuation     # smoke: print a rendered example
+  python -m src.memory.data.continuation     # smoke: print a rendered example
 """
 from __future__ import annotations
 
@@ -29,9 +29,9 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, IterableDataset
 
-from .data_qa import collate_qa
+from .common import collate_qa
 
-REPO = Path(__file__).resolve().parents[2]
+REPO = Path(__file__).resolve().parents[3]
 FINEWEB_TRAIN = REPO / "data/fineweb_edu/train.parquet"
 FINEWEB_VAL = REPO / "data/fineweb_edu/val.parquet"
 
@@ -50,7 +50,7 @@ class ContinuationDataset(IterableDataset):
                  pad_token_id: int = 128_001, trigger: str = None,
                  objective: str = "continuation"):
         import json
-        from .data_masked_reconstruction import _decode_cache
+        from .mae import _decode_cache
         assert objective == "continuation"
         self.tok = tokenizer
         self.compress_len = compress_len

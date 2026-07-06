@@ -24,7 +24,7 @@ appending irrelevant bAbI sentences drawn from OTHER stories, keeping the real
 supporting facts intact at the front. This (a) matches the input length of the
 other objectives and (b) turns every example into a retrieve-among-noise read.
 
-  python -m src.memory.data_babi        # smoke: render a few examples, check ctx len
+  python -m src.memory.data.babi        # smoke: render a few examples, check ctx len
 """
 from __future__ import annotations
 
@@ -35,7 +35,7 @@ from typing import List, Optional
 import torch
 from torch.utils.data import DataLoader, IterableDataset
 
-from .data_qa import collate_qa
+from .common import collate_qa
 
 _SENT_SPLIT = re.compile(r"(?<=[.!?])\s+")
 
@@ -84,13 +84,23 @@ def _load_babi_rows(tasks, split: str):
     generation if offline. The story field is QUESTION-AGNOSTIC by construction."""
     task_set = set(tasks)
 
+    # SAFE FIX: resolve/validate the split name UP FRONT so an unrecognized string
+    # fails loudly rather than silently defaulting to "train". (Done before the HF
+    # try-block so the raise isn't swallowed by the offline-fallback except.)
+    if split == "train":
+        hf_split = "train"
+    elif split in ("validation", "val"):
+        hf_split = "validation"
+    else:
+        raise ValueError(
+            f"bAbI: unrecognized split {split!r} (expected 'train', 'validation', or 'val')")
+
     # facebook/babi_qa ships per-task configs but as a (now-unsupported) dataset
     # script; Muennighoff/babi ships a plain parquet with a `task` column and a
     # ready-made `passage`/`question`/`answer` schema — try the parquet first.
     for name in ("Muennighoff/babi",):
         try:
             from datasets import load_dataset
-            hf_split = "validation" if split in ("validation", "val") else "train"
             ds = load_dataset(name, split=hf_split)
             rows = []
             for ex in ds:
@@ -110,9 +120,16 @@ def _load_babi_rows(tasks, split: str):
             print(f"[babi] {name} unavailable ({type(e).__name__}: {str(e)[:80]}); "
                   f"trying next source", flush=True)
 
-    # Offline fallback: synthesize task-1 single-supporting-fact stories. Seed by SPLIT so the
-    # train/val fallback streams are disjoint — a fixed 1234 for both made offline val a verbatim
-    # copy of train (silent leakage when HF is unreachable).
+    # Offline fallback: synthesize task-1 single-supporting-fact stories. SAFE FIX: only
+    # fabricate task-1 data when task 1 was actually requested — otherwise this would silently
+    # serve a task-1 stream for a DIFFERENT requested task set (wrong data, no error). Fail loud.
+    if 1 not in task_set:
+        raise RuntimeError(
+            f"bAbI HF source unreachable and requested tasks {sorted(task_set)} do not include "
+            f"task 1 — the offline fallback only synthesizes task-1 stories. Restore network "
+            f"access (Muennighoff/babi) or include task 1 in the requested tasks.")
+    # Seed by SPLIT so the train/val fallback streams are disjoint — a fixed 1234 for both made
+    # offline val a verbatim copy of train (silent leakage when HF is unreachable).
     is_val = split in ("validation", "val")
     print(f"[babi] HF bAbI unreachable — generating programmatic task-1 stories "
           f"(offline fallback, split={'val' if is_val else 'train'})", flush=True)
@@ -246,7 +263,7 @@ def make_babi_dataloader(tokenizer, context_len: int, batch_size: int,
 if __name__ == "__main__":  # smoke: render a few bAbI examples, confirm ctx len
     import sys
     from pathlib import Path
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
     from transformers import AutoTokenizer
     from src.memory.config import ReprConfig
 

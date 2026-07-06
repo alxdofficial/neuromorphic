@@ -34,10 +34,10 @@ from transformers import AutoTokenizer
 
 from src.memory.config import ReprConfig
 from scripts.train.train import make_mixed_val_sets, BABI_DEFAULT_TASKS
-from src.memory.data_masked_reconstruction import make_long_passage_mae_dataloader
-from src.memory.data_babi import make_babi_dataloader
-from src.memory.data_continuation import make_continuation_dataloader
-from src.memory.data_conditioned_reconstruction_bio import make_conditioned_reconstruction_bio_dataloader
+from src.memory.data.mae import make_long_passage_mae_dataloader
+from src.memory.data.babi import make_babi_dataloader
+from src.memory.data.continuation import make_continuation_dataloader
+from src.memory.data.bio import make_conditioned_reconstruction_bio_dataloader
 
 TASKS = ["mae", "babi", "continuation", "condrecon_bio"]
 N_BATCHES = 4                    # 4×8 = 32 examples audited per task/split

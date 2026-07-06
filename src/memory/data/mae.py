@@ -23,9 +23,9 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, IterableDataset
 
-from .data_qa import collate_qa
+from .common import collate_qa
 
-REPO = Path(__file__).resolve().parents[2]
+REPO = Path(__file__).resolve().parents[3]
 FINEWEB_TRAIN = REPO / "data/fineweb_edu/train.parquet"
 FINEWEB_VAL = REPO / "data/fineweb_edu/val.parquet"
 TEXT_CACHE = REPO / "data/fineweb_edu/text_cache"   # decoded-text cache dir

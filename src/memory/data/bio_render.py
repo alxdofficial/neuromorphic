@@ -36,6 +36,7 @@ _A_BEFORE = ("uni", "use", "uni", "eu", "one", "ewe", "u.")
 # name and drop any fact whose gendered language conflicts, so we never render
 # "Sverre, the daughter of …".
 try:
+    # NOTE (Phase 3): scripts.data_gen.tasks.biographical → scripts.data_build.generate.bio
     from scripts.data_gen.tasks.biographical import pools as _pools
     _FEM_NAMES = set(_pools.FIRST_NAMES_F)
     _MASC_NAMES = set(_pools.FIRST_NAMES_M)
@@ -298,7 +299,7 @@ def render_value(ent, rng: random.Random, year_as_words, *, n_facts: int = 3,
 if __name__ == "__main__":  # smoke: print keys + values per entity type
     import sys
     from pathlib import Path
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
     from scripts.data_gen.tasks.biographical.state import build_scenario
     from scripts.data_gen.tasks.biographical.pools import year_as_words
 
