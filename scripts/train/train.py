@@ -40,10 +40,10 @@ from src.memory.model import ReprLearningModel
 
 
 REPO = Path(__file__).resolve().parents[2]
-COMPOSITE_TRAIN_P = REPO / "data/wave1/composite_v1/train/passages.jsonl"
-COMPOSITE_TRAIN_Q = REPO / "data/wave1/composite_v1/train/questions.jsonl"
-COMPOSITE_VAL_P   = REPO / "data/wave1/composite_v1/val/passages.jsonl"
-COMPOSITE_VAL_Q   = REPO / "data/wave1/composite_v1/val/questions.jsonl"
+COMPOSITE_TRAIN_P = REPO / "data/bio/train/passages.jsonl"
+COMPOSITE_TRAIN_Q = REPO / "data/bio/train/questions.jsonl"
+COMPOSITE_VAL_P   = REPO / "data/bio/val/passages.jsonl"
+COMPOSITE_VAL_Q   = REPO / "data/bio/val/questions.jsonl"
 
 
 def lr_at_step(step: int, max_steps: int, base_lr: float, warmup_steps: int) -> float:
