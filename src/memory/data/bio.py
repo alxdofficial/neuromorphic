@@ -27,10 +27,9 @@ from torch.utils.data import IterableDataset, DataLoader
 from .common import collate_qa
 from .bio_render import render_key, render_value
 
-# bio world builder + lexical helper (worldspec files restored from git)
-# NOTE (Phase 3): scripts.data_gen.tasks.biographical → scripts.data_build.generate.bio
-from scripts.data_gen.tasks.biographical.state import build_scenario
-from scripts.data_gen.tasks.biographical.pools import year_as_words
+# bio world builder + lexical helper (build/generate layer: scripts/data_build/generate/bio/)
+from scripts.data_build.generate.bio.state import build_scenario
+from scripts.data_build.generate.bio.pools import year_as_words
 
 # default per-type entity counts (≈410 entities → supports n_pairs up to ~32)
 _WORLD = dict(n_people=200, n_public_figures=30, n_orgs=60, n_nations=20,

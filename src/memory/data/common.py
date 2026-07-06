@@ -29,7 +29,7 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from scripts.data_gen.common.sampler import CompositeSampler  # noqa: E402  (Phase 3 → scripts.data_build.common.sampler)
+from scripts.data_build.common.sampler import CompositeSampler  # noqa: E402
 
 from ..config import ReprConfig
 
