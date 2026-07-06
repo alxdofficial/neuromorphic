@@ -3,10 +3,10 @@
 The natural-language sibling of ``data_conditioned_reconstruction.py`` (which is
 random-word MQAR). Here a **key** is a short identifying phrase for a world entity
 and a **value** is a fact-dense natural sentence packing several of that entity's
-*other* random attributes (see ``conditioned_reconstruction_bio_templates.py``).
-The encoder ingests N
+*other* random attributes (see ``bio_render.py``). The encoder ingests N
 ``key = value`` lines → memory; the decoder reproduces a queried key's value
-sentence verbatim, conditioned on the key. Loss only on the value span.
+sentence verbatim, conditioned on the key. Loss only on the un-guessable
+fact-value spans (not the entity name or template scaffolding).
 
 Emits the exact per-sample dict ``data_qa.collate_qa`` consumes, so the whole
 ``compute_loss`` path + REAL/SHUF/OFF gate are reused unchanged — only the
@@ -87,32 +87,55 @@ class ConditionedReconstructionBioDataset(IterableDataset):
     def _ids(self, s: str) -> List[int]:
         return self.tok(s, add_special_tokens=False).input_ids
 
-    def _value_ids_content(self, value: str, name: str, given: str, lead_space: bool):
-        """Tokenize a value and mark content=False on the entity-name tokens (which are
-        given verbatim in the key → key-derivable dead weight that dilutes the gate, sweep
-        bug #2). Uses char offsets so it catches the name wherever the persona places it."""
+    def _value_ids_content(self, value: str, name: str, given: str, lead_space: bool,
+                           value_subs=()):
+        """Tokenize a value and mark content=True on ONLY the fact-VALUE character spans
+        (the substrings render_value actually packed via ``value_out``), excluding the entity
+        name and all template/persona scaffolding.
+
+        Scoring loss on the whole sentence charged ~90% of the CE mass to key-independent
+        connectives ('recognized for', 'a graduate of', 'In brief —') → SHUF−REAL≈0. Restricting
+        to the un-guessable fact spans concentrates the objective where a wrong-entity memory
+        actually fails (value-span mask). Falls back to the old name-excluded mask when no value
+        spans are given/matched, so a name-only value never yields an all-False (loss-less) mask."""
         s = (" " + value) if lead_space else value
         enc = self.tok(s, add_special_tokens=False, return_offsets_mapping=True)
-        spans = []
-        for nm in {x for x in (name, given) if x}:
-            start = 0
-            while True:
-                i = s.find(nm, start)
-                if i < 0:
-                    break
-                spans.append((i, i + len(nm)))
-                start = i + 1
-        def _is_name(a, b):
+
+        def _spans_of(needles):
+            out = []
+            for nd in {x for x in needles if x}:
+                start = 0
+                while True:
+                    i = s.find(nd, start)
+                    if i < 0:
+                        break
+                    out.append((i, i + len(nd)))
+                    start = i + 1
+            return out
+
+        name_spans = _spans_of((name, given))
+        val_spans = _spans_of(value_subs)
+
+        def _overlaps(spans, a, b):
             return any(not (b <= x or a >= y) for x, y in spans)
-        content = [not _is_name(a, b) for (a, b) in enc.offset_mapping]
+
+        if val_spans:
+            content = [_overlaps(val_spans, a, b) and not _overlaps(name_spans, a, b)
+                       for (a, b) in enc.offset_mapping]
+            if any(content):
+                return enc.input_ids, content
+        # no value spans matched (name-only value / degenerate draw) → old name-excluded mask.
+        content = [not _overlaps(name_spans, a, b) for (a, b) in enc.offset_mapping]
         return enc.input_ids, content
 
     def _render_pair(self, ent, rng):
         key, excl = render_key(ent, rng, year_as_words)
-        val = render_value(ent, rng, year_as_words, n_facts=self.n_facts, exclude=excl)
+        vsubs: List[str] = []
+        val = render_value(ent, rng, year_as_words, n_facts=self.n_facts,
+                           exclude=excl, value_out=vsubs)
         name = ent.attrs.get("name") or ent.attrs.get("title") or ent.key
         given = ent.attrs.get("given_name") or name
-        return key, val, name, given
+        return key, val, name, given, vsubs
 
     def _gen(self, rng: random.Random) -> dict:
         # Fill-to-budget: pack (key = value) lines until the next would exceed context_len,
@@ -123,19 +146,21 @@ class ConditionedReconstructionBioDataset(IterableDataset):
         values: List[str] = []
         names: List[str] = []
         givens: List[str] = []
+        valsubs: List[List[str]] = []
         cum = 0
         line_lens: List[int] = []
         budget = self.context_len - 8                          # margin for BPE line-join effects
         for e in pool:
-            k, v, nm, gv = self._render_pair(e, rng)
+            k, v, nm, gv, vs = self._render_pair(e, rng)
             tries = 0
             while k in keys and tries < 5:                     # avoid a bare-name key collision
-                k, v, nm, gv = self._render_pair(e, rng)
+                k, v, nm, gv, vs = self._render_pair(e, rng)
                 tries += 1
             line_len = len(self._ids(f"{k} = {v}\n"))
             if cum + line_len > budget and len(keys) >= max(self.n_query, 1):
                 break                                          # budget full → stop packing
             keys.append(k); values.append(v); names.append(nm); givens.append(gv)
+            valsubs.append(vs)
             line_lens.append(line_len); cum += line_len
 
         context_str = "".join(f"{k} = {v}\n" for k, v in zip(keys, values))
@@ -169,14 +194,14 @@ class ConditionedReconstructionBioDataset(IterableDataset):
         for n, j in enumerate(qi):
             if n == 0:
                 # space-prefixed value (matches "= v" in the context), like the multi-query cue below.
-                v_ids, v_content = self._value_ids_content(values[j], names[j], givens[j], True)
+                v_ids, v_content = self._value_ids_content(values[j], names[j], givens[j], True, valsubs[j])
             else:
                 cue = self._ids(f" {keys[j]} =")          # inline cue for the next pair (given)
                 answer_ids += cue
                 content += [False] * len(cue)
-                v_ids, v_content = self._value_ids_content(values[j], names[j], givens[j], True)
+                v_ids, v_content = self._value_ids_content(values[j], names[j], givens[j], True, valsubs[j])
             answer_ids += v_ids
-            content += v_content                          # value facts load-bearing; name tokens excluded
+            content += v_content                          # loss only on the un-guessable fact-value spans
 
         return {
             "context_ids": torch.tensor(ctx, dtype=torch.long),

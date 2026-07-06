@@ -125,7 +125,17 @@ def _decade(v: Any) -> str:
 # ── per-attribute clause fragments (apposition-friendly: read after "Name, …") ──
 # Each entry: list of templates; {v}=humanized value, {yr}=year form, {a}=article.
 
-def _clause(attr: str, raw: Any, rng: random.Random, year_as_words) -> str | None:
+# attrs whose clause renders a YEAR / DECADE surface form (≠ the raw value string), so the
+# load-bearing value substring is `yr` / `dec`, not `v`. Everything else's value substring is `v`.
+_YEAR_ATTRS = {"birth_year", "award_year", "founding_year", "year", "year_released"}
+_DECADE_ATTRS = {"founding_decade", "decade", "release_decade"}
+
+
+def _clause(attr: str, raw: Any, rng: random.Random, year_as_words) -> tuple[str, str] | None:
+    """Return ``(phrase, value_substr)``: the apposition fragment and the exact fact-value
+    substring inside it (the humanized value / year / decade form — the only span a reader
+    must recover). The connectives around it ('recognized for', 'a graduate of') are
+    key-independent scaffolding; bio.py scores loss only on ``value_substr`` (value-span mask)."""
     v = _humanize(raw)
     yr = _yr(raw, rng, year_as_words)
     a = _art(v)
@@ -174,7 +184,11 @@ def _clause(attr: str, raw: Any, rng: random.Random, year_as_words) -> str | Non
         "release_decade":    [f"released in the {dec}"],
     }
     opts = table.get(attr)
-    return rng.choice(opts) if opts else None
+    if not opts:
+        return None
+    phrase = rng.choice(opts)
+    vsub = yr if attr in _YEAR_ATTRS else dec if attr in _DECADE_ATTRS else v
+    return phrase, vsub
 
 
 # ── attribute pools the value can pack (own-entity attrs only) ──
@@ -258,16 +272,25 @@ def render_key(ent, rng: random.Random, year_as_words) -> tuple[str, set[str]]:
 
 
 def render_value(ent, rng: random.Random, year_as_words, *, n_facts: int = 3,
-                 exclude: set[str] = frozenset()) -> str:
-    """One fact-dense apposition sentence packing up to ``n_facts`` random attrs."""
+                 exclude: set[str] = frozenset(), value_out: list | None = None) -> str:
+    """One fact-dense apposition sentence packing up to ``n_facts`` random attrs.
+
+    If ``value_out`` is given, it is filled with the exact fact-value substrings actually
+    placed into the sentence (in order) — the loss-side value-span mask in bio.py scores only
+    those, excluding the entity name and all connective/persona scaffolding."""
     name = _entity_name(ent)
     given = ent.attrs.get("given_name") or name
+    if value_out is not None:
+        value_out.clear()
     g = _name_gender(ent)
     available = [
         a for a in ATTR_POOL.get(ent.entity_type, [])
         if ent.attrs.get(a) is not None and a not in exclude
         and _fact_gender(ent.attrs[a]) in (None, g)             # gender-consistent facts only
-        and not (a == "short_name" and _name_derivable(ent.attrs[a], ent.attrs.get("name")))
+        # name-derivable facts are key-derivable dead weight: short_name (sweep #5), and org/work
+        # type words already inside the entity name ('… Association' → 'an association').
+        and not (a in ("short_name", "org_type", "work_type")
+                 and _name_derivable(ent.attrs[a], ent.attrs.get("name")))
     ]
     # collapse correlated groups → keep one representative so packed facts are independent
     drop: set[str] = set()
@@ -280,7 +303,10 @@ def render_value(ent, rng: random.Random, year_as_words, *, n_facts: int = 3,
     if not available:
         return f"{name}."
     picked = rng.sample(available, min(n_facts, len(available)))
-    clauses = [c for a in picked if (c := _clause(a, ent.attrs[a], rng, year_as_words))]
+    rendered = [r for a in picked if (r := _clause(a, ent.attrs[a], rng, year_as_words))]
+    clauses = [c for (c, _vs) in rendered]
+    if value_out is not None:
+        value_out.extend(vs for (_c, vs) in rendered)
     if not clauses:
         return f"{name}."
     persona = rng.choice(PERSONAS)
