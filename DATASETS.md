@@ -8,7 +8,9 @@ One canonical `<name>` per dataset, tied across all three layers:
 - **load** (runtime) — `src/memory/data/<name>.py` — the `Dataset` + `make_<name>_dataloader`
   (registered in `src/memory/data/__init__.py::REGISTRY`).
 
-See `scripts/data_build/README.md` and `data/README.md` for the layer mechanics.
+See `scripts/data_build/README.md` and `data/README.md` for the layer mechanics, and
+`HARNESS.md` for how these adapters are composed into training (the mix spec `src/memory/data/mixes.py`
+and the `src/memory/training/` harness).
 
 | name | what | source | role | reader (`src/memory/data/`) | build (`scripts/data_build/`) | data (`data/` or cache) | status | gotchas |
 |---|---|---|---|---|---|---|---|---|
