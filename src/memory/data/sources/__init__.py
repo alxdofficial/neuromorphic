@@ -13,7 +13,9 @@ from .base import Source, CorpusItem, KeyedItem, QAItem
 # name → (submodule, class-name)
 _SOURCES: dict[str, tuple[str, str]] = {
     "babi": ("babi", "BabiSource"),
-    # added incrementally as sources are extracted: bio, fineweb, pile, redpajama, mqar, ...
+    "bio": ("bio", "BioSource"),
+    "fineweb": ("fineweb", "FinewebSource"),
+    # added incrementally as sources are extracted: pile, redpajama, mqar, ...
 }
 
 

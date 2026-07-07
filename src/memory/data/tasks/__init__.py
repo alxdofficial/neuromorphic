@@ -12,7 +12,10 @@ from .base import Task, TaskDataset, make_task_dataloader
 # style → (submodule, class-name)
 _TASKS: dict[str, tuple[str, str]] = {
     "qa": ("qa", "QATask"),
-    # added incrementally: reconstruction, continuation, mae, multisession
+    "reconstruction": ("reconstruction", "ReconstructionTask"),
+    "continuation": ("continuation", "ContinuationTask"),
+    "mae": ("mae", "MaeTask"),
+    # added incrementally: multisession
 }
 
 
