@@ -1,23 +1,70 @@
-"""Mixed multi-task dataloader + fixed val-set construction (one loader per task).
+"""Mixed multi-task dataloader + fixed val-set construction, built from the 4-layer data spec.
 
-Extracted verbatim from ``scripts/train/train.py`` (harness reorg phase 2). No logic changes.
-The explicit per-task branches are kept (the makers have different signatures) — do NOT try to
-unify them through REGISTRY. The bio task-construction constants + the default mix are sourced
-from ``src.memory.data.mixes``.
+Each mixed-task name (mae/babi/continuation/condrecon_bio) resolves via ``mixes.TASK_SPEC`` to a
+(Source, Task) pair; this composes an ``EpisodeSpec`` from the runtime args and builds one loader
+per task through ``SOURCE_REGISTRY × get_task × make_task_dataloader``. Adding a source/task no
+longer edits this file — only the per-source construction kwargs (the genuinely source-specific
+bits: fineweb min_len/src-tok, babi tasks, bio world/n_facts) live in ``_build_source``.
+
+See ``docs/data_arch_plan.md`` (Orchestration). Replaces the old hardcoded per-task branches.
 """
 from __future__ import annotations
 
-from src.memory.data.mae import make_long_passage_mae_dataloader
-from src.memory.data.babi import make_babi_dataloader
-from src.memory.data.continuation import make_continuation_dataloader
-from src.memory.data.bio import make_conditioned_reconstruction_bio_dataloader
-from src.memory.data.mixes import (
-    DEFAULT_TRAIN_MIX,
-    CONDRECON_BIO_N_PAIRS as MIXED_CONDRECON_BIO_N_PAIRS,
-    CONDRECON_BIO_N_FACTS as MIXED_CONDRECON_BIO_N_FACTS,
-)
+from src.memory.data.mixes import TASK_SPEC, CONDRECON_BIO_N_PAIRS, CONDRECON_BIO_N_FACTS
+from src.memory.data.sources import SOURCE_REGISTRY
+from src.memory.data.tasks import get_task
+from src.memory.data.tasks.base import make_task_dataloader
+from src.memory.data.schedule import EpisodeSpec
 
 from .utils import materialize_val_set
+
+
+def _query_lag(bio_query_window) -> str:
+    """CLI --bio-query-window → EpisodeSpec.query_lag: None=any, 0=first(early), -1=last(recent)."""
+    if bio_query_window is None:
+        return "any"
+    if bio_query_window == 0:
+        return "early"
+    if bio_query_window == -1:
+        return "recent"
+    return str(int(bio_query_window))
+
+
+def _build_source(src_name, task_style, tokenizer, *, split, ctx_len, predict_len,
+                  mae_src_tok, babi_tasks, seed):
+    """The ONE place source-specific construction kwargs live (each source has genuinely different
+    build params). ``split`` is "train" | "val"; sources translate to their own split vocab."""
+    if src_name == "fineweb":
+        min_len = ctx_len + (predict_len if task_style == "continuation" else 0)
+        return SOURCE_REGISTRY["fineweb"](
+            tokenizer, split=split, src_tokenizer_name=mae_src_tok, min_len=min_len, seed=seed)
+    if src_name == "babi":
+        return SOURCE_REGISTRY["babi"](
+            tokenizer, split=("validation" if split != "train" else "train"),
+            tasks=babi_tasks, seed=seed)
+    if src_name == "bio":
+        return SOURCE_REGISTRY["bio"](
+            tokenizer, split=("validation" if split != "train" else "train"),
+            world_seed=0, n_facts=CONDRECON_BIO_N_FACTS, seed=seed)
+    raise ValueError(f"no source-construction rule for {src_name!r} (mixed task backing)")
+
+
+def _build_loader(mix_task, tokenizer, cfg, *, split, ctx_len, m_slots, mae_src_tok,
+                  babi_tasks, predict_len, window_size, bio_query_window, seed, num_workers):
+    """Build ONE mixed-task loader: TASK_SPEC[mix_task] → (source, task) × EpisodeSpec × cfg."""
+    meta = TASK_SPEC[mix_task]
+    pad = cfg.pad_token_id if cfg.pad_token_id is not None else 0
+    source = _build_source(meta.source, meta.task_style, tokenizer, split=split, ctx_len=ctx_len,
+                           predict_len=predict_len, mae_src_tok=mae_src_tok, babi_tasks=babi_tasks,
+                           seed=seed)
+    spec = EpisodeSpec(source=meta.source, task=meta.task_style, total_len=ctx_len,
+                       window_size=window_size, n_inputs=CONDRECON_BIO_N_PAIRS, n_queries=1,
+                       query_lag=_query_lag(bio_query_window), predict_len=predict_len)
+    task = get_task(meta.task_style)
+    if hasattr(task, "m_slots"):                 # MAE task: the capacity-relative memory budget
+        task.m_slots = m_slots
+    return make_task_dataloader(source, task, spec, tokenizer, batch_size=cfg.batch_size,
+                                pad_token_id=pad, seed=seed, num_workers=num_workers)
 
 
 def make_mixed_train_dataloaders(mixed_tasks, tokenizer, cfg, *, ctx_len: int,
@@ -25,73 +72,29 @@ def make_mixed_train_dataloaders(mixed_tasks, tokenizer, cfg, *, ctx_len: int,
                                  predict_len: int, num_workers: int = 1,
                                  train_seed: int = 42, window_size: int = None,
                                  bio_query_window: int = None) -> dict:
-    """One TRAIN dataloader per mixed task, all on the uniform interface
-    (context_len/chunk = ctx_len, M = m_slots). Homogeneous batches; the
-    round-robin alternates which loader is pulled each step.
-
-    ``bio_query_window`` (+ ``window_size``) turns condrecon_bio into a STREAMING-WRITE
-    retention probe: the queried key→value pair is pinned into that window (0 = first =
-    max lag), so the other pairs are distractors between it and the end-of-context query."""
-    _pad = cfg.pad_token_id if cfg.pad_token_id is not None else 0
-    dls = {}
-    for t in mixed_tasks:
-        if t == "mae":
-            dls[t] = make_long_passage_mae_dataloader(
-                tokenizer, batch_size=cfg.batch_size, src_tokenizer_name=mae_src_tok,
-                split="train", ctx_len=ctx_len, m_slots=m_slots, seed=train_seed,
-                pad_token_id=_pad, num_workers=num_workers)
-        elif t == "babi":
-            dls[t] = make_babi_dataloader(
-                tokenizer, context_len=ctx_len, batch_size=cfg.batch_size,
-                split="train", seed=train_seed, pad_token_id=_pad, tasks=babi_tasks,
-                num_workers=num_workers)
-        elif t == "continuation":
-            dls[t] = make_continuation_dataloader(
-                tokenizer, batch_size=cfg.batch_size, compress_len=ctx_len,
-                predict_len=predict_len, split="train", seed=train_seed, pad_token_id=_pad,
-                objective="continuation", src_tokenizer_name=mae_src_tok,
-                num_workers=num_workers)
-        elif t == "condrecon_bio":
-            dls[t] = make_conditioned_reconstruction_bio_dataloader(
-                tokenizer, context_len=ctx_len, batch_size=cfg.batch_size,
-                n_pairs=MIXED_CONDRECON_BIO_N_PAIRS, n_query=1, n_facts=MIXED_CONDRECON_BIO_N_FACTS,
-                split="train", world_seed=0, stream_seed=train_seed, pad_token_id=_pad, num_workers=num_workers,
-                window_size=window_size, query_window=bio_query_window)
-        else:
-            raise ValueError(f"unknown mixed task {t!r} (expected mae/babi/continuation/condrecon_bio)")
-    return dls
+    """One TRAIN dataloader per mixed task (uniform interface: context_len/chunk = ctx_len, M =
+    m_slots). ``bio_query_window`` (+ ``window_size``) turns condrecon_bio into a streaming-write
+    retention probe (queried pair pinned to a window; the rest are distractors)."""
+    return {
+        t: _build_loader(t, tokenizer, cfg, split="train", ctx_len=ctx_len, m_slots=m_slots,
+                         mae_src_tok=mae_src_tok, babi_tasks=babi_tasks, predict_len=predict_len,
+                         window_size=window_size, bio_query_window=bio_query_window,
+                         seed=train_seed, num_workers=num_workers)
+        for t in mixed_tasks
+    }
 
 
 def make_mixed_val_sets(mixed_tasks, tokenizer, cfg, val_batches, *, ctx_len: int,
                         m_slots: int, mae_src_tok: str, babi_tasks,
                         predict_len: int, window_size: int = None,
                         bio_query_window: int = None) -> dict:
-    """One materialized (fixed) VAL set per mixed task — disjoint val seed so the
-    eval data never overlaps the training stream. ``bio_query_window`` mirrors the
-    train-side streaming retention placement (see make_mixed_train_dataloaders)."""
-    _pad = cfg.pad_token_id if cfg.pad_token_id is not None else 0
+    """One materialized (fixed) VAL set per mixed task — disjoint val seed (7) so eval never overlaps
+    the training stream. ``bio_query_window`` mirrors the train-side streaming retention placement."""
     sets = {}
     for t in mixed_tasks:
-        if t == "mae":
-            dl = make_long_passage_mae_dataloader(
-                tokenizer, batch_size=cfg.batch_size, src_tokenizer_name=mae_src_tok,
-                split="val", ctx_len=ctx_len, m_slots=m_slots, seed=7,
-                pad_token_id=_pad, num_workers=0)
-        elif t == "babi":
-            dl = make_babi_dataloader(
-                tokenizer, context_len=ctx_len, batch_size=cfg.batch_size,
-                split="validation", seed=7, pad_token_id=_pad, tasks=babi_tasks,
-                num_workers=0)
-        elif t == "continuation":
-            dl = make_continuation_dataloader(
-                tokenizer, batch_size=cfg.batch_size, compress_len=ctx_len,
-                predict_len=predict_len, split="validation", seed=7, pad_token_id=_pad,
-                objective="continuation", src_tokenizer_name=mae_src_tok, num_workers=0)
-        elif t == "condrecon_bio":
-            dl = make_conditioned_reconstruction_bio_dataloader(
-                tokenizer, context_len=ctx_len, batch_size=cfg.batch_size,
-                n_pairs=MIXED_CONDRECON_BIO_N_PAIRS, n_query=1, n_facts=MIXED_CONDRECON_BIO_N_FACTS,
-                split="validation", world_seed=0, stream_seed=7, pad_token_id=_pad, num_workers=0,
-                window_size=window_size, query_window=bio_query_window)
+        dl = _build_loader(t, tokenizer, cfg, split="val", ctx_len=ctx_len, m_slots=m_slots,
+                           mae_src_tok=mae_src_tok, babi_tasks=babi_tasks, predict_len=predict_len,
+                           window_size=window_size, bio_query_window=bio_query_window,
+                           seed=7, num_workers=0)
         sets[t] = materialize_val_set(dl, val_batches)
     return sets

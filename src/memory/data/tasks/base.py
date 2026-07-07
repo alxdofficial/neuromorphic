@@ -69,9 +69,19 @@ class TaskDataset(IterableDataset):
             yield ex
 
 
+def _collate(samples, pad_token_id):
+    """collate_qa + the capacity-relative k_slots/n_tokens stamping the MAE loss path reads
+    (harmless no-op for tasks that don't emit k_slots)."""
+    batch = collate_qa(samples, pad_token_id)
+    if "k_slots" in samples[0]:
+        batch.k_slots = max(int(s["k_slots"]) for s in samples)
+        batch.n_tokens = [int(s["n_tokens"]) for s in samples]
+    return batch
+
+
 def make_task_dataloader(source, task: Task, spec: EpisodeSpec, tokenizer, *,
                          batch_size: int, pad_token_id: int, seed: int = 0,
                          num_workers: int = 2) -> DataLoader:
     ds = TaskDataset(source, task, spec, tokenizer, pad_token_id=pad_token_id, seed=seed)
     return DataLoader(ds, batch_size=batch_size, num_workers=num_workers,
-                      collate_fn=lambda s: collate_qa(s, pad_token_id))
+                      collate_fn=lambda s: _collate(s, pad_token_id))
