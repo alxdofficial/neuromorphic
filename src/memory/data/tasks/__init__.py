@@ -15,6 +15,7 @@ _TASKS: dict[str, tuple[str, str]] = {
     "reconstruction": ("reconstruction", "ReconstructionTask"),
     "continuation": ("continuation", "ContinuationTask"),
     "mae": ("mae", "MaeTask"),
+    "overwrite": ("overwrite", "OverwriteTask"),
     # added incrementally: multisession
 }
 

@@ -15,7 +15,12 @@ _SOURCES: dict[str, tuple[str, str]] = {
     "babi": ("babi", "BabiSource"),
     "bio": ("bio", "BioSource"),
     "fineweb": ("fineweb", "FinewebSource"),
-    # added incrementally as sources are extracted: pile, redpajama, mqar, ...
+    # procedural keyed sources (runtime, no download):
+    "mqar": ("mqar", "MqarSource"),
+    "ruler_overwrite": ("ruler_overwrite", "RulerOverwriteSource"),
+    # corpus sources (bucket-1 natural text; best-effort HF sample, see ingest/):
+    "pile": ("pile", "PileSource"),
+    "redpajama": ("redpajama", "RedpajamaSource"),
 }
 
 
