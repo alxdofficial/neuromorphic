@@ -1,5 +1,11 @@
 # Data code + storage reorganization plan (2026-07-06)
 
+> **STATUS: COMPLETED.** The 3-layer build/store/load split described here is done and still
+> correct for the **build** (`scripts/data_build/`) and **store** (`data/<name>/`) layers. The
+> **Load** layer's "one reader module per dataset" structure was subsequently **decomposed further**
+> into Source / Task / Schedule by `docs/data_arch_plan.md` (2026-07-07) — refer to that for the
+> current `src/memory/data/` layout. This doc is kept as the historical record of the 3-layer split.
+
 Goal: make everything about a dataset findable in one obvious place, with **one consistent `<name>`
 across all three layers** and a clear generate → store → load separation. Higher-risk churn is
 acceptable; the plan is ordered with a verification step after each move.

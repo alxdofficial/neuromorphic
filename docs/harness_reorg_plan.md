@@ -1,5 +1,9 @@
 # Training-harness + diagnostics reorganization plan (2026-07-06)
 
+> **STATUS: COMPLETED.** Complementary to `docs/data_arch_plan.md` (2026-07-07), which further
+> splits `src/memory/training/objectives.py` into an `objectives/` package and adds a
+> `behavioral_kl` objective — an extension of the harness structure established here, not a change to it.
+
 Goal: one clear, principled structure for the **training harness** and **diagnostics**, matching
 the library/executable split the data reorg already established (`src/memory/data/` library vs
 `scripts/data_build/` executables). Full fix in one arc, not incremental patches.
