@@ -6,12 +6,12 @@ Every dataset has a matching triplet keyed by the same canonical `<name>`:
   load   → `src/memory/data/<name>.py`  (this package)
 See `DATASETS.md` at the repo root for the full index.
 
-- `common.py` holds the shared `QABatch` / `QADataset` / `collate_qa` /
-  `make_qa_dataloader` / `_pack_context` contract; every reader imports from it.
+- `common.py` holds the shared `QABatch` / `collate_qa` / `_pack_context`
+  contract; every reader imports from it.
 - `REGISTRY` maps `<name>` → `make_*_dataloader` (lazy: importing this package
   never pulls `datasets`/heavy deps until a loader is actually built).
-- The hot names (`QABatch`, `collate_qa`, `make_mixed_qa_dataloader`,
-  `make_qa_dataloader`) are re-exported here for back-compat.
+- The hot names (`QABatch`, `collate_qa`, `make_mixed_qa_dataloader`) are
+  re-exported here for back-compat.
 """
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ import importlib
 from typing import Callable
 
 # ── back-compat re-exports (names imported directly by train.py / diagnostics) ──
-from .common import QABatch, QADataset, collate_qa, make_qa_dataloader, _pack_context
+from .common import QABatch, collate_qa, _pack_context
 from .mixed import MixedQADataset, make_mixed_qa_dataloader
 
 # name → (submodule, factory-function-name). Kept lazy via _lazy_maker below.
@@ -54,6 +54,6 @@ REGISTRY: dict[str, Callable] = {
 
 __all__ = [
     "REGISTRY",
-    "QABatch", "QADataset", "collate_qa", "make_qa_dataloader", "_pack_context",
+    "QABatch", "collate_qa", "_pack_context",
     "MixedQADataset", "make_mixed_qa_dataloader",
 ]

@@ -1,10 +1,10 @@
 """CLI for the memory training harness: argparse builder + args→ReprConfig mapping.
 
-Extracted verbatim from ``scripts/train/train.py::main`` (harness reorg phase 3). ``build_parser``
-holds all 91 flags; ``args_to_config`` holds the post-parse validation, budget matching, and every
-cfg override. The only changes from the original ``main`` body: the ``--mixed-tasks`` default/choices
-now read ``DEFAULT_TRAIN_MIX`` / ``TASK_SPEC`` from ``src.memory.data.mixes`` (same values), and the
-post-parse block is a function taking ``(args, ap)`` returning ``(cfg, composite_task_weights)``.
+Extracted from ``scripts/train/train.py::main`` (harness reorg phase 3). ``build_parser``
+holds the flags; ``args_to_config`` holds the post-parse validation, budget matching, and every
+cfg override. ``--mixed-tasks`` default/choices read ``DEFAULT_TRAIN_MIX`` / ``TASK_SPEC`` from
+``src.memory.data.mixes``; the post-parse block is a function taking ``(args, ap)`` returning
+the ``ReprConfig``. The retired composite-QA (``--task qa``) machinery has been removed.
 """
 from __future__ import annotations
 
@@ -49,11 +49,8 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--val-every", type=int, default=500)
     ap.add_argument("--save-every", type=int, default=2000)
     ap.add_argument("--val-batches", type=int, default=32,
-                    help="Number of batches in the fixed val set. With the "
-                         "composite mix sampling 9 families + 3 external sources, "
-                         "10 batches ≈ 1 example per family (high per-family "
-                         "noise). 32 batches × BS=2 = 64 examples ≈ ~5 per family. "
-                         "Bumped from old default of 10.")
+                    help="Number of batches in the fixed per-task val set "
+                         "(mixed trainer materializes this many per task).")
     # Default chunk_size 4096→8192 (2026-05-28 tranche-3 protocol; hard datasets
     # need the larger window to fit evidence + distractors).
     ap.add_argument("--chunk-size", type=int, default=8192)
@@ -63,16 +60,12 @@ def build_parser() -> argparse.ArgumentParser:
                          "matched across ICAE/CCM/AutoCompressor/Beacon "
                          "(and soft_pointer_graph if selected). Derives icae_n_slots, "
                          "ccm_n_comp, autocompressor_n_slots, and Beacon's α.")
-    ap.add_argument("--passages-per-chunk", type=int, default=0,
-                    help="composite_v1 passages sampled per chunk. 0 = auto: "
-                         "scales with chunk_size (~75 per 1024 tokens). "
-                         "Manual override accepted as positive int.")
     ap.add_argument("--task", type=str, default="mixed",
-                    choices=["mixed", "qa"],
+                    choices=["mixed"],
                     help="mixed = ONE model trained on an equal round-robin of --mixed-tasks "
-                         "(mae babi continuation condrecon_bio), evaluated per-task (default, active); "
-                         "qa = composite multi-hop QA mix. (Standalone single-task entry points were "
-                         "removed; the per-task loaders live on as components of --task mixed.)")
+                         "(mae babi continuation condrecon_bio), evaluated per-task (the only "
+                         "training path). The retired composite multi-hop QA mix (--task qa) and "
+                         "its standalone single-task entry points were removed.")
     ap.add_argument("--mixed-tasks", nargs="+", default=list(DEFAULT_TRAIN_MIX),
                     choices=list(TASK_SPEC),
                     help="mixed: tasks in the equal round-robin (default: mae babi continuation "
@@ -313,52 +306,6 @@ def build_parser() -> argparse.ArgumentParser:
     # without it, so default ON is a safety net you can disable for full speed.
     ap.add_argument("--grad-ckpt-stream", action=argparse.BooleanOptionalAction,
                     default=True)
-    ap.add_argument("--no-hotpot", action="store_true",
-                    help="Disable HotpotQA source (default: enabled)")
-    # 2026-05-28: hard-only protocol enables narrative + musique by default;
-    # use --no-narrative/--no-musique to disable (action='store_false').
-    ap.add_argument("--narrative", action=argparse.BooleanOptionalAction, default=True,
-                    help="Enable NarrativeQA source (default: ENABLED for "
-                         "tranche-3 hard-only protocol). Uses random window "
-                         "(oracle-centering removed in post-audit fix).")
-    ap.add_argument("--musique", action=argparse.BooleanOptionalAction, default=True,
-                    help="Enable MuSiQue-Ans source (default: ENABLED for "
-                         "tranche-3 hard-only protocol). Contamination-controlled "
-                         "2-4 hop QA — complements HotpotQA by eliminating "
-                         "shortcut reasoning.")
-    ap.add_argument("--babilong", action=argparse.BooleanOptionalAction,
-                    default=True,
-                    help="Enable BABILong source (default: ENABLED for the "
-                         "v2.1 joint sweep — train + held-out eval, fine-tuned "
-                         "small-model track only). Synthetic state-tracking, "
-                         "pre-formatted at the config length (4k/8k/16k). "
-                         "Use --no-babilong to disable.")
-    ap.add_argument("--babilong-config", type=str, default="auto",
-                    help="BABILong length config. 'auto' picks the closest "
-                         "config below chunk_size (e.g. 4k for chunk=4096, "
-                         "8k for chunk=8192). Manual: 0k, 1k, 2k, 4k, 8k, "
-                         "16k, 32k, 64k, 128k.")
-    ap.add_argument("--mix-weights", nargs="+", type=float,
-                    default=[0.2, 0.2, 0.2, 0.2, 0.2],
-                    metavar="W",
-                    help="Sampling weights for (composite, hotpot, narrative, "
-                         "musique, babilong). v2.1 joint-sweep default: equal "
-                         "0.2 each across the 5 sources (composite restricted "
-                         "to biographical via --composite-task-weights). Equal-"
-                         "by-source is the least-gameable fair-head-to-head mix. "
-                         "Older 3-tuple callers still work; missing entries "
-                         "default to 0.")
-    ap.add_argument("--composite-task-weights", nargs="+",
-                    default=["biographical:1.0"],
-                    metavar="FAMILY:W",
-                    help="Per-family weights inside composite_v1. v2.1 joint-"
-                         "sweep default: 'biographical:1.0' — composite is "
-                         "restricted to the biographical family only (the "
-                         "hardest/most-relational family; atomic+relational+"
-                         "temporal+aggregation question types over a controlled "
-                         "entity-relation world). Unlisted families get weight 0 "
-                         "(filtered out). Pass e.g. '' or list families to "
-                         "override; 'biographical:2.0 calendar:1.0' for ratios.")
     ap.add_argument("--patience", type=int, default=5,
                     help="Stop training when best.pt hasn't updated for this "
                          "many consecutive val evals past --min-step-for-stop. "
@@ -390,9 +337,8 @@ def build_parser() -> argparse.ArgumentParser:
 def args_to_config(args, ap):
     """Apply post-parse validation + build the ReprConfig from parsed args.
 
-    Mutates ``args`` in place (chunk_size / mix_weights / babilong_config / passages_per_chunk
-    auto-adjust) and returns ``(cfg, composite_task_weights)``. ``ap`` is the parser (for
-    ``ap.error``)."""
+    Mutates ``args`` in place (chunk_size / window / compress_len auto-adjust from mixed_ctx)
+    and returns the ``ReprConfig``. ``ap`` is the parser (for ``ap.error``)."""
     # ── reproducibility: wire the seed (was an unused cfg field) ─────────────
     import random as _random
     import numpy as _np
@@ -400,12 +346,11 @@ def args_to_config(args, ap):
     torch.manual_seed(args.seed); torch.cuda.manual_seed_all(args.seed)
 
     # ── fail-fast guards (cheap, before any model/data construction) ─────────
-    if "hlvocab_baseline" in args.variants and args.task != "masked_reconstruction" \
-            and args.chunk_size > 1024:
+    if "hlvocab_baseline" in args.variants and args.chunk_size > 1024:
         raise SystemExit(
             f"hlvocab_baseline builds an [L,L] STDP kernel guarded at L<=1024, but "
-            f"--task {args.task} --chunk-size {args.chunk_size} yields L>1024. Use "
-            f"--task masked_reconstruction, or --chunk-size <=1024 (single window).")
+            f"--chunk-size {args.chunk_size} yields L>1024. Use --chunk-size <=1024 "
+            f"(single window).")
     if args.contrastive_shuf_coef > 0 and args.batch_size < 2:
         raise SystemExit(
             f"--contrastive-shuf-coef {args.contrastive_shuf_coef} needs batch_size>=2 "
@@ -430,64 +375,6 @@ def args_to_config(args, ap):
 
     if "v21" in args.variants:
         raise SystemExit("v21 is not supported in v1h yet.")
-
-    # Flag/weight consistency. The flags toggle source *availability*; the
-    # weights control *sampling*. A source with weight=0 is never sampled,
-    # so enabling the flag without bumping the weight is a no-op that
-    # silently loads ~570MB of data (HotpotQA) or downloads NarrativeQA
-    # while contributing nothing. Surface this immediately.
-    # Pad mix_weights to length 5 for the 5-source schema.
-    padded_weights = list(args.mix_weights) + [0.0] * (5 - len(args.mix_weights))
-    args.mix_weights = padded_weights
-
-    # Parse --composite-task-weights "family:weight" pairs into a dict (used by the QA path).
-    composite_task_weights = None
-    if args.composite_task_weights:
-        composite_task_weights = {}
-        for item in args.composite_task_weights:
-            if ":" not in item:
-                raise SystemExit(
-                    f"--composite-task-weights expects 'family:weight', got {item!r}"
-                )
-            fam, w = item.split(":", 1)
-            composite_task_weights[fam.strip()] = float(w)
-        print(f"[composite] per-family weights: {composite_task_weights}")
-
-    # QA composite mix-weight ⇔ source-flag consistency. ONLY meaningful for --task qa (the
-    # composite path). --task mixed uses its own mae/babi/continuation/condrecon_bio loaders and
-    # ignores these QA-source flags, so gate the checks — otherwise a mixed run that passes
-    # --mix-weights zeroing a QA source (whose flag defaults on) SystemExits for no reason.
-    if args.task == "qa":
-        if args.narrative and args.mix_weights[2] <= 0:
-            raise SystemExit(
-                "--narrative is set but mix_weights[2] (NarrativeQA) is 0. "
-                "Either drop --narrative or pass --mix-weights with a positive "
-                "third value (e.g. --mix-weights 0.5 0.3 0.2)."
-            )
-        if (not args.no_hotpot) and args.mix_weights[1] <= 0:
-            # HotpotQA is on by default; if user explicitly zeros the weight
-            # they likely meant to disable the source entirely.
-            raise SystemExit(
-                "HotpotQA is enabled but mix_weights[1] is 0. Either pass "
-                "--no-hotpot or set --mix-weights with a positive second value."
-            )
-        if args.mix_weights[0] <= 0:
-            raise SystemExit(
-                "Composite (mix_weights[0]) is 0. composite_v1 is the primary "
-                "source and cannot be disabled."
-            )
-        if args.musique and args.mix_weights[3] <= 0:
-            raise SystemExit(
-                "--musique is set but mix_weights[3] (MuSiQue) is 0. Either drop "
-                "--musique or pass --mix-weights with a positive fourth value "
-                "(e.g. --mix-weights 0.4 0.2 0.2 0.2)."
-            )
-        if args.babilong and args.mix_weights[4] <= 0:
-            raise SystemExit(
-                "--babilong is set but mix_weights[4] (BABILong) is 0. Either drop "
-                "--babilong or pass --mix-weights with a positive fifth value "
-                "(e.g. --mix-weights 0.35 0.15 0.15 0.15 0.2)."
-            )
 
     # Base config. Memory-token count + per-variant LoRA ranks/slots are set
     # below (matched-budget block + masked_reconstruction override). LoRA-all:
@@ -632,32 +519,6 @@ def args_to_config(args, ap):
                 f"got d_llama={cfg.d_llama} (backbone={cfg.llama_model}). Pass "
                 f"--backbone HuggingFaceTB/SmolLM2-135M, or --allow-unmatched-backbone "
                 f"to override (capacity match will be off).")
-    elif args.task == "qa":
-        # composite multi-hop QA: 30:1 COMPRESSION + ~13M memory params. Memory budget
-        # M = ceil(context / 30); params matched to the graph anchor (d_graph=384,
-        # write=3/read=2, N=1024 ≈ 13.0M) on SmolLM2-135M (d=576). Ranks calibrated
-        # for d=576 — capacity match is approximate on other backbones.
-        # (See scripts/diagnostics/param_count.py.)
-        cfg.use_llama_lora = True
-        cfg.llama_lora_rank = 16; cfg.llama_lora_alpha = 32
-        _ctx = args.compress_len if args.task == "continuation" else args.chunk_size
-        _M = max(1, -(-_ctx // 30))                      # ceil(ctx/30) — the 30:1 budget
-        cfg.n_flat_codes = _M
-        cfg.icae_n_slots = _M; cfg.icae_lora_rank = 223; cfg.icae_lora_alpha = 446
-        cfg.ccm_n_comp = _M; cfg.ccm_lora_rank = 111; cfg.ccm_lora_alpha = 222
-        cfg.autocompressor_n_slots = _M
-        cfg.autocompressor_lora_rank = 110; cfg.autocompressor_lora_alpha = 220
-        cfg.beacon_ratio = 30                            # condensing ratio = the 30:1 compression
-        from transformers import AutoConfig as _ACL2
-        from src.memory.common import beacon_wrap_layers as _bwl2
-        _nlayers2 = _ACL2.from_pretrained(cfg.llama_model).num_hidden_layers
-        cfg.beacon_wrap_layers = _bwl2(_nlayers2, 23)
-        # graph: ~13M via WIDER node/edge vectors (d_graph 256→384); E = M (same 30:1 budget)
-        cfg.graph_d_graph = 384; cfg.graph_write_layers = 3; cfg.graph_read_layers = 2
-        cfg.graph_n_nodes = 1024; cfg.graph_n_edges = _M
-        print(f"[capacity] {args.task}: 30:1 compression → M={_M} (ctx {_ctx}); "
-              f"~13M memory params (graph d_graph=384, E={_M}, baselines icae r223 / "
-              f"ccm r111 / ac r110 / beacon 23L).")
     cfg.contrastive_shuf_coef = args.contrastive_shuf_coef
     # graph experiment overrides (win over the task defaults above): wider node/edge
     # vectors (removes the read-token rank handicap) + sparse node selection (entmax).
@@ -819,42 +680,11 @@ def args_to_config(args, ap):
     cfg.mixed_gate_batches = int(args.mixed_gate_batches)   # REAL/SHUF/OFF binding gate in mixed val (0=off)
     cfg.task_mode = args.task        # accurate ckpt metadata (dispatch still keys on this)
     # actual PER-TASK context length — encoder time-constants (assoc-decay half-life) derive from it.
-    # mixed: compress_len := mixed_ctx (set above); qa: the context is CHUNK_SIZE (compress_len would
-    # under-count 8x at the defaults → 8x-too-fast decay); other single tasks: compress_len.
-    cfg.ctx_len = int(args.chunk_size) if args.task == "qa" else int(args.compress_len)
+    # mixed: compress_len := mixed_ctx (set above).
+    cfg.ctx_len = int(args.compress_len)
     cfg.seed = args.seed             # record the actual seed in ckpt metadata
     cfg.anomaly_from = args.anomaly_from   # debug: backward anomaly detection from this step (-1 = off)
 
-    # Auto-pick BABILong config to match chunk_size (audit fix #10).
-    if args.babilong_config == "auto":
-        # Map chunk_size to nearest BABILong config at or below it.
-        cs = args.chunk_size
-        if cs >= 16384:
-            args.babilong_config = "16k"
-        elif cs >= 8192:
-            args.babilong_config = "8k"
-        elif cs >= 4096:
-            args.babilong_config = "4k"
-        elif cs >= 2048:
-            args.babilong_config = "2k"
-        elif cs >= 1024:
-            args.babilong_config = "1k"
-        else:
-            args.babilong_config = "0k"
-        if args.babilong:
-            print(f"[auto] babilong_config = {args.babilong_config} "
-                  f"(scaled for chunk_size={args.chunk_size})")
-
-    # Auto-scale composite passages_per_chunk with chunk_size if user passed 0.
-    # composite_v1 passages average ~13 tokens; we target ~75 passages per
-    # 1024 chunk tokens so the chunk fills to ~95% even after rejecting
-    # over-long candidates.
-    if args.passages_per_chunk <= 0:
-        args.passages_per_chunk = max(75, (args.chunk_size // 1024) * 75)
-        print(f"[auto] composite passages_per_chunk = {args.passages_per_chunk} "
-              f"(scaled for chunk_size={args.chunk_size})")
-
-    print(f"config: chunk={args.chunk_size}, window={args.window_size}, "
-          f"passages_per_chunk={args.passages_per_chunk}")
+    print(f"config: chunk={args.chunk_size}, window={args.window_size}")
     print(f"Steps: {args.steps}, batch={cfg.batch_size}")
-    return cfg, composite_task_weights
+    return cfg

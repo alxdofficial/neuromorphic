@@ -14,7 +14,7 @@ from .checkpoint import save_checkpoint, _ckpt_metadata, _grad_group_norm
 from .objectives import (
     _infonce_logits_weights, _same_answer_valid_mask, _coding_rate, _grad_cached_objective_step,
 )
-from .loops import train_one_variant, train_mixed_variant, probe_bs
+from .loops import train_mixed_variant, probe_bs
 
 __all__ = [
     "lr_at_step", "to_device", "materialize_val_set",
@@ -23,5 +23,5 @@ __all__ = [
     "save_checkpoint", "_ckpt_metadata", "_grad_group_norm",
     "_infonce_logits_weights", "_same_answer_valid_mask", "_coding_rate",
     "_grad_cached_objective_step",
-    "train_one_variant", "train_mixed_variant", "probe_bs",
+    "train_mixed_variant", "probe_bs",
 ]
