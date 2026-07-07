@@ -77,6 +77,81 @@ def _coding_rate(memory, eps2=0.5):
     return R.mean()
 
 
+def _behavioral_kl_step(model, batch, cfg, window_size):
+    """Behavioral-KL context distillation — the loss-neutrality fix (2026-07-07 survey).
+
+    TEACHER = the frozen LM reading the FULL context (memory_override = raw context embeds, exactly
+    what FullContextEncoder emits: pads zeroed + memory_mask). STUDENT = the frozen LM reading the
+    encoder's compressed memory. Loss = w_ce·CE(student, truth) + w_kl·KL(teacher ‖ student) on the
+    answer(value-span) positions, temp-scaled. Teacher is stop-grad; gradient flows through the
+    STUDENT forward into the encoder. Differentiable — no RL (discrete-text distillation needs RL
+    only because its memory is text; ours is continuous latent tokens). See research_memory_landscape.
+
+    Why it breaks loss-neutrality: KL's optimum is "memory reproduces the frozen LM's full-context
+    behavior" (a sufficient statistic → forces USE), and E[KL]=I(context;answer) so gradient
+    concentrates where memory matters — unlike CE, which the LM can minimize from priors. Only helps
+    where the teacher genuinely uses the context (un-guessable data) — degenerate on MAE (teacher
+    reconstructs itself), so it falls back to plain CE when answer logits are absent/misaligned.
+
+    BACKWARD RUNS INSIDE — the caller must NOT call loss.backward()."""
+    F = torch.nn.functional
+    kl_coef = float(getattr(cfg, "kl_coef", 1.0))
+    ce_coef = float(getattr(cfg, "kl_ce_coef", 1.0))
+    temp = float(getattr(cfg, "kl_temp", 2.0))          # Hinton-style T≈2 (survey default)
+    embed = model.decoder.llama.get_input_embeddings()
+
+    # MAE batch: teacher reconstructs itself → KL degenerate; skip the (expensive) teacher forward.
+    if getattr(model, "task_mode", None) == "masked_reconstruction":
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            s_out = model.compute_loss(batch, window_size=window_size)
+        (ce_coef * s_out["loss"]).backward()
+        out_real = {k: v for k, v in s_out.items() if not torch.is_tensor(v) or not v.requires_grad}
+        out_real["loss"] = torch.tensor(ce_coef * float(s_out["loss_recon"]), device=batch.context_ids.device)
+        out_real["loss_recon"] = s_out["loss_recon"]
+        return out_real, out_real["loss"], {"obj_kl": 0.0, "obj_ce": float(s_out["loss_recon"])}
+
+    # ── teacher: frozen LM over the FULL context (no grad, detached target) ──
+    with torch.no_grad():
+        ctx_embeds = embed(batch.context_ids)
+        ctx_embeds = ctx_embeds * batch.context_mask.unsqueeze(-1).to(ctx_embeds.dtype)  # zero pads
+        t_aux = {"memory_mask": batch.context_mask,
+                 "load_balance_loss": torch.zeros((), device=ctx_embeds.device, dtype=ctx_embeds.dtype)}
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            t_out = model.compute_loss(batch, window_size=window_size,
+                                       memory_override=(ctx_embeds, t_aux), return_logits=True)
+    t_logits = t_out.get("sel_logits")
+
+    # ── student: encoder memory, WITH grad ──
+    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+        s_out = model.compute_loss(batch, window_size=window_size, return_logits=True)
+    s_logits = s_out.get("sel_logits")
+
+    ce = s_out["loss"]                                  # grad-carrying CE(+std aux)
+    kl_val = 0.0
+    if (t_logits is None or s_logits is None
+            or t_logits.shape != s_logits.shape):       # MAE / empty / misaligned → plain-CE fallback
+        (ce_coef * ce).backward()
+    else:
+        assert torch.equal(t_out["sel_targets"], s_out["sel_targets"]), \
+            "behavioral-KL: teacher/student answer positions misaligned"
+        with torch.no_grad():
+            tl = t_logits.float() / temp
+            p_t = F.softmax(tl, dim=-1)
+            logp_t = torch.log_softmax(tl, dim=-1)
+        logp_s = F.log_softmax(s_logits.float() / temp, dim=-1)
+        kl = (p_t * (logp_t - logp_s)).sum(-1).mean() * (temp * temp)   # forward KL, temp-corrected
+        (ce_coef * ce + kl_coef * kl).backward()
+        kl_val = float(kl.detach())
+
+    out_real = {k: v for k, v in s_out.items()
+                if not torch.is_tensor(v) or not v.requires_grad}
+    ce_det = float(s_out["loss_recon"])
+    total = ce_coef * ce_det + kl_coef * kl_val
+    out_real["loss"] = torch.tensor(total, device=batch.context_ids.device)   # backward already done
+    out_real["loss_recon"] = s_out["loss_recon"]
+    return out_real, out_real["loss"], {"obj_kl": kl_val, "obj_ce": ce_det}
+
+
 def _grad_cached_objective_step(model, batch, cfg, window_size):
     """contrastive/trajectory objective step (train_mixed_variant — the trainer that actually
     runs mixed; the 2026-07-02 lesson: the legacy coef lived only in train_one_variant and was

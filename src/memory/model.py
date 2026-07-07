@@ -659,6 +659,7 @@ class ReprLearningModel(nn.Module):
         shuffle_roll: int = 1,          # SHUF roll amount (in-batch InfoNCE sweeps r=1..B−1)
         return_memory: bool = False,    # stash pre-roll memory+aux on the out dict
         encoder_only: bool = False,     # build memory, return WITHOUT decoding (GradCache cut point)
+        return_logits: bool = False,    # add answer-position sel_logits/sel_targets (behavioral-KL distillation)
     ) -> dict:
         """v1h composite-QA loss.
 
@@ -1213,6 +1214,17 @@ class ReprLearningModel(nn.Module):
         }
         if return_memory:
             out["_memory"], out["_mem_aux"] = _mem_ret
+        if return_logits:
+            # answer-position logits for behavioral-KL distillation (teacher = full-context memory
+            # override, student = encoder memory). pred_mask.nonzero() is row-major over identical
+            # answer packing, so student/teacher sel_logits align 1:1 by (row, answer-token). sel_targets
+            # returned so the caller can assert the alignment. None when no content positions.
+            if pred_mask.any():
+                out["sel_logits"] = sel_logits            # [N_pred, V] (grad on the student call)
+                out["sel_targets"] = sel_targets          # [N_pred]
+            else:
+                out["sel_logits"] = None
+                out["sel_targets"] = None
         if splat_telemetry is not None:
             out.update(splat_telemetry)
         if graph_telemetry is not None:

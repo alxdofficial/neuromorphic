@@ -24,7 +24,7 @@ from src.memory.data import mixes
 from .utils import lr_at_step, to_device, materialize_val_set
 from .eval import run_val, run_mixed_val
 from .checkpoint import save_checkpoint, _ckpt_metadata, _grad_group_norm
-from .objectives import _grad_cached_objective_step, _coding_rate
+from .objectives import _grad_cached_objective_step, _coding_rate, _behavioral_kl_step
 from .data_mix import make_mixed_train_dataloaders, make_mixed_val_sets
 
 # src/memory/training/loops.py → parents[3] == repo root (train.py used parents[2] from
@@ -729,7 +729,12 @@ def train_mixed_variant(
         _mode = str(getattr(cfg, "objective_mode", "plain"))
         _legacy_coef = float(getattr(cfg, "contrastive_shuf_coef", 0.0))
         _obj_extras = {}
-        if _mode in ("contrastive", "trajectory"):
+        if _mode == "behavioral_kl":
+            # context distillation: teacher (full-context) ‖ student (memory) KL on answer spans.
+            # backward runs INSIDE (two frozen-LM forwards). obj_kl logged every step.
+            out, loss, _obj_extras = _behavioral_kl_step(model, batch, cfg, window_size)
+            _needs_backward = False
+        elif _mode in ("contrastive", "trajectory"):
             # in-batch InfoNCE (+GRPO): backward runs INSIDE (GradCache memory cut) — no
             # loss.backward() below. Loud by construction: obj_nce is logged every step.
             out, loss, _obj_extras = _grad_cached_objective_step(model, batch, cfg, window_size)

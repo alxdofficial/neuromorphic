@@ -242,14 +242,23 @@ def build_parser() -> argparse.ArgumentParser:
                          "identity before each decoder layer (READ) so the frozen LM's mixing can't smooth "
                          "the graph tokens together through depth. Requires --slotgraph3-read edges + "
                          "--slotgraph3-write lm + --slotgraph3-write-layers N>0.")
-    ap.add_argument("--objective-mode", choices=["plain", "contrastive", "trajectory"], default="plain",
+    ap.add_argument("--objective-mode", choices=["plain", "contrastive", "trajectory", "behavioral_kl"], default="plain",
                     help="training objective (mixed trainer): 'plain' = CE only; 'contrastive' = "
                          "+ objective_coef × in-batch InfoNCE (each example's memory must explain its "
                          "own target best vs all B-1 other memories; 1 encoder run + GradCache rolled "
                          "reads); 'trajectory' = contrastive + GRPO on the sampled discrete read "
-                         "expansion (router-only REINFORCE, reward = binding advantage).")
+                         "expansion (router-only REINFORCE, reward = binding advantage); 'behavioral_kl' "
+                         "= kl_ce_coef·CE + kl_coef·KL(teacher=full-context ‖ student=memory) on answer "
+                         "spans (context distillation — the loss-neutrality fix; teacher stop-grad, "
+                         "differentiable, no RL).")
     ap.add_argument("--objective-coef", type=float, default=0.5,
                     help="weight of the InfoNCE term (contrastive/trajectory modes).")
+    ap.add_argument("--kl-coef", type=float, default=2.0,
+                    help="behavioral_kl: weight of the KL(teacher‖student) term (survey default α≈2).")
+    ap.add_argument("--kl-ce-coef", type=float, default=1.0,
+                    help="behavioral_kl: weight of the CE-to-ground-truth term (grounds the distillation).")
+    ap.add_argument("--kl-temp", type=float, default=2.0,
+                    help="behavioral_kl: softmax temperature on teacher/student logits (Hinton-style T≈2).")
     ap.add_argument("--grpo-samples", type=int, default=4,
                     help="trajectory mode: number of Gumbel-top-k read-expansion rollouts per step.")
     ap.add_argument("--grpo-coef", type=float, default=1.0,
@@ -768,6 +777,9 @@ def args_to_config(args, ap):
     cfg.grpo_samples = int(args.grpo_samples)
     cfg.grpo_coef = float(args.grpo_coef)
     cfg.grpo_entropy_coef = float(args.grpo_entropy_coef)
+    cfg.kl_coef = float(args.kl_coef)
+    cfg.kl_ce_coef = float(args.kl_ce_coef)
+    cfg.kl_temp = float(args.kl_temp)
     if args.objective_mode != "plain":
         if args.task != "mixed":
             raise SystemExit(f"--objective-mode {args.objective_mode} is implemented in the MIXED trainer "
@@ -776,7 +788,8 @@ def args_to_config(args, ap):
         if args.contrastive_shuf_coef > 0:
             raise SystemExit("--objective-mode and --contrastive-shuf-coef are mutually exclusive "
                              "(the legacy softplus is its own mode; pick one).")
-        if args.batch_size < 2:
+        # behavioral_kl needs no in-batch negatives (teacher/student, not memory rolls) → any B ok.
+        if args.batch_size < 2 and args.objective_mode != "behavioral_kl":
             raise SystemExit(f"--objective-mode {args.objective_mode} needs batch_size >= 2 "
                              f"(in-batch negatives; got {args.batch_size}).")
         # contrastive is objective-level (GradCache over ANY prepend memory) so it runs for the
