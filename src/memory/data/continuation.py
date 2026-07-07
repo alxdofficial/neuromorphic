@@ -74,12 +74,20 @@ class ContinuationDataset(IterableDataset):
         cache = _decode_cache(Path(parquet_path), split, src_tokenizer_name)
         self.docs = []
         n_total = 0
-        for line in open(cache):
-            n_total += 1
-            arr = np.asarray(tokenizer(json.loads(line)["text"],
-                                       add_special_tokens=False).input_ids, dtype=np.int64)
-            if arr.shape[0] >= need:
-                self.docs.append(arr)
+        # Silence the benign "sequence longer than model max length" warning: whole docs are
+        # tokenized for the cache then sliced at emit time, so over-length is expected/harmless.
+        from transformers.utils import logging as _hf_logging
+        _prev_verbosity = _hf_logging.get_verbosity()
+        _hf_logging.set_verbosity_error()
+        try:
+            for line in open(cache):
+                n_total += 1
+                arr = np.asarray(tokenizer(json.loads(line)["text"],
+                                           add_special_tokens=False).input_ids, dtype=np.int64)
+                if arr.shape[0] >= need:
+                    self.docs.append(arr)
+        finally:
+            _hf_logging.set_verbosity(_prev_verbosity)
         if not self.docs:
             raise ValueError(
                 f"No FineWeb-edu doc has ≥ {need} tokens (compress_len+predict_len) in "

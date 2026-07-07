@@ -46,6 +46,8 @@ class QABatch:
     answer_content_mask: Tensor  # [B, T_a] bool — True at load-bearing content positions
     task_family: list[str]       # length B — per-example task family for telemetry
     question_type: list[str]     # length B — per-example question type for telemetry
+    answer_refs: list = None     # length B — per-example reference answer strings (for generated
+                                 # EM/F1 eval on abstractive QA); optional, dropped by loss/CE paths
 
 
 def _pack_context(
@@ -236,6 +238,9 @@ def collate_qa(samples: list[dict], pad_token_id: int = 128_001) -> QABatch:
         answer_ids[i, :ta] = s["answer_ids"]
         answer_mask[i, :ta] = True
         cm = s["answer_content_mask_list"]
+        assert len(cm) == ta, (                              # fail loud on a malformed sample
+            f"answer_content_mask_list length {len(cm)} != answer_ids length {ta} "
+            f"(task={s.get('task_family')!r}); a length-mismatched mask silently mis-scores loss.")
         for j, v in enumerate(cm):
             if j < T_a and v:
                 answer_content_mask[i, j] = True
@@ -250,6 +255,7 @@ def collate_qa(samples: list[dict], pad_token_id: int = 128_001) -> QABatch:
         answer_content_mask=answer_content_mask,
         task_family=[s["task_family"] for s in samples],
         question_type=[s["question_type"] for s in samples],
+        answer_refs=[s.get("answer_refs", []) for s in samples],
     )
 
 

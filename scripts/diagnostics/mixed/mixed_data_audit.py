@@ -42,7 +42,8 @@ from src.memory.data.bio import make_conditioned_reconstruction_bio_dataloader
 
 TASKS = ["mae", "babi", "continuation", "condrecon_bio"]
 N_BATCHES = 4                    # 4×8 = 32 examples audited per task/split
-CTX, M, PLEN = 1024, 32, 64
+from src.memory.data.mixes import DEFAULT_MIXED_M
+CTX, M, PLEN = 1024, DEFAULT_MIXED_M, 64   # M follows the mixed default (mixes.DEFAULT_MIXED_M)
 SRC_TOK = "meta-llama/Llama-3.2-1B"
 PASS, FAIL, WARN = "PASS", "FAIL", "WARN"
 results = []

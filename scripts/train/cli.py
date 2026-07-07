@@ -14,7 +14,7 @@ import torch
 
 from src.memory.config import ReprConfig
 from src.memory.data.babi import DEFAULT_TASKS as BABI_DEFAULT_TASKS
-from src.memory.data.mixes import DEFAULT_TRAIN_MIX, TASK_SPEC
+from src.memory.data.mixes import DEFAULT_TRAIN_MIX, TASK_SPEC, DEFAULT_MIXED_M
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -84,9 +84,9 @@ def build_parser() -> argparse.ArgumentParser:
                          "the first N val batches per task (0=off; ~triples that task's eval cost). Use e.g. 8.")
     ap.add_argument("--mixed-ctx", type=int, default=1024,
                     help="mixed: uniform context_len/chunk for ALL tasks (default 1024).")
-    ap.add_argument("--mixed-M", type=int, default=64,
+    ap.add_argument("--mixed-M", type=int, default=DEFAULT_MIXED_M,
                     help="mixed: uniform memory budget M (slots/edges) for ALL tasks "
-                         "(default 64 → 16:1 compression at ctx=1024). Raised from 32 for the "
+                         "(default = mixes.DEFAULT_MIXED_M = 64 → 16:1 compression at ctx=1024). Raised from 32 for the "
                          "streaming-write regime: gives binding headroom so a retention failure "
                          "is a binding failure, not slot-starvation (forgetting pressure comes "
                          "from distractor load > M, not a tiny M).")
@@ -431,26 +431,7 @@ def args_to_config(args, ap):
     padded_weights = list(args.mix_weights) + [0.0] * (5 - len(args.mix_weights))
     args.mix_weights = padded_weights
 
-    if args.narrative and args.mix_weights[2] <= 0:
-        raise SystemExit(
-            "--narrative is set but mix_weights[2] (NarrativeQA) is 0. "
-            "Either drop --narrative or pass --mix-weights with a positive "
-            "third value (e.g. --mix-weights 0.5 0.3 0.2)."
-        )
-    if (not args.no_hotpot) and args.mix_weights[1] <= 0:
-        # HotpotQA is on by default; if user explicitly zeros the weight
-        # they likely meant to disable the source entirely.
-        raise SystemExit(
-            "HotpotQA is enabled but mix_weights[1] is 0. Either pass "
-            "--no-hotpot or set --mix-weights with a positive second value."
-        )
-    if args.mix_weights[0] <= 0:
-        raise SystemExit(
-            "Composite (mix_weights[0]) is 0. composite_v1 is the primary "
-            "source and cannot be disabled."
-        )
-
-    # Parse --composite-task-weights "family:weight" pairs into a dict.
+    # Parse --composite-task-weights "family:weight" pairs into a dict (used by the QA path).
     composite_task_weights = None
     if args.composite_task_weights:
         composite_task_weights = {}
@@ -462,18 +443,42 @@ def args_to_config(args, ap):
             fam, w = item.split(":", 1)
             composite_task_weights[fam.strip()] = float(w)
         print(f"[composite] per-family weights: {composite_task_weights}")
-    if args.musique and args.mix_weights[3] <= 0:
-        raise SystemExit(
-            "--musique is set but mix_weights[3] (MuSiQue) is 0. Either drop "
-            "--musique or pass --mix-weights with a positive fourth value "
-            "(e.g. --mix-weights 0.4 0.2 0.2 0.2)."
-        )
-    if args.babilong and args.mix_weights[4] <= 0:
-        raise SystemExit(
-            "--babilong is set but mix_weights[4] (BABILong) is 0. Either drop "
-            "--babilong or pass --mix-weights with a positive fifth value "
-            "(e.g. --mix-weights 0.35 0.15 0.15 0.15 0.2)."
-        )
+
+    # QA composite mix-weight ⇔ source-flag consistency. ONLY meaningful for --task qa (the
+    # composite path). --task mixed uses its own mae/babi/continuation/condrecon_bio loaders and
+    # ignores these QA-source flags, so gate the checks — otherwise a mixed run that passes
+    # --mix-weights zeroing a QA source (whose flag defaults on) SystemExits for no reason.
+    if args.task == "qa":
+        if args.narrative and args.mix_weights[2] <= 0:
+            raise SystemExit(
+                "--narrative is set but mix_weights[2] (NarrativeQA) is 0. "
+                "Either drop --narrative or pass --mix-weights with a positive "
+                "third value (e.g. --mix-weights 0.5 0.3 0.2)."
+            )
+        if (not args.no_hotpot) and args.mix_weights[1] <= 0:
+            # HotpotQA is on by default; if user explicitly zeros the weight
+            # they likely meant to disable the source entirely.
+            raise SystemExit(
+                "HotpotQA is enabled but mix_weights[1] is 0. Either pass "
+                "--no-hotpot or set --mix-weights with a positive second value."
+            )
+        if args.mix_weights[0] <= 0:
+            raise SystemExit(
+                "Composite (mix_weights[0]) is 0. composite_v1 is the primary "
+                "source and cannot be disabled."
+            )
+        if args.musique and args.mix_weights[3] <= 0:
+            raise SystemExit(
+                "--musique is set but mix_weights[3] (MuSiQue) is 0. Either drop "
+                "--musique or pass --mix-weights with a positive fourth value "
+                "(e.g. --mix-weights 0.4 0.2 0.2 0.2)."
+            )
+        if args.babilong and args.mix_weights[4] <= 0:
+            raise SystemExit(
+                "--babilong is set but mix_weights[4] (BABILong) is 0. Either drop "
+                "--babilong or pass --mix-weights with a positive fifth value "
+                "(e.g. --mix-weights 0.35 0.15 0.15 0.15 0.2)."
+            )
 
     # Base config. Memory-token count + per-variant LoRA ranks/slots are set
     # below (matched-budget block + masked_reconstruction override). LoRA-all:

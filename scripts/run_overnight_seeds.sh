@@ -7,7 +7,7 @@ LOG=outputs/memory/overnight.log
 : > "$LOG"
 log() { echo "[$(date -u +%H:%M:%S)] $*" | tee -a "$LOG"; }
 
-COMMON="--task mixed --steps 4000 --batch-size 8 --backbone HuggingFaceTB/SmolLM2-135M --src-tokenizer meta-llama/Llama-3.2-1B --mixed-ctx 1024 --mixed-M 32 --mixed-gate-batches 8"
+COMMON="--task mixed --steps 4000 --batch-size 8 --backbone HuggingFaceTB/SmolLM2-135M --src-tokenizer meta-llama/Llama-3.2-1B --mixed-ctx 1024 --mixed-M 64 --mixed-gate-batches 8"
 
 # prefix:variant:extra-flags  (the 7 trainable models)
 SPECS=(

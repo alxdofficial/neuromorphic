@@ -108,12 +108,21 @@ class LongPassageMAEDataset(IterableDataset):
         cache = _decode_cache(Path(parquet_path), split, src_tokenizer_name)
         self.docs = []
         n_total = 0
-        for line in open(cache):
-            n_total += 1
-            arr = np.asarray(self.tok(json.loads(line)["text"],
-                                      add_special_tokens=False).input_ids, dtype=np.int64)
-            if arr.shape[0] >= ctx_len:
-                self.docs.append(arr)
+        # Whole docs are tokenized here (for the cache) then sliced to ctx_len at emit time, so a doc
+        # longer than the tokenizer's model_max_length is expected and harmless — silence the noisy
+        # "sequence longer than max length" warning so it can't mask real ones. Restored after.
+        from transformers.utils import logging as _hf_logging
+        _prev_verbosity = _hf_logging.get_verbosity()
+        _hf_logging.set_verbosity_error()
+        try:
+            for line in open(cache):
+                n_total += 1
+                arr = np.asarray(self.tok(json.loads(line)["text"],
+                                          add_special_tokens=False).input_ids, dtype=np.int64)
+                if arr.shape[0] >= ctx_len:
+                    self.docs.append(arr)
+        finally:
+            _hf_logging.set_verbosity(_prev_verbosity)
         if not self.docs:
             raise ValueError(
                 f"No FineWeb-edu doc has >= {ctx_len} tokens in {parquet_path} after "

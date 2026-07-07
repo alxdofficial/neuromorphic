@@ -41,7 +41,7 @@ from transformers import AutoTokenizer
 from src.memory.config import ReprConfig
 from src.memory.model import ReprLearningModel
 from src.memory.training import make_mixed_val_sets, run_val, _continuation_early_loss
-from src.memory.data.mixes import TASK_MODE, DEFAULT_TRAIN_MIX
+from src.memory.data.mixes import TASK_MODE, DEFAULT_TRAIN_MIX, DEFAULT_MIXED_M
 from src.memory.data.babi import DEFAULT_TASKS as BABI_DEFAULT_TASKS
 
 TRAINED_VARIANTS = [
@@ -51,7 +51,7 @@ TRAINED_VARIANTS = [
 ]
 # Campaign launch constants (must match the run that produced the checkpoints).
 MIXED_CTX = 1024
-MIXED_M = 32
+MIXED_M = DEFAULT_MIXED_M   # follows the mixed default (mixes.DEFAULT_MIXED_M); was hardcoded 32
 WINDOW_SIZE = 1024          # min(window_size_default=1024, chunk_size=1024)
 PREDICT_LEN = 64
 MAE_SRC_TOK = "meta-llama/Llama-3.2-1B"

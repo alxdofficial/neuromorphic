@@ -36,6 +36,11 @@ TASK_SPEC: dict[str, TaskSpec] = {
 # continuation = gist-LM; condrecon_bio = the realistic key→value binding anchor).
 DEFAULT_TRAIN_MIX: tuple[str, ...] = ("mae", "babi", "continuation", "condrecon_bio")
 
+# default uniform memory budget M (slots/edges) for the mixed regimen — the SINGLE source of truth.
+# The CLI --mixed-M default and the mixed diagnostics import this so they never drift (raised 32→64
+# for the streaming-write regime: binding headroom, forgetting pressure from distractor load).
+DEFAULT_MIXED_M: int = 64
+
 # bio conditioned-reconstruction construction constants (fill-to-budget packs key=value lines to
 # ~ctx_len; n_pairs = MAX entity pool — the world supports ~32 after the train/val name firewall;
 # n_facts = attributes packed per value sentence).
