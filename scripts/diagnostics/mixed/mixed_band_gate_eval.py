@@ -42,7 +42,7 @@ from src.memory.config import ReprConfig
 from src.memory.model import ReprLearningModel
 from src.memory.training import make_mixed_val_sets, run_val, _continuation_early_loss
 from src.memory.data.mixes import TASK_MODE, DEFAULT_TRAIN_MIX, DEFAULT_MIXED_M
-from src.memory.data.babi import DEFAULT_TASKS as BABI_DEFAULT_TASKS
+from src.memory.data.sources.babi import DEFAULT_TASKS as BABI_DEFAULT_TASKS
 
 TRAINED_VARIANTS = [
     "icae_baseline", "ccm_baseline", "autocompressor_baseline", "beacon_baseline",

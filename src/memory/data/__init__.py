@@ -23,11 +23,9 @@ from .common import QABatch, QADataset, collate_qa, make_qa_dataloader, _pack_co
 from .mixed import MixedQADataset, make_mixed_qa_dataloader
 
 # name → (submodule, factory-function-name). Kept lazy via _lazy_maker below.
+# TRAIN readers (babi/bio/mae/continuation) are GONE — superseded by the sources/ + tasks/ packages
+# (SOURCE_REGISTRY × get_task, built by training/data_mix.py). Only EVAL readers + mixed remain.
 _MAKERS: dict[str, tuple[str, str]] = {
-    "babi":        ("babi",         "make_babi_dataloader"),
-    "bio":         ("bio",          "make_conditioned_reconstruction_bio_dataloader"),
-    "mae":         ("mae",          "make_long_passage_mae_dataloader"),
-    "continuation": ("continuation", "make_continuation_dataloader"),
     "babilong":    ("babilong",     "make_babilong_dataloader"),
     "hotpot":      ("hotpot",       "make_hotpot_dataloader"),
     "musique":     ("musique",      "make_musique_dataloader"),

@@ -13,7 +13,7 @@ import argparse
 import torch
 
 from src.memory.config import ReprConfig
-from src.memory.data.babi import DEFAULT_TASKS as BABI_DEFAULT_TASKS
+from src.memory.data.sources.babi import DEFAULT_TASKS as BABI_DEFAULT_TASKS
 from src.memory.data.mixes import DEFAULT_TRAIN_MIX, TASK_SPEC, DEFAULT_MIXED_M
 
 

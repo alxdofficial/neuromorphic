@@ -17,7 +17,7 @@ import torch
 from src.memory.config import ReprConfig
 from src.memory.data.mixed import make_mixed_qa_dataloader
 from src.memory.data.common import collate_qa
-from src.memory.data.babi import DEFAULT_TASKS as BABI_DEFAULT_TASKS
+from src.memory.data.sources.babi import DEFAULT_TASKS as BABI_DEFAULT_TASKS
 from src.memory.model import ReprLearningModel
 from src.memory.data import mixes
 
@@ -951,12 +951,19 @@ def probe_bs(variants, llama, tokenizer, cfg, args):
     run, so the reported max-BS is directly usable as that arm's --batch-size."""
     import time
     from dataclasses import replace as _dc_replace
-    from src.memory.data.bio import ConditionedReconstructionBioDataset
+    from src.memory.data.sources import SOURCE_REGISTRY
+    from src.memory.data.tasks import get_task
+    from src.memory.data.tasks.base import TaskDataset
+    from src.memory.data.schedule import EpisodeSpec
     device = "cuda"
     _pad = cfg.pad_token_id if cfg.pad_token_id is not None else 128_001
-    ds = ConditionedReconstructionBioDataset(tokenizer, context_len=args.chunk_size, n_pairs=args.cond_recon_n_pairs,
-                     n_query=args.cond_recon_n_query, n_facts=args.cond_recon_bio_n_facts,
-                     world_seed=0, stream_seed=0, pad_token_id=_pad)
+    # Rebuild the conditioned-reconstruction sample pool via the 4-layer path (Source × Task × spec).
+    source = SOURCE_REGISTRY["bio"](tokenizer, split="train", world_seed=0,
+                                    n_facts=args.cond_recon_bio_n_facts)
+    task = get_task("reconstruction")
+    spec = EpisodeSpec(source="bio", task="reconstruction", total_len=args.chunk_size,
+                       n_inputs=args.cond_recon_n_pairs, n_queries=args.cond_recon_n_query)
+    ds = TaskDataset(source, task, spec, tokenizer, pad_token_id=_pad)
     pool, it = [], iter(ds)
     for _ in range(max(args.probe_bs_list)):
         pool.append(next(it))

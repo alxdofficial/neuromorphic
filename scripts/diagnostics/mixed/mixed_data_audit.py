@@ -33,12 +33,8 @@ if str(REPO) not in sys.path:
 from transformers import AutoTokenizer
 
 from src.memory.config import ReprConfig
-from src.memory.training import make_mixed_val_sets
-from src.memory.data.babi import DEFAULT_TASKS as BABI_DEFAULT_TASKS
-from src.memory.data.mae import make_long_passage_mae_dataloader
-from src.memory.data.babi import make_babi_dataloader
-from src.memory.data.continuation import make_continuation_dataloader
-from src.memory.data.bio import make_conditioned_reconstruction_bio_dataloader
+from src.memory.training import make_mixed_train_dataloaders, make_mixed_val_sets
+from src.memory.data.sources.babi import DEFAULT_TASKS as BABI_DEFAULT_TASKS
 
 TASKS = ["mae", "babi", "continuation", "condrecon_bio"]
 N_BATCHES = 4                    # 4×8 = 32 examples audited per task/split
@@ -171,18 +167,9 @@ def main():
     vs = make_mixed_val_sets(TASKS, tok, cfg, N_BATCHES, ctx_len=CTX, m_slots=M,
                              mae_src_tok=SRC_TOK, babi_tasks=BABI_DEFAULT_TASKS, predict_len=PLEN)
     print("building TRAIN loaders (split=train, run seed 42)...")
-    tl = {
-        "mae": make_long_passage_mae_dataloader(tok, batch_size=8, src_tokenizer_name=SRC_TOK, split="train",
-                                                ctx_len=CTX, m_slots=M, seed=42, pad_token_id=pad, num_workers=0),
-        "babi": make_babi_dataloader(tok, context_len=CTX, batch_size=8, split="train", seed=42,
-                                     pad_token_id=pad, tasks=BABI_DEFAULT_TASKS, num_workers=0),
-        "continuation": make_continuation_dataloader(tok, batch_size=8, compress_len=CTX, predict_len=PLEN,
-                                                     split="train", seed=42, pad_token_id=pad,
-                                                     objective="continuation", src_tokenizer_name=SRC_TOK, num_workers=0),
-        "condrecon_bio": make_conditioned_reconstruction_bio_dataloader(
-            tok, context_len=CTX, batch_size=8, n_pairs=24, n_query=1, n_facts=3, split="train",
-            world_seed=0, stream_seed=42, pad_token_id=pad, num_workers=0),
-    }
+    tl = make_mixed_train_dataloaders(TASKS, tok, cfg, ctx_len=CTX, m_slots=M,
+                                      mae_src_tok=SRC_TOK, babi_tasks=BABI_DEFAULT_TASKS,
+                                      predict_len=PLEN, num_workers=0)
 
     for task in TASKS:
         print(f"\n{'='*90}\n{task.upper()}\n{'='*90}")

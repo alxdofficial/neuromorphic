@@ -39,7 +39,7 @@ from src.memory.config import ReprConfig
 from src.memory.model import ReprLearningModel
 from src.memory.training import make_mixed_val_sets, to_device
 from src.memory.data.mixes import TASK_MODE
-from src.memory.data.babi import DEFAULT_TASKS as BABI_DEFAULT_TASKS
+from src.memory.data.sources.babi import DEFAULT_TASKS as BABI_DEFAULT_TASKS
 
 DEV = "cuda"
 TASKS = ["mae", "babi", "condrecon_bio"]

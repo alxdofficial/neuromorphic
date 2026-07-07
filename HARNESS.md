@@ -8,10 +8,15 @@ Design rationale + history: `docs/harness_reorg_plan.md`.
 
 | Question | Answer |
 |---|---|
-| What dataset **adapters** exist? | `src/memory/data/__init__.py` — `REGISTRY` (name → loader) |
-| Which datasets **train**, and how does each route? | `src/memory/data/mixes.py` — `TASK_SPEC` + `DEFAULT_TRAIN_MIX` |
+| What **sources** (datasets) exist? | `src/memory/data/sources/` — `SOURCE_REGISTRY`. (`REGISTRY` = eval-only flat readers.) |
+| What **task styles** exist? | `src/memory/data/tasks/` — `get_task` / `TASK_STYLES` (reconstruction/qa/continuation/mae/overwrite) |
+| Which datasets **train**, and how does each route? | `src/memory/data/mixes.py` — `TASK_SPEC` (`source × task_style × task_mode`) + `DEFAULT_TRAIN_MIX` |
 | Where is the **trainer / objective / eval** code? | `src/memory/training/` (library) |
 | Where is the **CLI**? | `scripts/train/{train.py, cli.py}` |
+
+**Data is 4 orthogonal layers** (`docs/data_arch_plan.md`, `DATASETS.md`): **Source** (where tokens
+come from) × **Task** (what's asked) × **EpisodeSpec** (`schedule.py` — how hard) × **Objective**
+(how scored). task ≠ objective — they compose as a matrix.
 
 ## `src/memory/training/` — the reusable harness (importable)
 
@@ -21,7 +26,8 @@ src/memory/training/
   loops.py        # train_mixed_variant (the mixed benchmark path), train_one_variant
                   #   (single-task path), probe_bs. main() calls both.
   objectives.py   # the objective ladder: _infonce_logits_weights, _same_answer_valid_mask,
-                  #   _coding_rate, _grad_cached_objective_step  (CE / InfoNCE / coding-rate / GRPO)
+                  #   _coding_rate, _grad_cached_objective_step (CE / InfoNCE / coding-rate / GRPO),
+                  #   _behavioral_kl_step (context distillation: KL(teacher=full-ctx ‖ student=memory))
   eval.py         # run_val, run_mixed_val, _continuation_early_loss, CONT_EARLY_TOKENS
   checkpoint.py   # save_checkpoint, _ckpt_metadata, _grad_group_norm
   data_mix.py     # make_mixed_train_dataloaders, make_mixed_val_sets (build loaders from the spec)
@@ -33,18 +39,16 @@ Imported **explicitly** (`from src.memory.training import …`), never eagerly f
 
 ## `src/memory/data/mixes.py` — the training-mix spec
 
-The single source of truth for *what trains and how it routes*, co-located with the adapter
-`REGISTRY`:
-
-- `TaskSpec(adapter, task_mode, role)` — `adapter` is the `REGISTRY` key backing the task;
-  `task_mode` sets `model.task_mode` (routes `compute_loss`; `"masked_reconstruction"` = the MAE
-  infill path, everything else = the generic QA/CE path); `role` ∈ {`train`, `eval`}.
-- `TASK_SPEC` — mix-task name → spec. A mix name may differ from its adapter (a *framing* over an
-  adapter): `condrecon_bio` is the conditioned-reconstruction framing over the `bio` reader.
-- `DEFAULT_TRAIN_MIX = ("mae", "babi", "continuation", "condrecon_bio")`.
-- `TASK_MODE` — flat `{name → task_mode}` convenience dict. `CONDRECON_BIO_N_PAIRS/N_FACTS` — bio
-  construction constants.
-- Import-time assert: every `TaskSpec.adapter` ∈ `REGISTRY` (catches spec/registry drift).
+The single source of truth for *what trains and how it routes*:
+- `TaskSpec(source, task_style, task_mode, role)` — `source` ∈ `SOURCE_REGISTRY`, `task_style` ∈
+  `TASK_STYLES`; `task_mode` sets `model.task_mode` (`"masked_reconstruction"` = MAE infill,
+  else generic QA/CE path).
+- `TASK_SPEC` — mix-task name → spec. The name may differ from the source (a *framing*):
+  `condrecon_bio` = `reconstruction` over the `bio` source; `mae`/`continuation` both over `fineweb`.
+- `DEFAULT_TRAIN_MIX = ("mae", "babi", "continuation", "condrecon_bio")`. `TASK_MODE` flat dict.
+- `training/data_mix.py` composes `SOURCE_REGISTRY[spec.source] × get_task(spec.task_style) ×
+  EpisodeSpec` — adding a source/task never edits `data_mix`. Import-time assert: every
+  `TaskSpec.source` ∈ `SOURCE_REGISTRY`, `task_style` ∈ `TASK_STYLES`.
 
 ## `scripts/train/` — the entrypoint (executable)
 
@@ -71,9 +75,13 @@ on `sys.path` and import the harness from `src.memory.training` + the spec from
 
 ## How to…
 
-- **Add a training task**: register the reader in `src/memory/data/__init__.py::REGISTRY`, add a
-  `TaskSpec` in `mixes.py` (and to `DEFAULT_TRAIN_MIX` if it should train by default), and add its
-  loader-construction branch in `training/data_mix.py` (the makers have heterogeneous signatures).
+- **Add a dataset (source)**: `src/memory/data/sources/<name>.py` (yield items) + register in
+  `sources/__init__.py::_SOURCES`. Reuse an existing task, or add one in `tasks/<style>.py`.
+- **Add a training task (mix entry)**: add a `TaskSpec(source, task_style, task_mode)` in
+  `mixes.py::TASK_SPEC` (+ `DEFAULT_TRAIN_MIX` if default). Per-source construction kwargs (only if
+  novel) go in `training/data_mix.py::_build_source`; the rest is automatic.
+- **Add an objective**: a step fn in `training/objectives.py` + a dispatch branch in `loops.py` +
+  an `--objective-mode` choice in `cli.py` (e.g. `behavioral_kl`: `--kl-coef`/`--kl-temp`).
 - **Add a CLI flag**: `scripts/train/cli.py` (`build_parser` + map it in `args_to_config`).
 - **Add a diagnostic**: drop it in the matching `scripts/diagnostics/<subject>/` folder; use
   `Path(__file__).resolve().parents[3]` for the repo root.

@@ -1,24 +1,29 @@
 # Datasets — the index
 
-One canonical `<name>` per dataset, tied across all three layers:
+**Data is 4 orthogonal layers (2026-07-07 refactor — see `docs/data_arch_plan.md`):**
+- **Source** (*where tokens come from*) — `src/memory/data/sources/<name>.py` + `SOURCE_REGISTRY`.
+  Yields raw items (`CorpusItem`/`KeyedItem`/`QAItem`); knows nothing about windows/queries.
+- **Task** (*what's presented/asked*) — `src/memory/data/tasks/<style>.py` + `get_task`. Shapes
+  items → the on-the-wire sample. Styles: `reconstruction`, `qa`, `continuation`, `mae`, `overwrite`.
+- **Schedule** (*how hard*) — `src/memory/data/schedule.py` `EpisodeSpec` + `Curriculum`.
+- **Objective** (*how scored*) — `src/memory/training/objectives.py`: `plain` CE / `contrastive` /
+  `behavioral_kl` (context distillation) — composes with any task. **task ≠ objective.**
 
-- **build** (offline) — `scripts/data_build/{generate,ingest}/<name>` — *generate* =
-  synthesize procedurally; *ingest* = download + clean + pretokenize→parquet.
-- **store** (on disk) — `data/<name>/` — the build layer's output (gitignored).
-- **load** (runtime) — `src/memory/data/<name>.py` — the `Dataset` + `make_<name>_dataloader`
-  (registered in `src/memory/data/__init__.py::REGISTRY`).
+Build/store still per-name: **build** `scripts/data_build/{generate,ingest}/<name>`; **store**
+`data/<name>/`. Training mixes = `(source, task, spec)` in `src/memory/data/mixes.py::TASK_SPEC`,
+composed by `src/memory/training/data_mix.py`. `REGISTRY` now holds only the **eval** flat readers.
+See `HARNESS.md` for the training wiring.
 
-See `scripts/data_build/README.md` and `data/README.md` for the layer mechanics, and
-`HARNESS.md` for how these adapters are composed into training (the mix spec `src/memory/data/mixes.py`
-and the `src/memory/training/` harness).
-
-| name | what | source | role | reader (`src/memory/data/`) | build (`scripts/data_build/`) | data (`data/` or cache) | status | gotchas |
-|---|---|---|---|---|---|---|---|---|
-| `bio` | biographical conditioned-reconstruction (trusted anchor) | procedural | train | `bio.py` (+ `bio_render.py`) | `generate/bio/` (`build_scenario`) | `data/bio/{raw,raw_val,train,val}` | active | CE loss is scored **only on the fact-value spans** (`render_value`'s `value_out` → `_value_ids_content`), excluding the entity name + template/persona scaffolding, so SHUF−REAL charges for binding not boilerplate (Phase 5). `_name_derivable` also drops name-derivable `short_name`/`org_type`/`work_type` facts. |
-| `babi` | bAbI relational QA (story→question→1-word answer) | HF `Muennighoff/babi` (1k) | train | `babi.py` | `ingest/babi_10k.py` (TODO) | HF cache (`data/babi/` = Tier-B 10k) | active | reader uses the HF **1k** dump; the **10k** dump is needed for 80k-token budgets. Offline fallback only synthesizes task-1 (raises otherwise). Unknown split names raise. |
-| `babilong` | bAbI-in-haystack (long-context state-tracking) | HF `RMT-team/babilong` | **eval** | `babilong.py` | HF-auto (reader) | HF cache | active | only **qa1-qa10** exist at configs ≥1k — requesting qa11-qa20 there loads fewer tasks (now WARNs, not silent) |
-| `mae` | masked reconstruction (gist sentinel) | fineweb-edu corpus | train | `mae.py` | `ingest/fineweb.py` (TODO) | `data/fineweb_edu/{train,val}.parquet` + `cache/` | active | fineweb split has a ~1.25% train/val leak (rebuild document-disjoint). Text cache is now tokenizer-fingerprinted (`.meta`) so a mismatched-tokenizer cache regenerates. |
-| `continuation` | gist continuation (compress prefix → predict next span) | fineweb-edu corpus | train | `continuation.py` | `ingest/fineweb.py` (TODO) | `data/fineweb_edu/` (shares `cache/`) | active | same fineweb ~1.25% leak as `mae` |
+| name | what | kind | role | source (`data/sources/`) × task | build | gotchas |
+|---|---|---|---|---|---|---|
+| `bio` | biographical conditioned-reconstruction (trusted anchor) | keyed | train | `bio.py` × `reconstruction` (+ `bio_render.py`) | `generate/bio/` | loss on **fact-value spans only** (`value_subs` → task's `_value_ids_content`), excl. name + template, so SHUF−REAL charges for binding not boilerplate. `_name_derivable` drops key-derivable `short_name`/`org_type`/`work_type`. query-lag placement via `EpisodeSpec.query_lag`. |
+| `babi` | bAbI relational QA (story→1-word answer) | qa | train | `babi.py` × `qa` | `ingest/babi_10k.py` (TODO) | HF **1k** dump; 10k needed for 80k budgets. Offline fallback = task-1 only (raises otherwise). |
+| `fineweb` | fineweb-edu corpus (backs mae + continuation) | corpus | train | `fineweb.py` × `mae` / `continuation` | `ingest/fineweb.py` (TODO) | ~1.25% train/val leak (rebuild document-disjoint). **src_tokenizer = `meta-llama/Llama-3.2-1B`**, cache `.meta`-fingerprinted. |
+| `mqar` | random-token multi-query associative recall | keyed | train | `mqar.py` × `reconstruction` | runtime-procedural | un-guessable binding kill-switch (Zoology); multi-query = addressing. |
+| `ruler_overwrite` | same-key reassignment (v1→v2), query returns latest | keyed | train | `ruler_overwrite.py` × `overwrite` | runtime-procedural | T2 forced-forgetting probe (RULER-fork). answer = latest binding, stale = distractor. |
+| `pile` | The Pile natural text (bucket-1) | corpus | train | `pile.py` × `continuation`/`mae` | `ingest/pile/download.py` | `NeelNanda/pile-10k` stream; local-jsonl → HF-stream → "run ingest" error. |
+| `redpajama` | SlimPajama (dedup RedPajama, bucket-1) | corpus | train | `redpajama.py` × `continuation`/`mae` | `ingest/redpajama/download.py` | `DKYoon/SlimPajama-6B` (classic RedPajama-1T loader unsupported in datasets 4.5). |
+| `babilong` | bAbI-in-haystack (long-context) | qa | **eval** | flat `babilong.py` (REGISTRY) | HF-auto | only **qa1-qa10** at configs ≥1k (WARNs). |
 | `hotpot` | HotpotQA multi-hop (distractor) | HF `hotpot_qa` | eval | `hotpot.py` | HF-auto (reader) | HF cache | active | ~570MB first download; supporting paragraphs guaranteed in-context |
 | `musique` | MuSiQue-Ans 2-4 hop | HF `dgslibisey/MuSiQue` | eval | `musique.py` | HF-auto (reader) | HF cache | active | answerable-only subset (filtered) |
 | `narrativeqa` | NarrativeQA (summaries-only) | HF `narrativeqa` | eval | `narrativeqa.py` | HF-auto (reader) | HF cache | active | summaries-only setting; abstractive answers → headline metric is the LLM judge, EM/containment secondary |
