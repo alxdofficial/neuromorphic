@@ -38,6 +38,11 @@ def _build_source(src_name, task_style, tokenizer, *, split, ctx_len, predict_le
         min_len = ctx_len + (predict_len if task_style == "continuation" else 0)
         return SOURCE_REGISTRY["fineweb"](
             tokenizer, split=split, src_tokenizer_name=mae_src_tok, min_len=min_len, seed=seed)
+    if src_name == "multicorpus":
+        # continuation/mae VARIETY: unions fineweb+pile+redpajama+code (skips unreachable ones).
+        min_len = ctx_len + (predict_len if task_style == "continuation" else 0)
+        return SOURCE_REGISTRY["multicorpus"](
+            tokenizer, split=split, src_tokenizer_name=mae_src_tok, min_len=min_len, seed=seed)
     if src_name == "babi":
         return SOURCE_REGISTRY["babi"](
             tokenizer, split=("validation" if split != "train" else "train"),

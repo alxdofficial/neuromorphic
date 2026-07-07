@@ -31,10 +31,10 @@ class TaskSpec:
 # mix-task name → spec. The mix name MAY differ from the source (a task *framing* over a source):
 # "condrecon_bio" = the reconstruction task over the "bio" source; "mae"/"continuation" both over "fineweb".
 TASK_SPEC: dict[str, TaskSpec] = {
-    "mae":           TaskSpec("fineweb", "mae",            "masked_reconstruction"),
-    "babi":          TaskSpec("babi",    "qa",             "babi"),
-    "continuation":  TaskSpec("fineweb", "continuation",  "continuation"),
-    "condrecon_bio": TaskSpec("bio",     "reconstruction", "conditioned_reconstruction_bio"),
+    "mae":           TaskSpec("fineweb",     "mae",            "masked_reconstruction"),
+    "babi":          TaskSpec("babi",        "qa",             "babi"),
+    "continuation":  TaskSpec("multicorpus", "continuation",   "continuation"),   # VARIETY: fineweb+pile+redpajama+code
+    "condrecon_bio": TaskSpec("bio",         "reconstruction", "conditioned_reconstruction_bio"),
 }
 
 # the default 4-task training mix (mae = compression control; babi = relational binding sanity;

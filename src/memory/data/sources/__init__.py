@@ -21,6 +21,8 @@ _SOURCES: dict[str, tuple[str, str]] = {
     # corpus sources (bucket-1 natural text; best-effort HF sample, see ingest/):
     "pile": ("pile", "PileSource"),
     "redpajama": ("redpajama", "RedpajamaSource"),
+    "code": ("code", "CodeSource"),                       # source code — un-guessable exact-recall binding
+    "multicorpus": ("multicorpus", "MultiCorpusSource"),  # continuation/mae VARIETY (fineweb+pile+redpajama+code)
 }
 
 

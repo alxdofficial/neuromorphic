@@ -48,13 +48,18 @@ def _iter_local_texts(path: Path) -> Iterator[str]:
 
 
 def _iter_hf_texts(name: str, hf_name: str, hf_config: Optional[str], hf_split: str,
-                   n_docs: int, skip: int) -> Iterator[str]:
-    """Stream up to ``n_docs`` texts from HF (after skipping ``skip``). Raises a clear
-    ingest-first error if the hub is unreachable — so an offline env fails fast, never hangs."""
+                   n_docs: int, skip: int, hf_data_dir: Optional[str] = None) -> Iterator[str]:
+    """Stream up to ``n_docs`` texts from HF (after skipping ``skip``). ``hf_data_dir`` selects a
+    subdir (e.g. the-stack-smol ``data/python``). Raises a clear ingest-first error if the hub is
+    unreachable — so an offline env fails fast, never hangs."""
     try:
         from datasets import load_dataset
-        ds = (load_dataset(hf_name, hf_config, split=hf_split, streaming=True)
-              if hf_config else load_dataset(hf_name, split=hf_split, streaming=True))
+        _kw = {"split": hf_split, "streaming": True}
+        if hf_config:
+            _kw["name"] = hf_config
+        if hf_data_dir:
+            _kw["data_dir"] = hf_data_dir
+        ds = load_dataset(hf_name, **_kw)
     except Exception as e:  # network / offline / missing dataset
         raise RuntimeError(
             f"[{name}] HF dataset {hf_name!r} unreachable ({type(e).__name__}: {str(e)[:120]}). "
@@ -77,7 +82,8 @@ def _iter_hf_texts(name: str, hf_name: str, hf_config: Optional[str], hf_split: 
 
 
 def load_corpus_docs(tokenizer, *, name: str, hf_name: str, hf_config: Optional[str],
-                     split: str, min_len: int, n_docs: int) -> List[np.ndarray]:
+                     split: str, min_len: int, n_docs: int,
+                     hf_data_dir: Optional[str] = None) -> List[np.ndarray]:
     """Load → re-tokenize (backbone) → keep docs ≥ min_len. Local jsonl first, else HF stream."""
     local = local_jsonl(name, split)
     if local is not None:
@@ -87,8 +93,8 @@ def load_corpus_docs(tokenizer, *, name: str, hf_name: str, hf_config: Optional[
         # These sample sets typically expose only a 'train' split; carve a disjoint val slice by
         # skipping the first n_docs docs (train takes [0:n_docs], val takes [n_docs:2·n_docs]).
         skip = 0 if split == "train" else n_docs
-        texts = _iter_hf_texts(name, hf_name, hf_config, "train", n_docs, skip)
-        origin = f"HF:{hf_name}"
+        texts = _iter_hf_texts(name, hf_name, hf_config, "train", n_docs, skip, hf_data_dir)
+        origin = f"HF:{hf_name}" + (f"/{hf_data_dir}" if hf_data_dir else "")
 
     docs: List[np.ndarray] = []
     n_total = 0
