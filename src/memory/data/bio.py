@@ -56,7 +56,8 @@ class ConditionedReconstructionBioDataset(IterableDataset):
                  n_query: int = 1, n_facts: int = 3, world_seed: int = 0,
                  stream_seed: int = 0, n_items: int = 1_000_000,
                  pad_token_id: int = 128_001, relational: bool = False,
-                 exclude_names: set = None):
+                 exclude_names: set = None, window_size: int = None,
+                 query_window: int = None):
         self.tok = tokenizer
         self.context_len = context_len
         self.n_pairs = n_pairs
@@ -65,6 +66,13 @@ class ConditionedReconstructionBioDataset(IterableDataset):
         self.stream_seed = stream_seed
         self.n_items = n_items
         self.pad_token_id = pad_token_id
+        # STREAMING-WRITE retention control: with the encoder chunking the context into
+        # `window_size` windows, `query_window` pins the queried key→value pair into a chosen
+        # window so the other pairs act as distractors between it and the end-of-context query.
+        # query_window=0 → evidence in the FIRST window (max retention lag); -1 → last window
+        # (recency baseline); None → any window (current behaviour). See project_streaming_write.
+        self.window_size = window_size
+        self.query_window = query_window
         assert 1 <= n_query <= n_pairs
 
         scen = build_scenario(random.Random(world_seed), 0, **_WORLD)
@@ -172,8 +180,9 @@ class ConditionedReconstructionBioDataset(IterableDataset):
         # context. To guarantee n_query the loop may over-pack past budget when few
         # keys exist; those trailing lines can be truncated by the clamp, and
         # querying a truncated value would ask the decoder for absent tokens.
-        cum_end, queryable = 0, []
+        cum_end, queryable, starts = 0, [], []
         for i, ll in enumerate(line_lens):
+            starts.append(cum_end)                            # token offset where pair i's line begins
             cum_end += ll
             if cum_end <= valid:
                 queryable.append(i)
@@ -183,7 +192,23 @@ class ConditionedReconstructionBioDataset(IterableDataset):
             # caller to resample rather than crash the whole run; __iter__ distinguishes
             # an occasional bad draw (retry) from a fundamentally-too-small config (raise).
             return None
-        qi = rng.sample(queryable, self.n_query)
+        # STREAMING retention: restrict the query to pairs whose line sits in the target
+        # window (evidence placement = the lag axis). Prefer pairs FULLY inside the window
+        # (their whole binding is written in that one window); fall back to pairs that start
+        # there, then to any queryable, so an unlucky pack never crashes the run.
+        qcands = queryable
+        if self.query_window is not None and self.window_size:
+            ws = self.window_size
+            tgt = self.query_window if self.query_window >= 0 else max(0, (valid - 1) // ws)
+            win = lambda i: (starts[i] // ws, (starts[i] + line_lens[i] - 1) // ws)
+            full = [i for i in queryable if win(i) == (tgt, tgt)]
+            starts_in = [i for i in queryable if win(i)[0] == tgt]
+            qcands = full or starts_in or queryable
+        if len(qcands) >= self.n_query:
+            qi = rng.sample(qcands, self.n_query)
+        else:                                                  # target window under-populated: top up
+            extra = [i for i in queryable if i not in qcands]
+            qi = qcands + rng.sample(extra, self.n_query - len(qcands))
         # Condition with the "key =" form the context uses ("k = v\n") so the decoder
         # predicts the value IN-DISTRIBUTION (a bare key makes the model — esp. the
         # full-context ceiling — predict " =" instead of the value: the inverted-band bug).
@@ -239,7 +264,8 @@ def make_conditioned_reconstruction_bio_dataloader(tokenizer, context_len: int, 
                              n_pairs: int = 16, n_query: int = 1, n_facts: int = 3,
                              split: str = "train", world_seed: int = 0,
                              stream_seed: int = 0, pad_token_id: int = None,
-                             num_workers: int = 2, relational: bool = False) -> DataLoader:
+                             num_workers: int = 2, relational: bool = False,
+                             window_size: int = None, query_window: int = None) -> DataLoader:
     if pad_token_id is None:                                  # LLM-agnostic default
         pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
     # val builds a DIFFERENT world AND drops any entity whose canonical name also exists
@@ -250,7 +276,8 @@ def make_conditioned_reconstruction_bio_dataloader(tokenizer, context_len: int, 
     ds = ConditionedReconstructionBioDataset(tokenizer, context_len=context_len, n_pairs=n_pairs,
                         n_query=n_query, n_facts=n_facts, world_seed=ws,
                         stream_seed=stream_seed, pad_token_id=pad_token_id,
-                        relational=relational, exclude_names=exclude)
+                        relational=relational, exclude_names=exclude,
+                        window_size=window_size, query_window=query_window)
     return DataLoader(ds, batch_size=batch_size, num_workers=num_workers,
                       collate_fn=lambda s: collate_qa(s, pad_token_id))
 

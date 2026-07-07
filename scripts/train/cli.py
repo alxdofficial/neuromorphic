@@ -103,6 +103,12 @@ def build_parser() -> argparse.ArgumentParser:
                     help="conditioned_reconstruction: words per value (1 = single-token value).")
     ap.add_argument("--cond-recon-bio-n-facts", type=int, default=3,
                     help="conditioned_reconstruction_bio: random facts packed per value sentence (2-4).")
+    ap.add_argument("--bio-query-window", type=int, default=None,
+                    help="STREAMING-WRITE retention probe (condrecon_bio): pin the queried key→value "
+                         "pair into this encoder window (0 = first = max retention lag, distractors "
+                         "after; -1 = last = recency baseline; unset = any window). Ties to "
+                         "--window-size; use with --window-size < --mixed-ctx to make the streaming "
+                         "windows real (e.g. --window-size 256 --mixed-ctx 1024 --bio-query-window 0).")
     ap.add_argument("--backbone", type=str, default=None,
                     help="override cfg.llama_model (e.g. HuggingFaceTB/SmolLM2-135M for "
                          "the compression line). Auto-sets d_llama from the config.")
@@ -522,6 +528,7 @@ def args_to_config(args, ap):
         cfg.autocompressor_lora_rank = args.port_lora_rank
         print(f"[capacity] ICAE/CCM/AutoCompressor LoRA rank → {args.port_lora_rank}")
     cfg.mae_mask_ratio = args.mae_mask_ratio
+    cfg.cond_recon_bio_query_window = args.bio_query_window   # streaming retention placement (mixed path)
     _ceil = lambda a, b: -(-a // b)
     _beacon_M = (_ceil(args.chunk_size, args.window_size)
                  * _ceil(args.window_size, cfg.beacon_ratio))

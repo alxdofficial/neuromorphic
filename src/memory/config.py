@@ -166,6 +166,10 @@ class ReprConfig:
     grad_clip: float = 1.0
     log_every: int = 50
     save_every: int = 5000
+    # streaming-write retention probe (condrecon_bio): pin the queried key→value pair into this
+    # encoder window (0 = first = max retention lag, distractors after; -1 = last = recency
+    # baseline; None = any window). Ties to --window-size. See project_streaming_write.
+    cond_recon_bio_query_window: Optional[int] = None
 
     # ── biomem (chunk-parallel gated-delta synaptic-grid memory; models/biomem/) ─────
     biomem_n_cols: int = 36            # C — #columns (= scan heads); C*K = d_grid = 576

@@ -629,14 +629,18 @@ def train_mixed_variant(
         weight_decay=cfg.weight_decay, betas=(0.9, 0.95),
         fused=torch.cuda.is_available())
 
+    # streaming-write retention placement for condrecon_bio (queried pair pinned to a window);
+    # None = off (any window). window_size ties the placement to the encoder's chunking.
+    _bio_qw = getattr(cfg, "cond_recon_bio_query_window", None)
     train_dls = make_mixed_train_dataloaders(
         mixed_tasks, tokenizer, cfg, ctx_len=mixed_ctx, m_slots=mixed_M,
         mae_src_tok=mae_src_tok, babi_tasks=babi_tasks, predict_len=predict_len,
-        train_seed=train_seed)
+        train_seed=train_seed, window_size=window_size, bio_query_window=_bio_qw)
     print(f"  Materializing fixed per-task val sets ({val_batches} batches each)...")
     val_sets = make_mixed_val_sets(
         mixed_tasks, tokenizer, cfg, val_batches, ctx_len=mixed_ctx, m_slots=mixed_M,
-        mae_src_tok=mae_src_tok, babi_tasks=babi_tasks, predict_len=predict_len)
+        mae_src_tok=mae_src_tok, babi_tasks=babi_tasks, predict_len=predict_len,
+        window_size=window_size, bio_query_window=_bio_qw)
     print(f"  Val sets ready: {{ {', '.join(f'{t}:{len(val_sets[t])}' for t in mixed_tasks)} }}")
 
     jsonl_path = out_dir / f"jsonl/{variant}.jsonl"

@@ -23,10 +23,15 @@ from .utils import materialize_val_set
 def make_mixed_train_dataloaders(mixed_tasks, tokenizer, cfg, *, ctx_len: int,
                                  m_slots: int, mae_src_tok: str, babi_tasks,
                                  predict_len: int, num_workers: int = 1,
-                                 train_seed: int = 42) -> dict:
+                                 train_seed: int = 42, window_size: int = None,
+                                 bio_query_window: int = None) -> dict:
     """One TRAIN dataloader per mixed task, all on the uniform interface
     (context_len/chunk = ctx_len, M = m_slots). Homogeneous batches; the
-    round-robin alternates which loader is pulled each step."""
+    round-robin alternates which loader is pulled each step.
+
+    ``bio_query_window`` (+ ``window_size``) turns condrecon_bio into a STREAMING-WRITE
+    retention probe: the queried key→value pair is pinned into that window (0 = first =
+    max lag), so the other pairs are distractors between it and the end-of-context query."""
     _pad = cfg.pad_token_id if cfg.pad_token_id is not None else 0
     dls = {}
     for t in mixed_tasks:
@@ -50,7 +55,8 @@ def make_mixed_train_dataloaders(mixed_tasks, tokenizer, cfg, *, ctx_len: int,
             dls[t] = make_conditioned_reconstruction_bio_dataloader(
                 tokenizer, context_len=ctx_len, batch_size=cfg.batch_size,
                 n_pairs=MIXED_CONDRECON_BIO_N_PAIRS, n_query=1, n_facts=MIXED_CONDRECON_BIO_N_FACTS,
-                split="train", world_seed=0, stream_seed=train_seed, pad_token_id=_pad, num_workers=num_workers)
+                split="train", world_seed=0, stream_seed=train_seed, pad_token_id=_pad, num_workers=num_workers,
+                window_size=window_size, query_window=bio_query_window)
         else:
             raise ValueError(f"unknown mixed task {t!r} (expected mae/babi/continuation/condrecon_bio)")
     return dls
@@ -58,9 +64,11 @@ def make_mixed_train_dataloaders(mixed_tasks, tokenizer, cfg, *, ctx_len: int,
 
 def make_mixed_val_sets(mixed_tasks, tokenizer, cfg, val_batches, *, ctx_len: int,
                         m_slots: int, mae_src_tok: str, babi_tasks,
-                        predict_len: int) -> dict:
+                        predict_len: int, window_size: int = None,
+                        bio_query_window: int = None) -> dict:
     """One materialized (fixed) VAL set per mixed task — disjoint val seed so the
-    eval data never overlaps the training stream."""
+    eval data never overlaps the training stream. ``bio_query_window`` mirrors the
+    train-side streaming retention placement (see make_mixed_train_dataloaders)."""
     _pad = cfg.pad_token_id if cfg.pad_token_id is not None else 0
     sets = {}
     for t in mixed_tasks:
@@ -83,6 +91,7 @@ def make_mixed_val_sets(mixed_tasks, tokenizer, cfg, val_batches, *, ctx_len: in
             dl = make_conditioned_reconstruction_bio_dataloader(
                 tokenizer, context_len=ctx_len, batch_size=cfg.batch_size,
                 n_pairs=MIXED_CONDRECON_BIO_N_PAIRS, n_query=1, n_facts=MIXED_CONDRECON_BIO_N_FACTS,
-                split="validation", world_seed=0, stream_seed=7, pad_token_id=_pad, num_workers=0)
+                split="validation", world_seed=0, stream_seed=7, pad_token_id=_pad, num_workers=0,
+                window_size=window_size, query_window=bio_query_window)
         sets[t] = materialize_val_set(dl, val_batches)
     return sets
