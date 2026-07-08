@@ -33,9 +33,8 @@ def _build_one(name, tokenizer, *, split, seed, n_docs):
     if name == "multiwoz":
         from .multiwoz import MultiWOZSource
         return MultiWOZSource(tokenizer, split=split, seed=seed, n_docs=n_docs)
-    if name == "babi":
-        from .babi import BabiSource
-        return BabiSource(tokenizer, split=split, seed=seed)
+    # NB: bAbI is intentionally NOT unioned here — it needs per-segment entity renaming (pack_rename),
+    # which the qa task only applies to the top-level source. Co-packing raw bAbI items would collide.
     raise ValueError(f"qa_multi: unknown qa source {name!r} (have {DEFAULT_QA})")
 
 

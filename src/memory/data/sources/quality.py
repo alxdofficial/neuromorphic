@@ -6,10 +6,11 @@ one ``QAItem`` per (story, question). The whole STORY is the context (split into
 the question carries the lettered option menu; the answer is the correct option's *text* (EM-scorable
 and un-guessable as free-form generation, unlike a bare A/B/C/D letter).
 
-LONG-CONTEXT regime. QuALITY articles all EXCEED 4096 tokens, so this source is meant for
-``total_len >= 4096`` (ideally >= 8192). The qa Task packs facts at the front and TAIL-truncates the
-overflow, so at ``total_len=1024`` most of the story is dropped — that is expected; run QuALITY with a
-large ``total_len``. The article tail (which contains the ending) is what survives truncation.
+LONG-CONTEXT regime. QuALITY articles run ~4.7k–7.9k backbone tokens (median ~6.8k), so the WHOLE gold
+article is one Unit — and ``pack_streaming_episode`` never truncates a query's own facts (an oversized
+gold Unit signals resample, not truncation). So the real floor is ``total_len >= ~8192`` (7.9k article +
+question + margin); at ``total_len=4096`` essentially every story overflows and the task resamples until
+it raises. This source is UNWIRED (excluded from ``qa_multi``); wire it only with a large ``total_len``.
 
 Answer-in-context caveat: QuALITY answers are ABSTRACTIVE option sentences (median ~11 words), so the
 gold option text is a verbatim substring of the article only ~6% of the time — a substring

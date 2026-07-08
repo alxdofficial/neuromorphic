@@ -30,5 +30,9 @@ class ReconstructionTask(Task):
                       answer_exclude=tuple(x for x in (it.name, it.given) if x),
                       refs=(it.value_text,))
                  for it in items]
+        # No answer-un-guessability filter (unlike qa.py): bio attribute values come from small finite
+        # pools (occupations/decades/…), so two entities legitimately share a value-span — and the query
+        # is a unique KEY, so the answer is addressed by key, not by value-uniqueness. A QA-style filter
+        # would reject most distractors and starve the fill; it isn't needed here.
         return pack_streaming_episode(units[:nq], units[nq:], spec, tok, pad_token_id,
                                       task_family="conditioned_reconstruction_bio", rng=rng)

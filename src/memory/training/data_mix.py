@@ -66,10 +66,14 @@ def _build_loader(mix_task, tokenizer, cfg, *, split, ctx_len, m_slots, mae_src_
     source = _build_source(meta.source, meta.task_style, tokenizer, split=split, ctx_len=ctx_len,
                            predict_len=predict_len, mae_src_tok=mae_src_tok, babi_tasks=babi_tasks,
                            seed=seed)
-    # query_lag: an explicit --bio-query-window pin wins (streaming-placement experiments); otherwise
-    # vary_lag tasks sample early/recent/any per episode ("vary"), the rest default to "any". n_queries
-    # is NOT set here — the qa/reconstruction tasks read it from the SOURCE (Source.pack_n_queries).
-    lag = _query_lag(bio_query_window) if bio_query_window is not None else ("vary" if meta.vary_lag else "any")
+    # query_lag: an explicit --bio-query-window pin wins for the BIO source only (its streaming-retention
+    # probe) — NOT other vary_lag tasks (babi/doc_qa), which keep sampling early/recent/any per episode.
+    # vary_lag tasks default to "vary"; the rest to "any". n_queries is NOT set here — the qa/
+    # reconstruction tasks read it from the SOURCE (Source.pack_n_queries).
+    if bio_query_window is not None and meta.source == "bio":
+        lag = _query_lag(bio_query_window)
+    else:
+        lag = "vary" if meta.vary_lag else "any"
     spec = EpisodeSpec(source=meta.source, task=meta.task_style, total_len=ctx_len,
                        window_size=window_size, n_inputs=CONDRECON_BIO_N_PAIRS,
                        query_lag=lag, predict_len=predict_len)
@@ -91,11 +95,13 @@ def make_mixed_train_dataloaders(mixed_tasks, tokenizer, cfg, *, ctx_len: int,
     # Per-task seed OFFSET: without it, tasks that share a doc pool (mae=fineweb, continuation=
     # multicorpus⊇fineweb) draw the SAME doc+offset in lockstep from an identical RNG, correlating the
     # two objectives and halving effective corpus diversity. i*10_007 (prime) decorrelates the streams.
+    # ×2 makes every TRAIN seed EVEN; the val side (below) is ODD → train/val RNG streams are provably
+    # disjoint for ANY --seed (else train_seed==7 would collide with the val base).
     return {
         t: _build_loader(t, tokenizer, cfg, split="train", ctx_len=ctx_len, m_slots=m_slots,
                          mae_src_tok=mae_src_tok, babi_tasks=babi_tasks, predict_len=predict_len,
                          window_size=window_size, bio_query_window=bio_query_window,
-                         seed=train_seed + i * 10_007, num_workers=num_workers)
+                         seed=(train_seed + i * 10_007) * 2, num_workers=num_workers)
         for i, t in enumerate(mixed_tasks)
     }
 
@@ -111,6 +117,6 @@ def make_mixed_val_sets(mixed_tasks, tokenizer, cfg, val_batches, *, ctx_len: in
         dl = _build_loader(t, tokenizer, cfg, split="val", ctx_len=ctx_len, m_slots=m_slots,
                            mae_src_tok=mae_src_tok, babi_tasks=babi_tasks, predict_len=predict_len,
                            window_size=window_size, bio_query_window=bio_query_window,
-                           seed=7 + i * 10_007, num_workers=0)   # per-task offset — see train-side note
+                           seed=(7 + i * 10_007) * 2 + 1, num_workers=0)   # ODD → disjoint from even train seeds
         sets[t] = materialize_val_set(dl, val_batches)
     return sets

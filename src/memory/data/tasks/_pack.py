@@ -74,7 +74,8 @@ def pack_streaming_episode(query_units: List[Unit], filler_units: List[Unit], sp
     total_len context per `spec`, then emit the queries + span-masked answers. Returns None (resample)
     if the query facts alone overflow the budget."""
     T = spec.total_len
-    budget = T - 8                                          # margin for BPE join effects
+    budget = T - 8                                          # small slack; keeps used < T so no query unit
+                                                            # is ever clamped by the [:T] (causality safety)
 
     def ids(s):
         return tok(s, add_special_tokens=False).input_ids

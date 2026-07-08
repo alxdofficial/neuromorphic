@@ -667,6 +667,11 @@ class ReprLearningModel(nn.Module):
         acceptable for a 4-window streaming episode (continuation is ~1/5 of the mix)."""
         T_ctx = batch.context_ids.shape[1]
         predict_len = batch.answer_ids.shape[1]
+        # intermediate-horizon targets are sliced predict_len tokens after each boundary; if that exceeds
+        # window_size, adjacent horizons' targets OVERLAP and those tokens get double-scored. Guard it.
+        assert predict_len <= window_size, (
+            f"multi-horizon continuation needs predict_len ({predict_len}) <= window_size "
+            f"({window_size}); otherwise horizon targets overlap and are double-counted")
         n_windows = (T_ctx + window_size - 1) // window_size
         boundaries = [min((i + 1) * window_size, T_ctx) for i in range(n_windows)]  # increasing; last == T_ctx
         boundaries = boundaries[-n_horizons:]                                       # keep the deepest (incl. full-context)

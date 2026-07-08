@@ -9,6 +9,7 @@ Data/build: HF ``Muennighoff/babi`` (1k), auto-downloaded; 10k ingest =
 """
 from __future__ import annotations
 
+import itertools
 import random
 import re
 from typing import List
@@ -85,17 +86,6 @@ def _split_sents(text: str) -> List[str]:
     flat = text.replace("\n", " ").strip()
     return [s.strip() for s in _SENT_SPLIT.split(flat) if s.strip()]
 
-
-def _caps_names(text: str) -> set:
-    """bAbI named entities = capitalized alphabetic tokens (minus sentence-initial 'The'). Used to
-    keep distractors DISJOINT from the gold story (bAbI reuses a tiny name pool, so a same-name
-    distractor would silently contradict the queried entity's labelled state)."""
-    out = set()
-    for w in text.replace("\n", " ").split():
-        w = w.strip(".,!?;:'\"")
-        if w and w[0].isupper() and w.isalpha() and w != "The":
-            out.add(w)
-    return out
 
 
 def _load_babi_rows(tasks, split: str):
@@ -189,27 +179,33 @@ class BabiSource(Source):
         return out
 
     def rename_pools(self, rng):
-        """Fresh shuffled (name_pool, object_pool) for ONE episode — the qa Task pops disjoint entities
-        from these across all co-packed segments so no two segments share a person or object."""
+        """Fresh shuffled entity ITERATORS (name_iter, object_iter) for ONE episode — the qa Task pulls
+        disjoint entities from these across all co-packed segments so no two segments share a person or
+        object. Each iterator is the shuffled curated pool followed by an INEXHAUSTIBLE unique tail
+        (``Person{i}``/``item{i}``), so co-packing arbitrarily many segments (BEAM-scale total_len) never
+        exhausts the pool and never re-uses a name — the tail ids are episode-global (the iterator is
+        shared across all rename() calls), so they can't collide across segments."""
         names, objs = _RENAME_NAMES[:], _RENAME_OBJECTS[:]
         rng.shuffle(names)
         rng.shuffle(objs)
-        return names, objs
+        name_iter = itertools.chain(names, (f"Person{i}" for i in itertools.count()))
+        obj_iter = itertools.chain(objs, (f"item{i}" for i in itertools.count()))
+        return name_iter, obj_iter
 
-    def rename(self, item: QAItem, name_pool: list, obj_pool: list) -> QAItem:
-        """Return a copy of `item` with its people (capitalized names) and portable objects replaced by
-        fresh entities POPPED from `name_pool` / `obj_pool` (mutated in place, so co-packed segments get
-        globally disjoint entities). Locations are left untouched (answers, not subjects). The same map
-        is applied to facts, question, AND answer, so a person/object answer stays consistent."""
+    def rename(self, item: QAItem, name_iter, obj_iter) -> QAItem:
+        """Return a copy of `item` with its people and portable objects replaced by fresh entities PULLED
+        from the shared `name_iter` / `obj_iter` (so co-packed segments get globally disjoint entities).
+        Locations are left untouched (answers, not subjects). The same map is applied to facts, question,
+        AND answer, so a person/object answer stays consistent."""
         text = " ".join(item.facts) + " " + item.question + " " + item.answer
         toks = {w.strip(".,!?;:'\"") for w in text.split()}
         people = toks & self.people_vocab                 # data-derived: real names only (not Where/What/…)
         objects = toks & self.object_vocab
         rmap = {}
-        for p in sorted(people):                          # sorted → deterministic given the pools
-            rmap[p] = name_pool.pop() if name_pool else f"Person{len(rmap)}"
+        for p in sorted(people):                          # sorted → deterministic given the shuffled pools
+            rmap[p] = next(name_iter)
         for o in sorted(objects):
-            rmap[o] = obj_pool.pop() if obj_pool else f"object{len(rmap)}"
+            rmap[o] = next(obj_iter)
 
         def sub(s: str) -> str:
             # whole-word substitution; longest-first avoids partial hits (none expected in bAbI)
