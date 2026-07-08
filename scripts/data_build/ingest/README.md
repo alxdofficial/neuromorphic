@@ -17,6 +17,14 @@ script, and nothing is stored under `data/` for them:
 `ruler` is fully synthesized at runtime (no download). `locomo` is a static
 JSON auto-downloaded once to `data/eval/locomo10.json`.
 
+## Shipped ingest scripts
+Each of these is a `<name>/download.py` that pulls from HF, cleans, and writes
+`data/<name>/{train,val}.jsonl`; the matching source is `src/memory/data/sources/<name>.py`:
+
+- `code/`, `hotpot_train/`, `multiwoz/`, `musique_train/`, `pile/`, `quality/`,
+  `redpajama/`, `squad/`, `triviaqa/` — training sources (RC-QA variety for
+  `qa_rc`, corpus variety for `continuation` via `multicorpus`, etc.).
+
 ## TODO — scripts to add (Tier-B)
 - `fineweb.py`  — build `data/fineweb_edu/{train,val}.parquet` (the mae/
   continuation corpus). Currently the parquet provenance is UNSCRIPTED; this

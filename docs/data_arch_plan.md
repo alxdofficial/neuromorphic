@@ -1,5 +1,10 @@
 # Data architecture plan — Source / Task / Schedule / Objective (2026-07-07)
 
+> **STATUS: phases 1-2, 4-7 COMPLETED.** The Source/Task/Schedule split and the mixes.py/data_mix.py
+> rewire landed as designed. The one sub-phase **NOT executed**: Layer O (splitting
+> `src/memory/training/objectives.py` into an `objectives/` package) — objectives stayed a flat
+> file; see the Layer O section below for the current state.
+
 Goal: make the data layer **comprehensive and modular** — many datasets, many task styles, a
 configurable difficulty schedule, and objectives that compose — by decomposing the current
 *fused* readers into four orthogonal concepts. Builds **on top of** the completed 3-layer
@@ -43,6 +48,12 @@ The user's "folder per dataset name" is honored at **build** and **store** (alre
 ---
 
 ## Layer L1 — Sources: `src/memory/data/sources/` (NEW)
+
+> Snapshot note: the source list below is as originally planned. 9 more sources have since shipped
+> under `src/memory/data/sources/`: `squad`, `triviaqa`, `hotpot_train`, `musique_train`,
+> `multiwoz`, `quality`, `qa_multi` (the multi-source RC aggregator), `code`, `multicorpus` (the
+> fineweb+pile+redpajama+code aggregator backing `continuation`). See `sources/__init__.py` for the
+> live `SOURCE_REGISTRY`.
 
 A **Source** yields raw *items* and (optionally) a noise pool. It does NO windowing, query
 placement, or distractor insertion. Item kinds + the interface tasks consume:
@@ -109,6 +120,11 @@ One shared controller; every field is a knob the user named. Same spec drives ev
 the hard setting throughout (curriculum can mask whether the hard regime is learned).
 
 ## Layer O — Objectives: `src/memory/training/objectives/` (package, was `objectives.py`)
+
+> **SUPERSEDED / ABANDONED.** This package split never happened. `src/memory/training/objectives.py`
+> is still a single flat file (it grew a `_behavioral_kl_step` alongside the CE/InfoNCE/coding-rate/
+> GRPO ladder in place, no package). Treat everything below as the plan that was NOT taken; the
+> `behavioral_kl` objective itself did ship, just not via this package structure.
 
 Split the flat `objectives.py` into a package (keep the extracted fns byte-identical):
 - `objectives/ce.py` — plain CE / masked_reconstruction (currently in `loops.py`'s compute path).

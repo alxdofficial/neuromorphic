@@ -6,13 +6,16 @@ locally, not tracked) — regenerate from the build layer or re-download.
 
 ```
 data/
-  bio/                     # composite biographical conditioned-reconstruction set
+  bio/                     # biographical conditioned-reconstruction world set
     raw/  raw_val/         #   per-family raw generator output (train / val)
     train/  val/           #   packed passages.jsonl + questions.jsonl (the reader input)
   fineweb_edu/             # corpus backing mae + continuation
     train.parquet  val.parquet   # pretokenized (Llama-3 ids) — the ingest OUTPUT
     cache/                 # runtime decoded-text caches (SmolLM2 re-tokenization),
                            #   tokenizer-fingerprinted via sidecar .meta
+  code/  hotpot_train/  multiwoz/  musique_train/  pile/  quality/  redpajama/
+  squad/  triviaqa/        # training sources ingested via scripts/data_build/ingest/<name>/
+                           #   download.py; each holds train.jsonl + val.jsonl
   eval/                    # eval-only static sets
     locomo10.json          #   LoCoMo dialogues
     needle*.parquet        #   needle-in-a-haystack sets
@@ -22,13 +25,14 @@ data/
 
 ## How to (re)produce
 
-- **`data/bio/`** — run the composite generator/orchestration under
-  `scripts/data_build/generate/bio/` + `scripts/data_build/common/composite.py`
-  (world builder `build_scenario`). The trainer reads
-  `data/bio/{train,val}/{passages,questions}.jsonl`.
+- **`data/bio/`** — run the generator/orchestration under
+  `scripts/data_build/generate/bio/` (world builder `build_scenario`). The
+  trainer reads `data/bio/{train,val}/{passages,questions}.jsonl`.
 - **`data/fineweb_edu/*.parquet`** — provenance currently UNSCRIPTED; the
   reproducible builder is `scripts/data_build/ingest/fineweb.py` (TODO). The
   `cache/` dir is auto-populated by the `mae`/`continuation` readers on first use.
+- **`data/{code,hotpot_train,multiwoz,musique_train,pile,quality,redpajama,squad,triviaqa}/`** —
+  each built by `scripts/data_build/ingest/<name>/download.py`.
 - **`data/eval/locomo10.json`** — auto-downloaded once by `src/memory/data/locomo.py`.
 - HF datasets (`babi`, `babilong`, `hotpot`, `musique`, `narrativeqa`) are
   auto-downloaded by their readers to the HF cache — nothing stored here.

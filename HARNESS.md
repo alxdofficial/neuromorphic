@@ -23,8 +23,7 @@ come from) × **Task** (what's asked) × **EpisodeSpec** (`schedule.py` — how 
 ```
 src/memory/training/
   __init__.py     # public surface (diagnostics + the CLI import from here)
-  loops.py        # train_mixed_variant (the mixed benchmark path), train_one_variant
-                  #   (single-task path), probe_bs. main() calls both.
+  loops.py        # train_mixed_variant (the mixed benchmark path), probe_bs.
   objectives.py   # the objective ladder: _infonce_logits_weights, _same_answer_valid_mask,
                   #   _coding_rate, _grad_cached_objective_step (CE / InfoNCE / coding-rate / GRPO),
                   #   _behavioral_kl_step (context distillation: KL(teacher=full-ctx ‖ student=memory))
@@ -45,7 +44,7 @@ The single source of truth for *what trains and how it routes*:
   else generic QA/CE path).
 - `TASK_SPEC` — mix-task name → spec. The name may differ from the source (a *framing*):
   `condrecon_bio` = `reconstruction` over the `bio` source; `mae`/`continuation` both over `fineweb`.
-- `DEFAULT_TRAIN_MIX = ("mae", "babi", "continuation", "condrecon_bio")`. `TASK_MODE` flat dict.
+- `DEFAULT_TRAIN_MIX = ("mae", "babi", "qa_rc", "continuation", "condrecon_bio")`. `TASK_MODE` flat dict.
 - `training/data_mix.py` composes `SOURCE_REGISTRY[spec.source] × get_task(spec.task_style) ×
   EpisodeSpec` — adding a source/task never edits `data_mix`. Import-time assert: every
   `TaskSpec.source` ∈ `SOURCE_REGISTRY`, `task_style` ∈ `TASK_STYLES`.
@@ -53,8 +52,8 @@ The single source of truth for *what trains and how it routes*:
 ## `scripts/train/` — the entrypoint (executable)
 
 - `train.py` — thin `main()`: parse args → build tokenizer + frozen LM → call
-  `train_mixed_variant` / `train_one_variant` / `probe_bs` → write summary. ~150 lines.
-- `cli.py` — `build_parser()` (all 91 flags) + `args_to_config(args, ap) → (cfg, …)`.
+  `train_mixed_variant` / `probe_bs` → write summary. ~150 lines.
+- `cli.py` — `build_parser()` (the mixed-training flags) + `args_to_config(args, ap) → (cfg, …)`.
 
 Run: `python -m scripts.train.train --task mixed --variants slotgraph3_baseline …`
 (`--backbone HuggingFaceTB/SmolLM2-135M` for the param-matched 135M setup).

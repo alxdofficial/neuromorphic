@@ -1,9 +1,11 @@
 # docs/ index
 
 The active line is an **always-on implicit memory layer** for a frozen LM: an encoder compresses a
-1024-token context into M=32 memory tokens (32:1), trained on a mixed 4-task objective
-(mae / babi / continuation / condrecon_bio) on SmolLM2-135M (d=576). The source of truth for each
-model is its code under `src/memory/models/<name>/`.
+2048-token context into M=96 memory tokens (21:1), trained on a mixed 5-task objective
+(mae / babi / qa_rc / continuation / condrecon_bio) on SmolLM2-135M (d=576) — the current sweep
+default (`src/memory/data/mixes.py`); some numbers quoted deeper in these docs (e.g. `cohort_results.md`)
+are the published cohort's own fixed config (ctx=1024, M=32, 4-task), not this default. The source
+of truth for each model is its code under `src/memory/models/<name>/`.
 
 ## Active cohort (see `src/memory/model.py` VARIANTS)
 - **Published baselines:** `icae`, `ccm`, `autocompressor`, `beacon` — learnable tokens through the

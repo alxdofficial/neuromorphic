@@ -1,8 +1,9 @@
 # Training-harness + diagnostics reorganization plan (2026-07-06)
 
-> **STATUS: COMPLETED.** Complementary to `docs/data_arch_plan.md` (2026-07-07), which further
-> splits `src/memory/training/objectives.py` into an `objectives/` package and adds a
-> `behavioral_kl` objective — an extension of the harness structure established here, not a change to it.
+> **STATUS: COMPLETED.** Complementary to `docs/data_arch_plan.md` (2026-07-07), which adds a
+> `behavioral_kl` objective — an extension of the harness structure established here, not a change
+> to it. (Later drift: the objectives-package split `data_arch_plan.md` also planned was never
+> executed — `objectives.py` stayed a flat file; `behavioral_kl` shipped inside it.)
 
 Goal: one clear, principled structure for the **training harness** and **diagnostics**, matching
 the library/executable split the data reorg already established (`src/memory/data/` library vs
@@ -89,6 +90,8 @@ Pure mechanical extraction from `train.py` — no logic changes:
 src/memory/training/
   __init__.py     # public surface (what diagnostics + the CLI import)
   loops.py        # train_mixed_variant, train_one_variant, probe_bs
+                  #   (later drift: train_one_variant removed along with the composite-dataset
+                  #   single-task path; loops.py now only exports train_mixed_variant/probe_bs)
   objectives.py   # _infonce_logits_weights, _same_answer_valid_mask, _coding_rate,
                   #   _grad_cached_objective_step   (the CE / InfoNCE / coding-rate / GRPO ladder)
   eval.py         # run_val, run_mixed_val, _continuation_early_loss, materialize_val_set

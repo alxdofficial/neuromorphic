@@ -38,8 +38,8 @@ def emit_passages_jsonl(
 ) -> int:
     """Render each entity samples_per_entity times and emit passages.
 
-    Returns count written. Each row conforms to the PassageRow schema
-    in common/schema.py.
+    Returns count written. (The live bio SOURCE uses render_key/render_value directly at runtime;
+    this JSONL-emit path is a legacy offline generator.)
     """
     rng = random.Random(seed)
     count = 0
