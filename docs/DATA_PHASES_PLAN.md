@@ -44,13 +44,83 @@ architectural unlock our prior audit flagged: **honor `chunk_offset`** in the en
 | **long agent trajectories** | SWE-Gym / SWE-agent rollouts, THUDM/AgentInstruct (format seed) | compress the trajectory → next action | **the defensibly-OPEN novelty** (see positioning) |
 | **GUI** | Mind2Web, AndroidControl/AITW, OS-World, WebArena traces | compress screen-state + action history → next action | observations accumulate to 1000s of tokens |
 
-### 1c. GRPO / RL polish
+### 1c. GRPO / RL polish — **genuinely novel; get the mechanics right**
 **Reward = task success given ONLY the compressed memory** — forces the memory to carry the load-bearing
-bits (a memory that drops the auth token fails the checker). Verifiable-reward sources: math
-(GSM8K/MATH/NuminaMath), code-with-tests (execution), tool-use success (Nemotron Pivot `pass_rate`),
-long-context checkable answers. Recipe: SFT warm-start (Nemotron-Agentic-v1) → GRPO on RLVR. Cleanest
-plug: **Nemotron Pivot** (`expected_action`/`pass_rate`, NeMo-Gym-compatible) — reuse its reward instead
-of building one.
+bits (a memory that drops the auth token fails the checker). Research verdict: *GRPO to train a soft-token
+compression encoder read by a FROZEN decoder, with reward from memory-only decoding, does not yet exist in
+the literature* — a genuinely novel combination (the whole compression line trains by supervised
+recon/CE/behavioral-KL; nearest RL works each miss one axis: Cmprsr = abstractive text not soft tokens;
+MEM1 = same model compresses+reasons; "2602.08382" = decoder not frozen; Titans = not RL).
+
+The load-bearing design decisions (from the sweep):
+1. **Form the GRPO group by sampling G different MEMORY ENCODINGS, not decoder rollouts.** GRPO's advantage
+   is a REINFORCE estimator on the policy being optimized = the *encoder*. Inject encoder stochasticity
+   (reparameterized Gaussian head / dropout / Gumbel over discrete memory), decode each memory greedily,
+   group-normalize across memories. Fixing the memory and sampling decoder rollouts is evidence-starved
+   (variance = decoding noise only) and maximally exposed to zero-variance-group collapse (DAPO).
+2. **Two distinct KLs, both useful.** KL-1 = GRPO's β·KL(encoder‖frozen-initial-encoder) — prevents
+   memory-policy collapse. KL-2 = **behavioral KL(decoder|full-context ‖ decoder|memory)** = the
+   context-distillation objective (already built). **Make behavioral-KL the dense always-on PRIMARY loss
+   for fidelity; reserve GRPO for the residual non-differentiable / exact-match reward** — running RL
+   without it throws away the better-conditioned gradient for the fidelity sub-problem.
+3. **Pitfalls to instrument:** reward hacking/Goodhart (gold peaks then degrades — memory memorizes
+   probe-surface cues); GRPO std-normalization length/verbosity bias → an "inflate memory-embedding
+   norm/entropy" shortcut; **posterior collapse** (strong AR decoder ignores the latent, KL→0) + VQ
+   codebook collapse (EMA/dead-code reset); reward sparsity → **probe MULTIPLE facts per compressed
+   context** (densifies reward) + DAPO dynamic sampling to drop zero-variance groups.
+
+**Verifiable-reward sources — the honest picture:** math/code/tool RLVR sets are overwhelmingly
+SHORT-context (the problem statement IS the whole input → compression isn't load-bearing). The genuinely
+long-context + verifiable material is **synthetic generators** + **repo-scale code envs**:
+- **RULER generator** (`NVIDIA/RULER`, `scripts/data/prepare.py`) — unlimited synthetic long-context at any
+  length, exact-substring reward, 13 configs incl. variable-tracking (multi-hop). **Fork `prepare.py` to
+  inject value-OVERWRITE events → this is our novel streaming-write data** (the "RULER-fork overwrite"
+  recipe — not published).
+- **BABILong** (eval `RMT-team/babilong` + train `-train-5k-samples`) — facts-in-haystack, single-word
+  exact-match, public generator; extends our bAbI line to long context.
+- **SWE-Gym / R2E-Gym / Nebius-SWE-agent-trajectories (80k reward-labeled)** — execution-verified repo RL
+  where compression must localize the bug.
+- Short-context math/code (GSM8K/MATH/NuminaMath/Big-Math-RL-Verified; APPS/CodeContests/xLAM) → make them
+  "needles" by embedding at random depth in FineWeb/PG-19 distractors, reward = `math_verify`/tests.
+
+**Cleanest recipe:** behavioral-KL context distillation as the dense warm-start (fixes most fidelity + the
+loss-neutrality problem) → layer GRPO for the exact-match/execution residual, group over memory encodings,
+encoder-KL anchor. **Start on RULER + BABILong** (unlimited, cheap exact-match, and they cover the
+streaming-write/overwrite gap), validate the loop, then add QASPER/LongCite (real long-doc) + SWE-Gym.
+
+### Phase-1 top-8 dataset shortlist (genuine long-range dependency AND cheap verifiable reward)
+Ranked by fit; paths + licenses research-gathered (verify before ingest):
+1. **RULER generator** (`NVIDIA/RULER`, research-use) — unlimited synthetic long-context, exact-match, and
+   the base for the fork-overwrite streaming-write data. **Start here.**
+2. **SWE-Gym** (`SWE-Gym/SWE-Gym`, MIT, prebuilt Docker envs) — cheapest real repo-scale execution reward.
+3. **QASPER** (`allenai/qasper`, CC-BY-4.0) — real train split, provably non-gist-gameable, span/yes-no/
+   unanswerable → EM + a built-in refusal axis.
+4. **LongCite-45k** (`zai-org/LongCite-45k`, Apache-2.0) — 128k-word contexts, citation-span verification =
+   purely programmatic long-range reward.
+5. **BABILong-train** (`RMT-team/babilong-train-5k-samples`, Apache/BSD) — facts-in-haystack, exact-match,
+   public generator; extends our bAbI line.
+6. **WikiBigEdit** (`lukasthede/WikiBigEdit`, Apache-2.0, 502k, 8 sequential timesteps) — the only
+   train-scale genuinely-streaming EM-rewardable set; direct fit for the forced-forgetting gate.
+7. **R2E-Gym / Nebius-SWE-agent-trajectories** (`R2E-Gym/R2E-Gym-V1` Apache; `nebius/SWE-agent-trajectories`
+   CC-BY-4.0, 80k reward-labeled) — scale execution-verified repo RL + SFT warm-start.
+8. **PerLTQA + LoCoMo-generation** (`Elvin-Yiming-Du/PerLTQA` train 5,155 CC-BY-NC; `snap-research/locomo`
+   generator) — the only checkable conversational-memory train set + the scriptable recipe to scale it.
+
+*Honorable mentions:* RepoQA / LoCoDiff (clean long-code memory probes), LongCoder/LCC (~100k train),
+Nemotron-RL-Agentic-Tool-Use-Pivot (RLVR tool-use), Big-Math-RL-Verified (math-needle reward sanity).
+
+> **⚠ Personalization has almost no public TRAINING data** — nearly every conversational-memory resource
+> is eval-only (LongMemEval, MSC, LoCoMo, Conversation-Chronicles). The only real checkable train splits
+> are PerLTQA (5k, CC-BY-NC), WikiBigEdit (502k, factual not conversational), PrefEval (3k, 4-way-MC). So
+> the practical path is **synthetic generation**: sample personas + atomic facts on a temporal/causal graph
+> → generate N filler sessions injecting each fact at a scheduled session → probe whose gold = the injected
+> fact's value span → reward = EM/containment (mirrors our existing condrecon value-span mask). Reuse
+> LoCoMo's `generate_conversations.py` (event-graph) + PrefEval's generator + WikiBigEdit's Wikidata-diff pipeline.
+>
+> **⚠ Code repo-context caveat** (arXiv:2510.13697): much of the apparent repo-context gain ≈ RoPE
+> long-context adaptation, not genuine cross-file reasoning → hold out **cross-file-dependent** targets
+> (CrossCodeEval-style) to force real memory use. NarrativeQA is also gist-gameable (Q&A written from the
+> plot summary alone) — prefer QASPER/QMSum/LongCite for genuine long-range long-doc.
 
 ### Harness integration (Source × Task × EpisodeSpec × Objective)
 - **New Sources** (`sources/`): `msc`, `conversation_chronicles`, `temporalwiki`/`newsedits`,
@@ -87,28 +157,43 @@ converges on a protocol — emulate the strongest (CCM/Cartridges):
   *"match full-context quality at X× less KV-memory, Y× throughput"* (Cartridges: 38.6× / 26.4×).
 
 ### 2b. Memory / long-context benchmarks (the core panel)
-Have (eval readers): `babilong`, `locomo`, `ruler`, `narrativeqa`, `hotpot`, `musique`. **Add:**
+Have (eval readers): `babilong`, `locomo`, `ruler`, `narrativeqa`, `hotpot`, `musique`. Verdicts from the
+sweep (differentiator = score collapses without context AND can't be recovered from the frozen decoder's
+parametric knowledge):
 
-| benchmark | measures | note |
+**Headline trio (decisive, low-confound, and where our family competes):**
+| benchmark | verdict | why |
 |---|---|---|
-| **LongMemEval** | multi-session chat memory (updates + multi-session splits) | **PRIMARY** — updates make a generic prior provably wrong → REAL≫SHUF only if memory binds current value |
-| **∞Bench / InfiniteBench**, **HELMET**, **LongBench-v2**, **LOFT** | modern long-context suites | **WHITE SPACE**: no prior compression paper ran these cross-method — running us + ceiling/floor/competitors is a genuine contribution |
-| **NoLiMa** | associative NIAH (lexical overlap removed) | the un-gameable needle |
-| **WikiBigEdit** | Locality (stability) / Update (plasticity) / Multi-hop (binding) | the **stability-plasticity instrument** — our axis-2 headline |
-| **LaMP**, PerLTQA | personalization / lifelong | the "implicit preference applied later" claim |
-| **BEAM-1M/10M**, **MemoryAgentBench** | scale-up headline | verify data integrity first (2025 benchmarks) |
+| **LongMemEval** (`xiaowu0162/longmemeval`, _S 115k / _M 1.5M / _Oracle) | **YES — strongest** | maps onto "always-on memory cache"; 30–60% oracle-vs-full gap = recall/update-bound; **no trainable compressor has published on it — genuine whitespace**. Baselines GPT-4o 60.6/Oracle 87.0. Competitors: Mem0, Zep |
+| **RULER** (`NVIDIA/RULER` generator) | **YES — cleanest** | fully synthetic, zero knowledge-leakage, decisive length collapse; core soft-token compressors haven't used it (open slot); Titans reports S-NIAH |
+| **BABILong** (have reader) | **YES — decisive** | scattered facts + multi-hop; **RMT and Titans compete here directly** (Titans ~94%@1M) → natural head-to-head; = our forced-forgetting/retention-vs-lag gate |
 
-LoCoMo only as a caveated cross-reference (audited dirty, ~6% wrong keys).
+**Comparability panel (report because the compression baselines do):**
+| benchmark | note |
+|---|---|
+| **LongBench v1** (+ v2) | de-facto standard the compression line reports (LongLLMLingua, Activation Beacon, InfiniRetri) → include for cross-method comparability |
+| **multi-doc NQ + MuSiQue** (concatenated-distractor form) | the RAG-vs-compression battleground; xRAG/LongLLMLingua give reference numbers. **QA differentiator ranking: MuSiQue > HotpotQA > 2Wiki > NQ > TriviaQA** (TriviaQA gist-gameable — skip) |
+| **∞Bench Retrieve.\*** or **NIAH multi-needle/multi-hop** | cheap retrieval sanity + full-context comparison (single-needle is saturated — skip) |
 
-### 2c. Capability benchmarks — two tiers
-- **Sanity ("didn't break the frozen LLM"):** MT-Bench, AlpacaEval-2-LC, HumanEval+/MBPP, **GSM8K**
-  (reasoning-preservation — LLMLingua-2 precedent). Single-turn/standalone → nothing to compress; just
-  certify base skill survived.
+**Secondary / caveated:** WikiBigEdit (great for TRAINING the forced-forgetting gate, but as an *eval* it's
+RAG-saturated → may not separate a learned compressor from plain RAG); StreamingQA/MSC (weak metrics; MSC
+→ DMR is the standard bridge, MemGPT 93.4/Zep 94.8); NoLiMa (associative NIAH, lexical overlap removed);
+LaMP/PerLTQA (personalization); BEAM/MemoryAgentBench (scale — audit integrity first); LoCoMo only as a
+caveated cross-reference (audited dirty, ~6% wrong keys). **LOFT: off-path** (heavy/multimodal, no
+compression paper used it).
+
+### 2c. Capability benchmarks — retention controls vs differentiators
+- **Capability-retention control (NOT memory evidence):** MT-Bench, AlpacaEval-2-LC, HumanEval+/MBPP, and
+  the reasoning/math sets (MMLU/GPQA/GSM8K/MATH) all have **nothing to compress** — single-turn / closed-
+  book. For a FROZEN decoder the "didn't break it" check is near-trivial. **Report at most one, explicitly
+  labeled "capability retention," never as a memory claim** (precedent: Cartridges uses MMLU only as a
+  generality control; LLMLingua uses GSM8K only as "CoT-survives-compression").
 - **Differentiators (memory is *supposed* to help):** **WebArena** (accumulating observations),
-  **AgentBench** (5–50 turns), **CrossCodeEval** / **RepoBench** (EM/Edit-Sim), **SWE-bench-Verified**
-  (%Resolved).
+  **AgentBench** (5–50 turns), **CrossCodeEval** / **RepoBench** (EM/Edit-Sim; hold out *cross-file* targets
+  per the RoPE caveat), **SWE-bench-Verified** (%Resolved — and the soft-token *trajectory* angle here is
+  our defensible novelty).
 - **Skip:** Arena-Hard (redundant vs AlpacaEval), GAIA (gist-gameable), plain HumanEval/MBPP (EvalPlus
-  dominates).
+  dominates), TriviaQA (parametric confound), single-needle NIAH (saturated), 2Wiki (prefer MuSiQue).
 
 ### 2d. Competitor head-to-heads (shared benchmark to beat them on)
 | competitor | approach | shared benchmark for head-to-head |
