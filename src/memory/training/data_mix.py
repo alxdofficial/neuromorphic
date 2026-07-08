@@ -47,6 +47,10 @@ def _build_source(src_name, task_style, tokenizer, *, split, ctx_len, predict_le
         return SOURCE_REGISTRY["babi"](
             tokenizer, split=("validation" if split != "train" else "train"),
             tasks=babi_tasks, seed=seed)
+    if src_name == "qa_multi":
+        # REAL QA variety (squad/triviaqa/hotpot/musique/multiwoz) — each sub-source uses its own
+        # train / held-out-train-slice split; "val" maps to the held-out slice, not the eval sets.
+        return SOURCE_REGISTRY["qa_multi"](tokenizer, split=split, seed=seed)
     if src_name == "bio":
         return SOURCE_REGISTRY["bio"](
             tokenizer, split=("validation" if split != "train" else "train"),

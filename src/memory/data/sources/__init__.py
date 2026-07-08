@@ -18,6 +18,14 @@ _SOURCES: dict[str, tuple[str, str]] = {
     # procedural keyed sources (runtime, no download):
     "mqar": ("mqar", "MqarSource"),
     "ruler_overwrite": ("ruler_overwrite", "RulerOverwriteSource"),
+    # real QA sources (yield QAItem for the qa task; bounded HF samples, see ingest/):
+    "squad": ("squad", "SquadSource"),                    # extractive RC (single-span)
+    "triviaqa": ("triviaqa", "TriviaQASource"),           # factoid + evidence
+    "hotpot_train": ("hotpot_train", "HotpotTrainSource"),   # 2-hop (train split, firewalled from eval)
+    "musique_train": ("musique_train", "MusiqueTrainSource"),  # 2-4 hop, shortcut-reduced
+    "multiwoz": ("multiwoz", "MultiWOZSource"),           # dialogue slot-recall (real, non-synthetic)
+    "quality": ("quality", "QualitySource"),              # long-document comprehension (needs total_len>=4096)
+    "qa_multi": ("qa_multi", "QaMultiSource"),            # QA VARIETY (squad+triviaqa+hotpot+musique+multiwoz)
     # corpus sources (bucket-1 natural text; best-effort HF sample, see ingest/):
     "pile": ("pile", "PileSource"),
     "redpajama": ("redpajama", "RedpajamaSource"),

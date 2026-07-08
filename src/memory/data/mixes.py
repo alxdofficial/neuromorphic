@@ -33,13 +33,14 @@ class TaskSpec:
 TASK_SPEC: dict[str, TaskSpec] = {
     "mae":           TaskSpec("fineweb",     "mae",            "masked_reconstruction"),
     "babi":          TaskSpec("babi",        "qa",             "babi"),
+    "qa_rc":         TaskSpec("qa_multi",    "qa",             "qa"),              # REAL QA variety: squad+triviaqa+hotpot+musique+multiwoz
     "continuation":  TaskSpec("multicorpus", "continuation",   "continuation"),   # VARIETY: fineweb+pile+redpajama+code
     "condrecon_bio": TaskSpec("bio",         "reconstruction", "conditioned_reconstruction_bio"),
 }
 
 # the default 4-task training mix (mae = compression control; babi = relational binding sanity;
 # continuation = gist-LM; condrecon_bio = the realistic key→value binding anchor).
-DEFAULT_TRAIN_MIX: tuple[str, ...] = ("mae", "babi", "continuation", "condrecon_bio")
+DEFAULT_TRAIN_MIX: tuple[str, ...] = ("mae", "babi", "qa_rc", "continuation", "condrecon_bio")
 
 # default uniform memory budget M (slots/edges) for the mixed regimen — the SINGLE source of truth.
 # The CLI --mixed-M default and the mixed diagnostics import this so they never drift (raised 32→64

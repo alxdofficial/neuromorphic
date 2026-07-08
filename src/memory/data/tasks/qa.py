@@ -43,7 +43,7 @@ class QATask(Task):
             gold_names |= _caps_names(f)
         added, cap = 0, (spec.n_distractors or None)
         guard = 0
-        while len(ctx_ids) < ctx_len and guard < 8 * ctx_len:
+        while pool and len(ctx_ids) < ctx_len and guard < 8 * ctx_len:   # empty pool → no padding (pad-tokens fill below)
             guard += 1
             if cap is not None and added >= cap:
                 break
