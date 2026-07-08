@@ -29,9 +29,12 @@ def _answer_of(answers: dict) -> str:
     return UNANSWERABLE
 
 
-def stream_split(hf_split: str, n_docs: int):
+def stream_split(hf_split: str, n_docs: int, seed: int = 42):
+    # Load the FULL split (SQuAD2 is small) and SHUFFLE before taking n_docs — else first-N is
+    # unrepresentative: SQuAD2's ordering makes the head answerable-heavy (~7% unanswerable) while the
+    # true train ratio is ~33% and dev is ~50%, which badly skews the doc_qa train/val abstain balance.
     from datasets import load_dataset
-    ds = load_dataset(HF_NAME, split=hf_split, streaming=True)
+    ds = load_dataset(HF_NAME, split=hf_split).shuffle(seed=seed)
     out = []
     for ex in ds:
         ctx = (ex.get("context") or "").strip()

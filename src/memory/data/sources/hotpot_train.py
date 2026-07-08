@@ -170,6 +170,9 @@ class HotpotTrainSource(Source):
                 facts, ok = self._paras_to_facts(row)
                 if ok:
                     break
+            # If all 50 draws overflow (ok stays False — very rare), we emit the best-effort item anyway:
+            # its oversized gold Unit makes the packer return None → TaskDataset resamples the episode, so
+            # it degrades gracefully rather than crashing.
             out.append(QAItem(
                 facts=facts, question=row["question"], answer=row["answer"], task_id=0,
                 meta={"dataset": self.DATASET, "aliases": row.get("aliases", [])}))

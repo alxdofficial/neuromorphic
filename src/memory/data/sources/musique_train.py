@@ -165,6 +165,8 @@ class MusiqueTrainSource(Source):
                 facts, ok = self._paras_to_facts(row)
                 if ok:
                     break
+            # rare all-oversized draw (ok stays False): the emitted oversized gold makes the packer
+            # return None → TaskDataset resamples the episode; graceful, not a crash. See hotpot_train.
             out.append(QAItem(
                 facts=facts, question=row["question"], answer=row["answer"], task_id=0,
                 meta={"dataset": self.DATASET, "aliases": row.get("aliases", [])}))

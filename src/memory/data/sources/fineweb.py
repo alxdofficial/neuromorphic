@@ -22,6 +22,7 @@ from pathlib import Path
 import numpy as np
 
 from .base import Source, CorpusItem, REPO
+from ._corpus import _tokenize_cached
 
 FINEWEB_TRAIN = REPO / "data/fineweb_edu/train.parquet"
 FINEWEB_VAL = REPO / "data/fineweb_edu/val.parquet"
@@ -95,23 +96,19 @@ class FinewebSource(Source):
         # (e.g. SmolLM2) would be a token-identity mismatch, so decode → text (cached) → re-tokenize
         # with the BACKBONE tokenizer — the firewall the old mae/continuation readers shared.
         cache = _decode_cache(Path(path), split, src_tokenizer_name)
-        self.docs = []
-        n_total = 0
-        # Whole docs are tokenized here (for the cache) then sliced to a window at emit time (Task),
-        # so a doc longer than the tokenizer's model_max_length is expected and harmless — silence the
-        # noisy "sequence longer than max length" warning so it can't mask real ones. Restored after.
+        # BACKBONE-tokenize the decoded text once and disk-cache the ids (npz), so this ~14k-doc
+        # re-tokenization doesn't run on every construction (diagnostics / per-variant startup). Whole
+        # docs are sliced to a window at emit time, so over-length docs are harmless — silence that warn.
         from transformers.utils import logging as _hf_logging
         _prev_verbosity = _hf_logging.get_verbosity()
         _hf_logging.set_verbosity_error()
         try:
-            for line in open(cache):
-                n_total += 1
-                arr = np.asarray(self.tok(json.loads(line)["text"],
-                                          add_special_tokens=False).input_ids, dtype=np.int64)
-                if arr.shape[0] >= min_len:
-                    self.docs.append(arr)
+            docs_all = _tokenize_cached(cache, self.tok,
+                                        lambda: (json.loads(line)["text"] for line in open(cache)))
         finally:
             _hf_logging.set_verbosity(_prev_verbosity)
+        n_total = len(docs_all)
+        self.docs = [a for a in docs_all if a.shape[0] >= min_len]
         if not self.docs:
             raise ValueError(
                 f"No FineWeb-edu doc has >= {min_len} tokens in {path} after re-tokenization. "

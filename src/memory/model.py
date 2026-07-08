@@ -306,6 +306,11 @@ class ReprLearningModel(nn.Module):
             surprise = (self._token_surprise(enc_in, getattr(batch, "context_ids", None), batch.context_mask)
                         if getattr(self.encoder, "wants_surprise", False) else None)
             state = self.encoder.init_streaming_state(B, device, ctx_embeds.dtype)
+            # MAE is INTENTIONALLY a single-shot write over the whole span (NOT the windowed cadence the
+            # generic continuation/qa/bio path uses): it is the pure compression-FIDELITY reference (the
+            # floor/ceiling band), so it measures storage capacity, not streaming write. The streaming-
+            # write path is exercised by the other 4 tasks. Stream MAE too only if you want a windowed
+            # fidelity variant.
             state, _ = self.encoder.streaming_write(state, enc_in, batch.context_mask, surprise=surprise)
             memory, mem_aux = self.encoder.finalize_memory(state)      # [B, M, d]
         memory = memory.to(ctx_embeds.dtype)

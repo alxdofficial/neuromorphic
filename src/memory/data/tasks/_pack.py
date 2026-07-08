@@ -116,16 +116,28 @@ def pack_streaming_episode(query_units: List[Unit], filler_units: List[Unit], sp
         misses = 0
 
     # 3. order the writes by query_lag — WHERE the queried facts sit (the retention-lag axis).
-    #    "vary" samples the lag per episode (retention-lag robustness across training).
+    #    "vary" samples the lag per episode; a numeric string is a streaming-window INDEX (0=first/long
+    #    lag, -1=last/short lag, k>0 = land the query in window k by pre-filling ~k*window tokens).
     lag = spec.query_lag
     if lag == "vary":
         lag = rng.choice(("early", "recent", "any"))
-    if lag == "recent":
+    win = int(lag) if (isinstance(lag, str) and lag.lstrip("-").isdigit()) else None
+    if lag == "recent" or win == -1:
         seq = chosen + list(query_units)                   # queried facts last = short lag
     elif lag == "any":
         seq = list(query_units) + chosen
         rng.shuffle(seq)
-    else:                                                  # "early" / window index → queried facts first = long lag
+    elif win and win > 0:                                  # land queried facts in streaming window `win`
+        target = win * spec.effective_window
+        before, after, acc = [], [], 0
+        for u in chosen:
+            if acc < target:
+                before.append(u)
+                acc += len(wids(u))
+            else:
+                after.append(u)
+        seq = before + list(query_units) + after
+    else:                                                  # "early" / win==0 → first window = long lag
         seq = list(query_units) + chosen
 
     # 4. materialize context from the CACHED per-write ids (no re-tokenization). Guaranteed <= budget

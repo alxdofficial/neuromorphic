@@ -47,6 +47,16 @@ class QATask(Task):
 
         query_units = [_unit(it, gold=True) for it in items[:nq]]
         filler_units = [_unit(it, gold=False) for it in items[nq:]]
+        # Top up the residual budget with the source's distractor POOL (cross-example noise sentences/
+        # paragraphs) AFTER the whole-item distractors — this both uses the pool the sources build and
+        # cuts the inherent padding of big-context sources (hotpot/musique fill their ~15% tail). Bounded
+        # sample; the packer's fill loop + un-guessability filter apply to these too. (rename sources have
+        # no useful pool — their fill is the renamed segments.)
+        if not rename:
+            pool = source.distractor_pool()
+            if pool:
+                filler_units += [Unit(write=s.rstrip("\n") + "\n")
+                                 for s in rng.sample(pool, min(len(pool), 48))]
 
         # Un-guessability filter: no distractor may contain a queried answer verbatim. Skipped for
         # rename sources — bAbI answers are shared locations (kitchen), NOT leaks: the unique renamed

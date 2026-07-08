@@ -438,6 +438,7 @@ def args_to_config(args, ap):
         print(f"[capacity] ICAE/CCM/AutoCompressor LoRA rank → {args.port_lora_rank}")
     cfg.mae_mask_ratio = args.mae_mask_ratio
     cfg.continuation_multi_horizon = not args.no_continuation_multi_horizon
+    cfg.cond_recon_bio_world_seed = args.cond_recon_bio_world_seed   # threaded into _build_source (bio world)
     cfg.cond_recon_bio_query_window = args.bio_query_window   # streaming retention placement (mixed path)
     _ceil = lambda a, b: -(-a // b)
     _beacon_M = (_ceil(args.chunk_size, args.window_size)

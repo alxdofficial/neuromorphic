@@ -31,7 +31,7 @@ def _query_lag(bio_query_window) -> str:
 
 
 def _build_source(src_name, task_style, tokenizer, *, split, ctx_len, predict_len,
-                  mae_src_tok, babi_tasks, seed):
+                  mae_src_tok, babi_tasks, seed, bio_world_seed=0):
     """The ONE place source-specific construction kwargs live (each source has genuinely different
     build params). ``split`` is "train" | "val"; sources translate to their own split vocab."""
     if src_name == "fineweb":
@@ -54,7 +54,7 @@ def _build_source(src_name, task_style, tokenizer, *, split, ctx_len, predict_le
     if src_name == "bio":
         return SOURCE_REGISTRY["bio"](
             tokenizer, split=("validation" if split != "train" else "train"),
-            world_seed=0, n_facts=CONDRECON_BIO_N_FACTS, seed=seed)
+            world_seed=bio_world_seed, n_facts=CONDRECON_BIO_N_FACTS, seed=seed)
     raise ValueError(f"no source-construction rule for {src_name!r} (mixed task backing)")
 
 
@@ -65,7 +65,7 @@ def _build_loader(mix_task, tokenizer, cfg, *, split, ctx_len, m_slots, mae_src_
     pad = cfg.pad_token_id if cfg.pad_token_id is not None else 0
     source = _build_source(meta.source, meta.task_style, tokenizer, split=split, ctx_len=ctx_len,
                            predict_len=predict_len, mae_src_tok=mae_src_tok, babi_tasks=babi_tasks,
-                           seed=seed)
+                           seed=seed, bio_world_seed=getattr(cfg, "cond_recon_bio_world_seed", 0))
     # query_lag: an explicit --bio-query-window pin wins for the BIO source only (its streaming-retention
     # probe) — NOT other vary_lag tasks (babi/doc_qa), which keep sampling early/recent/any per episode.
     # vary_lag tasks default to "vary"; the rest to "any". n_queries is NOT set here — the qa/
