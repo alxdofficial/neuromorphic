@@ -1,4 +1,4 @@
-"""Comprehensive data audit for the mixed 4-task benchmark (mae / babi / continuation / condrecon_bio).
+"""Comprehensive data audit for the mixed 5-task benchmark (mae / babi / qa_rc / continuation / condrecon_bio).
 
 Draws real batches from the EXACT loaders train.py uses (val via make_mixed_val_sets; train via the
 same factory fns with split=train) and checks, per task:
@@ -36,10 +36,10 @@ from src.memory.config import ReprConfig
 from src.memory.training import make_mixed_train_dataloaders, make_mixed_val_sets
 from src.memory.data.sources.babi import DEFAULT_TASKS as BABI_DEFAULT_TASKS
 
-TASKS = ["mae", "babi", "continuation", "condrecon_bio"]
+from src.memory.data.mixes import DEFAULT_MIXED_M, DEFAULT_TRAIN_MIX
+TASKS = list(DEFAULT_TRAIN_MIX)  # tracks the live 5-task mix (mae/babi/qa_rc/continuation/condrecon_bio)
 N_BATCHES = 4                    # 4×8 = 32 examples audited per task/split
-from src.memory.data.mixes import DEFAULT_MIXED_M
-CTX, M, PLEN = 1024, DEFAULT_MIXED_M, 64   # M follows the mixed default (mixes.DEFAULT_MIXED_M)
+CTX, M, PLEN, WIN = 2048, DEFAULT_MIXED_M, 64, 256   # follow the current sweep defaults (cli.py)
 SRC_TOK = "meta-llama/Llama-3.2-1B"
 PASS, FAIL, WARN = "PASS", "FAIL", "WARN"
 results = []
@@ -111,7 +111,7 @@ def invariants(task, batches, tok):
         tail = tok.decode(b.context_ids[0][b.context_mask[0].bool()])[-120:]
         head = tok.decode(b.answer_ids[0][b.answer_mask[0].bool()])[:120]
         print(f"    contiguity eyeball: ...{tail!r} ++ {head!r}")
-    elif task == "condrecon_bio":
+    elif task == "fact_recall":
         note(task, "answer VERBATIM in context", pc >= 97, f"{pc:.0f}%")
         note(task, "answer NOT in question", pq == 0, f"{pq:.0f}% leak")
         qents = []
@@ -123,7 +123,7 @@ def invariants(task, batches, tok):
                 qents.append(bool(words) and all(w in ctx for w in words[:2]))
         note(task, "queried entity present in context", 100 * sum(qents) / len(qents) >= 97,
              f"{100*sum(qents)/len(qents):.0f}%")
-    elif task == "mae":
+    elif task == "reconstruct":
         b = batches[0]
         same = all(bool(torch.equal(b.context_ids[i][b.context_mask[i].bool()],
                                     b.answer_ids[i][b.answer_mask[i].bool()])) for i in range(4))
@@ -140,7 +140,7 @@ def firewall(task, val_batches, train_batches, tok):
     th = {rowhash(b.context_ids[i], b.context_mask[i]) for b in train_batches for i in range(b.context_ids.shape[0])}
     inter = len(vh & th)
     note(task, "train∩val context overlap", inter == 0, f"{inter} shared rows")
-    if task == "condrecon_bio":
+    if task == "fact_recall":
         def ents(batches):
             # FULL entity name = the question prefix before '=' (drop parentheticals) — single capitalized
             # words would false-alarm on the generator's shared template vocabulary (Academy, Coastal, ...)
@@ -165,11 +165,12 @@ def main():
 
     print("building VAL sets (exact make_mixed_val_sets call)...")
     vs = make_mixed_val_sets(TASKS, tok, cfg, N_BATCHES, ctx_len=CTX, m_slots=M,
-                             mae_src_tok=SRC_TOK, babi_tasks=BABI_DEFAULT_TASKS, predict_len=PLEN)
+                             mae_src_tok=SRC_TOK, babi_tasks=BABI_DEFAULT_TASKS, predict_len=PLEN,
+                             window_size=WIN)
     print("building TRAIN loaders (split=train, run seed 42)...")
     tl = make_mixed_train_dataloaders(TASKS, tok, cfg, ctx_len=CTX, m_slots=M,
                                       mae_src_tok=SRC_TOK, babi_tasks=BABI_DEFAULT_TASKS,
-                                      predict_len=PLEN, num_workers=0)
+                                      predict_len=PLEN, num_workers=0, window_size=WIN)
 
     for task in TASKS:
         print(f"\n{'='*90}\n{task.upper()}\n{'='*90}")

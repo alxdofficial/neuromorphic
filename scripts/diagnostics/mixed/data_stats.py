@@ -107,7 +107,7 @@ def main():
                 qty = len(getattr(src, "docs", getattr(src, "rows",
                           getattr(src, "subs", []) or [])) or [])
                 spec = EpisodeSpec(source=sname, task=tstyle, total_len=args.total_len,
-                                   predict_len=64, n_inputs=24)
+                                   predict_len=64, n_inputs=40)   # bio pool = CONDRECON_BIO_N_PAIRS
                 s = episode_stats(src, get_task(tstyle), spec, tok, pad, n=args.n)
                 print(f"{sname:16} {qty:>7} {s['input_p50']:>7} {s['input_p90']:>7} {s['input_max']:>7} "
                       f"{100*s['pad_frac_mean']:>5.0f}% {s['ans_p50']:>8} {s['ans_p90']:>8} "
