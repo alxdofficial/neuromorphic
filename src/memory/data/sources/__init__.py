@@ -31,6 +31,23 @@ _SOURCES: dict[str, tuple[str, str]] = {
     "redpajama": ("redpajama", "RedpajamaSource"),
     "code": ("code", "CodeSource"),                       # source code — un-guessable exact-recall binding
     "multicorpus": ("multicorpus", "MultiCorpusSource"),  # continuation/mae VARIETY (fineweb+pile+redpajama+code)
+    # ── PHASE-1 (full-corpus training) sources — long-horizon / streaming / agentic ──────────────
+    # long real conversations (recall across turns/sessions):
+    "wildchat": ("wildchat", "WildChatSource"),           # real user↔assistant multi-turn (allenai/WildChat-1M)
+    "lmsys_chat": ("lmsys_chat", "LmsysChatSource"),      # real convos (lmsys/lmsys-chat-1m — GATED, needs HF access)
+    "msc": ("msc", "MSCSource"),                          # Multi-Session Chat — cross-session persona recall
+    # long documents (genuine long-range dependency):
+    "qasper": ("qasper", "QasperSource"),                 # NLP-paper QA (non-gist-gameable; span/yes-no/unanswerable)
+    "longcite": ("longcite", "LongCiteSource"),           # 128k-word contexts + citation-span reward
+    "govreport": ("govreport", "GovReportSource"),        # long gov reports (corpus)
+    "pg19": ("pg19", "PG19Source"),                       # full-length BOOKS (~1M+ tok — the long-horizon corpus)
+    # procedural long-context generators (unlimited, exact-match verifiable):
+    "ruler_niah": ("ruler_niah", "RulerNiahSource"),      # NIAH/multikey/vartrack generator (overwrite-fork base)
+    "babilong_train": ("babilong_train", "BabilongTrainSource"),  # bAbI facts in PG-19 haystack (TRAIN, ≠ eval babilong)
+    # streaming-update + agentic:
+    "wikibigedit": ("wikibigedit", "WikiBigEditSource"),  # sequential fact-update (forced-forgetting gate)
+    "swe_trajectories": ("swe_trajectories", "SweTrajectoriesSource"),  # long agent trajectories (nebius, reward-labeled)
+    "perltqa": ("perltqa", "PerLTQASource"),              # personalization long-term QA (memory-anchor spans)
 }
 
 

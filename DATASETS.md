@@ -48,3 +48,22 @@ Each can graduate to its own `src/memory/data/<name>.py` reader when wired.
 
 `data/eval/` holds eval-only static sets: `locomo10.json` (LoCoMo) and the pre-generated
 `needle*.parquet` (needle-in-a-haystack) sets.
+
+## Phase-1 & Phase-2 sources (2026-07-08) — see `docs/DATA_PHASES_PLAN.md`
+
+**Phase-1 training sources** (`SOURCE_REGISTRY`, `sources/`): long real conversations — `wildchat`
+(allenai/WildChat-1M), `lmsys_chat` (lmsys/lmsys-chat-1m — **GATED**, needs HF access), `msc`
+(Multi-Session Chat); long docs — `qasper`, `longcite`, `govreport`, `pg19` (books, ~1M tok);
+procedural — `ruler_niah` (NIAH/multikey/vartrack generator + overwrite-fork base), `babilong_train`
+(bAbI-in-PG19, TRAIN — distinct from the eval `babilong`); streaming/agentic — `wikibigedit`
+(sequential fact-update / forced-forgetting), `swe_trajectories` (nebius, reward-labeled), `perltqa`
+(personalization). STAGED locally: babilong_train, wikibigedit, swe_trajectories, perltqa. Need a
+one-time ingest run (`scripts/data_build/ingest/<name>/download.py`): wildchat, msc, qasper, longcite,
+govreport, pg19. Gated: lmsys_chat.
+
+**Phase-2 eval readers** (`REGISTRY`, `data/`): `longmemeval` (HEADLINE — multi-session chat memory),
+`longbench` (v1 21-subtask + v2 MCQs), `infinitebench` (Retrieve.* + En.QA), `niah` (procedural).
+Already had: babilong, hotpot, musique, narrativeqa, ruler, locomo.
+
+datasets 4.x dropped loading-script support → qasper uses `revision="refs/convert/parquet"`, pg19 uses
+`emozilla/pg19`, longbench pulls `data.zip` directly.

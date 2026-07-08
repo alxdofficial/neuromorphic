@@ -32,6 +32,11 @@ _MAKERS: dict[str, tuple[str, str]] = {
     "narrativeqa": ("narrativeqa",  "make_narrativeqa_dataloader"),
     "ruler":       ("ruler",        "make_ruler_dataloader"),
     "locomo":      ("locomo",       "make_locomo_dataloader"),
+    # ── PHASE-2 (test-eval) benchmark readers ────────────────────────────────────────────────────
+    "longmemeval":  ("longmemeval",  "make_longmemeval_dataloader"),   # HEADLINE: multi-session chat memory
+    "longbench":    ("longbench",    "make_longbench_dataloader"),     # v1 (21 subtasks) + v2 MCQs
+    "infinitebench": ("infinitebench", "make_infinitebench_dataloader"),  # ∞Bench Retrieve.* + En.QA
+    "niah":         ("niah",         "make_niah_dataloader"),          # procedural needle-in-haystack
     "mixed":       ("mixed",        "make_mixed_qa_dataloader"),
 }
 
