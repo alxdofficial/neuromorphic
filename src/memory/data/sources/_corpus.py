@@ -21,9 +21,7 @@ from typing import Iterator, List, Optional
 
 import numpy as np
 
-from .base import CorpusItem
-
-REPO = Path(__file__).resolve().parents[4]
+from .base import CorpusItem, REPO
 
 
 def local_jsonl(name: str, split: str) -> Optional[Path]:

@@ -141,7 +141,13 @@ class ReprConfig:
     beacon_wrap_layers: tuple = ()          # layer indices to wrap; () ⇒ ALL layers
 
     # ── masked_reconstruction (MAE) objective ──────────────────────────────
-    mae_mask_ratio: float = 0.85            # fraction of tokens masked in the forward
+    mae_mask_ratio: float = 0.85            # fraction of tokens masked in the forward (spec.mask_ratio overrides per-episode)
+
+    # ── continuation objective ─────────────────────────────────────────────
+    # Predict the next predict_len block at EACH streaming-window boundary (memory-through-256,
+    # -512, …) so one episode tests memory at growing compression horizons. Auto-active when
+    # window_size < total_len; False = single-shot (predict once at the full cutoff, old behavior).
+    continuation_multi_horizon: bool = True
 
     # ── Activation efficiency ──────────────────────────────────────────────
     # Activation-checkpoint each streaming-write window (peak ≈ one window of

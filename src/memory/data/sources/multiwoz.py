@@ -23,14 +23,12 @@ times, ``dontcare``); the verbatim filter drops exactly those non-recoverable sl
 from __future__ import annotations
 
 import json
-import re
 import urllib.request
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from .base import Source, QAItem
-
-REPO = Path(__file__).resolve().parents[4]
+from ._corpus import local_jsonl
 
 # Raw MultiWOZ 2.2 dialogue JSON (what the dead HF script downloads). train = 17 shards, dev = 2.
 _RAW_BASE = "https://github.com/budzianowski/multiwoz/raw/master/data/MultiWOZ_2.2"
@@ -50,9 +48,7 @@ _SLOT_PHRASE = {
 
 
 def _local_jsonl(split: str) -> Optional[Path]:
-    fname = "train" if split == "train" else "val"     # ingest writes train.jsonl / val.jsonl
-    p = REPO / "data" / "multiwoz" / f"{fname}.jsonl"
-    return p if p.exists() else None
+    return local_jsonl("multiwoz", split)          # ingest writes train.jsonl / val.jsonl
 
 
 def _shard_split(split: str) -> str:

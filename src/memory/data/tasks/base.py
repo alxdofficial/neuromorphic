@@ -55,10 +55,16 @@ class TaskDataset(IterableDataset):
 
     def __iter__(self):
         wi = torch.utils.data.get_worker_info()
-        rng = random.Random(self.seed + (wi.id if wi is not None else 0))
+        wid = wi.id if wi is not None else 0
+        rng = random.Random(self.seed + wid)
+        # telemetry: builds/episode surfaces a too-tight spec (many None-resamples) — both a data-health
+        # signal AND a perf signal (wasted tokenization). Readable externally when num_workers=0.
+        self.n_episodes = 0
+        self.n_builds = 0
         for _ in range(self.n_items):
-            ex = None
+            ex, tries = None, 0
             for _ in range(self._MAX_RETRY):
+                tries += 1
                 ex = self.task.build(self.source, self.spec, self.tok, rng, self.pad_token_id)
                 if ex is not None:
                     break
@@ -66,6 +72,12 @@ class TaskDataset(IterableDataset):
                 raise ValueError(
                     f"task {self.task.__class__.__name__} on source {self.source.kind!r} "
                     f"returned None {self._MAX_RETRY}× — spec too tight: {self.spec}")
+            self.n_episodes += 1
+            self.n_builds += tries
+            if tries >= 15 and self.n_episodes % 2000 == 1:          # throttled near-cap warning
+                print(f"[data] {self.task.__class__.__name__}/{self.source.kind} w{wid}: an episode "
+                      f"needed {tries}/{self._MAX_RETRY} resamples — spec may be too tight "
+                      f"(avg {self.n_builds / self.n_episodes:.1f} builds/episode)", flush=True)
             yield ex
 
 
@@ -76,6 +88,10 @@ def _collate(samples, pad_token_id):
     if "k_slots" in samples[0]:
         batch.k_slots = max(int(s["k_slots"]) for s in samples)
         batch.n_tokens = [int(s["n_tokens"]) for s in samples]
+    if "mask_ratio" in samples[0]:                     # mae curriculum mask-% (else loss uses cfg default)
+        batch.mask_ratio = float(samples[0]["mask_ratio"])
+    if "n_horizons" in samples[0]:                     # continuation: cap scored window boundaries (else all)
+        batch.n_horizons = int(samples[0]["n_horizons"])
     return batch
 
 

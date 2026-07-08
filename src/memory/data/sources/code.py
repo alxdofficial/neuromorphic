@@ -6,8 +6,9 @@ be recalled verbatim, not paraphrased) — the key→value binding stress test b
 and white space no prior compressor trained on (only CoMem, on agent trajectories). Whole-file
 corpus source (like fineweb): load files → backbone-tokenize → continuation / masked reconstruction.
 
-Default `bigcode/the-stack-smol` (self-contained parquet, no gating/S3; `data/python` subdir = 10k
-python files). Local sample: `scripts/data_build/ingest/code/download.py`. See DATASETS.md.
+Default `codeparrot/codeparrot-clean` (self-contained parquet, no gating/S3; `bigcode/the-stack-smol`
+is gated — see the `hf_name` note in `__init__` below). Local sample:
+`scripts/data_build/ingest/code/download.py`. See DATASETS.md.
 """
 from __future__ import annotations
 

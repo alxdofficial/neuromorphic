@@ -26,8 +26,7 @@ from pathlib import Path
 from typing import List
 
 from .base import Source, QAItem
-
-REPO = Path(__file__).resolve().parents[4]
+from ._corpus import local_jsonl
 
 DATASET = "hotpot"
 HF_NAME = "hotpot_qa"
@@ -36,8 +35,7 @@ HF_CONFIG = "distractor"
 
 def _local_jsonl(split: str):
     """Normalized-row jsonl staged by the ingest script for this split, if present."""
-    p = REPO / "data" / "hotpot_train" / f"{split}.jsonl"
-    return p if p.exists() else None
+    return local_jsonl("hotpot_train", split)
 
 
 def _normalize_hotpot(ex: dict) -> dict:

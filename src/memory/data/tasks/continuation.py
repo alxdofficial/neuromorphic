@@ -35,8 +35,11 @@ class ContinuationTask(Task):
         predict = d[s + compress_len: s + compress_len + predict_len]
 
         # continuation cue (the chat-template user turn); the value to predict is raw document text.
+        # NOTE: intermediate-horizon targets are sliced from context_ids by the loss (the block right
+        # after each window boundary), so no extra tokens are emitted here — answer_ids is the
+        # final-horizon (beyond-span) block. Multi-horizon needs predict_len <= window_size to tile.
         trigger_ids = tok("Continue the passage.", add_special_tokens=False).input_ids
-        return {
+        out = {
             "context_ids": torch.tensor(compress, dtype=torch.long),
             "context_mask": torch.ones(compress_len, dtype=torch.bool),   # full span, no pad
             "question_ids": torch.tensor(trigger_ids, dtype=torch.long),
@@ -46,3 +49,6 @@ class ContinuationTask(Task):
             "question_type": "continuation",
             "answer_refs": [],
         }
+        if spec.n_horizons is not None:                                   # cap # of scored boundaries
+            out["n_horizons"] = int(spec.n_horizons)
+        return out

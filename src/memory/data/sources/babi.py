@@ -26,6 +26,58 @@ _FALLBACK_PLACES = ["bathroom", "hallway", "kitchen", "garden", "bedroom",
                     "office", "school", "park", "cinema", "kitchen"]
 _FALLBACK_MOVES = ["moved to", "went to", "journeyed to", "travelled to", "went back to"]
 
+# bAbI locations are ANSWERS, not queried subjects → never renamed (a shared location across segments
+# doesn't make "where is <segment-k's person>?" ambiguous).
+_LOCATIONS = {"bathroom", "hallway", "kitchen", "garden", "bedroom", "office", "school", "park",
+              "cinema", "pantry", "closet", "porch", "cellar", "attic", "study", "lounge"}
+
+# object-transfer verbs → the noun after them is a portable OBJECT (used to derive bAbI's object vocab
+# from the data, so renaming works for any task subset without a hardcoded object list).
+_OBJ_VERB = re.compile(r"\b(?:picked up|put down|grabbed|took|got|left|dropped|discarded|"
+                       r"handed|passed|received|gave)\s+(?:the\s+)?(\w+)")
+
+# a capitalized word that is the SUBJECT of a bAbI ACTION verb (movement/transfer) is a PERSON. Derived
+# from the data. ACTION verbs only — NOT state verbs (is/was): "Where was the milk" would otherwise grab
+# the question word "Where". Every bAbI person moves at least once, so the action-verb vocab is complete.
+_PERSON_SUBJ = re.compile(r"\b([A-Z][a-z]+)\s+(?:went|moved|journeyed|travelled|picked|grabbed|took|"
+                          r"got|dropped|left|put|handed|passed|received|gave|discarded|carries|carried)\b")
+
+# Disjoint replacement pools (NOT overlapping bAbI's own Mary/John/… or milk/apple/football) — large
+# enough that ~20 co-packed segments each get globally unique people + objects with headroom.
+_RENAME_NAMES = [
+    "Aldric", "Beatrix", "Caspian", "Delphine", "Emeric", "Fenwick", "Guinevere", "Hadrian",
+    "Isolde", "Jorah", "Katarina", "Leontes", "Mirabel", "Nikolai", "Ophelia", "Percival",
+    "Quintus", "Rosalind", "Sebastian", "Theodora", "Ulric", "Vivienne", "Wendell", "Xanthe",
+    "Yseult", "Zephyrine", "Alaric", "Brunhilda", "Cornelius", "Drusilla", "Evander", "Faustine",
+    "Godfrey", "Henrietta", "Ignatius", "Jacinta", "Kenelm", "Lavinia", "Montague", "Nerissa",
+    "Osric", "Philippa", "Quenby", "Reinhold", "Seraphina", "Tobias", "Ursula", "Valerian",
+    "Winifred", "Xavier", "Yolanda", "Zebedee", "Anselm", "Bathsheba", "Cormac", "Dorothea",
+    "Ephraim", "Ferdinand", "Gwendolyn", "Horatio", "Idris", "Jemima", "Konrad", "Lucasta",
+    "Marius", "Nadezhda", "Octavian", "Perpetua", "Quillon", "Ruricius", "Sigismund", "Tatiana",
+    "Urien", "Verena", "Wilhelmina", "Xerxes", "Ysabeau", "Zenobia", "Ambrose", "Berengaria",
+    "Cyprian", "Desdemona", "Eberhard", "Florian", "Grimwald", "Hildegard", "Ithamar", "Jocasta",
+    "Kasimir", "Lucretia", "Meinhard", "Nunzio", "Odovacar", "Prudence", "Querela", "Roderick",
+    "Sidonia", "Thaddeus", "Ulfric", "Vespasia", "Waldemar", "Xiomara", "Ysolde", "Zephaniah",
+    "Anastasia", "Balthasar", "Clementine", "Dagobert", "Euphemia", "Frideric", "Genevieve",
+    "Hortensia", "Ivo", "Josceline", "Kunibert", "Ludmila", "Magnus", "Nicasius", "Ottoline",
+    "Pelagia", "Radulf", "Sabinus", "Theobald", "Umberto", "Valentina", "Wolfram", "Xenophon",
+    "Yorick", "Zelphina", "Archibald", "Bertrada", "Casimira", "Dietrich", "Estella", "Fulbert",
+    "Gisela", "Hubertus", "Immaculata", "Jehanne", "Kilian", "Leopolda", "Morwenna", "Norbert",
+    "Odalys", "Ptolemy", "Ravenna", "Sylvestra", "Torquil", "Ulyssa", "Vitalis", "Wenceslas",
+    "Ximena", "Yorath", "Zosimus", "Adalbert", "Brünhild", "Cecilia", "Deodatus", "Eulalia",
+]
+_RENAME_OBJECTS = [
+    "lantern", "kettle", "compass", "ledger", "trowel", "satchel", "goblet", "anvil", "quill",
+    "abacus", "mallet", "flask", "sextant", "chisel", "tankard", "harp", "spindle", "cauldron",
+    "beacon", "scroll", "brazier", "gauntlet", "censer", "astrolabe", "reliquary", "tuning-fork",
+    "cudgel", "phial", "bellows", "grindstone", "hourglass", "loom", "manacle", "plumb-bob",
+    "quiver", "rasp", "sledge", "torque", "vellum", "whetstone", "yardstick", "zither", "aiglet",
+    "buckler", "crampon", "dulcimer", "ewer", "firkin", "grommet", "halberd", "inkhorn", "jerkin",
+    "kazoo", "lyre", "matchlock", "nib", "oarlock", "pannier", "quern", "ratchet", "sabaton",
+    "thurible", "urn", "vise", "wimple", "xylophone", "yoke", "zarf", "amphora", "bodkin",
+    "caltrop", "distaff", "escutcheon", "fetlock", "gimlet", "holster", "ingot", "jubbah",
+]
+
 
 def _split_sents(text: str) -> List[str]:
     """Split a bAbI passage into individual fact SENTENCES (handles both the HF one-line form and
@@ -105,25 +157,65 @@ def _load_babi_rows(tasks, split: str):
 
 
 class BabiSource(Source):
-    """Yields bAbI stories as QAItems + a flat distractor-sentence pool."""
+    """Yields bAbI stories as QAItems. `pack_rename` tells the qa Task to co-pack MANY stories to fill
+    the budget but give each a DISJOINT set of entities (people + objects renamed per segment): bAbI
+    reuses a tiny name pool, so without renaming a distractor story's "Mary" collides with the gold's
+    "Mary" (ambiguous supervision). Renaming turns bAbI into a fill-the-budget, retrieve-the-right-
+    segment + bind-within-it task at a real compression ratio. Locations are answers → never renamed."""
 
     kind = "qa"
+    pack_n_queries = (1, 3)            # query several of the co-packed segments (addressing pressure)
+    pack_rename = True                 # co-packed bAbI segments must be entity-disjoint (see rename())
 
     def __init__(self, tokenizer, *, split: str = "train", tasks=DEFAULT_TASKS, seed: int = 0, **kw):
         self.tasks = tuple(tasks)
         self.rows = _load_babi_rows(self.tasks, split)
         if not self.rows:
             raise ValueError(f"bAbI: no rows for tasks={self.tasks} split={split}")
-        self._pool: List[str] = []
-        for story, _q, _a, _t in self.rows:
-            self._pool.extend(_split_sents(story))
+        # data-derived vocabularies: which tokens are PEOPLE (subjects of action verbs) and which are
+        # portable OBJECTS (picked up / dropped / …). Renaming keys off these sets, so capitalized
+        # non-names (Where/What/Following/Yesterday) and locations are never touched.
+        self.people_vocab, self.object_vocab = set(), set()
+        for story, q, _a, _t in self.rows:
+            self.object_vocab.update(m.group(1) for m in _OBJ_VERB.finditer(story))
+            self.people_vocab.update(m.group(1) for m in _PERSON_SUBJ.finditer(story + " " + q))
 
     def sample(self, rng, n: int) -> list:
         out = []
         for _ in range(n):
             story, q, a, t = self.rows[rng.randrange(len(self.rows))]
-            out.append(QAItem(facts=_split_sents(story), question=q, answer=a, task_id=t))
+            out.append(QAItem(facts=_split_sents(story), question=q, answer=a, task_id=t,
+                              meta={"dataset": "babi"}))    # per-dataset telemetry (task_family)
         return out
 
-    def distractor_pool(self) -> list:
-        return self._pool
+    def rename_pools(self, rng):
+        """Fresh shuffled (name_pool, object_pool) for ONE episode — the qa Task pops disjoint entities
+        from these across all co-packed segments so no two segments share a person or object."""
+        names, objs = _RENAME_NAMES[:], _RENAME_OBJECTS[:]
+        rng.shuffle(names)
+        rng.shuffle(objs)
+        return names, objs
+
+    def rename(self, item: QAItem, name_pool: list, obj_pool: list) -> QAItem:
+        """Return a copy of `item` with its people (capitalized names) and portable objects replaced by
+        fresh entities POPPED from `name_pool` / `obj_pool` (mutated in place, so co-packed segments get
+        globally disjoint entities). Locations are left untouched (answers, not subjects). The same map
+        is applied to facts, question, AND answer, so a person/object answer stays consistent."""
+        text = " ".join(item.facts) + " " + item.question + " " + item.answer
+        toks = {w.strip(".,!?;:'\"") for w in text.split()}
+        people = toks & self.people_vocab                 # data-derived: real names only (not Where/What/…)
+        objects = toks & self.object_vocab
+        rmap = {}
+        for p in sorted(people):                          # sorted → deterministic given the pools
+            rmap[p] = name_pool.pop() if name_pool else f"Person{len(rmap)}"
+        for o in sorted(objects):
+            rmap[o] = obj_pool.pop() if obj_pool else f"object{len(rmap)}"
+
+        def sub(s: str) -> str:
+            # whole-word substitution; longest-first avoids partial hits (none expected in bAbI)
+            for ent in sorted(rmap, key=len, reverse=True):
+                s = re.sub(rf"\b{re.escape(ent)}\b", rmap[ent], s)
+            return s
+
+        return QAItem(facts=[sub(f) for f in item.facts], question=sub(item.question),
+                      answer=sub(item.answer), task_id=item.task_id, meta=dict(item.meta or {}))

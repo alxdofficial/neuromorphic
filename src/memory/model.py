@@ -5,6 +5,7 @@ Llama decoder, and produces the reconstruction loss for training.
 """
 from __future__ import annotations
 import math
+from dataclasses import replace
 from typing import Optional
 
 import torch
@@ -649,9 +650,60 @@ class ReprLearningModel(nn.Module):
                 surprise[:, s:e] = ce
         return (surprise / math.log(V) * ctx_mask.float()).detach()                  # ~[0,1], padding→0
 
+    def compute_streaming_continuation_loss(
+        self, batch, *, window_size: int, n_horizons: int,
+        zero_memory: bool = False, shuffle_memory: bool = False, shuffle_roll: int = 1,
+    ) -> dict:
+        """Multi-horizon streaming continuation. At each streaming-window boundary b (256, 512, …,
+        T_ctx) compress the prefix [0:b] into memory and predict the next ``predict_len`` block from
+        that memory alone; average CE across horizons. The intermediate target blocks live INSIDE
+        ``context_ids`` (the token right after boundary b), and the final boundary (b == T_ctx)
+        predicts ``answer_ids`` (the block just past the compressed span — the classic single-shot
+        continuation). Reuses the generic decode per horizon via ``_force_generic`` sub-batches, so
+        every arm works with no encoder change and REAL/SHUF/OFF flow through per horizon.
+
+        n_horizons caps how many of the DEEPEST boundaries to score (the full-context one is always
+        included, so this stays comparable to single-shot eval). Cost ≈ n_horizons prefix re-streams;
+        acceptable for a 4-window streaming episode (continuation is ~1/5 of the mix)."""
+        T_ctx = batch.context_ids.shape[1]
+        predict_len = batch.answer_ids.shape[1]
+        n_windows = (T_ctx + window_size - 1) // window_size
+        boundaries = [min((i + 1) * window_size, T_ctx) for i in range(n_windows)]  # increasing; last == T_ctx
+        boundaries = boundaries[-n_horizons:]                                       # keep the deepest (incl. full-context)
+
+        losses, accs, last_out = [], [], None
+        for b in boundaries:
+            if b >= T_ctx:                                    # full-context horizon → predict answer_ids
+                sub = replace(batch, context_ids=batch.context_ids, context_mask=batch.context_mask,
+                              answer_ids=batch.answer_ids, answer_mask=batch.answer_mask,
+                              answer_content_mask=batch.answer_content_mask)
+            else:                                             # intermediate horizon → predict the in-context next block
+                if b + predict_len > T_ctx:                  # target would overflow the span → skip
+                    continue
+                tgt = batch.context_ids[:, b:b + predict_len]
+                cm = torch.ones_like(tgt, dtype=torch.bool)
+                sub = replace(batch, context_ids=batch.context_ids[:, :b], context_mask=batch.context_mask[:, :b],
+                              answer_ids=tgt, answer_mask=cm.clone(), answer_content_mask=cm)
+            out = self.compute_loss(sub, window_size=window_size, _force_generic=True,
+                                    zero_memory=zero_memory, shuffle_memory=shuffle_memory,
+                                    shuffle_roll=shuffle_roll)
+            losses.append(out["loss"]); accs.append(out["top1_acc"]); last_out = out
+
+        if not losses:                                        # degenerate (predict_len > window_size etc.) → single-shot
+            return self.compute_loss(batch, window_size=window_size, _force_generic=True,
+                                     zero_memory=zero_memory, shuffle_memory=shuffle_memory,
+                                     shuffle_roll=shuffle_roll)
+        loss = torch.stack(losses).mean()
+        out = dict(last_out)
+        out["loss"] = loss
+        out["loss_recon"] = loss
+        out["top1_acc"] = torch.stack(accs).mean()
+        out["n_horizons"] = len(losses)
+        return out
+
     def compute_loss(
         self,
-        batch,                          # QABatch from data_qa.py
+        batch,                          # QABatch from data/tasks/base.py::_collate
         window_size: int = 1024,
         zero_memory: bool = False,
         shuffle_memory: bool = False,
@@ -660,6 +712,7 @@ class ReprLearningModel(nn.Module):
         return_memory: bool = False,    # stash pre-roll memory+aux on the out dict
         encoder_only: bool = False,     # build memory, return WITHOUT decoding (GradCache cut point)
         return_logits: bool = False,    # add answer-position sel_logits/sel_targets (behavioral-KL distillation)
+        _force_generic: bool = False,   # internal: bypass the continuation multi-horizon dispatch (per-horizon calls)
     ) -> dict:
         """v1h composite-QA loss.
 
@@ -694,9 +747,24 @@ class ReprLearningModel(nn.Module):
         if getattr(self, "task_mode", None) == "masked_reconstruction":
             return self.compute_masked_reconstruction_loss(
                 batch, zero_memory=zero_memory, shuffle_memory=shuffle_memory,
-                mask_ratio=self.cfg.mae_mask_ratio,
+                mask_ratio=(getattr(batch, "mask_ratio", None)
+                            if getattr(batch, "mask_ratio", None) is not None else self.cfg.mae_mask_ratio),
                 memory_override=memory_override, shuffle_roll=shuffle_roll,
                 return_memory=return_memory, encoder_only=encoder_only)
+        # ---- streaming continuation: predict the next block at each window boundary ----
+        # Only for the plain CE / REAL-SHUF-OFF path (objective-mode + GradCache stay single-shot).
+        if (getattr(self, "task_mode", None) == "continuation" and not _force_generic
+                and getattr(self.cfg, "continuation_multi_horizon", True)
+                and memory_override is None and not encoder_only
+                and not return_memory and not return_logits):
+            T_ctx = batch.context_ids.shape[1]
+            n_windows = (T_ctx + window_size - 1) // window_size
+            n_h = getattr(batch, "n_horizons", None)
+            n_h = n_windows if n_h is None else min(int(n_h), n_windows)
+            if n_h > 1:
+                return self.compute_streaming_continuation_loss(
+                    batch, window_size=window_size, n_horizons=n_h,
+                    zero_memory=zero_memory, shuffle_memory=shuffle_memory, shuffle_roll=shuffle_roll)
         device = batch.context_ids.device
         B, T_ctx = batch.context_ids.shape
         T_q = batch.question_ids.shape[1]

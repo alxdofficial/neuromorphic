@@ -32,16 +32,13 @@ from pathlib import Path
 from typing import List, Optional
 
 from .base import Source, QAItem
-
-REPO = Path(__file__).resolve().parents[4]
+from ._corpus import local_jsonl
 
 _PARA_SPLIT = re.compile(r"\n{2,}")
 
 
 def _local_jsonl(split: str) -> Optional[Path]:
-    fname = "train" if split == "train" else "val"     # ingest writes train.jsonl / val.jsonl
-    p = REPO / "data" / "quality" / f"{fname}.jsonl"
-    return p if p.exists() else None
+    return local_jsonl("quality", split)          # ingest writes train.jsonl / val.jsonl
 
 
 def _hf_split(split: str) -> str:
@@ -57,7 +54,6 @@ def _iter_rows(split: str, n_docs: int, hf_name: str):
     (fully offline), else a bounded HF stream. Raises a clear ingest-first error if HF is unreachable."""
     local = _local_jsonl(split)
     if local is not None:
-        origin = f"data/quality/{split}.jsonl"
         with open(local) as fp:
             count = 0
             for line in fp:
@@ -68,7 +64,7 @@ def _iter_rows(split: str, n_docs: int, hf_name: str):
                 count += 1
                 if count >= n_docs:
                     break
-        return origin  # note: generators can't "return" a value usefully here; origin logged in loader
+        return
 
     try:
         from datasets import load_dataset

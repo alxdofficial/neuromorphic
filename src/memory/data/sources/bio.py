@@ -48,6 +48,7 @@ class BioSource(Source):
     """Yields biographical entities as key→value ``KeyedItem``s from one procedural world."""
 
     kind = "keyed"
+    pack_n_queries = (1, 3)            # tiny unique facts → high addressing pressure (query up to 3 keys)
 
     def __init__(self, tokenizer, *, split: str = "train", world_seed: int = 0,
                  n_facts: int = 3, seed: int = 0, **kw):

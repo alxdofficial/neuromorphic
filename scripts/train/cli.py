@@ -14,7 +14,7 @@ import torch
 
 from src.memory.config import ReprConfig
 from src.memory.data.sources.babi import DEFAULT_TASKS as BABI_DEFAULT_TASKS
-from src.memory.data.mixes import DEFAULT_TRAIN_MIX, TASK_SPEC, DEFAULT_MIXED_M
+from src.memory.data.mixes import DEFAULT_TRAIN_MIX, TASK_SPEC, TASK_ALIASES, DEFAULT_MIXED_M
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -54,7 +54,9 @@ def build_parser() -> argparse.ArgumentParser:
     # Default chunk_size 4096→8192 (2026-05-28 tranche-3 protocol; hard datasets
     # need the larger window to fit evidence + distractors).
     ap.add_argument("--chunk-size", type=int, default=8192)
-    ap.add_argument("--window-size", type=int, default=1024)
+    ap.add_argument("--window-size", type=int, default=256,
+                    help="streaming-write granularity (~paragraph). With --mixed-ctx 2048 ⇒ 8 windows: "
+                         "streaming continuation predicts at each boundary; condrecon retention-lag varies.")
     ap.add_argument("--mem-tokens", type=int, default=144,
                     help="Matched MEMORY budget: M memory tokens × d_llama, "
                          "matched across ICAE/CCM/AutoCompressor/Beacon "
@@ -63,28 +65,34 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--task", type=str, default="mixed",
                     choices=["mixed"],
                     help="mixed = ONE model trained on an equal round-robin of --mixed-tasks "
-                         "(mae babi continuation condrecon_bio), evaluated per-task (the only "
-                         "training path). The retired composite multi-hop QA mix (--task qa) and "
+                         "(reconstruct babi doc_qa continuation fact_recall), evaluated per-task (the "
+                         "only training path). The retired composite multi-hop QA mix (--task qa) and "
                          "its standalone single-task entry points were removed.")
     ap.add_argument("--mixed-tasks", nargs="+", default=list(DEFAULT_TRAIN_MIX),
-                    choices=list(TASK_SPEC),
-                    help="mixed: tasks in the equal round-robin (default: mae babi continuation "
-                         "condrecon_bio). mae = long-passage contiguous MAE compression; babi = "
-                         "relational; continuation = next-token prediction; condrecon_bio = "
-                         "biographical key→value closed-book recall. Used only when --task mixed.")
+                    choices=list(TASK_SPEC) + list(TASK_ALIASES),   # accepts old aliases (mae/qa_rc/condrecon_bio)
+                    help="mixed: tasks in the equal round-robin (default: reconstruct babi doc_qa "
+                         "continuation fact_recall). reconstruct = contiguous-passage MAE compression "
+                         "(fidelity); babi = relational binding (multi-segment renamed); doc_qa = real "
+                         "multi-source RC QA (squad/triviaqa/hotpot/musique/multiwoz); continuation = "
+                         "multi-horizon next-token prediction; fact_recall = biographical key→value "
+                         "closed-book recall. Old names (mae/qa_rc/condrecon_bio) still accepted.")
     ap.add_argument("--mixed-gate-batches", type=int, default=0,
                     help="mixed val: run the REAL/SHUF/OFF binding gate (example-specificity diagnostic) on "
                          "the first N val batches per task (0=off; ~triples that task's eval cost). Use e.g. 8.")
-    ap.add_argument("--mixed-ctx", type=int, default=1024,
-                    help="mixed: uniform context_len/chunk for ALL tasks (default 1024).")
+    ap.add_argument("--mixed-ctx", type=int, default=2048,
+                    help="mixed: uniform context_len/chunk for ALL tasks (default 2048 → 8×256 windows; "
+                         "tiles big-context QA better + fills bio at 40 pairs; 21:1 compression at M=96).")
     ap.add_argument("--mixed-M", type=int, default=DEFAULT_MIXED_M,
                     help="mixed: uniform memory budget M (slots/edges) for ALL tasks "
-                         "(default = mixes.DEFAULT_MIXED_M = 64 → 16:1 compression at ctx=1024). Raised from 32 for the "
-                         "streaming-write regime: gives binding headroom so a retention failure "
-                         "is a binding failure, not slot-starvation (forgetting pressure comes "
-                         "from distractor load > M, not a tiny M).")
+                         "(default = mixes.DEFAULT_MIXED_M = 96 → 21:1 compression at ctx=2048). 32→64→96: 96 "
+                         "keeps CAPACITY off the table (96 slots ≫ ~30 packed bindings) so the sweep measures "
+                         "ADDRESSING/structure, not slot-starvation; forgetting pressure comes from "
+                         "distractor load > M, not a tiny M.")
     ap.add_argument("--mae-mask-ratio", type=float, default=0.85,
                     help="mae: fraction of answer tokens replaced by <mask> in the forward.")
+    ap.add_argument("--no-continuation-multi-horizon", action="store_true",
+                    help="continuation: predict once at the full cutoff (single-shot) instead of at every "
+                         "streaming-window boundary. Ablation switch for the multi-horizon objective.")
     ap.add_argument("--hlvocab-emit", choices=["edge_query", "slotattn"], default="edge_query",
                     help="hlvocab emit read-out: edge_query (independent sharp-softmax) "
                          "| slotattn (Slot-Attention competition — slots partition candidates).")
@@ -429,6 +437,7 @@ def args_to_config(args, ap):
         cfg.autocompressor_lora_rank = args.port_lora_rank
         print(f"[capacity] ICAE/CCM/AutoCompressor LoRA rank → {args.port_lora_rank}")
     cfg.mae_mask_ratio = args.mae_mask_ratio
+    cfg.continuation_multi_horizon = not args.no_continuation_multi_horizon
     cfg.cond_recon_bio_query_window = args.bio_query_window   # streaming retention placement (mixed path)
     _ceil = lambda a, b: -(-a // b)
     _beacon_M = (_ceil(args.chunk_size, args.window_size)

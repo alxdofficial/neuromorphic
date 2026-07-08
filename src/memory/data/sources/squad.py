@@ -23,8 +23,8 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 from .base import Source, QAItem
+from ._corpus import local_jsonl
 
-REPO = Path(__file__).resolve().parents[4]
 _SENT_SPLIT = re.compile(r"(?<=[.!?])\s+")
 
 UNANSWERABLE = "unanswerable"
@@ -38,9 +38,7 @@ def _split_sents(text: str) -> List[str]:
 
 
 def _local_jsonl(split: str) -> Optional[Path]:
-    fname = "train" if split == "train" else "val"
-    p = REPO / "data" / "squad" / f"{fname}.jsonl"
-    return p if p.exists() else None
+    return local_jsonl("squad", split)
 
 
 def _answer_of(answers: dict) -> str:

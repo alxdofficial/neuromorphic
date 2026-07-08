@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Memory training harness: every memory variant × objective, with teacher-forced CE.
 
-Default objective = masked_reconstruction (sentence-pair MAE); other objectives
-(qa, conditioned_reconstruction[_bio], continuation) select via --task.
+Training is MIXED-only (--task mixed): ONE model per variant trained on an equal round-robin of
+--mixed-tasks (default: mae babi qa_rc continuation condrecon_bio), evaluated per-task. The decoder
+loss path per batch is routed by model.task_mode (set from mixes.task_mode). The old single-task
+entry points were removed with the composite dataset.
 
 For each variant:
  - Encoder ingests a context via streaming writes → memory tokens.

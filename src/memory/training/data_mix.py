@@ -1,7 +1,7 @@
 """Mixed multi-task dataloader + fixed val-set construction, built from the 4-layer data spec.
 
-Each mixed-task name (mae/babi/continuation/condrecon_bio) resolves via ``mixes.TASK_SPEC`` to a
-(Source, Task) pair; this composes an ``EpisodeSpec`` from the runtime args and builds one loader
+Each mixed-task name (mae/babi/qa_rc/continuation/condrecon_bio) resolves via ``mixes.TASK_SPEC`` to
+a (Source, Task) pair; this composes an ``EpisodeSpec`` from the runtime args and builds one loader
 per task through ``SOURCE_REGISTRY × get_task × make_task_dataloader``. Adding a source/task no
 longer edits this file — only the per-source construction kwargs (the genuinely source-specific
 bits: fineweb min_len/src-tok, babi tasks, bio world/n_facts) live in ``_build_source``.
@@ -10,7 +10,7 @@ See ``docs/data_arch_plan.md`` (Orchestration). Replaces the old hardcoded per-t
 """
 from __future__ import annotations
 
-from src.memory.data.mixes import TASK_SPEC, CONDRECON_BIO_N_PAIRS, CONDRECON_BIO_N_FACTS
+from src.memory.data.mixes import TASK_SPEC, CONDRECON_BIO_N_PAIRS, CONDRECON_BIO_N_FACTS, resolve_task
 from src.memory.data.sources import SOURCE_REGISTRY
 from src.memory.data.tasks import get_task
 from src.memory.data.tasks.base import make_task_dataloader
@@ -61,14 +61,18 @@ def _build_source(src_name, task_style, tokenizer, *, split, ctx_len, predict_le
 def _build_loader(mix_task, tokenizer, cfg, *, split, ctx_len, m_slots, mae_src_tok,
                   babi_tasks, predict_len, window_size, bio_query_window, seed, num_workers):
     """Build ONE mixed-task loader: TASK_SPEC[mix_task] → (source, task) × EpisodeSpec × cfg."""
-    meta = TASK_SPEC[mix_task]
+    meta = TASK_SPEC[resolve_task(mix_task)]     # accept old aliases (mae/qa_rc/condrecon_bio)
     pad = cfg.pad_token_id if cfg.pad_token_id is not None else 0
     source = _build_source(meta.source, meta.task_style, tokenizer, split=split, ctx_len=ctx_len,
                            predict_len=predict_len, mae_src_tok=mae_src_tok, babi_tasks=babi_tasks,
                            seed=seed)
+    # query_lag: an explicit --bio-query-window pin wins (streaming-placement experiments); otherwise
+    # vary_lag tasks sample early/recent/any per episode ("vary"), the rest default to "any". n_queries
+    # is NOT set here — the qa/reconstruction tasks read it from the SOURCE (Source.pack_n_queries).
+    lag = _query_lag(bio_query_window) if bio_query_window is not None else ("vary" if meta.vary_lag else "any")
     spec = EpisodeSpec(source=meta.source, task=meta.task_style, total_len=ctx_len,
-                       window_size=window_size, n_inputs=CONDRECON_BIO_N_PAIRS, n_queries=1,
-                       query_lag=_query_lag(bio_query_window), predict_len=predict_len)
+                       window_size=window_size, n_inputs=CONDRECON_BIO_N_PAIRS,
+                       query_lag=lag, predict_len=predict_len)
     task = get_task(meta.task_style)
     if hasattr(task, "m_slots"):                 # MAE task: the capacity-relative memory budget
         task.m_slots = m_slots
@@ -84,12 +88,15 @@ def make_mixed_train_dataloaders(mixed_tasks, tokenizer, cfg, *, ctx_len: int,
     """One TRAIN dataloader per mixed task (uniform interface: context_len/chunk = ctx_len, M =
     m_slots). ``bio_query_window`` (+ ``window_size``) turns condrecon_bio into a streaming-write
     retention probe (queried pair pinned to a window; the rest are distractors)."""
+    # Per-task seed OFFSET: without it, tasks that share a doc pool (mae=fineweb, continuation=
+    # multicorpus⊇fineweb) draw the SAME doc+offset in lockstep from an identical RNG, correlating the
+    # two objectives and halving effective corpus diversity. i*10_007 (prime) decorrelates the streams.
     return {
         t: _build_loader(t, tokenizer, cfg, split="train", ctx_len=ctx_len, m_slots=m_slots,
                          mae_src_tok=mae_src_tok, babi_tasks=babi_tasks, predict_len=predict_len,
                          window_size=window_size, bio_query_window=bio_query_window,
-                         seed=train_seed, num_workers=num_workers)
-        for t in mixed_tasks
+                         seed=train_seed + i * 10_007, num_workers=num_workers)
+        for i, t in enumerate(mixed_tasks)
     }
 
 
@@ -100,10 +107,10 @@ def make_mixed_val_sets(mixed_tasks, tokenizer, cfg, val_batches, *, ctx_len: in
     """One materialized (fixed) VAL set per mixed task — disjoint val seed (7) so eval never overlaps
     the training stream. ``bio_query_window`` mirrors the train-side streaming retention placement."""
     sets = {}
-    for t in mixed_tasks:
+    for i, t in enumerate(mixed_tasks):
         dl = _build_loader(t, tokenizer, cfg, split="val", ctx_len=ctx_len, m_slots=m_slots,
                            mae_src_tok=mae_src_tok, babi_tasks=babi_tasks, predict_len=predict_len,
                            window_size=window_size, bio_query_window=bio_query_window,
-                           seed=7, num_workers=0)
+                           seed=7 + i * 10_007, num_workers=0)   # per-task offset — see train-side note
         sets[t] = materialize_val_set(dl, val_batches)
     return sets

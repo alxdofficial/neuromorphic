@@ -11,8 +11,6 @@ as a standalone long-context qa source. See DATASETS.md / docs/data_arch_plan.md
 """
 from __future__ import annotations
 
-import random
-
 from .base import Source
 
 # default variety pool — all work at total_len=1024 (answer + gold facts in the front ~900 tok).
@@ -45,6 +43,7 @@ class QaMultiSource(Source):
     """Draws each QAItem from a randomly chosen QA sub-source; unions their distractor pools."""
 
     kind = "qa"
+    pack_n_queries = (1, 2)            # big RC contexts (hotpot/musique ~900 tok) → only ~2 golds fit at 2048
 
     def __init__(self, tokenizer, *, split: str = "train", seed: int = 0,
                  datasets=DEFAULT_QA, n_docs: int = 2500, **kw):

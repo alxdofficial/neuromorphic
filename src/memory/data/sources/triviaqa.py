@@ -24,8 +24,8 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 from .base import Source, QAItem
+from ._corpus import local_jsonl
 
-REPO = Path(__file__).resolve().parents[4]
 _SENT_SPLIT = re.compile(r"(?<=[.!?])\s+")
 
 HF_NAME = "mandarjoshi/trivia_qa"
@@ -35,9 +35,7 @@ Row = Tuple[List[str], str, str, List[str]]  # (facts, question, answer, aliases
 
 
 def _local_jsonl(split: str) -> Optional[Path]:
-    fname = "train" if split == "train" else "val"
-    p = REPO / "data" / "triviaqa" / f"{fname}.jsonl"
-    return p if p.exists() else None
+    return local_jsonl("triviaqa", split)
 
 
 def _sent_spans(text: str) -> List[List[int]]:

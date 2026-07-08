@@ -21,9 +21,8 @@ from pathlib import Path
 
 import numpy as np
 
-from .base import Source, CorpusItem
+from .base import Source, CorpusItem, REPO
 
-REPO = Path(__file__).resolve().parents[4]
 FINEWEB_TRAIN = REPO / "data/fineweb_edu/train.parquet"
 FINEWEB_VAL = REPO / "data/fineweb_edu/val.parquet"
 TEXT_CACHE = REPO / "data/fineweb_edu/cache"   # decoded-text cache dir

@@ -43,7 +43,7 @@ class MaeTask(Task):
         span = torch.tensor(d[s: s + ctx_len], dtype=torch.long)
 
         trigger_ids = tok("Reconstruct the text above.", add_special_tokens=False).input_ids
-        return {
+        out = {
             "context_ids": span,
             "context_mask": torch.ones(ctx_len, dtype=torch.bool),        # full span, no pad
             "question_ids": torch.tensor(trigger_ids, dtype=torch.long),
@@ -52,3 +52,6 @@ class MaeTask(Task):
             "task_family": "masked_reconstruction", "question_type": "masked_reconstruction",
             "answer_refs": [], "k_slots": self.m_slots, "n_tokens": ctx_len,
         }
+        if spec.mask_ratio is not None:                                   # curriculum mask-% override
+            out["mask_ratio"] = float(spec.mask_ratio)
+        return out

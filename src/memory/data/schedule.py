@@ -17,15 +17,18 @@ from typing import Optional
 class EpisodeSpec:
     """How to shape one training episode from a source's items. Every field is a difficulty knob."""
     source: str                     # SOURCE_REGISTRY key (where items come from)
-    task: str                       # TASK_REGISTRY key (how they're presented/asked)
+    task: str                       # TASK_STYLES key (how they're presented/asked)
     total_len: int = 1024           # target total context tokens (the compression numerator)
     window_size: Optional[int] = None   # streaming write granularity; None ⇒ single window (= total_len)
     n_inputs: int = 24              # MAX items packed into the context (fill-to-budget uses ≤ this)
     input_len: Optional[int] = None      # tokens per item, when a task needs a fixed per-item length
     n_distractors: int = 0          # filler items/interference between a write and its query
     n_queries: int = 1              # reads per episode (>1 forces addressing)
-    query_lag: str = "any"          # "recent" | "early" | "any" | window index — where the queried write sits
+    query_lag: str = "any"          # "recent" | "early" | "any" | "vary" (sampled per-episode) — where the queried write sits
     predict_len: int = 64           # continuation: tokens to predict after the compressed prefix
+    mask_ratio: Optional[float] = None   # mae: fraction of the span masked in the infill forward (None ⇒ cfg default)
+    n_horizons: Optional[int] = None     # continuation: predict blocks at the first N streaming-window boundaries
+                                         # (None ⇒ every boundary when window_size < total_len; 1 ⇒ single-shot)
 
     def with_(self, **kw) -> "EpisodeSpec":
         """Return a copy with fields overridden (curriculum stages build specs this way)."""

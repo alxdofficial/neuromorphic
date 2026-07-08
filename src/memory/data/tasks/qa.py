@@ -1,79 +1,63 @@
-"""QA task — story → question → answer, distractor-padded to the budget (bAbI-style).
+"""QA task — story/passage → question → answer, with other packed passages as distractors.
 
-Task half of the old ``data/babi.py``: pack the gold story's fact sentences at the front
-(guaranteed intact), then pad with entity-disjoint distractor sentences up to ``spec.total_len``,
-turning every example into a retrieve-among-noise read. Loss on every answer token.
+A QAItem becomes a `Unit(write=<facts>, query=<question>, answer=<answer>)`. The task packs `n_queries`
+(sampled from the SOURCE's `pack_n_queries`, so item-size drives it) gold facts + other items'
+contexts as distractors, placed by `query_lag`, via the shared streaming packer. The
+answer-un-guessability filter rejects any distractor whose text contains a query answer, so the answer
+lives in exactly one packed context (subsumes bAbI's old entity-disjoint distractor filtering).
 
-Consumes a ``qa``-kind source (``.sample`` gold QAItems + ``.distractor_pool()`` noise).
+`pack_rename` sources (bAbI) take a different fill path: co-pack MANY tiny segments to fill the budget,
+each entity-renamed disjoint (so no name collision), and DON'T answer-filter (shared locations aren't
+leaks — the unique renamed subject disambiguates). Consumes a `qa`-kind source.
 """
 from __future__ import annotations
 
-from typing import List
-
-import torch
-
 from .base import Task
+from ._pack import Unit, pack_streaming_episode
 from ..schedule import EpisodeSpec
-from ..sources.babi import _caps_names
 
 
 class QATask(Task):
     accepts = ("qa",)
 
     def build(self, source, spec: EpisodeSpec, tok, rng, pad_token_id: int) -> dict | None:
-        ctx_len = spec.total_len
-        item = source.sample(rng, 1)[0]
-        pool = source.distractor_pool()
+        lo, hi = getattr(source, "pack_n_queries", (1, max(1, spec.n_queries)))
+        nq = rng.randint(lo, hi)                             # per-source addressing pressure (1..max)
+        rename = getattr(source, "pack_rename", False)
 
-        def ids(s: str) -> List[int]:
-            return tok(s, add_special_tokens=False).input_ids
+        if rename:
+            # bAbI: co-pack many tiny segments to fill budget; rename entities disjoint per segment.
+            # ~total_len/75 segments (bAbI stories ~75–90 tok) with a little headroom for the fill loop.
+            items = source.sample(rng, max(nq + 1, spec.total_len // 75))
+            names, objs = source.rename_pools(rng)
+            items = [source.rename(it, names, objs) for it in items]
+        else:
+            # over-sample a distractor pool scaled with total_len (small items need more candidates).
+            items = source.sample(rng, nq + max(spec.n_inputs, spec.total_len // 24))
+        if len(items) < nq:
+            return None
 
-        # Real supporting facts first (front, intact), one fact per line.
-        ctx_ids: List[int] = []
-        for sent in item.facts:
-            ctx_ids += ids(sent + "\n")
-        # Over-long real story: keep the TAIL (the answer-relevant fact is usually the most recent).
-        if len(ctx_ids) > ctx_len:
-            ctx_ids = ctx_ids[-ctx_len:]
+        def _unit(it, *, gold: bool):
+            write = "".join(f.rstrip("\n") + "\n" for f in it.facts)      # one fact per line
+            if not gold:
+                return Unit(write=write)                                 # distractor: never queried
+            refs = [it.answer] + list((it.meta or {}).get("aliases", []))
+            return Unit(write=write, query=it.question, answer=it.answer,
+                        answer_spans=(), refs=tuple(refs))                # whole (short) answer scored
 
-        # Distractor padding to ~ctx_len; reject distractors sharing a gold entity (would contaminate
-        # the label). n_distractors>0 caps the count; 0 (default) fills the budget as bAbI always did.
-        gold_names = set()
-        for f in item.facts:
-            gold_names |= _caps_names(f)
-        added, cap = 0, (spec.n_distractors or None)
-        guard = 0
-        while pool and len(ctx_ids) < ctx_len and guard < 8 * ctx_len:   # empty pool → no padding (pad-tokens fill below)
-            guard += 1
-            if cap is not None and added >= cap:
-                break
-            d = rng.choice(pool)
-            if _caps_names(d) & gold_names:
-                continue
-            d_ids = ids(d + "\n")
-            if len(ctx_ids) + len(d_ids) > ctx_len:
-                room = ctx_len - len(ctx_ids)
-                if room > 0:
-                    ctx_ids += d_ids[:room]
-                break
-            ctx_ids += d_ids
-            added += 1
+        query_units = [_unit(it, gold=True) for it in items[:nq]]
+        filler_units = [_unit(it, gold=False) for it in items[nq:]]
 
-        valid = len(ctx_ids)
-        if valid < ctx_len:
-            ctx_ids = ctx_ids + [pad_token_id] * (ctx_len - valid)
+        # Un-guessability filter: no distractor may contain a queried answer verbatim. Skipped for
+        # rename sources — bAbI answers are shared locations (kitchen), NOT leaks: the unique renamed
+        # subject ("where is Ophelia?") disambiguates, so filtering them would needlessly underfill.
+        filler_ok = None
+        if not rename:
+            answers = [u.answer.lower() for u in query_units if u.answer]
+            def filler_ok(u):
+                w = u.write.lower()
+                return not any(a and a in w for a in answers)
 
-        question_ids = ids(item.question)
-        answer_ids = ids(item.answer)               # list tasks carry comma-joined answers; all content
-        content = [True] * len(answer_ids)
-
-        return {
-            "context_ids": torch.tensor(ctx_ids, dtype=torch.long),
-            "context_mask": torch.tensor([True] * valid + [False] * (ctx_len - valid), dtype=torch.bool),
-            "question_ids": torch.tensor(question_ids, dtype=torch.long),
-            "answer_ids": torch.tensor(answer_ids, dtype=torch.long),
-            "answer_content_mask_list": content,
-            "task_family": "babi",
-            "question_type": f"task{item.task_id}",
-            "answer_refs": [item.answer],
-        }
+        fam = (items[0].meta or {}).get("dataset", "qa")     # per-dataset telemetry label (task_family)
+        return pack_streaming_episode(query_units, filler_units, spec, tok, pad_token_id,
+                                      task_family=fam, rng=rng, filler_ok=filler_ok)

@@ -24,8 +24,7 @@ from pathlib import Path
 from typing import List
 
 from .base import Source, QAItem
-
-REPO = Path(__file__).resolve().parents[4]
+from ._corpus import local_jsonl
 
 DATASET = "musique"
 HF_NAME = "dgslibisey/MuSiQue"
@@ -33,8 +32,7 @@ HF_NAME = "dgslibisey/MuSiQue"
 
 def _local_jsonl(split: str):
     """Normalized-row jsonl staged by the ingest script for this split, if present."""
-    p = REPO / "data" / "musique_train" / f"{split}.jsonl"
-    return p if p.exists() else None
+    return local_jsonl("musique_train", split)
 
 
 def _normalize_musique(ex: dict) -> dict:
