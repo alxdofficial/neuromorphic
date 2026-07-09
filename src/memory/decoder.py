@@ -20,6 +20,29 @@ from torch import Tensor
 from .config import ReprConfig
 
 
+def build_prefix_cache(past_kv):
+    """Build a HF DynamicCache holding per-layer memory (K, V) as a NON-CAUSAL prefix —
+    the per-layer-KV read path (Beacon / MemoryLLM native, vs input-prepend).
+
+    ``past_kv`` = (K, V), each a length-L sequence of per-layer tensors of shape
+    ``[B, num_kv_heads, M, head_dim]``. The returned cache has ``get_seq_length()==M``, so a
+    subsequent ``decoder.llama.model(inputs_embeds=[B,T,d], attention_mask=<width M+T>,
+    past_key_values=cache, use_cache=True)`` lets every text query attend over all M memory
+    keys and returns TEXT-ONLY hidden states ``[B,T,d]`` (no ``[:, M:]`` slice). Injected keys
+    are consumed post-RoPE (unrotated/position-free); text RoPE is the only relative phase.
+    """
+    from transformers.cache_utils import DynamicCache
+    K, V = past_kv
+    pairs = [(K[l].contiguous(), V[l].contiguous()) for l in range(len(K))]
+    try:
+        return DynamicCache(ddp_cache_data=pairs)            # transformers >=5 fast path
+    except TypeError:                                        # older API: fill layer by layer
+        cache = DynamicCache()
+        for l, (k, v) in enumerate(pairs):
+            cache.update(k, v, l)
+        return cache
+
+
 def load_frozen_llama(model_name: str, dtype: torch.dtype = torch.bfloat16):
     """Load Llama, freeze all params, return the model + tokenizer.
 

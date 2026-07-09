@@ -314,6 +314,12 @@ def build_parser() -> argparse.ArgumentParser:
     # without it, so default ON is a safety net you can disable for full speed.
     ap.add_argument("--grad-ckpt-stream", action=argparse.BooleanOptionalAction,
                     default=True)
+    ap.add_argument("--compile-decoder", action=argparse.BooleanOptionalAction,
+                    default=False,
+                    help="torch.compile(dynamic=True) the shared frozen decoder transformer — "
+                         "speeds student+teacher decode for hook-free arms (icae/ccm/ac/beacon/"
+                         "slotgraph3/vqicae). Hooked arms (biomem/slotgraph reinforce) + 4-D "
+                         "rect/bidir masks graph-break; leave off for those.")
     ap.add_argument("--patience", type=int, default=5,
                     help="Stop training when best.pt hasn't updated for this "
                          "many consecutive val evals past --min-step-for-stop. "
@@ -481,11 +487,30 @@ def args_to_config(args, ap):
         cfg.ccm_n_comp = _M; cfg.ccm_lora_rank = 52; cfg.ccm_lora_alpha = 104
         cfg.autocompressor_n_slots = _M
         cfg.autocompressor_lora_rank = 52; cfg.autocompressor_lora_alpha = 104
+        # Faithful AutoCompressor accumulates κ summaries per seg_len segment → κ·n_segments ≈ M.
+        # seg_len = window_size so the single-shot MAE path (chunks 2048→8 internally) and the
+        # multi-window path both accumulate to the same M budget.
+        cfg.autocompressor_segment_len = args.window_size
+        _ac_nwin = max(1, args.mixed_ctx // args.window_size)
+        cfg.autocompressor_summary_per_window = max(1, _M // _ac_nwin)   # 96//8 = 12 at ctx2048/win256
         cfg.beacon_ratio = max(1, args.mixed_ctx // _M)  # ratio honors the uniform ctx:M (16:1 at M=64)
         from transformers import AutoConfig as _ACLM
         from src.memory.common import beacon_wrap_layers as _bwlm
         _nlayersm = _ACLM.from_pretrained(cfg.llama_model).num_hidden_layers
         cfg.beacon_wrap_layers = _bwlm(_nlayersm, 11)
+        # MemoryLLM: N=M slots/layer pool (~1.66M) + q/k/v/o LoRA all layers. r46 measured 7.88M
+        # (LoRA denser than estimated); r39 ≈ 7.0M cohort match. TODO precise-calibrate w/ param_count.
+        cfg.memoryllm_n_mem = _M
+        cfg.memoryllm_lora_rank = 39; cfg.memoryllm_lora_alpha = 78
+        cfg.memoryllm_k_new = max(1, _M // 12)           # random-drop K/window (~half-life over 8 windows)
+        # Gisting: κ=M/n_seg gist tokens per seg_len segment (accumulate to M), q/v LoRA r104 = ICAE-matched.
+        cfg.gisting_n_gist = _M; cfg.gisting_segment_len = args.window_size
+        cfg.gisting_gist_per_seg = max(1, _M // _ac_nwin)
+        cfg.gisting_lora_rank = 104; cfg.gisting_lora_alpha = 208
+        # Titans: read = N_p persistent + M_q readout = M; deep-MLP memory h sized to ~7M (2·d·h dominates).
+        cfg.titans_d_mem = cfg.d_llama
+        cfg.titans_n_persistent = max(1, _M // 6); cfg.titans_n_read_seeds = _M - cfg.titans_n_persistent
+        cfg.titans_mem_hidden = 4864                      # ~6.7-7.0M trainable (verify param_count)
         # slotgraph (icae-write + fixed partition + RMSNorm-bounded MP read): own frozen base +
         # encoder-LoRA + endpoint heads + the MP read modules (msg/update ≈1.0M). Encoder-LoRA rank
         # TRIMMED to r85 (from icae's r104) to offset the MP params → total ≈ icae's ~6.9M.
@@ -669,7 +694,11 @@ def args_to_config(args, ap):
         # EXCLUDED: vqicae (emits vq_loss → silently inert under the per-example-CE surrogate); hlvocab
         # (load_balance). trajectory stays sg3-only (needs sample_read_expansion).
         _OBJ_OK = {"slotgraph3_baseline", "icae_baseline", "ccm_baseline",
-                   "autocompressor_baseline", "beacon_baseline"}
+                   "autocompressor_baseline", "beacon_baseline",
+                   # aux-loss-free arms added 2026-07-09 (gisting/memoryllm/titans emit no vq/load-balance
+                   # aux loss, so they are valid under behavioral_kl; per-layer-KV students dispatch fine
+                   # via _prefix_kv_forward). Still gated by the pre-training verification (#158).
+                   "gisting_baseline", "memoryllm_baseline", "titans_baseline"}
         if args.objective_mode == "trajectory" and set(args.variants) != {"slotgraph3_baseline"}:
             raise SystemExit(f"--objective-mode trajectory supports --variants slotgraph3_baseline only "
                              f"(needs sample_read_expansion); got {args.variants}.")

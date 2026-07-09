@@ -1,4 +1,4 @@
-"""AutoCompressors / RMT-style recurrent soft-prompt summary compressor."""
+"""AutoCompressors — recurrent soft-prompt summary compressor with summary ACCUMULATION."""
 from __future__ import annotations
 
 import torch
@@ -9,16 +9,23 @@ from ...config import ReprConfig
 
 
 class AutoCompressorBaselineEncoder(nn.Module):
-    """AutoCompressors (Chevalier et al. EMNLP'23) / RMT-style RECURRENT soft-prompt
-    summary compressor on a FROZEN Llama-1B + encoder-LoRA — the recurrent baseline.
+    """AutoCompressors (Chevalier et al. EMNLP'23) on a FROZEN Llama + encoder-LoRA.
 
-    Per window: cat([carried summary (read-memory), window embeds, M write slots]),
-    run the LoRA-Llama, read the write-slot hiddens as the NEW summary (= next window's
-    read-memory). finalize returns the final M summary vectors as prepend memory. The
-    summary is the differentiable cross-window carry (BPTT'd by the trainer). Adapted to
-    a frozen backbone + LoRA (the papers fine-tune the whole LM) — same fair-comparison
-    adaptation as ICAE/CCM/Beacon. M = n_flat_codes (= mem_tokens). Port skeleton: RMT
-    MemoryCell (booydar/recurrent-memory-transformer)."""
+    The DEFINING mechanism vs plain RMT is **summary accumulation**: the summary vectors
+    σ_1..σ_{i-1} of ALL prior windows are CONCATENATED and prepended to window i (a direct
+    information pathway to every preceding segment — no re-compression of already-stored
+    summaries). Per window we append κ learnable <Sum> tokens after [accumulated σ ++ window
+    tokens], run the LoRA-Llama, and read the κ <Sum> output hiddens as this window's summary
+    σ_i, which is APPENDED to the accumulation (not overwritten). finalize returns the full
+    accumulated κ·n_windows ≈ M vectors as prepend memory. κ = M / n_windows keeps the final
+    budget matched to the other fixed-M baselines (12 slots × 8 windows = 96 at ctx2048/win256).
+
+    (An earlier version REPLACED a fixed single-summary carry each window — that is RMT, the
+    weaker predecessor AutoCompressor beats; restored to faithful accumulation 2026-07-08.)
+
+    Adapted to a frozen backbone + LoRA (the paper fine-tunes the whole LM) — same fair-comparison
+    adaptation as ICAE/CCM/Beacon. Full BPTT across windows (project preference). Per-window κ from
+    cfg.autocompressor_summary_per_window (set in the mixed capacity preset)."""
 
     def __init__(self, cfg: ReprConfig):
         super().__init__()
@@ -37,20 +44,29 @@ class AutoCompressorBaselineEncoder(nn.Module):
         base.model.gradient_checkpointing_enable(
             gradient_checkpointing_kwargs={"use_reentrant": False})
         self.base = base
-        self.M = int(getattr(cfg, "autocompressor_n_slots", 0) or cfg.n_flat_codes)
+        self.M = int(getattr(cfg, "autocompressor_n_slots", 0) or cfg.n_flat_codes)  # final budget cap
+        # κ = summary vectors emitted PER segment; κ·n_segments accumulates to ≈ M. Fallback assumes
+        # ctx/segment ≈ 8 when the preset didn't set it (non-mixed paths).
+        self.k = int(getattr(cfg, "autocompressor_summary_per_window", 0) or max(1, self.M // 8))
+        # AutoCompressor defines its OWN segment length (independent of the harness streaming window):
+        # streaming_write chunks whatever token_embeds it is handed into seg_len sub-segments and emits
+        # κ per sub-segment. This makes the emitted budget ≈ M in BOTH the single-shot MAE path (one
+        # 2048 window → 8 sub-segments → 96) and the multi-window path (eight 256 windows → 96) — so
+        # autocompressor is budget-matched to the fixed-M baselines on every task, not just streamed ones.
+        self.seg_len = int(getattr(cfg, "autocompressor_segment_len", 0) or 256)
         embed = base.get_input_embeddings()
         with torch.no_grad():
             mean_vec = embed.weight.float().mean(dim=0)
             emb_std = embed.weight.float().std().item()
-        slot_init = (mean_vec.view(1, cfg.d_llama).repeat(self.M, 1)
-                     + emb_std * torch.randn(self.M, cfg.d_llama))
-        self.slots = nn.Parameter(slot_init)                  # M write-memory slots
-        self.summary0 = nn.Parameter(slot_init.clone())       # initial read-memory (window 1)
+        slot_init = (mean_vec.view(1, cfg.d_llama).repeat(self.k, 1)
+                     + emb_std * torch.randn(self.k, cfg.d_llama))
+        self.slots = nn.Parameter(slot_init)                  # κ learnable <Sum> tokens (reused/window)
         self.norm = _NormMatch(cfg.d_llama)
         with torch.no_grad():   # seed norm-match scale to the backbone embed norm
             self.norm.scale.data.fill_(   # (0.9 default is ~3x too quiet on SmolLM2; match hlvocab)
                 base.get_input_embeddings().weight.float().norm(dim=-1).mean().item())
-        print(f"[AutoCompressor] encoder-LoRA wrapped {n_wrapped} layers; M={self.M} (recurrent)")
+        print(f"[AutoCompressor] encoder-LoRA wrapped {n_wrapped} layers; "
+              f"κ={self.k}/window → accumulate to M≤{self.M} (summary accumulation)")
 
     def train(self, mode: bool = True):
         super().train(mode)
@@ -58,28 +74,53 @@ class AutoCompressorBaselineEncoder(nn.Module):
         return self
 
     def init_streaming_state(self, batch_size: int, device, dtype):
-        return {"summary": self.summary0.to(dtype).unsqueeze(0)
-                .expand(batch_size, self.M, self.cfg.d_llama).contiguous()}
+        del batch_size, device, dtype
+        return {"acc": None, "valid": None}                   # empty accumulation (grows per window)
+
+    def _compress_segment(self, acc, valid, seg, seg_mask):
+        """Emit κ summaries for one segment, appended to the accumulation (σ_{<i} prepended, read-only)."""
+        B, Ws, d = seg.shape
+        slots = self.slots.to(seg.dtype).unsqueeze(0).expand(B, self.k, d)
+        _ones = lambda n: torch.ones(B, n, device=seg.device, dtype=torch.long)
+        if acc is None:                                       # first segment: no prior summaries
+            inp = torch.cat([seg, slots], dim=1)
+            attn = torch.cat([seg_mask.long(), _ones(self.k)], dim=1)
+        else:                                                 # prepend ALL prior summaries (accumulation)
+            inp = torch.cat([acc, seg, slots], dim=1)
+            attn = torch.cat([valid.long(), seg_mask.long(), _ones(self.k)], dim=1)
+        h = self.base.model(inputs_embeds=inp, attention_mask=attn).last_hidden_state
+        sigma = h[:, -self.k:, :].to(seg.dtype)               # this segment's κ summaries
+        # An all-pad segment contributes no real content: keep its κ slots (uniform length across the
+        # batch → clean batching) but mark them invalid so the decoder never attends to them.
+        chunk_valid = seg_mask.bool().any(dim=1).view(B, 1).expand(B, self.k)
+        if acc is None:
+            acc, valid = sigma, chunk_valid
+        else:
+            acc, valid = torch.cat([acc, sigma], dim=1), torch.cat([valid, chunk_valid], dim=1)
+        if acc.shape[1] > self.M:                             # defensive: never exceed the read budget
+            acc, valid = acc[:, :self.M], valid[:, :self.M]
+        return acc, valid
 
     def streaming_write(self, state, token_embeds, attention_mask=None, chunk_offset=0, **extra):
         del chunk_offset, extra
         B, W, d = token_embeds.shape
         if attention_mask is None:
             attention_mask = torch.ones(B, W, device=token_embeds.device, dtype=torch.bool)
-        summ = state["summary"]                               # [B, M, d] read-memory
-        slots = self.slots.to(token_embeds.dtype).unsqueeze(0).expand(B, self.M, d)
-        inp = torch.cat([summ, token_embeds, slots], dim=1)   # [B, M+W+M, d]
-        _ones = lambda n: torch.ones(B, n, device=attention_mask.device, dtype=torch.long)
-        attn = torch.cat([_ones(self.M), attention_mask.long(), _ones(self.M)], dim=1)
-        h = self.base.model(inputs_embeds=inp, attention_mask=attn).last_hidden_state
-        new_summary = h[:, -self.M:, :].to(token_embeds.dtype)   # write slots -> next read-memory
-        # all-pad window: carry the summary unchanged (no real tokens to compress)
-        has_real = attention_mask.bool().any(dim=1).view(-1, 1, 1)
-        new_summary = torch.where(has_real, new_summary, summ)
-        return {"summary": new_summary}, {}
+        acc, valid = state["acc"], state["valid"]             # [B, k_so_far, d] / [B, k_so_far] or None
+        # Chunk this call's tokens into AutoCompressor's own seg_len segments and accumulate κ each —
+        # so single-shot (W=2048) and per-window (W=256) calls both accumulate to ≈ M.
+        for s in range(0, W, self.seg_len):
+            if acc is not None and acc.shape[1] >= self.M:
+                break
+            acc, valid = self._compress_segment(acc, valid,
+                                                 token_embeds[:, s:s + self.seg_len],
+                                                 attention_mask[:, s:s + self.seg_len])
+        return {"acc": acc, "valid": valid}, {}
 
     def finalize_memory(self, state):
-        return self.norm(state["summary"].float()), {}       # [B, M, d_llama]
+        acc, valid = state["acc"], state["valid"]
+        mem = self.norm(acc.float())                          # [B, k_so_far, d_llama]
+        return mem, {"memory_mask": valid}                    # mask out all-pad-window summaries
 
     def forward(self, token_embeds, attention_mask=None, mask_positions=None):
         del mask_positions

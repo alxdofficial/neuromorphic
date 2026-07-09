@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import torch
 
+from ..decoder import disable_lora
+
 
 def _infonce_logits_weights(S, coef, inv_temp=1.0, valid=None):
     """Row-standardized InfoNCE over the memory-roll score matrix + the analytic dL/dS.
@@ -111,7 +113,14 @@ def _behavioral_kl_step(model, batch, cfg, window_size):
         return out_real, out_real["loss"], {"obj_kl": 0.0, "obj_ce": float(s_out["loss_recon"])}
 
     # ── teacher: frozen LM over the FULL context (no grad, detached target) ──
-    with torch.no_grad():
+    # disable_lora() is LOAD-BEARING: the decoder carries a trainable read-side LoRA
+    # (cli forces use_llama_lora=True for mixed; loops steps grad_norm_lora every step).
+    # Without disabling it here the "teacher" would read the SAME jointly-trained adapter
+    # as the student — a non-stationary reference that shares params with the student, so
+    # the optimizer could satisfy KL by moving the teacher (flattening context-sensitivity)
+    # instead of making memory sufficient. That breaks the E[KL]=I(context;answer) identity
+    # this objective rests on. Match the frozen-backbone precedent at model.py _encode_for_memory.
+    with torch.no_grad(), disable_lora():
         ctx_embeds = embed(batch.context_ids)
         ctx_embeds = ctx_embeds * batch.context_mask.unsqueeze(-1).to(ctx_embeds.dtype)  # zero pads
         t_aux = {"memory_mask": batch.context_mask,

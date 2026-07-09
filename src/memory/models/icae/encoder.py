@@ -117,7 +117,11 @@ class ICAEBaselineEncoder(nn.Module):
         # over prev-memory + window. base.training=False → HF per-layer ckpt is inert; the trainer's
         # per-window activation-checkpoint (grad_checkpoint_stream) covers this whole forward.
         h = self.base.model(inputs_embeds=inp, attention_mask=attn).last_hidden_state
-        mem = self.norm(h[:, -self.M:, :].float())           # [B, M, d_llama]
+        # Norm in fp32 for stability, then cast back to the running dtype so the memory
+        # carried into next window's cat([prev, token_embeds, slots]) matches (bf16 under
+        # autocast). Without the cast-back, fp32 `prev` collides with bf16 token_embeds in
+        # any eager/no-autocast path — the dtype landmine the debug-real-path convention warns of.
+        mem = self.norm(h[:, -self.M:, :].float()).to(h.dtype)   # [B, M, d_llama]
         return {"mem": mem}, {}
 
     def finalize_memory(self, state) -> tuple[Tensor, dict]:

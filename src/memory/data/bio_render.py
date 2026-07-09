@@ -89,8 +89,14 @@ def _starts_article(v: str) -> bool:
 def _name_derivable(short: str, name: str) -> bool:
     """True if `short` is a prefix/substring of the entity name (key-derivable). The org
     short_name is usually the name minus its last word, so the equality-only guard missed
-    it, leaking an 'also known as X' clause (sweep #5)."""
-    s, n = str(short).strip(), str(name or "").strip()
+    it, leaking an 'also known as X' clause (sweep #5).
+
+    CASEFOLDED both sides: org_type/work_type values are lowercase type words ('trust',
+    'association', 'symphony') while the entity name capitalizes them ('Wellcome Trust',
+    'X Symphony'). A case-SENSITIVE `s in n` missed exactly the case this filter exists to
+    catch — 'trust' not in 'Wellcome Trust' — leaking a key-derivable fact into the scored
+    value span (2026-07-08 sweep). Casefold is safe for short_name (already same-case)."""
+    s, n = str(short).strip().casefold(), str(name or "").strip().casefold()
     return bool(s) and (s == n or n.startswith(s) or s in n or n in s)
 
 

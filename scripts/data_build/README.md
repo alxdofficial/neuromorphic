@@ -11,6 +11,8 @@ scripts/data_build/
     ruler_overwrite/  # runtime-procedural (no offline build step; see its README.md)
   ingest/          # DOWNLOAD + clean/dedup + pretokenize→parquet (see ingest/README.md)
     code/  hotpot_train/  multiwoz/  musique_train/  pile/  quality/  redpajama/  squad/  triviaqa/
+    babilong_train/  govreport/  lmsys_chat/  longcite/  msc/  perltqa/  pg19/  qasper/
+    swe_trajectories/  wikibigedit/  wildchat/    # Phase-1 full-corpus sources (2026-07-08)
     #   fineweb.py, babi_10k.py  (still TODO Tier-B)
   orchestration/   # wave/build drivers: wave1_worldspec{,_extra}.py
 ```

@@ -2,7 +2,7 @@
 
 How training is organized, mirroring the data layer's split (see `DATASETS.md`):
 **importable logic lives in `src/memory/`; executable entrypoints live in `scripts/`.**
-Design rationale + history: `docs/harness_reorg_plan.md`.
+Design rationale + history: `docs/history/harness_reorg_plan.md`.
 
 ## The three questions this answers
 
@@ -43,8 +43,12 @@ The single source of truth for *what trains and how it routes*:
   `TASK_STYLES`; `task_mode` sets `model.task_mode` (`"masked_reconstruction"` = MAE infill,
   else generic QA/CE path).
 - `TASK_SPEC` — mix-task name → spec. The name may differ from the source (a *framing*):
-  `condrecon_bio` = `reconstruction` over the `bio` source; `mae`/`continuation` both over `fineweb`.
-- `DEFAULT_TRAIN_MIX = ("mae", "babi", "qa_rc", "continuation", "condrecon_bio")`. `TASK_MODE` flat dict.
+  `fact_recall` = `reconstruction` over the `bio` source; `reconstruct` = `mae` over `fineweb`;
+  `continuation` = `continuation` over `multicorpus` (fineweb+pile+redpajama+code); `doc_qa` = `qa`
+  over `qa_multi` (squad+triviaqa+hotpot_train+musique_train+multiwoz). Mix-task names were renamed
+  2026-07-08 (`mae`→`reconstruct`, `qa_rc`→`doc_qa`, `condrecon_bio`→`fact_recall`); old names still
+  resolve via `TASK_ALIASES`.
+- `DEFAULT_TRAIN_MIX = ("reconstruct", "babi", "doc_qa", "continuation", "fact_recall")`. `TASK_MODE` flat dict.
 - `training/data_mix.py` composes `SOURCE_REGISTRY[spec.source] × get_task(spec.task_style) ×
   EpisodeSpec` — adding a source/task never edits `data_mix`. Import-time assert: every
   `TaskSpec.source` ∈ `SOURCE_REGISTRY`, `task_style` ∈ `TASK_STYLES`.
@@ -86,4 +90,4 @@ on `sys.path` and import the harness from `src.memory.training` + the spec from
   `Path(__file__).resolve().parents[3]` for the repo root.
 
 Deliberately **not** restructured (high blast radius, unrelated to the harness): `ReprConfig`
-(`config.py`) and the core `model.py` — see `docs/harness_reorg_plan.md`.
+(`config.py`) and the core `model.py` — see `docs/history/harness_reorg_plan.md`.

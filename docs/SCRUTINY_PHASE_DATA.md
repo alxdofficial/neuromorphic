@@ -74,7 +74,11 @@ skip on unreachable). `kind` gates which tasks accept it.
 | `quality` | QuALITY (abstractive MC) | registered but **not** in the default mix (needs ctx≥4096) |
 
 Unwired scaffolding (registered, intentionally inert): `mqar`, `ruler_overwrite` (+ `tasks/overwrite.py`),
-`quality`. Every QA source tags `meta["dataset"]` so per-example provenance flows into `task_family`.
+`quality`. Also registered but not in the scrutiny-phase mix: the 12 Phase-1 full-corpus sources shipped
+2026-07-08 (`wildchat`, `lmsys_chat`, `msc`, `qasper`, `longcite`, `govreport`, `pg19`, `ruler_niah`,
+`babilong_train`, `wikibigedit`, `swe_trajectories`, `perltqa`) — these back the *next* phase, not this
+sweep; see `docs/DATA_PHASES_PLAN.md`. Every QA source tags `meta["dataset"]` so per-example provenance
+flows into `task_family`.
 
 ---
 

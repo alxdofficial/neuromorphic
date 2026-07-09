@@ -13,8 +13,11 @@ script, and nothing is stored under `data/` for them:
 - `hotpot`    → HF `hotpot_qa` distractor (reader: `src/memory/data/hotpot.py`)
 - `musique`   → HF `dgslibisey/MuSiQue`   (reader: `src/memory/data/musique.py`)
 - `narrativeqa` → HF `narrativeqa`        (reader: `src/memory/data/narrativeqa.py`)
+- `longmemeval` → HF hub file download    (reader: `src/memory/data/longmemeval.py`)
+- `longbench` → HF hub `data.zip`/`data.json` (v1+v2) (reader: `src/memory/data/longbench.py`)
+- `infinitebench` → HF hub per-subtask file (reader: `src/memory/data/infinitebench.py`)
 
-`ruler` is fully synthesized at runtime (no download). `locomo` is a static
+`ruler` and `niah` are fully synthesized at runtime (no download). `locomo` is a static
 JSON auto-downloaded once to `data/eval/locomo10.json`.
 
 ## Shipped ingest scripts
@@ -23,7 +26,10 @@ Each of these is a `<name>/download.py` that pulls from HF, cleans, and writes
 
 - `code/`, `hotpot_train/`, `multiwoz/`, `musique_train/`, `pile/`, `quality/`,
   `redpajama/`, `squad/`, `triviaqa/` — training sources (RC-QA variety for
-  `qa_rc`, corpus variety for `continuation` via `multicorpus`, etc.).
+  `doc_qa` via `qa_multi`, corpus variety for `continuation` via `multicorpus`, etc.).
+- **Phase-1 full-corpus sources (shipped 2026-07-08, not yet in the scrutiny-phase mix):**
+  `babilong_train/`, `govreport/`, `lmsys_chat/` (gated), `longcite/`, `msc/`, `perltqa/`, `pg19/`,
+  `qasper/`, `swe_trajectories/`, `wikibigedit/`, `wildchat/`. See `docs/DATA_PHASES_PLAN.md`.
 
 ## TODO — scripts to add (Tier-B)
 - `fineweb.py`  — build `data/fineweb_edu/{train,val}.parquet` (the mae/

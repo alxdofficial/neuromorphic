@@ -25,6 +25,9 @@ from .models.slotgraph import SlotGraphEncoder
 from .models.slotgraph2 import SlotGraph2Encoder
 from .models.slotgraph3 import SlotGraph3Encoder
 from .models.vqicae import VQICAEEncoder
+from .models.memoryllm import MemoryLLMBaselineEncoder
+from .models.gisting import GistingBaselineEncoder
+from .models.titans import TitansEncoder
 from .models.vanilla import FullContextEncoder, NullEncoder
 from .decoder import FrozenLlamaDecoder, disable_lora
 
@@ -77,6 +80,15 @@ class ReprLearningModel(nn.Module):
         "slotgraph3_baseline": SlotGraph3Encoder,
         # ICAE but each slot is a VQ-VAE code from a large codebook (discreteness experiment).
         "vqicae_baseline": VQICAEEncoder,
+        # MemoryLLM (arXiv:2402.04624): fixed per-layer latent pool + compress-then-RANDOM-DROP
+        # self-update, read as per-layer KV (native per-layer-KV read) (models/memoryllm/).
+        "memoryllm_baseline": MemoryLLMBaselineEncoder,
+        # Gisting (arXiv:2304.08467): learnable gist tokens compress context into their per-layer
+        # KV ("gist caching") — native per-layer-KV read (models/gisting/).
+        "gisting_baseline": GistingBaselineEncoder,
+        # Titans (arXiv:2501.00663): deep-MLP neural memory updated by a TEST-TIME gradient step
+        # (learns to memorize at test time); MAC prepend read (models/titans/).
+        "titans_baseline": TitansEncoder,
         "vanilla_llama": NullEncoder,         # loss floor — Llama with no memory
         "vanilla_full_context": FullContextEncoder,  # loss ceiling — Llama sees full evidence
     }
@@ -263,7 +275,8 @@ class ReprLearningModel(nn.Module):
     _MASKED_RECON_COMPRESSORS = ("icae_baseline", "ccm_baseline",
                         "autocompressor_baseline", "beacon_baseline",
                         "slotgraph_baseline", "slotgraph2_baseline",
-                        "slotgraph3_baseline", "vqicae_baseline")
+                        "slotgraph3_baseline", "vqicae_baseline",
+                        "memoryllm_baseline", "gisting_baseline", "titans_baseline")
 
     def compute_masked_reconstruction_loss(
         self,
@@ -356,38 +369,45 @@ class ReprLearningModel(nn.Module):
         rnd = torch.rand(B, T, device=device)                          # eval: seeded in run_val
         masked = (rnd < mask_ratio) & batch.context_mask
         dec_in = torch.where(masked.unsqueeze(-1), mask_vec.view(1, 1, -1), ctx_embeds)
-        full = torch.cat([memory, dec_in], dim=1)                      # [B, M+T, d]
-        attn = torch.cat([mem_mask, batch.context_mask.float()], dim=1).long()
-        if getattr(self.cfg, "rect_prepend_mask", False) and getattr(self.cfg, "bidir_mem_attn", False):
-            raise ValueError("rect_prepend_mask and bidir_mem_attn are mutually exclusive read geometries")
-        if getattr(self.cfg, "rect_prepend_mask", False) and M > 0:
-            attn = self._rect_prepend_mask(attn, M, full.dtype)        # [B,1,L,L] 4-D additive
-        elif getattr(self.cfg, "bidir_mem_attn", False) and M > 0:
-            attn = self._bidir_prepend_mask(attn, M, full.dtype)       # Set-LLM: bidirectional memory block
-        pos_ids = (self._uniform_mem_position_ids(B, M, full.shape[1], device)
-                   if getattr(self.cfg, "uniform_mem_pos", False) and M > 0 else None)
+        if getattr(self.encoder, "reads_per_layer_kv", False) and not zero_memory and mem_aux.get("past_kv") is not None:
+            # per-layer-KV native read (Beacon/MemoryLLM): memory[:, :M] is empty; inject the
+            # encoder's per-layer (K,V) as a prefix cache. dec_in stays memory-free (text-only out).
+            span_hidden = self._prefix_kv_forward(
+                dec_in, batch.context_mask, mem_aux["past_kv"], mem_aux.get("memory_mask"),
+                shuffle_memory=shuffle_memory, shuffle_roll=shuffle_roll)
+        else:
+            full = torch.cat([memory, dec_in], dim=1)                  # [B, M+T, d]
+            attn = torch.cat([mem_mask, batch.context_mask.float()], dim=1).long()
+            if getattr(self.cfg, "rect_prepend_mask", False) and getattr(self.cfg, "bidir_mem_attn", False):
+                raise ValueError("rect_prepend_mask and bidir_mem_attn are mutually exclusive read geometries")
+            if getattr(self.cfg, "rect_prepend_mask", False) and M > 0:
+                attn = self._rect_prepend_mask(attn, M, full.dtype)    # [B,1,L,L] 4-D additive
+            elif getattr(self.cfg, "bidir_mem_attn", False) and M > 0:
+                attn = self._bidir_prepend_mask(attn, M, full.dtype)   # Set-LLM: bidirectional memory block
+            pos_ids = (self._uniform_mem_position_ids(B, M, full.shape[1], device)
+                       if getattr(self.cfg, "uniform_mem_pos", False) and M > 0 else None)
 
-        # biomem: query-conditioned READ — a zero-init pre-hook at the tap layer reads
-        # every position's hidden through the frozen written edges and fuses the recall
-        # back. REAL = read; OFF (zero_memory) = no read; SHUF = read wrong-example edges.
-        hook_handle = self._install_conditioned_read_hook(zero_memory, shuffle_memory, B)
-        # per-layer prepend re-injection hook (legacy): a no-op unless an encoder sets
-        # reinforce_prepend_each_layer + emits 'prepend_struct'. The current slotgraph does NEITHER
-        # (its structure lives entirely in the post-LM message-passing read), so this returns [].
-        reinforce = self._install_prepend_reinforce_hooks(mem_aux, M, 0, shuffle_memory)
-        # biomem-prepend: re-read W at every layer with the current slot hiddens (no-op for others).
-        refresh = self._install_prepend_refresh_hooks(M, 0, zero_memory, shuffle_memory)
-        try:
-            base_out = self.decoder.llama.model(
-                inputs_embeds=full, attention_mask=attn, position_ids=pos_ids, use_cache=False)
-        finally:
-            if hook_handle is not None:
-                hook_handle.remove()
-            for hh in reinforce:
-                hh.remove()
-            for hh in refresh:
-                hh.remove()
-        span_hidden = base_out.last_hidden_state[:, M:]                 # [B,T,d]
+            # biomem: query-conditioned READ — a zero-init pre-hook at the tap layer reads
+            # every position's hidden through the frozen written edges and fuses the recall
+            # back. REAL = read; OFF (zero_memory) = no read; SHUF = read wrong-example edges.
+            hook_handle = self._install_conditioned_read_hook(zero_memory, shuffle_memory, B)
+            # per-layer prepend re-injection hook (legacy): a no-op unless an encoder sets
+            # reinforce_prepend_each_layer + emits 'prepend_struct'. The current slotgraph does NEITHER
+            # (its structure lives entirely in the post-LM message-passing read), so this returns [].
+            reinforce = self._install_prepend_reinforce_hooks(mem_aux, M, 0, shuffle_memory)
+            # biomem-prepend: re-read W at every layer with the current slot hiddens (no-op for others).
+            refresh = self._install_prepend_refresh_hooks(M, 0, zero_memory, shuffle_memory)
+            try:
+                base_out = self.decoder.llama.model(
+                    inputs_embeds=full, attention_mask=attn, position_ids=pos_ids, use_cache=False)
+            finally:
+                if hook_handle is not None:
+                    hook_handle.remove()
+                for hh in reinforce:
+                    hh.remove()
+                for hh in refresh:
+                    hh.remove()
+            span_hidden = base_out.last_hidden_state[:, M:]             # [B,T,d]
 
         # ---- 4. CE on masked positions (predict t_p from hidden p-1) ----
         pred_hidden = span_hidden[:, :-1]                              # predicts t_1..t_{T-1}
@@ -526,6 +546,36 @@ class ReprLearningModel(nn.Module):
         rest = torch.arange(1, L - M + 1, device=device)
         pos = torch.cat([torch.zeros(M, device=device, dtype=torch.long), rest], dim=0)
         return pos.unsqueeze(0).expand(B, -1)
+
+    def _prefix_kv_forward(self, inputs_embeds, base_mask, past_kv, memory_mask,
+                           *, shuffle_memory=False, shuffle_roll=1):
+        """Per-layer-KV READ (Beacon / MemoryLLM native): inject the encoder's per-layer (K, V)
+        as a NON-CAUSAL DynamicCache prefix and forward the frozen decoder over ``inputs_embeds``
+        alone. Returns TEXT-ONLY hidden [B, T, d] — the memory keys are attended-to only (no
+        residual, no ``[:, M:]`` slice needed). SHUF rolls the KV + mask along the batch in lockstep
+        (the caller's M==0 packing means the prepend-path SHUF at compute_loss L890 is skipped for
+        these arms, so the roll happens here). OFF is handled by the caller (never calls this)."""
+        from .decoder import build_prefix_cache
+        B = inputs_embeds.shape[0]
+        K, V = past_kv                                        # each: L × [B, n_kv_heads, M, head_dim]
+        mm = memory_mask
+        if shuffle_memory:
+            if B == 1:
+                raise ValueError("shuffle_memory (SHUF) requires batch size > 1.")
+            K = [torch.roll(k, shifts=int(shuffle_roll), dims=0) for k in K]
+            V = [torch.roll(v, shifts=int(shuffle_roll), dims=0) for v in V]
+            if mm is not None:
+                mm = torch.roll(mm, shifts=int(shuffle_roll), dims=0)
+        Mmem = K[0].shape[2]
+        if mm is None:
+            mm = torch.ones(B, Mmem, device=inputs_embeds.device)
+        # width Mmem + T: the mask keeps M memory columns even though inputs_embeds does not,
+        # because the DynamicCache prefix adds Mmem keys. cache_position defaults to arange(T)+Mmem.
+        attn = torch.cat([mm[:, :Mmem].to(base_mask.dtype), base_mask.to(base_mask.dtype)], dim=1).long()
+        cache = build_prefix_cache((K, V))
+        out = self.decoder.llama.model(inputs_embeds=inputs_embeds, attention_mask=attn,
+                                       past_key_values=cache, use_cache=True)
+        return out.last_hidden_state
 
     def _install_conditioned_read_hook(self, zero_memory: bool, shuffle_memory: bool, B=None):
         """Query-conditioned READ (biomem): register a pre-hook at the encoder's
@@ -1110,13 +1160,21 @@ class ReprLearningModel(nn.Module):
             _pos_qa = (self._uniform_mem_position_ids(B, M, T_total, device)
                        if (getattr(self.cfg, "uniform_mem_pos", False) and M > 0 and not zero_memory
                            and self.chat_template is None) else None)
-            base_out = self.decoder.llama.model(
-                inputs_embeds=full_embeds,
-                attention_mask=_attn_qa,
-                position_ids=_pos_qa,
-                use_cache=False,
-            )
-            hidden = base_out.last_hidden_state            # [B, T_total, d_llama]
+            if (getattr(self.encoder, "reads_per_layer_kv", False) and not zero_memory
+                    and finalize_aux.get("past_kv") is not None):
+                # per-layer-KV native read: M==0 above so full_embeds is memory-free ([pre,q,a]);
+                # inject the encoder's per-layer (K,V) as a prefix cache (memory attended as keys only).
+                hidden = self._prefix_kv_forward(
+                    full_embeds, attn_mask_full, finalize_aux["past_kv"], finalize_aux.get("memory_mask"),
+                    shuffle_memory=shuffle_memory, shuffle_roll=shuffle_roll)
+            else:
+                base_out = self.decoder.llama.model(
+                    inputs_embeds=full_embeds,
+                    attention_mask=_attn_qa,
+                    position_ids=_pos_qa,
+                    use_cache=False,
+                )
+                hidden = base_out.last_hidden_state        # [B, T_total, d_llama]
         finally:
             if hook_handle is not None:
                 hook_handle.remove()

@@ -8,7 +8,7 @@
 Goal: make the data layer **comprehensive and modular** — many datasets, many task styles, a
 configurable difficulty schedule, and objectives that compose — by decomposing the current
 *fused* readers into four orthogonal concepts. Builds **on top of** the completed 3-layer
-build/store/load reorg (`data_reorg_plan.md`) and the harness reorg (`harness_reorg_plan.md`);
+build/store/load reorg (`history/data_reorg_plan.md`) and the harness reorg (`history/harness_reorg_plan.md`);
 it further decomposes the **Load** layer and adds a **Schedule** and an **Objective** package.
 
 ## The four orthogonal concepts (the core idea)
@@ -54,6 +54,12 @@ The user's "folder per dataset name" is honored at **build** and **store** (alre
 > `multiwoz`, `quality`, `qa_multi` (the multi-source RC aggregator), `code`, `multicorpus` (the
 > fineweb+pile+redpajama+code aggregator backing `continuation`). See `sources/__init__.py` for the
 > live `SOURCE_REGISTRY`.
+>
+> Later update (2026-07-08): 12 more Phase-1 full-corpus sources shipped on top of those —
+> `wildchat`, `lmsys_chat`, `msc`, `qasper`, `longcite`, `govreport`, `pg19`, `ruler_niah`,
+> `babilong_train`, `wikibigedit`, `swe_trajectories`, `perltqa` — plus 4 Phase-2 eval readers in
+> `REGISTRY` (`longmemeval`, `longbench`, `infinitebench`, `niah`). None are wired into the current
+> scrutiny-phase `DEFAULT_TRAIN_MIX`; see `docs/DATA_PHASES_PLAN.md`.
 
 A **Source** yields raw *items* and (optionally) a noise pool. It does NO windowing, query
 placement, or distractor insertion. Item kinds + the interface tasks consume:
@@ -171,9 +177,9 @@ Split the flat `objectives.py` into a package (keep the extracted fns byte-ident
    write the data-arch section; remove stale reader-layout references.
 
 ## Doc reconciliation (no contradictory leftovers)
-- `data_reorg_plan.md` — **completed**; still correct for build/store and the 3-layer split. Add a
+- `history/data_reorg_plan.md` — **completed**; still correct for build/store and the 3-layer split. Add a
   header: "Load-layer reader structure superseded by `data_arch_plan.md` (Source/Task split)."
-- `harness_reorg_plan.md` — **completed**; complementary. The objectives-package split here extends
+- `history/harness_reorg_plan.md` — **completed**; complementary. The objectives-package split here extends
   it; add a one-line cross-ref.
 - `DATASETS.md` / `HARNESS.md` — **living indexes**; updated in Phase 7 to the new structure (not
   contradictory, just kept in sync).

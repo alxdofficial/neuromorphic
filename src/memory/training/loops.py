@@ -133,8 +133,13 @@ def train_mixed_variant(
 
     _mode_banner = str(getattr(cfg, "objective_mode", "plain"))
     if _mode_banner != "plain" or float(getattr(cfg, "contrastive_shuf_coef", 0.0)) > 0:
+        # InfoNCE is ONLY the contrastive/trajectory GradCache path — behavioral_kl applies CE+KL
+        # only (no InfoNCE), so advertise the KL terms for it instead (the old banner mislabeled it).
+        _is_nce = _mode_banner in ("contrastive", "trajectory")
         print(f"[objective] mode={_mode_banner}"
-              + (f"  InfoNCE coef={cfg.objective_coef} ({'in-batch, all B-1 negatives'})" if _mode_banner != 'plain' else "")
+              + (f"  InfoNCE coef={cfg.objective_coef} (in-batch, all B-1 negatives)" if _is_nce else "")
+              + (f"  KL(teacher‖student) coef={cfg.kl_coef} + CE coef={cfg.kl_ce_coef}, temp={cfg.kl_temp}"
+                 if _mode_banner == "behavioral_kl" else "")
               + (f"  GRPO G={cfg.grpo_samples} coef={cfg.grpo_coef} (router-only REINFORCE)"
                  if _mode_banner == "trajectory" else "")
               + (f"  legacy softplus coef={cfg.contrastive_shuf_coef}"

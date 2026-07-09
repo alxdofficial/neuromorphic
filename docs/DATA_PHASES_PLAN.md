@@ -2,8 +2,20 @@
 
 Plan for the two phases *after* the architecture-scrutiny phase, synthesizing a research sweep (2025-era
 memory/compression literature) with our prior data audit. Companion to `SCRUTINY_PHASE_DATA.md` (phase-0
-data) and `DATA_TASK_GUIDE.md`. **Status: PLAN — not yet built.** Dataset numbers/licenses were research-
-gathered; verify before ingesting (see "Verify-before-use" at the end).
+data) and `DATA_TASK_GUIDE.md`. **Status: PLAN — not yet TRAINED on / not yet evaluated.** Dataset
+numbers/licenses were research-gathered; verify before ingesting (see "Verify-before-use" at the end).
+
+> **UPDATE (2026-07-08): the Phase-1 sources + Phase-2 eval readers below have SHIPPED as code** (they
+> exist in `SOURCE_REGISTRY`/`REGISTRY` and can be loaded), but are **not yet in `DEFAULT_TRAIN_MIX`** —
+> the architecture-scrutiny sweep (`SCRUTINY_PHASE_DATA.md`) still trains only on the 5-task mix. Shipped
+> Phase-1 sources: `wildchat`, `lmsys_chat` (gated), `msc`, `qasper`, `longcite`, `govreport`, `pg19`,
+> `ruler_niah`, `babilong_train`, `wikibigedit`, `swe_trajectories`, `perltqa`. Shipped Phase-2 eval
+> readers: `longmemeval`, `longbench`, `infinitebench`, `niah`. Still NOT built: `streaming_update`/
+> `trajectory`/`tool_call` task styles, the `grpo` objective, weighted-mix/`Curriculum` wiring, the
+> `books`/`arxiv`/`long_web`/`long_wiki`/`ultrachat`/`ms_tod`/`repo`/`commits`/`swebench_train`/
+> `webarena_traces`/`aitw`/`toolbench`/`agent_instruct`/`gsm8k`/`math`/`apps` sources (see also
+> the former `docs/PHASE_PLAN.md`, now MERGED into this doc — its `books` ≈ this doc's shipped
+> `pg19`, its `multisession_chat` ≈ this doc's shipped `msc`).
 
 ## The three phases
 
@@ -89,22 +101,29 @@ encoder-KL anchor. **Start on RULER + BABILong** (unlimited, cheap exact-match, 
 streaming-write/overwrite gap), validate the loop, then add QASPER/LongCite (real long-doc) + SWE-Gym.
 
 ### Phase-1 top-8 dataset shortlist (genuine long-range dependency AND cheap verifiable reward)
-Ranked by fit; paths + licenses research-gathered (verify before ingest):
+Ranked by fit; paths + licenses research-gathered (verify before ingest). **Shipped-as-code status
+(2026-07-08) annotated per item** — shipping the Source doesn't mean it's wired into `DEFAULT_TRAIN_MIX`
+or that the GRPO/streaming-write task built on top of it exists yet (see the update note at the top):
 1. **RULER generator** (`NVIDIA/RULER`, research-use) — unlimited synthetic long-context, exact-match, and
-   the base for the fork-overwrite streaming-write data. **Start here.**
+   the base for the fork-overwrite streaming-write data. **Start here.** — **shipped as `sources/ruler_niah.py`**
+   (the overwrite-fork task itself is the separate `ruler_overwrite` source, already in the scrutiny mix).
 2. **SWE-Gym** (`SWE-Gym/SWE-Gym`, MIT, prebuilt Docker envs) — cheapest real repo-scale execution reward.
+   NOT shipped (distinct from the shipped `swe_trajectories` static reward-labeled source below).
 3. **QASPER** (`allenai/qasper`, CC-BY-4.0) — real train split, provably non-gist-gameable, span/yes-no/
-   unanswerable → EM + a built-in refusal axis.
+   unanswerable → EM + a built-in refusal axis. — **shipped as `sources/qasper.py`**.
 4. **LongCite-45k** (`zai-org/LongCite-45k`, Apache-2.0) — 128k-word contexts, citation-span verification =
-   purely programmatic long-range reward.
+   purely programmatic long-range reward. — **shipped as `sources/longcite.py`**.
 5. **BABILong-train** (`RMT-team/babilong-train-5k-samples`, Apache/BSD) — facts-in-haystack, exact-match,
-   public generator; extends our bAbI line.
+   public generator; extends our bAbI line. — **shipped as `sources/babilong_train.py`**.
 6. **WikiBigEdit** (`lukasthede/WikiBigEdit`, Apache-2.0, 502k, 8 sequential timesteps) — the only
-   train-scale genuinely-streaming EM-rewardable set; direct fit for the forced-forgetting gate.
+   train-scale genuinely-streaming EM-rewardable set; direct fit for the forced-forgetting gate. —
+   **shipped as `sources/wikibigedit.py`**.
 7. **R2E-Gym / Nebius-SWE-agent-trajectories** (`R2E-Gym/R2E-Gym-V1` Apache; `nebius/SWE-agent-trajectories`
-   CC-BY-4.0, 80k reward-labeled) — scale execution-verified repo RL + SFT warm-start.
+   CC-BY-4.0, 80k reward-labeled) — scale execution-verified repo RL + SFT warm-start. — the Nebius half
+   **shipped as `sources/swe_trajectories.py`**; R2E-Gym itself NOT shipped.
 8. **PerLTQA + LoCoMo-generation** (`Elvin-Yiming-Du/PerLTQA` train 5,155 CC-BY-NC; `snap-research/locomo`
-   generator) — the only checkable conversational-memory train set + the scriptable recipe to scale it.
+   generator) — the only checkable conversational-memory train set + the scriptable recipe to scale it. —
+   PerLTQA **shipped as `sources/perltqa.py`**; the LoCoMo-generation recipe NOT built.
 
 *Honorable mentions:* RepoQA / LoCoDiff (clean long-code memory probes), LongCoder/LCC (~100k train),
 Nemotron-RL-Agentic-Tool-Use-Pivot (RLVR tool-use), Big-Math-RL-Verified (math-needle reward sanity).
@@ -123,9 +142,9 @@ Nemotron-RL-Agentic-Tool-Use-Pivot (RLVR tool-use), Big-Math-RL-Verified (math-n
 > plot summary alone) — prefer QASPER/QMSum/LongCite for genuine long-range long-doc.
 
 ### Harness integration (Source × Task × EpisodeSpec × Objective)
-- **New Sources** (`sources/`): `msc`, `conversation_chronicles`, `temporalwiki`/`newsedits`,
-  `repobench_xfile`, `nemotron_agentic`, `swe_gym`, `gui_*`. Each gets a `pack_n_queries` + preprocessing
-  to ordered segments.
+- **New Sources** (`sources/`): `msc` — **shipped**. Still to add: `conversation_chronicles`,
+  `temporalwiki`/`newsedits`, `repobench_xfile`, `nemotron_agentic`, `swe_gym`, `gui_*`. Each gets a
+  `pack_n_queries` + preprocessing to ordered segments.
 - **New Tasks** (`tasks/`): **`streaming_update`** (ordered segments written sequentially, query the
   current value — the axis-2 task; needs the segment-stream batch contract + `chunk_offset`), **`trajectory`**
   (encode-history → next-action), **`tool_call`**.
@@ -157,7 +176,9 @@ converges on a protocol — emulate the strongest (CCM/Cartridges):
   *"match full-context quality at X× less KV-memory, Y× throughput"* (Cartridges: 38.6× / 26.4×).
 
 ### 2b. Memory / long-context benchmarks (the core panel)
-Have (eval readers): `babilong`, `locomo`, `ruler`, `narrativeqa`, `hotpot`, `musique`. Verdicts from the
+Have (eval readers): `babilong`, `locomo`, `ruler`, `narrativeqa`, `hotpot`, `musique` — **plus, shipped
+2026-07-08:** `longmemeval`, `longbench` (v1+v2), `infinitebench`, `niah` (all in `REGISTRY`, not yet run
+as the headline table below). Verdicts from the
 sweep (differentiator = score collapses without context AND can't be recovered from the frozen decoder's
 parametric knowledge):
 
@@ -239,3 +260,102 @@ compression paper used it).
 - Competitor numbers: spot-check the papers' PDFs before quoting (several were HTML-summarizer-extracted).
 - Positioning claim (repo-code scooped) is high-confidence; the "soft-token trajectory" white space is
   moderate-high — re-check for new arXiv before submission.
+
+---
+
+# Test-eval: comparison axes, run matrix & invariants
+
+> **Consolidated from the former `docs/PHASE_PLAN.md` (2026-07-09 docs cleanup).** This is the
+> single canonical phase plan; the full-corpus training data/objectives are in **PHASE 1** above,
+> the headline table + benchmark panels in **PHASE 2** above, and the test-eval comparison
+> framework + cross-phase invariants below. If this doc disagrees with the code, the code wins.
+
+## What "phase" means
+
+| phase | trains? | question | data character | scale (ctx / steps) |
+|---|---|---|---|---|
+| **architecture-scrutiny** (Phase 0, current) | yes | *which encoder architecture binds best?* | controlled / synthetic / short (bio, babi, fineweb) | 2k ctx, 4–8k steps, M=96 |
+| **full-corpus** (Phase 1) | yes | *is the chosen memory genuinely useful on real tasks?* | real long docs / chat / agents / code | 8k–32k ctx, 20–50k steps, M=96–192 |
+| **test-eval** (Phase 2) | **no** | *how does LM+memory compare to the alternatives?* | canonical benchmarks only | benchmark-defined |
+
+**The four decisive comparison axes (test-eval must cover all four):** (1) vs same-backbone
+**long-context** (does compression+memory beat raw extended context at equal-or-lower decode
+FLOPs?); (2) vs same-backbone **RAG** (does implicit memory beat explicit retrieval at equal
+decoder-read budget?); (3) vs **bigger frozen LM + same memory** (does binding transfer across
+backbones?); (4) vs **other memory projects** on their own benchmarks.
+
+## Axis 1 — long-context (vs extended-context LM). Run at 4k/8k/16k/32k → length-vs-accuracy curve.
+| benchmark | what | reader | metric |
+|---|---|---|---|
+| ✅ `ruler` | NIAH / multi-key / var-tracking / KV-retrieval | `data/ruler.py` | accuracy |
+| ✅ `locomo` | very-long-term dialogue memory | `data/locomo.py` | judge + EM |
+| ✅ `babilong` | bAbI-in-haystack | `data/babilong.py` | EM |
+| ✅ `longbench` (v1+v2) | 21 tasks / 503 hard MCQ (incl. code-repo, structured) | `data/longbench.py` | task-specific |
+| ✅ `infinitebench` | 100k+ tok; `Retrieve.KV`, `Code.Debug`, `Math.Find` | `data/infinitebench.py` | accuracy/ROUGE |
+| ✅ `niah` | needle-in-haystack (extend to multi-needle 64:1) | `data/niah.py` | accuracy |
+
+A memory paper without LongBench + ∞Bench is not comparable to the literature.
+
+## Axis 2 — RAG (vs same-backbone retriever). New eval-harness **mode** `--eval-arm rag`: swap the
+encoder for BM25 / e5-base-v2 prepending top-k chunks at the SAME decoder-read budget (M tokens).
+Headline: at equal decoder-read budget, does implicit memory beat explicit retrieval? (+ `locomo_rag`.)
+
+## Axis 3 — backbone scaling. Re-run axis-1 with `--backbone Qwen/Qwen2.5-{1.5B,3B}` (frozen) + the
+same trained encoder. A config matrix, no new benchmarks. Chart: memory benefit vs backbone size.
+
+## Axis 4 — vs external memory projects (MemGPT/Landmark/A-MEM/Mem0) on their benchmarks (= axis-1
+set + `multisession_chat_eval`, `ms_tod_eval`, optional `comedy`).
+
+## Base-capability regression (does memory DEGRADE the LM?). Run lm-eval-harness core on the
+memory-equipped model vs the bare frozen backbone via a thin `scripts/diagnostics/eval/lm_eval_runner.py`
+adapter (don't reimplement): `mmlu`, `hellaswag`, `arc_challenge`, `winogrande`, `truthfulqa`,
+`gsm8k`, `humaneval`/`mbpp`, `lambada`. **Pass = memory ≥ bare backbone within noise on every task**;
+any degradation is a headline-negative result.
+
+## Instruction/chat quality (fixed frozen judge): `mtbench`, `alpaca_eval`, `ifeval`, `longbench_chat`.
+## Agentic / SWE (final checkpoint only — expensive): `swebench_verified` (the strongest "is this
+useful" headline), `webarena`, `gaia`, `tau_bench`.
+## Binding-gate diagnostics carry over from scrutiny (REAL/SHUF/OFF + `babi_em` + structure canaries)
+as **diagnostics, not headline** — they explain *why* a model uses memory, on any bench with a SHUF control.
+
+## Config matrix & run plan
+One full-corpus checkpoint → scored across the 4-axis matrix by `scripts/diagnostics/eval/run_testeval_suite.py`:
+```
+for arm in [memory_equipped, long_context_32k, long_context_64k, rag, bigger_backbone+memory, bare_frozen]:
+  for bench in [ruler, locomo, babilong, longbench, infinitebench, multisession_chat, mmlu, …, swebench_verified]:
+    for length in [4k, 8k, 16k, 32k]:  run eval → outputs/testeval/<arm>_<bench>_<length>.json
+```
+Headline table (arm × benchmark-family) + length-vs-accuracy curves → `docs/testeval_results.md`.
+Report memory arms at **M=96 (matched) AND M=192 (scaling)**; hold decoder-read tokens EQUAL across
+memory vs RAG; fix + name the judge model in every table caption.
+
+## Open decisions (call before implementation)
+1. **Frozen 135M throughout full-corpus** (the comparability anchor); axis-3 is a test-eval-only
+   scaling probe; restrict stage-3 GRPO to *binding*-verifiable rewards (EM-QA / slot / code-binding),
+   not *reasoning*-verifiable (skip gsm8k/math until a bigger backbone is on the table).
+2. **Context ceiling**: SmolLM2-135M native RoPE = 8192; extend to 32k via NTK/YaRN on frozen weights
+   (needs the `transformers>=5.0` HF cache API). If 32k unstable, cap at 16k (still 170:1 at M=96).
+3. **GUI data**: text a11y-tree only (covers webarena/tau_bench without a vision detour).
+4. **Mix representation**: extend `mixes.py` in place behind a `--phase` flag (scrutiny preset stays
+   byte-identical as the default), not a parallel `mixes_full.py`.
+5. **External eval harness** (`lm_eval`/`swebench`/`webarena`): thin adapters in
+   `scripts/diagnostics/eval/`, not `src/memory/data/` (in-tree `REGISTRY` readers stay for in-tree benches).
+
+## Sequencing (dependency order)
+1. Long-corpus sources + doc-disjoint firewall → unblocks stage-1 + the length curriculum (cheapest, highest leverage).
+2. `multisession` task + chat/multisession sources → the core differentiator; unblocks axis-4.
+3. Test-eval readers (longbench/infinitebench) BEFORE the full-corpus run (scoring suite ready + catch contamination early).
+4. Weighted mixes + `Curriculum` wiring + `--phase` flag → the harness keystone.
+5. `repo`/`repo_qa` (code binding) → pairs with SWE-bench.
+6. Verifiable-reward GRPO → only after storage+addressing are solid (riskiest; lands last).
+7. Agentic task + sources + agent evals → most novel/expensive; after the text+code foundation is proven.
+(1–3 low-risk parallel; 4 is the keystone; 5–7 stack on top.)
+
+## Invariants (across both new phases; inherited from `SCRUTINY_PHASE_DATA.md` §10)
+1. **Causality** — a queried fact is always written before the query (session/turn N's query after its write).
+2. **Un-guessability** — the answer requires the compressed context; distractors never contain it.
+3. **Fixed compression denominator** — every context is exactly `total_len` (phase-scheduled); `M` uniform across arms.
+4. **Train/eval firewall** — every full-corpus train source is disjoint from every test-eval benchmark.
+5. **Frozen-backbone comparability** — backbone frozen in every arm except the decoder-LoRA (reported per-result).
+6. **Decode-budget parity** — memory arm and RAG arm read the SAME #decoder tokens (M ≈ K chunks); long-context reads more.
+7. **No silent Goodhart** — GRPO only with an external checker; binding-advantage reward stays a diagnostic, never a headline training signal.

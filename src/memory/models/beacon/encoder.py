@@ -92,6 +92,13 @@ class BeaconBaselineEncoder(nn.Module):
                     self._beacon_layers.append(w)
                     n_wrapped += 1
         self.base = base
+        _bc = base.config
+        self.n_kv_heads = getattr(_bc, "num_key_value_heads", None) or _bc.num_attention_heads
+        self.head_dim = getattr(_bc, "head_dim", None) or (_bc.hidden_size // _bc.num_attention_heads)
+        # NATIVE Beacon read = per-layer KV (the beacon key/value activations at EVERY layer),
+        # restored via the shared per-layer-KV path. beacon_read='prepend' keeps the legacy
+        # last-hidden prepend as an A/B control.
+        self.reads_per_layer_kv = (getattr(cfg, "beacon_read", "kv") == "kv")
         embed = base.get_input_embeddings()
         with torch.no_grad():
             mean_vec = embed.weight.float().mean(dim=0)
@@ -163,18 +170,45 @@ class BeaconBaselineEncoder(nn.Module):
             seq = torch.cat([prefix.to(seq.dtype), seq], dim=1)
             msk = torch.cat([pm.bool(), msk], dim=1)
             is_beacon = torch.cat([pb, is_beacon], dim=1)
+        # Capture per-layer beacon K,V (the NATIVE Beacon memory = keys/values at EVERY layer)
+        # via forward-hooks on each layer's k_proj/v_proj; the NEW beacons' K,V accumulate across
+        # windows exactly like the last-hidden readout below.
+        Ln = len(self.base.model.layers)
+        kbuf, vbuf, handles = [None] * Ln, [None] * Ln, []
+        if self.reads_per_layer_kv:
+            for _li, _layer in enumerate(self.base.model.layers):
+                handles.append(_layer.self_attn.k_proj.register_forward_hook(
+                    (lambda i: (lambda m, inp, o: kbuf.__setitem__(i, o)))(_li)))
+                handles.append(_layer.self_attn.v_proj.register_forward_hook(
+                    (lambda i: (lambda m, inp, o: vbuf.__setitem__(i, o)))(_li)))
         self._mask[0] = is_beacon.unsqueeze(-1).to(seq.dtype)
         try:
             h = self.base.model(inputs_embeds=seq, attention_mask=msk.long()).last_hidden_state
         finally:
             self._mask[0] = None
+            for _hh in handles:
+                _hh.remove()
         pos = is_beacon[0].nonzero(as_tuple=False).squeeze(-1)   # same across batch
-        new_beacons = h[:, pos, :]                    # [B, n_beacon, d]
+        new_beacons = h[:, pos, :]                    # [B, n_beacon, d]  (telemetry / prepend mode)
         new_valid = msk[:, pos]                       # [B, n_beacon] bool: beacon's unit had real tokens
         new_mem = new_beacons if prefix is None else torch.cat([prefix, new_beacons], dim=1)
         all_valid = (new_valid if prev_valid is None
                      else torch.cat([prev_valid, new_valid], dim=1))
-        return {**state, "mem": new_mem, "valid": all_valid}, {}
+        out_state = {**state, "mem": new_mem, "valid": all_valid}
+        if self.reads_per_layer_kv:
+            Bn, nnew = seq.shape[0], int(pos.numel())
+            def _to_kv(t):    # [B, seq, n_kv*hd] → beacon positions → [B, n_kv_heads, n_new, head_dim]
+                return t[:, pos, :].view(Bn, nnew, self.n_kv_heads, self.head_dim).permute(0, 2, 1, 3)
+            Knew = [_to_kv(kbuf[i]) for i in range(Ln)]
+            Vnew = [_to_kv(vbuf[i]) for i in range(Ln)]
+            pk = state.get("past_kv")
+            if pk is None:
+                out_state["past_kv"] = (Knew, Vnew)
+            else:
+                Kacc, Vacc = pk
+                out_state["past_kv"] = ([torch.cat([Kacc[i], Knew[i]], dim=2) for i in range(Ln)],
+                                        [torch.cat([Vacc[i], Vnew[i]], dim=2) for i in range(Ln)])
+        return out_state, {}
 
     def forward(self, token_embeds, attention_mask=None, mask_positions=None):
         """Legacy single-window path (non-QA losses). Closed-book: no question."""
@@ -191,7 +225,14 @@ class BeaconBaselineEncoder(nn.Module):
             mem = torch.zeros(state["B"], 1, self.cfg.d_llama,
                               device=state["device"], dtype=torch.float32)
             valid = torch.ones(state["B"], 1, device=state["device"], dtype=torch.bool)
-        # Per-beacon validity → memory_mask so the decoder never attends to a beacon that
-        # summarized only padding (consumed in compute_loss + the MAE prepend path).
+        if self.reads_per_layer_kv and state.get("past_kv") is not None:
+            # NATIVE per-layer-KV read: empty prepend memory (M=0 in the decoder layout); the
+            # beacon K,V ride in aux['past_kv'] and are injected as a non-causal cache prefix.
+            empty = torch.zeros(mem.shape[0], 0, self.cfg.d_llama,
+                                device=mem.device, dtype=torch.float32)
+            return empty, {"past_kv": state["past_kv"], "memory_mask": valid,
+                           "read_mode": "per_layer_kv"}
+        # Legacy prepend (beacon_read='prepend'): per-beacon validity → memory_mask so the decoder
+        # never attends to a beacon that summarized only padding.
         aux = {} if valid is None else {"memory_mask": valid}
         return self.norm(mem.float()), aux

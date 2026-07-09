@@ -31,8 +31,8 @@ class NullEncoder(nn.Module):
         # zero-width tensor so finalize_memory can recover B and the device.
         return torch.zeros(batch_size, 0, self.cfg.d_llama, device=device, dtype=dtype)
 
-    def streaming_write(self, state, token_embeds, attention_mask=None, chunk_offset=0):
-        del chunk_offset  # Null encoder has no encoder modules
+    def streaming_write(self, state, token_embeds, attention_mask=None, chunk_offset=0, **extra):
+        del chunk_offset, extra  # Null encoder has no encoder modules (ignores surprise etc.)
         return state, {}
 
     def finalize_memory(self, state: Tensor) -> tuple[Tensor, dict]:
@@ -96,11 +96,11 @@ class FullContextEncoder(nn.Module):
             "_dtype": dtype,
         }
 
-    def streaming_write(self, state, token_embeds, attention_mask=None, chunk_offset=0):
+    def streaming_write(self, state, token_embeds, attention_mask=None, chunk_offset=0, **extra):
         # Accumulate raw embeddings across the streaming windows. attention_mask
         # is honored: padded positions still occupy slots but are zero-vectored
         # so the decoder's positional encoding tracks correctly.
-        del chunk_offset
+        del chunk_offset, extra  # full-context carries raw embeds; ignores surprise etc.
         if attention_mask is not None:
             mask = attention_mask.to(token_embeds.dtype).unsqueeze(-1)
             token_embeds = token_embeds * mask

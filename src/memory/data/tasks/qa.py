@@ -12,9 +12,23 @@ leaks — the unique renamed subject disambiguates). Consumes a `qa`-kind source
 """
 from __future__ import annotations
 
+import re
+
 from .base import Task
 from ._pack import Unit, pack_streaming_episode
 from ..schedule import EpisodeSpec
+
+
+def _guessable_from_q(refs, question) -> bool:
+    """True if any answer/alias appears verbatim (case-insensitive, word-boundary) in the question
+    itself — the frozen decoder reads the question, so such a gold leaks the answer WITHOUT memory
+    (SHUF gate passes for free). Word-boundary avoids over-rejecting ('Muse' inside 'Museum')."""
+    q = (question or "").lower()
+    for r in refs:
+        r = (r or "").strip().lower()
+        if r and re.search(r"\b" + re.escape(r) + r"\b", q):
+            return True
+    return False
 
 
 class QATask(Task):
@@ -36,6 +50,22 @@ class QATask(Task):
             items = source.sample(rng, nq + max(spec.n_inputs, spec.total_len // 24))
         if len(items) < nq:
             return None
+
+        # Question-side un-guessability: gold (items[:nq]) must be drawn from items whose OWN question
+        # does not contain the answer verbatim. A gold question that embeds its answer (hotpot compare
+        # "…Muse or The Raconteurs?", triviaqa MC, multiwoz slot=hotel) leaks through the readable
+        # question, so the SHUF gate passes without memory — deflating doc_qa SHUF−REAL (2026-07-08
+        # sweep). Reorder so clean items are gold; leaky ones stay as distractors (write-only). babi
+        # (rename) leaks ~0% so this is a no-op there.
+        def _q_leaks(it):
+            refs = [it.answer] + list((it.meta or {}).get("aliases", []))
+            return _guessable_from_q(refs, it.question)
+        clean = [it for it in items if not _q_leaks(it)]
+        if len(clean) < len(items):
+            items = clean + [it for it in items if _q_leaks(it)]
+            nq = min(nq, len(clean))
+            if nq < 1:
+                return None
 
         def _unit(it, *, gold: bool):
             write = "".join(f.rstrip("\n") + "\n" for f in it.facts)      # one fact per line

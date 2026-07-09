@@ -50,6 +50,12 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
     print("Loading Llama (shared across variants, frozen)...")
     llama, _ = load_frozen_llama(cfg.llama_model, dtype=torch.bfloat16)
+    if getattr(args, "compile_decoder", False):
+        # Compile the shared frozen decoder transformer once; dynamic=True absorbs the variable
+        # padding/answer-span lengths into one guard instead of recompiling per T_total. Both the
+        # student decode and the behavioral_kl teacher decode reuse this module.
+        llama.model = torch.compile(llama.model, dynamic=True)
+        print("[compile] torch.compile(dynamic=True) on shared decoder transformer")
 
     if args.probe_bs:
         print(f"\n[probe-bs] per-arm max batch size, conditioned-reconstruction N={args.cond_recon_n_pairs}, "
