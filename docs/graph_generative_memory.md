@@ -44,8 +44,9 @@ This front-loads every problem the project has been fighting:
   trajectory/GRPO objective (`docs/OBJECTIVES.md` Rung 5) — which we hold until the memory is competent.
 
 ## 3. How it's trained (when we get there)
-- **Bootstrap differentiably first:** the graph state + read is the `slotgraph4` substrate (dense node+edge
-  states, Perceiver read/write); train it to competence with behavioral-KL + MAE-CE + provenance-InfoNCE so
+- **Bootstrap differentiably first:** the graph state + read is the `slotgraph4` substrate (node slots +
+  fixed k-regular edge states, propose→commit gated write, prepend+bidir read); train it to competence
+  with behavioral-KL + MAE-CE + provenance-InfoNCE so
   the *representation* is competent before adding a discrete build policy.
 - **Then add the build policy (GRPO):** sample G build trajectories per window; reward = the
   **counterfactual ablation gap** (CFPO: `CE_no_memory − CE_real`, group-baselined) — policy-independent, so

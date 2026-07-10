@@ -24,6 +24,7 @@ from .models.biomem import BioMemEncoder
 from .models.slotgraph import SlotGraphEncoder
 from .models.slotgraph2 import SlotGraph2Encoder
 from .models.slotgraph3 import SlotGraph3Encoder
+from .models.slotgraph4 import SlotGraph4Encoder
 from .models.vqicae import VQICAEEncoder
 from .models.memoryllm import MemoryLLMBaselineEncoder
 from .models.gisting import GistingBaselineEncoder
@@ -78,6 +79,10 @@ class ReprLearningModel(nn.Module):
         # (sparsemax routing + φ(src,dst,edge) + endpoint ids) during write AND before read; prepend the
         # top-k edges/node — no raw slots (models/slotgraph3/).
         "slotgraph3_baseline": SlotGraph3Encoder,
+        # free-invent graph done right: N node slots + a FIXED k-regular small-world edge-state tensor
+        # (Watts-Strogatz); NO routing head; propose→commit gated write (no delta rule); prepend read
+        # (node-centric + top-k salience edges) (models/slotgraph4/).
+        "slotgraph4_baseline": SlotGraph4Encoder,
         # ICAE but each slot is a VQ-VAE code from a large codebook (discreteness experiment).
         "vqicae_baseline": VQICAEEncoder,
         # MemoryLLM (arXiv:2402.04624): fixed per-layer latent pool + compress-then-RANDOM-DROP
@@ -275,7 +280,7 @@ class ReprLearningModel(nn.Module):
     _MASKED_RECON_COMPRESSORS = ("icae_baseline", "ccm_baseline",
                         "autocompressor_baseline", "beacon_baseline",
                         "slotgraph_baseline", "slotgraph2_baseline",
-                        "slotgraph3_baseline", "vqicae_baseline",
+                        "slotgraph3_baseline", "slotgraph4_baseline", "vqicae_baseline",
                         "memoryllm_baseline", "gisting_baseline", "titans_baseline")
 
     def compute_masked_reconstruction_loss(
@@ -1379,7 +1384,7 @@ class ReprLearningModel(nn.Module):
         for _k, _v in (finalize_aux or {}).items():
             if not (_k.startswith("biomem_") or _k.startswith("slotgraph_")
                     or _k.startswith("slotgraph2_") or _k.startswith("slotgraph3_")
-                    or _k.startswith("vqicae_")):
+                    or _k.startswith("slotgraph4_") or _k.startswith("vqicae_")):
                 continue
             if torch.is_tensor(_v) and _v.numel() == 1:
                 out[_k] = _v.detach()

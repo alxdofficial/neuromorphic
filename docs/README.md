@@ -37,7 +37,7 @@ outer streaming checkpoint). All comparisons must be **same-backbone, matched-pa
 - **`data_arch_plan.md`** — the 4-layer data model (Source × Task × EpisodeSpec × Objective); where data code lives.
 - **`OBJECTIVES.md`** — the binding objective ladder (MAE-CE → behavioral-KL → provenance-InfoNCE → bypass-gap → GRPO), with math + citations. Why binding is an *objective* problem.
 - **`graph_thesis.md`** — why a graph memory (the two lenses), and what the literature says about making latent topology load-bearing instead of collapsing. The standing rationale.
-- **Graph-memory arm designs:** `furlgraph_design.md` (input-grounded chain-merge), `slotgraph4_design.md` (free-invent dense edge-state slots — differentiable, buildable now), `graph_generative_memory.md` (the "spider web" — score-function/GRPO-era). All deferred behind the baseline sweep.
+- **Graph-memory arm designs:** `furlgraph_design.md` (input-grounded chain-merge), `slotgraph4_design.md` (free-invent slots + fixed k-regular small-world edge states, propose→commit gated write — differentiable, buildable now), `graph_generative_memory.md` (the "spider web" — score-function/GRPO-era). All deferred behind the baseline sweep.
 - **`mamba_two_lenses_memory.md`** — research note: Mamba/linear-attention lenses on compress-and-recall.
 - **`history/`** — archived records of the superseded slotgraph/biomem/treemem line and completed reorg
   plans (`cohort_results`, `slotgraph_*`, `biomem_chunkwise_plan`, `{data,harness}_reorg_plan`, …).

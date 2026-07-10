@@ -397,6 +397,27 @@ class ReprConfig:
     slotgraph3_custom_dff: int = 1152    # custom write: block FFN hidden (2×d=1152 → ~13M UNMATCHED capacity probe)
     slotgraph3_custom_heads: int = 9     # custom write: attention heads (d=576 / 9 = head_dim 64)
 
+    # ── slotgraph4 (fixed-topology sparse edge-state slot graph; models/slotgraph4/) ─────────────
+    # N node slots + a FIXED k-regular small-world edge-state tensor E:[N,k,d_e] (Watts-Strogatz, degree-
+    # preserved). NO routing head: topology is fixed, only edge STATES + node ASSIGNMENT are learned. Input =
+    # frozen-LM window hiddens; write = recurrent _SG4Block stack (fused self+cross, ReZero, competitive
+    # assignment) + ONE propose→commit gated write per window (decoupled α/β, EntNet post-norm, NO delta rule);
+    # read = PREPEND (node-centric + top-k salience edges). See docs/slotgraph4_design.md.
+    slotgraph4_n_nodes: int = 24         # N node slots (small; N ≤ d/2 for orthonormal ids)
+    slotgraph4_edges_per_node: int = 12  # k = WS out-degree (high for small N — nearly dense; storage=[N,k])
+    slotgraph4_d_edge: int = 64          # d_e — compact edge state dim (keeps the [N,k,d_e] tensor cheap)
+    slotgraph4_ws_beta: float = 0.5      # Watts-Strogatz rewiring prob (0=ring lattice, 1=random k-regular)
+    slotgraph4_seed: int = 0             # topology RNG seed (the WS graph is a deterministic FIXED buffer)
+    slotgraph4_window: int = 256         # streaming window size (input tokens per write step)
+    slotgraph4_d_key: int = 128          # competitive-read / node-pool query/key dim
+    slotgraph4_heads: int = 9            # write-block attention heads (d=576 / 9 = head_dim 64)
+    slotgraph4_d_ff: int = 2304          # write-block FFN hidden (recurrent single block ≈ 7M matched — verify)
+    slotgraph4_write_layers: int = 4     # write-stack depth (recurrent ⇒ ONE shared block applied this many times)
+    slotgraph4_recurrent: bool = True    # True ⇒ one shared _SG4Block × write_layers (param-light, preferred)
+    slotgraph4_read_topk: int = 32       # explicit edge tokens in the read (highest learned salience, soft-gated)
+    slotgraph4_boundary_tokens: bool = True  # learned on-manifold <mem_start>/<mem_end> around the prepend
+    slotgraph4_init_noise: bool = True   # per-forward Gaussian sampling of the initial latents (symmetry break)
+
     # ── vqicae (ICAE with VQ-VAE-discretized slots; models/vqicae/) ──────────
     # ICAE write, then each slot is quantized to its nearest code in a large EMA codebook
     # (straight-through + commitment loss + dead-code reinit). Tests discreteness of the memory.

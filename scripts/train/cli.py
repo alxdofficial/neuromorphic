@@ -535,6 +535,16 @@ def args_to_config(args, ap):
         cfg.slotgraph3_n_nodes = _M // 2          # K = 16 nodes → 2K = 32 stored latents (matched to M)
         cfg.slotgraph3_read_topk = 8              # expanded read view = 128 edge tokens (re-representation of the 32 latents)
         cfg.slotgraph3_d_key = 128                # richer routing keys; enc-LoRA r56 (config) → ~7.0M matched trainable
+        # slotgraph4 (fixed-topology sparse edge-state slot graph, propose→commit gated write, prepend read).
+        # MATCHED on ~7M trainable (recurrent single _SG4Block, d_ff tuned) + N node slots + N·k compact
+        # (d_e=64) edge states. STATE floats = N·d + N·k·d_e = 24·576 + 24·12·64 ≈ 32K (well under the ~55K
+        # prepend budget). READ = N node-centric + read_topk salience edges (+2 boundary) — an expanded
+        # re-representation of the state, NOT extra stored memory (report BOTH numbers, as for slotgraph3).
+        cfg.slotgraph4_n_nodes = max(8, _M // 4)          # N = 24 at M=96 (node-centric read → N tokens)
+        cfg.slotgraph4_edges_per_node = max(2, cfg.slotgraph4_n_nodes // 2)   # k ≈ N/2 (nearly dense at small N)
+        cfg.slotgraph4_read_topk = max(0, _M - cfg.slotgraph4_n_nodes)   # N node + (M-N) edge tokens ≈ M read
+        cfg.slotgraph4_window = args.window_size
+        cfg.slotgraph4_d_ff = 2304                        # recurrent single block ≈ 7.0M (verify param_count.py)
         # vqicae (icae + VQ-discretized slots): encoder-LoRA r96 + projns + EMA codebook (a buffer,
         # not gradient-trained) → ~7.0M trainable, matched to icae. Large codebook K=8192.
         cfg.vqicae_n_slots = _M
@@ -693,11 +703,12 @@ def args_to_config(args, ap):
         # also Goodharts SHUF−REAL with flat EM, the watermark is objective-driven, not sg3-specific).
         # EXCLUDED: vqicae (emits vq_loss → silently inert under the per-example-CE surrogate); hlvocab
         # (load_balance). trajectory stays sg3-only (needs sample_read_expansion).
-        _OBJ_OK = {"slotgraph3_baseline", "icae_baseline", "ccm_baseline",
+        _OBJ_OK = {"slotgraph3_baseline", "slotgraph4_baseline", "icae_baseline", "ccm_baseline",
                    "autocompressor_baseline", "beacon_baseline",
                    # aux-loss-free arms added 2026-07-09 (gisting/memoryllm/titans emit no vq/load-balance
                    # aux loss, so they are valid under behavioral_kl; per-layer-KV students dispatch fine
                    # via _prefix_kv_forward). Still gated by the pre-training verification (#158).
+                   # slotgraph4 is aux-loss-free (prepend arm) → valid under behavioral_kl.
                    "gisting_baseline", "memoryllm_baseline", "titans_baseline"}
         if args.objective_mode == "trajectory" and set(args.variants) != {"slotgraph3_baseline"}:
             raise SystemExit(f"--objective-mode trajectory supports --variants slotgraph3_baseline only "
