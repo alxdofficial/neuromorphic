@@ -84,7 +84,8 @@ class MemoryLLMBaselineEncoder(nn.Module):
             q = p_l[:, -self.K:, :].float()                      # last-K slots compress the window
             scores = torch.matmul(q, h_l.transpose(1, 2)) / (d ** 0.5)      # [B, K, W]
             scores = scores.masked_fill(pad, float("-inf"))
-            cand = torch.matmul(torch.softmax(scores, dim=-1), h_l).to(p_l.dtype)   # [B, K, d]
+            attn_w = torch.softmax(scores, dim=-1).nan_to_num(0.0)           # all-pad → NaN → 0
+            cand = torch.matmul(attn_w, h_l).to(p_l.dtype)                   # [B, K, d]
             # RANDOM DROP K slots (shared across the batch), keep N-K survivors, insert candidates.
             perm = torch.randperm(self.N, device=p_l.device)
             survivors = p_l[:, perm[:self.N - self.K], :]        # [B, N-K, d]

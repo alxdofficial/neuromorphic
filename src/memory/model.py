@@ -29,6 +29,7 @@ from .models.vqicae import VQICAEEncoder
 from .models.memoryllm import MemoryLLMBaselineEncoder
 from .models.gisting import GistingBaselineEncoder
 from .models.titans import TitansEncoder
+from .models.h2o import H2OBaselineEncoder
 from .models.vanilla import FullContextEncoder, NullEncoder
 from .decoder import FrozenLlamaDecoder, disable_lora
 
@@ -94,6 +95,10 @@ class ReprLearningModel(nn.Module):
         # Titans (arXiv:2501.00663): deep-MLP neural memory updated by a TEST-TIME gradient step
         # (learns to memorize at test time); MAC prepend read (models/titans/).
         "titans_baseline": TitansEncoder,
+        # H2O — Heavy-Hitter Oracle training-free KV eviction (Zhang 2023, arXiv:2306.14048).
+        # Keeps the M tokens with the highest cumulative attention-received score; no encoder
+        # training (eval-only: only the shared decoder read-LoRA trains). Two forward passes.
+        "h2o_baseline": H2OBaselineEncoder,
         "vanilla_llama": NullEncoder,         # loss floor — Llama with no memory
         "vanilla_full_context": FullContextEncoder,  # loss ceiling — Llama sees full evidence
     }
@@ -281,7 +286,8 @@ class ReprLearningModel(nn.Module):
                         "autocompressor_baseline", "beacon_baseline",
                         "slotgraph_baseline", "slotgraph2_baseline",
                         "slotgraph3_baseline", "slotgraph4_baseline", "vqicae_baseline",
-                        "memoryllm_baseline", "gisting_baseline", "titans_baseline")
+                        "memoryllm_baseline", "gisting_baseline", "titans_baseline",
+                        "h2o_baseline")
 
     def compute_masked_reconstruction_loss(
         self,
@@ -1384,7 +1390,8 @@ class ReprLearningModel(nn.Module):
         for _k, _v in (finalize_aux or {}).items():
             if not (_k.startswith("biomem_") or _k.startswith("slotgraph_")
                     or _k.startswith("slotgraph2_") or _k.startswith("slotgraph3_")
-                    or _k.startswith("slotgraph4_") or _k.startswith("vqicae_")):
+                    or _k.startswith("slotgraph4_") or _k.startswith("h2o_")
+                    or _k.startswith("vqicae_")):
                 continue
             if torch.is_tensor(_v) and _v.numel() == 1:
                 out[_k] = _v.detach()

@@ -418,6 +418,13 @@ class ReprConfig:
     slotgraph4_boundary_tokens: bool = True  # learned on-manifold <mem_start>/<mem_end> around the prepend
     slotgraph4_init_noise: bool = True   # per-forward Gaussian sampling of the initial latents (symmetry break)
 
+    # ── h2o (Heavy-Hitter Oracle KV eviction; models/h2o/) ────────────────────
+    # Training-free eval-only baseline. Keeps the M tokens with highest cumulative
+    # attention-received score (sum over all layers/heads). Own frozen base copy.
+    # No trainable encoder params; only the shared read-LoRA trains.
+    h2o_n_budget: int = 0              # M KV slots to keep; 0 ⇒ n_flat_codes
+    h2o_recent_ratio: float = 0.1      # fraction of M reserved for most-recent tokens (H2O local window)
+
     # ── vqicae (ICAE with VQ-VAE-discretized slots; models/vqicae/) ──────────
     # ICAE write, then each slot is quantized to its nearest code in a large EMA codebook
     # (straight-through + commitment loss + dead-code reinit). Tests discreteness of the memory.

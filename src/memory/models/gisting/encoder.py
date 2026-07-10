@@ -109,8 +109,9 @@ class GistingBaselineEncoder(nn.Module):
     def finalize_memory(self, state):
         K, V = state["K"], state["V"]
         if K is None:                                            # degenerate all-pad episode
-            B, dev = state["B"], state["device"]
-            z = [torch.zeros(B, self.n_kv, 1, self.head_dim, device=dev) for _ in range(self.L)]
+            B, dev, dt = state["B"], state["device"], state["dtype"]
+            z = [torch.zeros(B, self.n_kv, 1, self.head_dim, device=dev, dtype=dt)
+                 for _ in range(self.L)]
             empty = torch.zeros(B, 0, self.d, device=dev, dtype=torch.float32)
             return empty, {"past_kv": (z, list(z)), "memory_mask": torch.zeros(B, 1, device=dev),
                            "read_mode": "per_layer_kv"}

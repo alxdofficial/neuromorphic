@@ -510,7 +510,7 @@ def args_to_config(args, ap):
         # Titans: read = N_p persistent + M_q readout = M; deep-MLP memory h sized to ~7M (2·d·h dominates).
         cfg.titans_d_mem = cfg.d_llama
         cfg.titans_n_persistent = max(1, _M // 6); cfg.titans_n_read_seeds = _M - cfg.titans_n_persistent
-        cfg.titans_mem_hidden = 4864                      # ~6.7-7.0M trainable (verify param_count)
+        cfg.titans_mem_hidden = 5448                      # 7.002M trainable (2×576×5448 + gates + persist + seeds)
         # slotgraph (icae-write + fixed partition + RMSNorm-bounded MP read): own frozen base +
         # encoder-LoRA + endpoint heads + the MP read modules (msg/update ≈1.0M). Encoder-LoRA rank
         # TRIMMED to r85 (from icae's r104) to offset the MP params → total ≈ icae's ~6.9M.
@@ -545,6 +545,8 @@ def args_to_config(args, ap):
         cfg.slotgraph4_read_topk = max(0, _M - cfg.slotgraph4_n_nodes)   # N node + (M-N) edge tokens ≈ M read
         cfg.slotgraph4_window = args.window_size
         cfg.slotgraph4_d_ff = 2304                        # recurrent single block ≈ 7.0M (verify param_count.py)
+        # h2o (training-free KV eviction): M = same budget; no encoder LoRA (eval-only arm).
+        cfg.h2o_n_budget = _M
         # vqicae (icae + VQ-discretized slots): encoder-LoRA r96 + projns + EMA codebook (a buffer,
         # not gradient-trained) → ~7.0M trainable, matched to icae. Large codebook K=8192.
         cfg.vqicae_n_slots = _M

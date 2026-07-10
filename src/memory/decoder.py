@@ -43,19 +43,24 @@ def build_prefix_cache(past_kv):
         return cache
 
 
-def load_frozen_llama(model_name: str, dtype: torch.dtype = torch.bfloat16):
+def load_frozen_llama(model_name: str, dtype: torch.dtype = torch.bfloat16,
+                      attn_implementation: str = "sdpa"):
     """Load Llama, freeze all params, return the model + tokenizer.
 
     Llama is put in inference mode (no dropout) by `.train(False)`.
     All parameters get `requires_grad = False`. Gradient still flows
     through Llama during backward — Llama just doesn't update.
+
+    attn_implementation: "sdpa" (default, fast) or "eager" (needed when the
+    caller wants attention weights via output_attentions — e.g. H2O's
+    heavy-hitter scoring; sdpa/flash return None for weights).
     """
     from transformers import AutoModelForCausalLM, AutoTokenizer
     tok = AutoTokenizer.from_pretrained(model_name)
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         dtype=dtype,
-        attn_implementation="sdpa",
+        attn_implementation=attn_implementation,
     )
     for p in model.parameters():
         p.requires_grad = False
