@@ -349,9 +349,10 @@ class SlotGraph4Encoder(nn.Module):
                 aE = torch.sigmoid(self.alpha_edge(gh_e)).reshape(B, N, k, de)
                 bE = torch.sigmoid(self.beta_edge(gh_e)).reshape(B, N, k, de)
                 E = self.edge_norm(aE * E + bE * dE)
-                if not bool(active.all()):                                # freeze rows idle this window
-                    X = torch.where(active[:, None, None], X, X0)
-                    E = torch.where(active[:, None, None, None], E, E0)
+                # freeze rows idle this window. Always apply the where (no `bool(active.all())` guard —
+                # that forced a GPU→CPU sync ×8/step; where is a no-op when active is all-True).
+                X = torch.where(active[:, None, None], X, X0)
+                E = torch.where(active[:, None, None, None], E, E0)
 
         with torch.autocast("cuda", enabled=False):
             memory_full, keep_read = self._build_read(X, E, B)
@@ -410,25 +411,44 @@ class SlotGraph4Encoder(nn.Module):
 
     @torch.no_grad()
     def _canaries(self, memory, X, E, device):
-        def _within_cos(x):
+        # All reductions stay ON-GPU as 0-dim tensors — NO .item()/float()/torch.tensor round-trips here.
+        # The trainer's logging does one float(_v.detach()) per value when it actually logs, so this
+        # removes ~14 in-finalize host syncs + the per-example Python loop from EVERY step (canaries are
+        # diagnostics; values are identical to the old float path within fp precision).
+        z = torch.zeros((), device=device)
+
+        def _pr_gpu(x):                       # participation ratio (effective rank) of rows of x:[N,d]
+            if x.shape[0] < 2:
+                return z
+            xc = x.float() - x.float().mean(0, keepdim=True); C = xc.t() @ xc
+            return C.diagonal().sum() ** 2 / (C * C).sum().clamp_min(1e-12)
+
+        def _pr_batched(x):                   # mean over the batch of per-example PR; x:[B,M,d]
+            B_ = x.shape[0]
+            if x.shape[1] < 2:
+                return z
+            xc = x.float() - x.float().mean(1, keepdim=True)          # center over M per example
+            C = torch.einsum("bmd,bme->bde", xc, xc)                  # [B,d,d] per-example grams
+            tr = C.diagonal(dim1=-2, dim2=-1).sum(-1)                 # [B]
+            return (tr ** 2 / (C * C).sum((-1, -2)).clamp_min(1e-12)).mean()
+
+        def _within_cos(x):                   # mean off-diagonal cosine among the S rows of x:[B,S,·]
             S = x.shape[1]
             if S < 2:
-                return 0.0
+                return z
             xn = F.normalize(x, dim=-1); cos = xn @ xn.transpose(-1, -2)
             off = cos.sum((-1, -2)) - cos.diagonal(dim1=-2, dim2=-1).sum(-1)
-            return float((off / (S * (S - 1))).mean())
+            return (off / (S * (S - 1))).mean()
+
         B = memory.shape[0]
         E_flat = E.reshape(B, -1, self.de)
-        aux = {
-            "slotgraph4_mem_effrank": torch.tensor(_participation_ratio(memory.reshape(-1, self.d)), device=device),
-            "slotgraph4_node_effrank": torch.tensor(_participation_ratio(X.reshape(-1, self.d)), device=device),
-            "slotgraph4_edge_effrank": torch.tensor(_participation_ratio(E_flat.reshape(-1, self.de)), device=device),
-            "slotgraph4_node_cos": torch.tensor(_within_cos(X), device=device),
-            "slotgraph4_edge_cos": torch.tensor(_within_cos(E_flat), device=device),
+        return {
+            "slotgraph4_mem_effrank": _pr_gpu(memory.reshape(-1, self.d)),
+            "slotgraph4_node_effrank": _pr_gpu(X.reshape(-1, self.d)),
+            "slotgraph4_edge_effrank": _pr_gpu(E_flat.reshape(-1, self.de)),
+            "slotgraph4_node_cos": _within_cos(X),
+            "slotgraph4_edge_cos": _within_cos(E_flat),
             # per-example vs cross-example mem rank (blur vs shared-frame; see slotgraph3 canaries)
-            "slotgraph4_mem_effrank_perex": torch.tensor(
-                sum(_participation_ratio(memory[i]) for i in range(B)) / max(1, B), device=device),
-            "slotgraph4_mem_effrank_cross": torch.tensor(
-                _participation_ratio(memory.mean(dim=1)) if B > 1 else 0.0, device=device),
+            "slotgraph4_mem_effrank_perex": _pr_batched(memory),
+            "slotgraph4_mem_effrank_cross": _pr_gpu(memory.mean(dim=1)) if B > 1 else z,
         }
-        return aux

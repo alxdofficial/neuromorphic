@@ -126,7 +126,8 @@ def run_val(model, val_set, device, n_batches: int, window_size: int,
                 continue
             sink = last_graph_eval if k.startswith("graph_") else (
                 last_biomem_eval if k.startswith("biomem_") else (
-                last_slotgraph_eval if k.startswith(("slotgraph_", "slotgraph2_", "slotgraph3_")) else (
+                last_slotgraph_eval if k.startswith(("slotgraph_", "slotgraph2_",
+                                                     "slotgraph3_", "slotgraph4_")) else (
                 last_vqicae_eval if k.startswith("vqicae_") else None)))
             if sink is None:
                 continue

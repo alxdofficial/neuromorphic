@@ -16,7 +16,7 @@ Algorithm (our streaming adaptation):
   5. Decoder reads those M per-layer KV pairs via the shared `_prefix_kv_forward` path.
 
 ASTERISKS (for the results table):
-  * Training-free — no learnable encoder; only the shared read-LoRA on the decoder is trained.
+  * Training-free / eval-only — no learnable encoder or decoder adapter; the trainer skips this arm.
   * Two forward passes per encode (score pass + KV pass).
   * Eviction uses attention scores from the LM's OWN causal context, not the decoder's.
   * Does NOT implement H2O's optional "recent" window bias (our M budget is already fixed).

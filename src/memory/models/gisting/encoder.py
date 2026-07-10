@@ -59,7 +59,8 @@ class GistingBaselineEncoder(nn.Module):
         return self
 
     def init_streaming_state(self, batch_size, device, dtype):
-        return {"K": None, "V": None, "B": batch_size, "device": device, "dtype": dtype}
+        return {"K": None, "V": None, "valid": None,
+                "B": batch_size, "device": device, "dtype": dtype}
 
     def _capture_seg(self, seg, seg_mask):
         """Append κ gist tokens after the segment, run the frozen base, capture the gist tokens'
@@ -89,22 +90,36 @@ class GistingBaselineEncoder(nn.Module):
         B, W, d = token_embeds.shape
         if attention_mask is None:
             attention_mask = torch.ones(B, W, device=token_embeds.device, dtype=torch.bool)
-        Kacc, Vacc = state["K"], state["V"]
+        Kacc, Vacc, valid = state["K"], state["V"], state.get("valid")
         n = 0 if Kacc is None else Kacc[0].shape[2]
         for s in range(0, W, self.seg_len):
             if n >= self.M:
                 break
             sm = attention_mask[:, s:s + self.seg_len]
-            if not sm.any():                                     # skip an all-pad segment
+            active = sm.bool().any(dim=1)
+            if not active.any():                                 # skip a batch-global all-pad segment
                 continue
             Kn, Vn = self._capture_seg(token_embeds[:, s:s + self.seg_len], sm)
+            # zero the gist K/V of idle (all-pad) rows. Mask-MULTIPLY (not where+zeros_like): one fused
+            # kernel + one fewer alloc per layer, bit-identical (keep∈{0,1} broadcasts over the row axis).
+            keepf = active.view(B, 1, 1, 1).to(Kn[0].dtype)
+            Kn = [k * keepf for k in Kn]
+            Vn = [v * keepf for v in Vn]
+            seg_valid = active.view(B, 1).expand(B, self.k)
             if Kacc is None:
                 Kacc, Vacc = Kn, Vn
+                valid = seg_valid
             else:
                 Kacc = [torch.cat([Kacc[i], Kn[i]], dim=2) for i in range(self.L)]
                 Vacc = [torch.cat([Vacc[i], Vn[i]], dim=2) for i in range(self.L)]
+                valid = torch.cat([valid, seg_valid], dim=1)
             n += self.k
-        return {**state, "K": Kacc, "V": Vacc}, {}
+            if Kacc[0].shape[2] > self.M:
+                Kacc = [k[:, :, :self.M, :] for k in Kacc]
+                Vacc = [v[:, :, :self.M, :] for v in Vacc]
+                valid = valid[:, :self.M]
+                n = self.M
+        return {**state, "K": Kacc, "V": Vacc, "valid": valid}, {}
 
     def finalize_memory(self, state):
         K, V = state["K"], state["V"]
@@ -117,7 +132,11 @@ class GistingBaselineEncoder(nn.Module):
                            "read_mode": "per_layer_kv"}
         B, n = K[0].shape[0], K[0].shape[2]
         empty = torch.zeros(B, 0, self.d, device=K[0].device, dtype=torch.float32)   # M=0 prepend
-        mm = torch.ones(B, n, device=K[0].device)
+        mm = state.get("valid")
+        if mm is None:
+            mm = torch.ones(B, n, device=K[0].device, dtype=torch.bool)
+        else:
+            mm = mm[:, :n].to(device=K[0].device)
         return empty, {"past_kv": (K, V), "memory_mask": mm, "read_mode": "per_layer_kv"}
 
     def forward(self, token_embeds, attention_mask=None, mask_positions=None):

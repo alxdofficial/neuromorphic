@@ -94,7 +94,8 @@ class ICAEBaselineEncoder(nn.Module):
         # RMT/AutoCompressor-style persistent memory: the M compressed slots carried across
         # windows. Empty at window 0 so the first window is exactly single-shot ICAE
         # ([window ++ slots]) → published-ICAE behavior is the n_windows=1 special case.
-        return {"mem": torch.zeros(batch_size, 0, d, device=device, dtype=dtype)}
+        return {"mem": torch.zeros(batch_size, 0, d, device=device, dtype=dtype),
+                "seen_real": torch.zeros(batch_size, device=device, dtype=torch.bool)}
 
     def streaming_write(self, state, token_embeds, attention_mask=None,
                         chunk_offset=0, **extra):
@@ -109,6 +110,7 @@ class ICAEBaselineEncoder(nn.Module):
         B, W, d = token_embeds.shape
         if attention_mask is None:
             attention_mask = torch.ones(B, W, device=token_embeds.device, dtype=torch.bool)
+        active = attention_mask.bool().any(dim=1)
         slots = self.slots.to(token_embeds.dtype).unsqueeze(0).expand(B, self.M, d)
         inp = torch.cat([prev, token_embeds, slots], dim=1)  # [B, M_prev + W + M, d]
         _ones = lambda n: torch.ones(B, n, device=attention_mask.device, dtype=torch.long)
@@ -121,10 +123,23 @@ class ICAEBaselineEncoder(nn.Module):
         # carried into next window's cat([prev, token_embeds, slots]) matches (bf16 under
         # autocast). Without the cast-back, fp32 `prev` collides with bf16 token_embeds in
         # any eager/no-autocast path — the dtype landmine the debug-real-path convention warns of.
-        mem = self.norm(h[:, -self.M:, :].float()).to(h.dtype)   # [B, M, d_llama]
-        return {"mem": mem}, {}
+        proposed = self.norm(h[:, -self.M:, :].float()).to(h.dtype)   # [B, M, d_llama]
+        if prev.shape[1] == 0:
+            mem = torch.where(active.view(B, 1, 1), proposed, torch.zeros_like(proposed))
+        else:
+            mem = torch.where(active.view(B, 1, 1), proposed, prev)
+        seen = state.get("seen_real")
+        if seen is None:
+            seen = torch.zeros(B, device=token_embeds.device, dtype=torch.bool)
+        seen = seen | active
+        return {"mem": mem, "seen_real": seen}, {}
 
     def finalize_memory(self, state) -> tuple[Tensor, dict]:
         # Memory is already the compressed M slots after the last window's recurrent write
         # (streaming_write). n_windows >= 1 always, so state["mem"] is [B, M, d].
-        return state["mem"], {}
+        mem = state["mem"]
+        seen = state.get("seen_real")
+        aux = {}
+        if seen is not None and mem.shape[1] > 0:
+            aux["memory_mask"] = seen.view(-1, 1).expand(-1, mem.shape[1])
+        return mem, aux

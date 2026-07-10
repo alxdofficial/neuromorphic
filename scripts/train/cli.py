@@ -28,14 +28,18 @@ def build_parser() -> argparse.ArgumentParser:
     # hlvocab_baseline + soft_pointer_graph_baseline are ABANDONED (2026-06-15) —
     # still selectable via explicit --variants for reproduction, out of the default.
     ap.add_argument("--variants", nargs="+", default=[
-        "slotgraph_baseline",         # emergent-topology slot memory (supersedes graph_baseline)
-        "biomem_baseline",            # chunk-parallel gated-delta synaptic-grid (fast-weights arm)
-        "icae_baseline",              # ICAE (ICLR'24)
-        "ccm_baseline",               # CCM (ICLR'24)
-        "autocompressor_baseline",    # AutoCompressor/RMT-style recurrent summary
-        "beacon_baseline",            # Activation Beacon
-        "vanilla_llama",              # MAE loss FLOOR (band lower bound)
-        "vanilla_full_context",       # MAE loss CEILING (band upper bound)
+        # ACTIVE trainable cohort (2026-07-10): published closed-book compressors + our graph arm,
+        # matched ~7M params / M=96. Dropped from active: beacon (too close to icae/autocompressor),
+        # slotgraph3 (superseded by slotgraph4), ccm/vqicae/biomem/slotgraph(1,2) (still selectable).
+        "icae_baseline",              # ICAE (ICLR'24) — prepend
+        "autocompressor_baseline",    # AutoCompressor/RMT-style recurrent summary — prepend
+        "titans_baseline",            # Titans (deep-MLP test-time-autograd memory) — MAC prepend; needs --no-grad-ckpt-stream
+        "gisting_baseline",           # Gisting (per-layer gist-KV) — native per-layer-KV read
+        "memoryllm_baseline",         # MemoryLLM (per-layer pool + random-drop) — native per-layer-KV read
+        "slotgraph4_baseline",        # OUR arm — fixed-topology edge-state slot graph (prepend+bidir)
+        "vanilla_llama",              # MAE loss FLOOR (band lower bound; eval-only)
+        "vanilla_full_context",       # MAE loss CEILING (band upper bound; eval-only)
+        "h2o_baseline",               # training-free KV eviction reference (eval-only)
     ])
     ap.add_argument("--steps", type=int, default=8_000)
     ap.add_argument("--batch-size", type=int, default=8)
@@ -719,6 +723,23 @@ def args_to_config(args, ap):
             raise SystemExit(f"--objective-mode supports {sorted(_OBJ_OK)} (aux-loss-free prepend arms); "
                              f"got {args.variants}. vqicae/hlvocab emit aux losses inert under the "
                              f"GradCache surrogate — excluded by design.")
+        # GradCache (contrastive/trajectory) detaches ONLY the prepend memory into mem_leaf and re-enters
+        # the encoder graph exactly once (objectives.py mem.backward). The per-layer-KV arms carry their
+        # DIFFERENTIABLE content in aux["past_kv"] (empty prepend), which GradCache passes verbatim to
+        # every roll — so the 2nd roll's backward hits the freed encoder graph ("backward a 2nd time").
+        # behavioral_kl is safe (its own CE+KL backward, no GradCache), so keep these arms whitelisted
+        # for it and block them ONLY for the GradCache modes. beacon defaults to per-layer-KV
+        # (beacon_read="kv"), so it is affected too despite the "ANY prepend memory" comment above.
+        if args.objective_mode in ("contrastive", "trajectory"):
+            _KV_ARMS = {"beacon_baseline", "gisting_baseline", "memoryllm_baseline"}
+            _bad_kv = _KV_ARMS.intersection(args.variants)
+            if _bad_kv:
+                raise SystemExit(
+                    f"--objective-mode {args.objective_mode} (GradCache) does NOT support the per-layer-KV "
+                    f"arms {sorted(_bad_kv)}: their differentiable memory lives in aux['past_kv'], which "
+                    f"GradCache reuses across rolls → 2nd-backward-through-freed-graph crash. These arms "
+                    f"are valid under --objective-mode behavioral_kl only. (beacon is per-layer-KV when "
+                    f"beacon_read=kv, the default.)")
         if args.objective_mode == "trajectory":
             if (args.slotgraph3_read or "raw") != "raw" or (args.slotgraph3_edge_budget or 0) > 0:
                 raise SystemExit("--objective-mode trajectory needs the raw read and per-node top-k "

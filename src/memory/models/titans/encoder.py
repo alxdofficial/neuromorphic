@@ -81,6 +81,11 @@ class TitansEncoder(nn.Module):
         B, W, d = token_embeds.shape
         if attention_mask is None:
             attention_mask = torch.ones(B, W, device=token_embeds.device, dtype=torch.bool)
+        active = attention_mask.bool().any(dim=1)   # [B]; drives _freeze_inactive below
+        # (No `if not active.any(): return` early-out: it would force a per-window GPU→CPU sync ×8/step.
+        #  The all-pad-batch case is handled bit-identically by _freeze_inactive — loss=0 → grads=0 →
+        #  updates frozen back to the old weights — so the shortcut only saved rare wasted compute at
+        #  the cost of a guaranteed sync every window. Removed.)
         m = attention_mask.to(token_embeds.dtype).unsqueeze(-1)
         x = token_embeds * m
         # enable_grad: the test-time memory update must run even under eval's no_grad (Titans updates
@@ -98,8 +103,11 @@ class TitansEncoder(nn.Module):
             # MEAN per valid token (not sum): a .sum() over the 256-token window makes the inner grad
             # ~256× too large and explodes across the 8-window recurrence (observed NaN).
             loss = err.sum() / attention_mask.to(pred.dtype).sum().clamp_min(1.0)
+            # retain_graph defaults to create_graph: in train (create_graph=True) the graph the outer
+            # backward needs is kept; in eval it's freed right after this grad call (frees per-window
+            # loss-graph buffers). Was an explicit retain_graph=True → held eval buffers needlessly.
             g1, gb1, g2, gb2 = torch.autograd.grad(
-                loss, [W1, b1, W2, b2], create_graph=self.training, retain_graph=True)
+                loss, [W1, b1, W2, b2], create_graph=self.training)
             # data-dependent gates from the window-mean key
             km = (k * m).sum(1) / m.sum(1).clamp_min(1e-3)           # [B,dM]
             alpha = torch.sigmoid(self.g_alpha(km))
@@ -113,6 +121,17 @@ class TitansEncoder(nn.Module):
             nb1, nSb1 = _upd(b1, state["S_b1"], gb1)
             nW2, nS2 = _upd(W2, state["S_W2"], g2)
             nb2, nSb2 = _upd(b2, state["S_b2"], gb2)
+            def _freeze_inactive(new, old):
+                shp = (B,) + (1,) * (new.dim() - 1)
+                return torch.where(active.view(shp), new, old)
+            nW1 = _freeze_inactive(nW1, W1)
+            nS1 = _freeze_inactive(nS1, state["S_W1"])
+            nb1 = _freeze_inactive(nb1, b1)
+            nSb1 = _freeze_inactive(nSb1, state["S_b1"])
+            nW2 = _freeze_inactive(nW2, W2)
+            nS2 = _freeze_inactive(nS2, state["S_W2"])
+            nb2 = _freeze_inactive(nb2, b2)
+            nSb2 = _freeze_inactive(nSb2, state["S_b2"])
         return {"W1": nW1, "b1": nb1, "W2": nW2, "b2": nb2,
                 "S_W1": nS1, "S_b1": nSb1, "S_W2": nS2, "S_b2": nSb2}, {}
 

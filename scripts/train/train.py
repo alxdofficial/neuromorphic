@@ -64,12 +64,13 @@ def main():
         return
 
     summaries = []
-    # MIXED multi-task (the only training path): vanilla floor/ceiling have no
+    # MIXED multi-task (the only training path): vanilla floor/ceiling and H2O have no
     # trainable params in the mixed round-robin (they are eval-only references) — skip them.
-    mixed_variants = [v for v in args.variants if not v.startswith("vanilla_")]
-    skipped = [v for v in args.variants if v.startswith("vanilla_")]
+    eval_only = {"h2o_baseline"}
+    mixed_variants = [v for v in args.variants if not v.startswith("vanilla_") and v not in eval_only]
+    skipped = [v for v in args.variants if v.startswith("vanilla_") or v in eval_only]
     if skipped:
-        print(f"[mixed] skipping eval-only vanilla references: {skipped}")
+        print(f"[mixed] skipping eval-only references: {skipped}")
     for variant in mixed_variants:
         out_dir = REPO / f"outputs/memory/{args.out_tag}_{variant}"
         out_dir.mkdir(parents=True, exist_ok=True)

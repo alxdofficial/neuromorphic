@@ -255,7 +255,9 @@ def train_mixed_variant(
         }
         # arm collapse/health canaries at train frequency (biomem edge/decay/beta/sat/mem_effrank/…, etc.)
         for _k, _v in out.items():
-            if _v is None or not _k.startswith(("graph_", "biomem_", "slotgraph_", "slotgraph2_", "slotgraph3_", "vqicae_")):
+            if _v is None or not _k.startswith(("graph_", "biomem_", "slotgraph_",
+                                                "slotgraph2_", "slotgraph3_", "slotgraph4_",
+                                                "vqicae_")):
                 continue    # "graph_" added for parity with eval.py/val-row forwarding (graph_baseline canaries)
             if isinstance(_v, (int, float)):
                 train_row[_k] = float(_v)

@@ -46,7 +46,7 @@ class MemoryLLMBaselineEncoder(nn.Module):
         self.head_dim = getattr(_bc, "head_dim", None) or (_bc.hidden_size // _bc.num_attention_heads)
         self.d = cfg.d_llama
         self.N = int(getattr(cfg, "memoryllm_n_mem", 0) or cfg.n_flat_codes)   # slots per layer
-        self.K = int(getattr(cfg, "memoryllm_k_new", 8))                       # dropped+inserted / window
+        self.K = max(1, min(int(getattr(cfg, "memoryllm_k_new", 8)), self.N))  # dropped+inserted / window
         embed = base.get_input_embeddings()
         with torch.no_grad():
             mean = embed.weight.float().mean(0)
@@ -71,25 +71,35 @@ class MemoryLLMBaselineEncoder(nn.Module):
         B, W, d = token_embeds.shape
         if attention_mask is None:
             attention_mask = torch.ones(B, W, device=token_embeds.device, dtype=torch.bool)
+        active = attention_mask.bool().any(dim=1)
+        if not active.any():
+            return state, {}
         # per-layer context hiddens for THIS window (hs[l] = input to layer l)
         out = self.base.model(inputs_embeds=token_embeds, attention_mask=attention_mask.long(),
                               output_hidden_states=True, use_cache=False)
         hs = out.hidden_states                                   # tuple length L+1
         pool = state["pool"]                                     # [L, B, N, d]
-        pad = (~attention_mask.bool()).view(B, 1, W)             # True where pad → mask out as keys
+        # BATCHED candidate SDPA across the L context depths (was a 30-iteration Python loop of tiny
+        # GEMMs+softmaxes). Under the trainer's bf16 autocast the matmuls run in bf16 regardless, so the
+        # old per-layer .float() upcasts were dead (autocast recasts) — dropped. softmax stays fp32-promoted
+        # by autocast, as before. Result bit-identical to the per-layer loop.
+        H = torch.stack([hs[l] for l in range(self.L)], dim=0)   # [L, B, W, d] input to each layer
+        Q = pool[:, :, -self.K:, :]                              # [L, B, K, d] last-K slots compress the window
+        scores = torch.matmul(Q, H.transpose(-1, -2)) / (d ** 0.5)          # [L, B, K, W]
+        pad = (~attention_mask.bool()).view(1, B, 1, W)          # True where pad → mask out as keys
+        scores = scores.masked_fill(pad, float("-inf"))
+        attn_w = torch.softmax(scores, dim=-1).nan_to_num(0.0)              # all-pad → NaN → 0
+        cand = torch.matmul(attn_w, H).to(pool.dtype)                       # [L, B, K, d]
+        # RANDOM DROP K slots per layer (kept as a loop so the per-layer randperm RNG stream is
+        # bit-identical to the pre-batch version). keep N-K survivors, insert candidates; idle-row freeze.
         new_layers = []
         for l in range(self.L):
-            h_l = hs[l].float()                                  # [B, W, d] context at depth l
             p_l = pool[l]                                        # [B, N, d]
-            q = p_l[:, -self.K:, :].float()                      # last-K slots compress the window
-            scores = torch.matmul(q, h_l.transpose(1, 2)) / (d ** 0.5)      # [B, K, W]
-            scores = scores.masked_fill(pad, float("-inf"))
-            attn_w = torch.softmax(scores, dim=-1).nan_to_num(0.0)           # all-pad → NaN → 0
-            cand = torch.matmul(attn_w, h_l).to(p_l.dtype)                   # [B, K, d]
-            # RANDOM DROP K slots (shared across the batch), keep N-K survivors, insert candidates.
             perm = torch.randperm(self.N, device=p_l.device)
             survivors = p_l[:, perm[:self.N - self.K], :]        # [B, N-K, d]
-            new_layers.append(torch.cat([survivors, cand], dim=1))          # [B, N, d]
+            proposed = torch.cat([survivors, cand[l]], dim=1)    # [B, N, d]
+            proposed = torch.where(active.view(B, 1, 1), proposed, p_l)
+            new_layers.append(proposed)
         return {"pool": torch.stack(new_layers, dim=0)}, {}
 
     def finalize_memory(self, state):

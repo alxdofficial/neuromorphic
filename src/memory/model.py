@@ -4,6 +4,7 @@ The model takes one of the encoder variants (see VARIANTS) and the frozen
 Llama decoder, and produces the reconstruction loss for training.
 """
 from __future__ import annotations
+import copy
 import math
 from dataclasses import replace
 from typing import Optional
@@ -111,16 +112,28 @@ class ReprLearningModel(nn.Module):
         chat_template: Optional[ChatTemplate] = None,
     ):
         super().__init__()
-        self.cfg = cfg
         self.variant = variant
 
         if variant not in self.VARIANTS:
             raise ValueError(
                 f"Unknown variant {variant!r}. Must be one of {list(self.VARIANTS)}."
             )
+        if variant in {"slotgraph4_baseline", "h2o_baseline"}:
+            cfg = copy.copy(cfg)
+        if variant == "slotgraph4_baseline":
+            if getattr(cfg, "rect_prepend_mask", False):
+                raise ValueError("slotgraph4_baseline requires bidir_mem_attn; rect_prepend_mask is incompatible")
+            cfg.bidir_mem_attn = True
+            cfg.uniform_mem_pos = True
+        if variant == "h2o_baseline":
+            cfg.use_llama_lora = False
+        self.cfg = cfg
 
         self.encoder = self.VARIANTS[variant](cfg)
         self.decoder = FrozenLlamaDecoder(cfg, llama_model=llama_model)
+        if variant == "h2o_baseline":
+            for p in self.decoder.parameters():
+                p.requires_grad_(False)
 
         # soft_pointer_graph / biomem read via the prepend path but (unlike hlvocab, slotgraph and the
         # ports) have no own base copy at init to size their norm-match from — calibrate the prepend
@@ -731,7 +744,7 @@ class ReprLearningModel(nn.Module):
         n_horizons caps how many of the DEEPEST boundaries to score (the full-context one is always
         included, so this stays comparable to single-shot eval). Cost ≈ n_horizons prefix re-streams;
         acceptable for a 4-window streaming episode (continuation is ~1/5 of the mix)."""
-        T_ctx = batch.context_ids.shape[1]
+        B, T_ctx = batch.context_ids.shape
         predict_len = batch.answer_ids.shape[1]
         # intermediate-horizon targets are sliced predict_len tokens after each boundary; if that exceeds
         # window_size, adjacent horizons' targets OVERLAP and those tokens get double-scored. Guard it.
@@ -741,21 +754,68 @@ class ReprLearningModel(nn.Module):
         n_windows = (T_ctx + window_size - 1) // window_size
         boundaries = [min((i + 1) * window_size, T_ctx) for i in range(n_windows)]  # increasing; last == T_ctx
         boundaries = boundaries[-n_horizons:]                                       # keep the deepest (incl. full-context)
+        # which boundaries actually decode a horizon (full-context always; intermediate only if the
+        # predict_len target block fits inside the span) — snapshot memory ONLY at these.
+        keep = {b for b in boundaries if b >= T_ctx or b + predict_len <= T_ctx}
+
+        # ── Stream the encoder ONCE and SNAPSHOT (memory, aux) at each scored boundary ──
+        # (was: re-encode the prefix [0:b] from scratch per horizon → O(n_horizons^2) window-forwards.)
+        # Numerically identical: the memory at boundary b is a deterministic function of the prefix, and
+        # streaming_write sees the same window slices in the same order. For accumulate-in-finalize arms
+        # (slotgraph4/h2o) the state after window w already holds emb[:, :b], so finalize there equals the
+        # old per-horizon re-encode; for incremental arms (icae/ac/titans/gisting/memoryllm) finalize is a
+        # cheap pure read, so this is the O(n) win. One shared encoder graph → correct summed gradients.
+        snapshots = {}
+        if keep:
+            device = batch.context_ids.device
+            embed = self.decoder.llama.get_input_embeddings()
+            with torch.no_grad():
+                ctx_embeds_full = embed(batch.context_ids)
+            enc_input = self._encode_for_memory(ctx_embeds_full, batch.context_mask)
+            surprise_full = (self._token_surprise(enc_input, batch.context_ids, batch.context_mask)
+                             if getattr(self.encoder, "wants_surprise", False) else None)
+            with torch.no_grad():
+                q_embeds_const = embed(batch.question_ids)
+            state = self.encoder.init_streaming_state(B, device, ctx_embeds_full.dtype)
+            ckpt_stream = (getattr(self.cfg, "grad_checkpoint_stream", True)
+                           and self.training and torch.is_grad_enabled())
+            for w in range(n_windows):
+                s = w * window_size
+                e = min(s + window_size, T_ctx)
+                win_emb = enc_input[:, s:e, :]
+                win_mask = batch.context_mask[:, s:e]
+                win_sur = surprise_full[:, s:e] if surprise_full is not None else None
+                if ckpt_stream:
+                    def _write(st, em, mk, su=win_sur, off=s):
+                        new_st, _ = self.encoder.streaming_write(st, em, mk, chunk_offset=off, surprise=su)
+                        return new_st
+                    state = torch.utils.checkpoint.checkpoint(
+                        _write, state, win_emb, win_mask, use_reentrant=False)
+                else:
+                    state, _ = self.encoder.streaming_write(
+                        state, win_emb, win_mask, chunk_offset=s, surprise=win_sur)
+                if e in keep:                                 # snapshot memory at this boundary
+                    snap = dict(state) if isinstance(state, dict) else state
+                    if isinstance(snap, dict):                # question is constant across horizons
+                        snap["question_embeds"] = q_embeds_const
+                        snap["question_mask"] = batch.question_mask
+                    snapshots[e] = self.encoder.finalize_memory(snap)
 
         losses, accs, last_out = [], [], None
         for b in boundaries:
+            if b not in keep:                                 # intermediate target would overflow → skip
+                continue
             if b >= T_ctx:                                    # full-context horizon → predict answer_ids
-                sub = replace(batch, context_ids=batch.context_ids, context_mask=batch.context_mask,
-                              answer_ids=batch.answer_ids, answer_mask=batch.answer_mask,
+                sub = replace(batch, answer_ids=batch.answer_ids, answer_mask=batch.answer_mask,
                               answer_content_mask=batch.answer_content_mask)
             else:                                             # intermediate horizon → predict the in-context next block
-                if b + predict_len > T_ctx:                  # target would overflow the span → skip
-                    continue
                 tgt = batch.context_ids[:, b:b + predict_len]
                 cm = torch.ones_like(tgt, dtype=torch.bool)
-                sub = replace(batch, context_ids=batch.context_ids[:, :b], context_mask=batch.context_mask[:, :b],
-                              answer_ids=tgt, answer_mask=cm.clone(), answer_content_mask=cm)
+                sub = replace(batch, answer_ids=tgt, answer_mask=cm.clone(), answer_content_mask=cm)
+            # decode via the snapshot memory (memory_override SKIPS the encoder); SHUF/OFF roll the given
+            # memory exactly as they would the freshly-encoded memory, so REAL/SHUF/OFF parity holds.
             out = self.compute_loss(sub, window_size=window_size, _force_generic=True,
+                                    memory_override=snapshots[b],
                                     zero_memory=zero_memory, shuffle_memory=shuffle_memory,
                                     shuffle_roll=shuffle_roll)
             losses.append(out["loss"]); accs.append(out["top1_acc"]); last_out = out
@@ -1077,9 +1137,26 @@ class ReprLearningModel(nn.Module):
         # Compressed-memory variants don't set this — every memory slot is
         # real content and all M positions should be attended.
         mem_mask_from_enc = finalize_aux.get("memory_mask")
+        # Hoist per-row lengths to CPU in ONE sync each (was 2·B .item() syncs inside the loop).
+        q_lens_l = q_lens.tolist()
+        a_lens_l = a_lens.tolist()
+        # Vectorized answer→prediction alignment (replaces the per-answer-token `for k in range(t_a)`
+        # inner loop, which did a GPU→CPU sync per token via `if not answer_content_for_loss[i,k]`).
+        # ans_start[i] = header offset + memory + post-mem scaffold + question + post-q scaffold.
+        ans_start_vec = (L_pre + M + L_post_mem) + q_lens.long() + L_post_q       # [B]
+        T_a = answer_content_for_loss.shape[1]
+        _k = torch.arange(T_a, device=device)
+        pred_pos = ans_start_vec[:, None] + _k[None, :] - 1                       # [B, T_a]
+        valid_km = (answer_content_for_loss.bool()
+                    & (_k[None, :] < a_lens[:, None])
+                    & (pred_pos >= 0) & (pred_pos < T_total - 1))                 # [B, T_a]
+        _rows = torch.arange(B, device=device)[:, None].expand(B, T_a)[valid_km]
+        _cols = pred_pos[valid_km]
+        pred_mask[_rows, _cols] = True
+        pred_targets[_rows, _cols] = answer_ids_for_loss[valid_km]
         for i in range(B):
-            t_q = int(q_lens[i].item())
-            t_a = int(a_lens[i].item())
+            t_q = q_lens_l[i]
+            t_a = a_lens_l[i]
             col = 0
             # Scaffold: pre-memory header (chat-template path only; no-op when ct=None)
             if L_pre > 0:
@@ -1109,21 +1186,12 @@ class ReprLearningModel(nn.Module):
                 full_embeds[i, col:col + L_post_q] = post_q_embeds.to(q_embeds.dtype)
                 attn_mask_full[i, col:col + L_post_q] = True
                 col += L_post_q
-            # Real answer (with eot appended if chat-template path)
-            ans_start = col
+            # Real answer (with eot appended if chat-template path). The answer→prediction alignment
+            # (pred_mask/pred_targets) is done vectorially ABOVE the loop; col here must match the
+            # ans_start_vec formula (header+M+post_mem+question+post_q) exactly.
             if t_a > 0:
                 full_embeds[i, col:col + t_a] = a_embeds[i, :t_a]
                 attn_mask_full[i, col:col + t_a] = True
-            # Per-row prediction alignment: logit at position p predicts token at p+1.
-            # To predict answer[k] (real token at position ans_start+k), we use
-            # the logit at position ans_start+k-1. Loss only at content positions.
-            for k in range(t_a):
-                if not answer_content_for_loss[i, k]:
-                    continue
-                pred_pos = ans_start + k - 1
-                if 0 <= pred_pos < T_total - 1:
-                    pred_mask[i, pred_pos] = True
-                    pred_targets[i, pred_pos] = answer_ids_for_loss[i, k]
 
         # ---- 4. Llama forward (causal mask is native; padding via attn_mask) ----
         # soft_pointer_graph reads via the SAME prepend path as the baselines: its

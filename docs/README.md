@@ -15,9 +15,10 @@ each baseline uses the READ mechanism from its OWN paper** (not a forced-uniform
 departure from a clean fixed-footprint feed-forward memory is disclosed as an asterisk in results.
 
 - **Prepend-read compressors:** `icae`, `autocompressor` (faithful summary-accumulation), `titans`
-  (deep-MLP memory + test-time autograd write, MAC prepend), `vqicae` (VQ-discretized ICAE).
+  (deep-MLP memory + test-time autograd write, MAC prepend), `vqicae` (VQ-discretized ICAE),
+  `ccm` (this port reads normalized COMP-token hidden states via prepend).
 - **Per-layer-KV compressors** (native read via the shared prefix-cache path, `decoder.build_prefix_cache`
-  + `model._prefix_kv_forward`): `beacon`, `gisting`, `memoryllm` (per-layer pool + random-drop), `ccm`.
+  + `model._prefix_kv_forward`): `beacon`, `gisting`, `memoryllm` (per-layer pool + random-drop).
 - **`h2o`** — training-free KV-cache eviction; an eval-only efficiency/KV-ratio reference (0 trainable params).
 - **Our arms:** `slotgraph` / `slotgraph2` / `slotgraph3` (graph-over-learned-vocab) and `biomem`
   (fast-Hebbian columns); **FurlGraph** is the next design (`furlgraph_design.md`, deferred).
