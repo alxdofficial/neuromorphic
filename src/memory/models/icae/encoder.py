@@ -118,7 +118,8 @@ class ICAEBaselineEncoder(nn.Module):
         # Inner LlamaModel → last_hidden_state (skip lm_head). Causal: the slots at the END read
         # over prev-memory + window. base.training=False → HF per-layer ckpt is inert; the trainer's
         # per-window activation-checkpoint (grad_checkpoint_stream) covers this whole forward.
-        h = self.base.model(inputs_embeds=inp, attention_mask=attn).last_hidden_state
+        h = self.base.model(inputs_embeds=inp, attention_mask=attn,
+                            use_cache=False).last_hidden_state   # else HF builds+pins a 30-layer KV cache it discards
         # Norm in fp32 for stability, then cast back to the running dtype so the memory
         # carried into next window's cat([prev, token_embeds, slots]) matches (bf16 under
         # autocast). Without the cast-back, fp32 `prev` collides with bf16 token_embeds in

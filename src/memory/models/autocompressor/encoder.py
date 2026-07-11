@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.utils.checkpoint as _ckpt
 
 from ...common import _NormMatch
 from ...config import ReprConfig
@@ -109,12 +110,25 @@ class AutoCompressorBaselineEncoder(nn.Module):
         acc, valid = state["acc"], state["valid"]             # [B, k_so_far, d] / [B, k_so_far] or None
         # Chunk this call's tokens into AutoCompressor's own seg_len segments and accumulate κ each —
         # so single-shot (W=2048) and per-window (W=256) calls both accumulate to ≈ M.
+        # The MAE single-shot path passes W=2048 → 8 segments in ONE call with NO outer per-window
+        # checkpoint, so all 8 segment forwards' activations stay live (the ~4-6GB B=8 peak driver, and
+        # unique to this arm). Checkpoint each segment when the loop runs >1 seg under grad, so only one
+        # segment's activations are held (frozen base, train(False) → no dropout/RNG → recompute is exact).
+        n_seg = -(-W // self.seg_len)
+        ckpt_seg = (n_seg > 1 and self.training and torch.is_grad_enabled()
+                    and getattr(self.cfg, "grad_checkpoint_stream", True))
         for s in range(0, W, self.seg_len):
             if acc is not None and acc.shape[1] >= self.M:
                 break
-            acc, valid = self._compress_segment(acc, valid,
-                                                 token_embeds[:, s:s + self.seg_len],
-                                                 attention_mask[:, s:s + self.seg_len])
+            seg = token_embeds[:, s:s + self.seg_len]
+            sm = attention_mask[:, s:s + self.seg_len]
+            # checkpoint only once acc/valid are real tensors (checkpoint can't take None args); the
+            # first segment (acc=None) is cheap to hold anyway — nothing accumulated yet.
+            if ckpt_seg and acc is not None:
+                acc, valid = _ckpt.checkpoint(
+                    self._compress_segment, acc, valid, seg, sm, use_reentrant=False)
+            else:
+                acc, valid = self._compress_segment(acc, valid, seg, sm)
         return {"acc": acc, "valid": valid}, {}
 
     def finalize_memory(self, state):
