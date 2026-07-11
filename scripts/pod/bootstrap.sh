@@ -78,6 +78,12 @@ on_exit() {
 }
 trap on_exit EXIT
 
+# FAIL LOUD on any setup error (clone/checkout/deps/R2-pull/untar). Without this (was only
+# `set -uo pipefail`), a failed step fell through to TRAINING → a pod could silently train the wrong
+# ref or a degraded data mix and report it as a result. The training call re-enables `set +e` (below)
+# so its exit code is captured, not fatal.
+set -e
+
 # ── python env ───────────────────────────────────────────────────────────────
 # Vast's own images (vastai/pytorch) ship torch in a venv at /venv/main. ACTIVATE it, or `python3`
 # is the system interpreter with NO torch → pip would reinstall torch (gigabytes, minutes of billed
@@ -114,6 +120,12 @@ r2 cp "$(key data.tar.gz)" "$WORK/data.tar.gz"
 mkdir -p "$REPO_DIR/data"
 tar xzf "$WORK/data.tar.gz" -C "$REPO_DIR"     # tar stores paths as data/<source>/...
 echo "[bootstrap] data sources: $(ls "$REPO_DIR/data" | tr '\n' ' ')"
+# Assert the expected training sources are present — pack_data.sh only WARNs on a missing source, so a
+# partial tarball would otherwise silently train a degraded mix (audit blocker #3). babi/bio are NOT
+# tarred (HF-runtime / procedural), so they are not checked here.
+_need="fineweb_edu pile redpajama code squad triviaqa hotpot_train musique_train multiwoz"
+_missing=""; for s in $_need; do [ -d "$REPO_DIR/data/$s" ] || _missing="$_missing $s"; done
+[ -z "$_missing" ] || { echo "[bootstrap] FATAL missing data sources:$_missing"; exit 1; }
 
 # ── train ────────────────────────────────────────────────────────────────────
 # titans keeps its per-window autograd memory live across windows → disable the

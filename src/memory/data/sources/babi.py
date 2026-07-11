@@ -122,11 +122,13 @@ def _load_babi_rows(tasks, split: str):
             print(f"[babi] {name} unavailable ({type(e).__name__}: {str(e)[:80]}); "
                   f"trying next source", flush=True)
 
-    if 1 not in task_set:
+    if task_set != {1}:
         raise RuntimeError(
-            f"bAbI HF source unreachable and requested tasks {sorted(task_set)} do not include "
-            f"task 1 — the offline fallback only synthesizes task-1 stories. Restore network "
-            f"access (Muennighoff/babi) or include task 1 in the requested tasks.")
+            f"bAbI HF source unreachable and the offline fallback only synthesizes TASK-1 stories, but "
+            f"the requested tasks are {sorted(task_set)} (≠ {{1}}). Silently training the default "
+            f"multi-task set on task-1-only would corrupt the binding mix and misreport the arm (audit "
+            f"blocker #3). Restore network access (Muennighoff/babi), or request exactly task 1 to use "
+            f"the offline fallback.")
     is_val = split in ("validation", "val")
     print(f"[babi] HF bAbI unreachable — generating programmatic task-1 stories "
           f"(offline fallback, split={'val' if is_val else 'train'})", flush=True)

@@ -72,6 +72,14 @@ def _load_cfg_from_ckpt(ckpt: Path) -> tuple[ReprConfig, dict]:
     # r52 / memoryllm r39 / titans h4650), else the rebuilt model shape-mismatches the state_dict.
     cfg_src = sd["metadata"].get("cfg_all") or sd["metadata"]["cfg_dict"]
     cfg = ReprConfig(**{k: v for k, v in cfg_src.items() if k in valid})
+    # cfg_all also holds the ~20 DYNAMICALLY-attached fields cli.py sets (titans_mem_hidden=4650,
+    # memoryllm_lora_rank=39, gisting_*, kl_coef, …) that are NOT ReprConfig dataclass fields, so the
+    # constructor above cannot accept them. Restore them via setattr — WITHOUT this the encoder falls
+    # back to its getattr default (titans h=4864, memoryllm r=46) and load_state_dict RAISES on the
+    # resulting shape mismatch (strict=False still errors on shape), crashing the eval of titans/memoryllm.
+    for k, v in cfg_src.items():
+        if k not in valid:
+            setattr(cfg, k, v)
     return cfg, sd
 
 
