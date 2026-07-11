@@ -28,6 +28,9 @@ STATE_DIR="$HERE/state"
 VAST="$REPO/.venv/bin/vastai"; [ -x "$VAST" ] || VAST=vastai
 export VAST_API_KEY="$(cat "$HOME/.config/vastai/api_key")"
 R2_CRED="$HOME/.config/r2/credentials"
+# HF token for gated repos (meta-llama/Llama-3.2-1B FineWeb src-tokenizer). Shipped to the pod over
+# SSH (never vast metadata). Prefer the standard hf cache location; fall back to $HF_TOKEN env.
+HF_TOKEN_FILE="${HF_TOKEN_FILE:-$HOME/.cache/huggingface/token}"
 SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10)
 
 register_key() {
@@ -59,9 +62,14 @@ start_pod() {   # $1=instance_id $2=arm  + run cfg via env RUN_ID/OUT_TAG/REPO_R
   if [ -z "${host:-}" ]; then echo "[drive] $arm: no ssh-url yet for $iid (still booting?)"; return 1; fi
   echo "[drive] $arm ($iid) → root@$host:$port ; waiting for sshd…"
   wait_ssh "$host" "$port" || { echo "[drive] $arm: ssh never came up"; return 1; }
-  # copy R2 creds over the encrypted channel (not vast metadata)
+  # copy R2 creds (+ HF token) over the encrypted channel (not vast metadata)
   ssh "${SSH_OPTS[@]}" -p "$port" "root@$host" "mkdir -p /root/.config/r2"
   scp "${SSH_OPTS[@]}" -P "$port" "$R2_CRED" "root@$host:/root/.config/r2/credentials"
+  if [ -f "$HF_TOKEN_FILE" ]; then
+    scp "${SSH_OPTS[@]}" -P "$port" "$HF_TOKEN_FILE" "root@$host:/root/.config/hf_token"
+  else
+    echo "[drive] $arm: WARNING no HF token at $HF_TOKEN_FILE — gated FineWeb tokenizer will 401 on the pod"
+  fi
   # start bootstrap in a detached remote tmux; source creds → env that bootstrap reads
   ssh "${SSH_OPTS[@]}" -p "$port" "root@$host" bash -s <<EOF
 set -a; source /root/.config/r2/credentials; set +a

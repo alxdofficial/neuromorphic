@@ -63,10 +63,17 @@ DEFAULT_ARMS = [
 # (a 4080S and a 4090 share sm_89; an "RTX PRO 4000 Blackwell" and a 5090 share sm_120
 # but the workstation card has a fraction of the SMs/bandwidth). Pin the exact card so
 # "we want speed" gets the card we mean. min_cc stays as a bf16 sanity guard.
+# Images: use VAST'S OWN pre-cached image (vastai/pytorch), NOT raw Docker Hub (pytorch/pytorch).
+# Vast hosts keep the vastai/* images warm → the container is ready in seconds; a raw Docker Hub
+# pull on a cold host took ~8.4 min (505s) in a live test (image download + apt + locale-gen) — pure
+# billed idle. The `-auto` tag selects the torch build matching the host driver. cuda-13.0.3-auto was
+# VALIDATED on a 5090 (torch 2.12/cu130, sm_120/Blackwell + bf16 OK). NOTE: the vast image ships torch
+# in a venv at /venv/main (bootstrap activates it) and sets HF_HOME=/workspace/.hf_home.
+_VAST_IMG = "vastai/pytorch:cuda-13.0.3-auto"
 GPU_TIERS = {
-    "4090":   {"gpu_name": "RTX_4090", "min_cc": 890,  "image": "pytorch/pytorch:2.4.1-cuda12.1-cudnn9-runtime"},
-    "5090":   {"gpu_name": "RTX_5090", "min_cc": 1200, "image": "pytorch/pytorch:2.8.0-cuda12.8-cudnn9-runtime"},
-    "3090":   {"gpu_name": "RTX_3090", "min_cc": 800,  "image": "pytorch/pytorch:2.4.1-cuda12.1-cudnn9-runtime"},
+    "4090":   {"gpu_name": "RTX_4090", "min_cc": 890,  "image": _VAST_IMG},
+    "5090":   {"gpu_name": "RTX_5090", "min_cc": 1200, "image": _VAST_IMG},
+    "3090":   {"gpu_name": "RTX_3090", "min_cc": 800,  "image": _VAST_IMG},
 }
 DEFAULT_GPU = "5090"   # 32GB Blackwell — the per-layer-KV arms (gisting/memoryllm) need >24GB
                        # for the full 5-task behavioral_kl mix at B=8; 5090 fits all arms uniformly.
@@ -221,8 +228,8 @@ def main():
     min_cc = args.min_compute_cap if args.min_compute_cap is not None else tier["min_cc"]
     image = args.image if args.image is not None else tier["image"]
     if args.gpu == "5090":
-        print("[launch] NOTE: 5090 is Blackwell (sm_120) — requires the CUDA-12.8/torch-≥2.7 "
-              f"image ({image}). Verify that tag exists (or pass --image) before --go.")
+        print(f"[launch] NOTE: 5090 (Blackwell sm_120) uses the vast pre-cached image {image} "
+              "— validated: torch 2.12/cu130, sm_120 + bf16 OK, instant load.")
 
     env = _vast_env()
     run_id = _run_id()

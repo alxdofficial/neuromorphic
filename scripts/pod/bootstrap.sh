@@ -78,9 +78,18 @@ on_exit() {
 }
 trap on_exit EXIT
 
-# Install a lightweight aws CLI early (pip; the pytorch image has python) so status
-# markers work even if later steps fail.
-python3 -m pip install -q --no-input awscli 2>&1 | tail -1 || pip install -q awscli
+# ── python env ───────────────────────────────────────────────────────────────
+# Vast's own images (vastai/pytorch) ship torch in a venv at /venv/main. ACTIVATE it, or `python3`
+# is the system interpreter with NO torch → pip would reinstall torch (gigabytes, minutes of billed
+# idle). Also prefer `uv` (present on the vast image) → installs in seconds (~55s for the whole set).
+if [ -f /venv/main/bin/activate ]; then
+  source /venv/main/bin/activate
+  echo "[bootstrap] activated venv /venv/main (python=$(command -v python))"
+fi
+pipi() { if command -v uv >/dev/null 2>&1; then uv pip install -q "$@"; else python3 -m pip install -q --no-input "$@"; fi; }
+
+# Install a lightweight aws CLI early so status markers work even if later steps fail.
+pipi awscli 2>&1 | tail -1 || python3 -m pip install -q --no-input awscli
 put_status "RUNNING started=$(date -u +%FT%TZ)"
 
 # ── code ─────────────────────────────────────────────────────────────────────
@@ -94,9 +103,9 @@ echo "[bootstrap] HEAD=$(git -C "$REPO_DIR" rev-parse --short HEAD)"
 # vast.ai pytorch images ship torch+CUDA. Install only what the repo adds on top.
 echo "[bootstrap] installing python deps"
 if [ -f "$REPO_DIR/requirements.txt" ]; then
-  python3 -m pip install -q --no-input -r "$REPO_DIR/requirements.txt" 2>&1 | tail -3
+  pipi -r "$REPO_DIR/requirements.txt" 2>&1 | tail -3
 else
-  python3 -m pip install -q --no-input transformers datasets safetensors pyarrow accelerate 2>&1 | tail -3
+  pipi transformers datasets safetensors pyarrow accelerate 2>&1 | tail -3
 fi
 
 # ── data ─────────────────────────────────────────────────────────────────────
@@ -111,6 +120,14 @@ echo "[bootstrap] data sources: $(ls "$REPO_DIR/data" | tr '\n' ' ')"
 # streaming grad-checkpoint for that arm only (matches the local config).
 EXTRA=()
 [ "$ARM" = "titans_baseline" ] && EXTRA+=(--no-grad-ckpt-stream)
+
+# Gated HF dep: the FineWeb src-tokenizer is meta-llama/Llama-3.2-1B (GATED — needs a Meta-approved
+# HF token) for the reconstruct/continuation tasks. The vast image sets HF_HOME=/workspace/.hf_home,
+# so a token file under ~/.cache is ignored → export HF_TOKEN (path-independent, highest priority).
+# drive.sh ships the token to /root/.config/hf_token over the SSH channel (never vast metadata).
+[ -f /root/.config/hf_token ] && export HF_TOKEN="$(cat /root/.config/hf_token)"
+[ -n "${HF_TOKEN:-}" ] && echo "[bootstrap] HF_TOKEN present (gated FineWeb tokenizer enabled)" \
+                       || echo "[bootstrap] WARNING no HF_TOKEN — meta-llama/Llama-3.2-1B will 401 (reconstruct/continuation fail)"
 
 echo "[bootstrap] training $ARM for $STEPS steps (behavioral_kl, B=$BATCH)"
 cd "$REPO_DIR"

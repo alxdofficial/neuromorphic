@@ -12,6 +12,31 @@ ceiling.
 
 ---
 
+## 0. VALIDATED end-to-end (2026-07-11 live test) + the gotchas it found
+
+A full single-arm run (icae_baseline, B=8, behavioral_kl, 5090) was driven on a real pod:
+clone → deps → R2 data → 30 steps → checkpoint. **TRAIN_EXIT=0, peak_vram 22.1 GB, 30 steps
+in 1.1 min** (matches local). Four setup gotchas were found and folded into the scripts:
+
+1. **Use vast's OWN image, not Docker Hub.** `vastai/pytorch:cuda-13.0.3-auto` is pre-cached on
+   hosts → container ready in **seconds**. The raw `pytorch/pytorch:2.8.0-cuda12.8` image on a cold
+   host took **505 s (8.4 min)** to become ready (pull + apt + locale-gen) = pure billed idle.
+   `launch.py` now uses `vastai/pytorch:cuda-13.0.3-auto` for every tier (torch 2.12/cu130, Blackwell
+   sm_120 + bf16 verified on a 5090). The `-auto` tag picks the torch build matching the host driver.
+2. **The vast image ships torch in a venv at `/venv/main`** — bare `python3` is the *system*
+   interpreter with **no torch**, so unactivated it would pip-reinstall torch (GBs, minutes).
+   `bootstrap.sh` now `source /venv/main/bin/activate` before anything, and uses **`uv pip install`**
+   (present on the image) → all repo deps in **~55 s**.
+3. **Gated HF dep:** the FineWeb `--src-tokenizer` is **`meta-llama/Llama-3.2-1B` (GATED)**. Needs a
+   Meta-approved HF token or the reconstruct/continuation tasks 401. `drive.sh` ships the local token
+   (`~/.cache/huggingface/token`) to the pod over SSH; bootstrap exports it as `HF_TOKEN`.
+4. **The vast image sets `HF_HOME=/workspace/.hf_home`** → a token file at `~/.cache/huggingface/token`
+   is IGNORED. Must use the **`HF_TOKEN` env var** (path-independent, highest priority) — which is what
+   bootstrap now does. (Also: SmolLM2-135M backbone is NOT gated, downloads fine; R2 819 MB pull = ~75 s;
+   vast SSH can be transiently flaky — retry.)
+
+---
+
 ## 1. One-time setup
 
 ### 1a. vast.ai
