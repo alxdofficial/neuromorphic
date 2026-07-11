@@ -6,7 +6,7 @@ the ``compute_loss`` path). Consumed by ``src/memory/training/data_mix.py``; imp
 diagnostics that build mixed val sets.
 
 Replaces the old ``scripts/train/train.py`` constants ``MIXED_TASKS_DEFAULT`` / ``MIXED_TASK_MODE``
-/ ``MIXED_CONDRECON_BIO_*``. See ``docs/data_arch_plan.md`` and ``DATASETS.md``.
+/ ``MIXED_CONDRECON_BIO_*``. See ``docs/history/docs/history/data_arch_plan.md`` and ``DATASETS.md``.
 """
 from __future__ import annotations
 

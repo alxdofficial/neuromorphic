@@ -13,7 +13,7 @@ Resolution order (BEST-EFFORT, never hangs):
   2. Else HF-stream a BOUNDED, answer-filtered sample of ``mandarjoshi/trivia_qa`` config ``rc``.
   3. Else (offline) raise a clear "run ingest first" error — no silent hang.
 
-Ingest: ``scripts/data_build/ingest/triviaqa/download.py``. See DATASETS.md / docs/data_arch_plan.md (L1).
+Ingest: ``scripts/data_build/ingest/triviaqa/download.py``. See DATASETS.md / docs/history/docs/history/data_arch_plan.md (L1).
 """
 from __future__ import annotations
 

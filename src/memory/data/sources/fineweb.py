@@ -12,7 +12,7 @@ re-tokenize firewall. ``min_len`` is the minimum re-tokenized doc length to keep
 for the mae task, ``compress_len + predict_len`` for continuation.
 
 Data: ``data/fineweb_edu/{train,val}.parquet`` (+ ``cache/``); ingest =
-``scripts/data_build/ingest/fineweb.py`` (TODO). See DATASETS.md / docs/data_arch_plan.md.
+``scripts/data_build/ingest/fineweb.py`` (TODO). See DATASETS.md / docs/history/docs/history/data_arch_plan.md.
 """
 from __future__ import annotations
 

@@ -1,13 +1,13 @@
 # Data Plan — Full-Corpus Training & Test-Eval Phases
 
 Plan for the two phases *after* the architecture-scrutiny phase, synthesizing a research sweep (2025-era
-memory/compression literature) with our prior data audit. Companion to `SCRUTINY_PHASE_DATA.md` (phase-0
-data) and `DATA_TASK_GUIDE.md`. **Status: PLAN — not yet TRAINED on / not yet evaluated.** Dataset
+memory/compression literature) with our prior data audit. Companion to `DATA.md` (phase-0
+data) and `DATA.md`. **Status: PLAN — not yet TRAINED on / not yet evaluated.** Dataset
 numbers/licenses were research-gathered; verify before ingesting (see "Verify-before-use" at the end).
 
 > **UPDATE (2026-07-08): the Phase-1 sources + Phase-2 eval readers below have SHIPPED as code** (they
 > exist in `SOURCE_REGISTRY`/`REGISTRY` and can be loaded), but are **not yet in `DEFAULT_TRAIN_MIX`** —
-> the architecture-scrutiny sweep (`SCRUTINY_PHASE_DATA.md`) still trains only on the 5-task mix. Shipped
+> the architecture-scrutiny sweep (`DATA.md`) still trains only on the 5-task mix. Shipped
 > Phase-1 sources: `wildchat`, `lmsys_chat` (gated), `msc`, `qasper`, `longcite`, `govreport`, `pg19`,
 > `ruler_niah`, `babilong_train`, `wikibigedit`, `swe_trajectories`, `perltqa`. Shipped Phase-2 eval
 > readers: `longmemeval`, `longbench`, `infinitebench`, `niah`. Still NOT built: `streaming_update`/
@@ -351,7 +351,7 @@ memory vs RAG; fix + name the judge model in every table caption.
 7. Agentic task + sources + agent evals → most novel/expensive; after the text+code foundation is proven.
 (1–3 low-risk parallel; 4 is the keystone; 5–7 stack on top.)
 
-## Invariants (across both new phases; inherited from `SCRUTINY_PHASE_DATA.md` §10)
+## Invariants (across both new phases; inherited from `DATA.md` §8)
 1. **Causality** — a queried fact is always written before the query (session/turn N's query after its write).
 2. **Un-guessability** — the answer requires the compressed context; distractors never contain it.
 3. **Fixed compression denominator** — every context is exactly `total_len` (phase-scheduled); `M` uniform across arms.

@@ -23,7 +23,7 @@ are {0,1,2,3} over 4 options), so the gold option is ``options[answer]`` directl
 
 Bounded local-cache-first: ``data/quality/<split>.jsonl`` (written by the ingest script) is used if
 present, else a bounded HF stream (``n_docs`` rows). Ingest:
-``scripts/data_build/ingest/quality/download.py``. See DATASETS.md / docs/data_arch_plan.md (Layer L1).
+``scripts/data_build/ingest/quality/download.py``. See DATASETS.md / docs/history/docs/history/data_arch_plan.md (Layer L1).
 """
 from __future__ import annotations
 

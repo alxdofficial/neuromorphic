@@ -11,7 +11,7 @@ the number of random alnum chunks (≈ tokens) per key / value. Draws yield DIST
 key would make the query target ambiguous).
 
 Generator stub: ``scripts/data_build/generate/mqar/README.md`` (nothing to build). See
-DATASETS.md / docs/data_arch_plan.md (Layer L1).
+DATASETS.md / docs/history/docs/history/data_arch_plan.md (Layer L1).
 """
 from __future__ import annotations
 

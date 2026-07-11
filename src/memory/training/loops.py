@@ -40,6 +40,13 @@ def train_mixed_variant(
     Per-task val rows are logged to the run jsonl, each tagged with `task` + `step`;
     per-task best_step/best_metric are tracked independently."""
     device = "cuda"
+    # Per-arm cfg adjustments so ONE sweep command is correct for every arm (cfg is shared across the
+    # variant loop). Titans' inner test-time-autograd (create_graph) conflicts with the outer streaming
+    # activation-checkpoint → force stream-ckpt OFF for titans only (was a manual --no-grad-ckpt-stream).
+    if variant == "titans_baseline" and getattr(cfg, "grad_checkpoint_stream", False):
+        import dataclasses as _dc
+        cfg = _dc.replace(cfg, grad_checkpoint_stream=False)
+        print("[titans] stream activation-checkpoint auto-disabled (create_graph incompatibility)")
     llama_arg = None if cfg.use_llama_lora else llama
     model = ReprLearningModel(cfg, variant=variant, llama_model=llama_arg).to(device)
     n_trainable = model.n_trainable_params()
@@ -133,15 +140,13 @@ def train_mixed_variant(
 
     _mode_banner = str(getattr(cfg, "objective_mode", "plain"))
     if _mode_banner != "plain" or float(getattr(cfg, "contrastive_shuf_coef", 0.0)) > 0:
-        # InfoNCE is ONLY the contrastive/trajectory GradCache path — behavioral_kl applies CE+KL
+        # InfoNCE is ONLY the contrastive GradCache path — behavioral_kl applies CE+KL
         # only (no InfoNCE), so advertise the KL terms for it instead (the old banner mislabeled it).
-        _is_nce = _mode_banner in ("contrastive", "trajectory")
+        _is_nce = _mode_banner == "contrastive"
         print(f"[objective] mode={_mode_banner}"
               + (f"  InfoNCE coef={cfg.objective_coef} (in-batch, all B-1 negatives)" if _is_nce else "")
               + (f"  KL(teacher‖student) coef={cfg.kl_coef} + CE coef={cfg.kl_ce_coef}, temp={cfg.kl_temp}"
                  if _mode_banner == "behavioral_kl" else "")
-              + (f"  GRPO G={cfg.grpo_samples} coef={cfg.grpo_coef} (router-only REINFORCE)"
-                 if _mode_banner == "trajectory" else "")
               + (f"  legacy softplus coef={cfg.contrastive_shuf_coef}"
                  if float(getattr(cfg, 'contrastive_shuf_coef', 0.0)) > 0 else ""),
               flush=True)
@@ -167,8 +172,8 @@ def train_mixed_variant(
             # backward runs INSIDE (two frozen-LM forwards). obj_kl logged every step.
             out, loss, _obj_extras = _behavioral_kl_step(model, batch, cfg, window_size)
             _needs_backward = False
-        elif _mode in ("contrastive", "trajectory"):
-            # in-batch InfoNCE (+GRPO): backward runs INSIDE (GradCache memory cut) — no
+        elif _mode == "contrastive":
+            # in-batch InfoNCE: backward runs INSIDE (GradCache memory cut) — no
             # loss.backward() below. Loud by construction: obj_nce is logged every step.
             out, loss, _obj_extras = _grad_cached_objective_step(model, batch, cfg, window_size)
             _needs_backward = False
@@ -255,9 +260,7 @@ def train_mixed_variant(
         }
         # arm collapse/health canaries at train frequency (biomem edge/decay/beta/sat/mem_effrank/…, etc.)
         for _k, _v in out.items():
-            if _v is None or not _k.startswith(("graph_", "biomem_", "slotgraph_",
-                                                "slotgraph2_", "slotgraph3_", "slotgraph4_",
-                                                "vqicae_")):
+            if _v is None or not _k.startswith(("graph_", "biomem_", "slotgraph_", "vqicae_")):
                 continue    # "graph_" added for parity with eval.py/val-row forwarding (graph_baseline canaries)
             if isinstance(_v, (int, float)):
                 train_row[_k] = float(_v)

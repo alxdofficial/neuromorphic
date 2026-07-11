@@ -31,14 +31,20 @@ outer streaming checkpoint). All comparisons must be **same-backbone, matched-pa
 
 ## Docs (current)
 - **`REFERENCES.md`** — authoritative paper/dataset links for every baseline & data source (never re-search).
-- **`DATA_PHASES_PLAN.md`** — the canonical phase plan: Phase-1 full-corpus training + Phase-2 test-eval
+- **`DATA.md`** — THE authoritative "what runs now": sources, the 5 tasks (with worked examples), the shared
+  packer, multi-horizon continuation, the per-task objective dispatch (MAE→CE / QA→KL / continuation-fallback),
+  and the current sweep config. Consolidates the former SCRUTINY_PHASE_DATA + DATA_TASK_GUIDE + data_arch_plan.
+- **`DATA_PHASES_PLAN.md`** — the FUTURE phase plan: Phase-1 full-corpus training + Phase-2 test-eval
   (headline table, the 4 comparison axes, run matrix, invariants). *Merged `PHASE_PLAN.md` into this.*
-- **`SCRUTINY_PHASE_DATA.md`** — Phase-0 (architecture-scrutiny) datasets / generation / objectives reference.
-- **`DATA_TASK_GUIDE.md`** — what each task does, with an example per task × datasource + config knobs.
-- **`data_arch_plan.md`** — the 4-layer data model (Source × Task × EpisodeSpec × Objective); where data code lives.
 - **`OBJECTIVES.md`** — the binding objective ladder (MAE-CE → behavioral-KL → provenance-InfoNCE → bypass-gap → GRPO), with math + citations. Why binding is an *objective* problem.
 - **`graph_thesis.md`** — why a graph memory (the two lenses), and what the literature says about making latent topology load-bearing instead of collapsing. The standing rationale.
-- **Graph-memory arm designs:** `furlgraph_design.md` (input-grounded chain-merge), `slotgraph4_design.md` (free-invent slots + fixed k-regular small-world edge states, propose→commit gated write — differentiable, buildable now), `graph_generative_memory.md` (the "spider web" — score-function/GRPO-era). All deferred behind the baseline sweep.
+- **Graph-memory arm design:** **`slotgraph_design.md` — THE slotgraph** (the canonical, converged arm:
+  96 nodes / no edge tokens / persistent plastic value-path edge state / learnable inter-layer diff+product
+  operator / propose→commit / prepend+bidir read). Gated on a first behavioral-KL binding baseline before
+  the edge machinery is built. Predecessor design docs kept for provenance, NOT current: `slotgraph4_design.md`
+  (fixed WS edge-state slots — the immediate parent whose write/read machinery slotgraph inherits),
+  `furlgraph_design.md` (input-grounded chain-merge), `graph_generative_memory.md` (the "spider web" —
+  score-function/GRPO-era).
 - **`mamba_two_lenses_memory.md`** — research note: Mamba/linear-attention lenses on compress-and-recall.
 - **`history/`** — archived records of the superseded slotgraph/biomem/treemem line and completed reorg
   plans (`cohort_results`, `slotgraph_*`, `biomem_chunkwise_plan`, `{data,harness}_reorg_plan`, …).

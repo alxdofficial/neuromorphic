@@ -19,7 +19,7 @@ Resolution order (BEST-EFFORT, never hangs):
      splits upstream — no skip-carving needed).
   3. Else (offline) raise a clear "run ingest first" error — no silent hang.
 
-Ingest: ``scripts/data_build/ingest/govreport/download.py``. See DATASETS.md / docs/data_arch_plan.md (L1).
+Ingest: ``scripts/data_build/ingest/govreport/download.py``. See DATASETS.md / docs/history/docs/history/data_arch_plan.md (L1).
 """
 from __future__ import annotations
 

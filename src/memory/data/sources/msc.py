@@ -22,7 +22,7 @@ Resolution order (BEST-EFFORT, never hangs):
   2. Else HF-stream a BOUNDED sample of ``nayohan/multi_session_chat`` (real train/validation splits).
   3. Else (offline) raise a clear "run ingest first" error — no silent hang.
 
-Ingest: ``scripts/data_build/ingest/msc/download.py``. See DATASETS.md / docs/data_arch_plan.md (L1).
+Ingest: ``scripts/data_build/ingest/msc/download.py``. See DATASETS.md / docs/history/docs/history/data_arch_plan.md (L1).
 """
 from __future__ import annotations
 

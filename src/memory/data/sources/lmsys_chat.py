@@ -17,7 +17,7 @@ Resolution order (BEST-EFFORT, never hangs):
   2. Else HF-stream a BOUNDED sample of ``lmsys/lmsys-chat-1m`` (needs the accepted agreement + token).
   3. Else (gated / offline) raise a clear "accept the agreement, then run ingest" error.
 
-Ingest: ``scripts/data_build/ingest/lmsys_chat/download.py``. See DATASETS.md / docs/data_arch_plan.md (L1).
+Ingest: ``scripts/data_build/ingest/lmsys_chat/download.py``. See DATASETS.md / docs/history/docs/history/data_arch_plan.md (L1).
 """
 from __future__ import annotations
 

@@ -23,9 +23,6 @@ from .models.ccm import CCMBaselineEncoder
 from .models.icae import ICAEBaselineEncoder
 from .models.biomem import BioMemEncoder
 from .models.slotgraph import SlotGraphEncoder
-from .models.slotgraph2 import SlotGraph2Encoder
-from .models.slotgraph3 import SlotGraph3Encoder
-from .models.slotgraph4 import SlotGraph4Encoder
 from .models.vqicae import VQICAEEncoder
 from .models.memoryllm import MemoryLLMBaselineEncoder
 from .models.gisting import GistingBaselineEncoder
@@ -69,22 +66,11 @@ class ReprLearningModel(nn.Module):
         # gated fast-Hebbian cortical-column grid — memory lives in fast synaptic
         # STATE (fast edges), read+write are signal propagation (models/biomem/).
         "biomem_baseline": BioMemEncoder,
-        # fixed-partition graph slot memory — ICAE write + a FIXED node/edge slot partition; each edge
-        # predicts (hard ST) which two node slots it links; read = a multi-hop residual message-passing
-        # GNN over the predicted graph, prepended (models/slotgraph/).
+        # THE slotgraph — 96 node slots, NO edge tokens; ONE shared frozen LM (write-harvest + read
+        # LoRAs); persistent per-edge state on the attention VALUE path, harvested from the LM's per-layer
+        # attention, error-correcting/per-edge-gated/EntNet-bounded commit; prepend+bidir read shaped by
+        # the edge state (models/slotgraph/; docs/slotgraph_design.md).
         "slotgraph_baseline": SlotGraphEncoder,
-        # per-layer graph-transformer memory: fixed node/edge partition at d_llama; per streaming window,
-        # L layers rewrite the graph (additive-residual latents + per-layer SOFT dst paintbrush, source
-        # fixed to the home node); prepend the M graph tokens (models/slotgraph2/).
-        "slotgraph2_baseline": SlotGraph2Encoder,
-        # compressed-implicit graph: per-node (node_lat, edge_lat) state EXPANDED to explicit edge tokens
-        # (sparsemax routing + φ(src,dst,edge) + endpoint ids) during write AND before read; prepend the
-        # top-k edges/node — no raw slots (models/slotgraph3/).
-        "slotgraph3_baseline": SlotGraph3Encoder,
-        # free-invent graph done right: N node slots + a FIXED k-regular small-world edge-state tensor
-        # (Watts-Strogatz); NO routing head; propose→commit gated write (no delta rule); prepend read
-        # (node-centric + top-k salience edges) (models/slotgraph4/).
-        "slotgraph4_baseline": SlotGraph4Encoder,
         # ICAE but each slot is a VQ-VAE code from a large codebook (discreteness experiment).
         "vqicae_baseline": VQICAEEncoder,
         # MemoryLLM (arXiv:2402.04624): fixed per-layer latent pool + compress-then-RANDOM-DROP
@@ -118,11 +104,13 @@ class ReprLearningModel(nn.Module):
             raise ValueError(
                 f"Unknown variant {variant!r}. Must be one of {list(self.VARIANTS)}."
             )
-        if variant in {"slotgraph4_baseline", "h2o_baseline"}:
+        if variant in {"slotgraph_baseline", "h2o_baseline"}:
             cfg = copy.copy(cfg)
-        if variant == "slotgraph4_baseline":
+        if variant == "slotgraph_baseline":
+            # THE slotgraph read geometry is prepend + Set-LLM bidirectional at a uniform memory position
+            # (the relational read needs intra-memory attention; see docs/slotgraph_design.md §6).
             if getattr(cfg, "rect_prepend_mask", False):
-                raise ValueError("slotgraph4_baseline requires bidir_mem_attn; rect_prepend_mask is incompatible")
+                raise ValueError("slotgraph_baseline requires bidir_mem_attn; rect_prepend_mask is incompatible")
             cfg.bidir_mem_attn = True
             cfg.uniform_mem_pos = True
         if variant == "h2o_baseline":
@@ -297,8 +285,7 @@ class ReprLearningModel(nn.Module):
     # slicing applies to these; vanillas pass through at M=0 / M=T).
     _MASKED_RECON_COMPRESSORS = ("icae_baseline", "ccm_baseline",
                         "autocompressor_baseline", "beacon_baseline",
-                        "slotgraph_baseline", "slotgraph2_baseline",
-                        "slotgraph3_baseline", "slotgraph4_baseline", "vqicae_baseline",
+                        "slotgraph_baseline", "vqicae_baseline",
                         "memoryllm_baseline", "gisting_baseline", "titans_baseline",
                         "h2o_baseline")
 
@@ -1457,9 +1444,7 @@ class ReprLearningModel(nn.Module):
         # or babi/continuation drop them).
         for _k, _v in (finalize_aux or {}).items():
             if not (_k.startswith("biomem_") or _k.startswith("slotgraph_")
-                    or _k.startswith("slotgraph2_") or _k.startswith("slotgraph3_")
-                    or _k.startswith("slotgraph4_") or _k.startswith("h2o_")
-                    or _k.startswith("vqicae_")):
+                    or _k.startswith("h2o_") or _k.startswith("vqicae_")):
                 continue
             if torch.is_tensor(_v) and _v.numel() == 1:
                 out[_k] = _v.detach()

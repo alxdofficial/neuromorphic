@@ -11,7 +11,7 @@ Resolution order (BEST-EFFORT, never hangs on the procedural sources):
   3. Else (HF unreachable / offline) raise a clear "run ingest first" error — no silent hang.
 
 Ingest scripts: ``scripts/data_build/ingest/{pile,redpajama}/download.py``.
-See DATASETS.md / docs/data_arch_plan.md (Layer L1).
+See DATASETS.md / docs/history/docs/history/data_arch_plan.md (Layer L1).
 """
 from __future__ import annotations
 

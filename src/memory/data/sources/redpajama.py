@@ -11,7 +11,7 @@ parquet-native). The classic ``togethercomputer/RedPajama-Data-1T-Sample`` is a 
 dataset, which ``datasets`` ≥ 4.x no longer supports — pass ``hf_name=`` to override if you have a
 parquet-native RedPajama mirror.
 
-Ingest: ``scripts/data_build/ingest/redpajama/download.py``. See DATASETS.md / docs/data_arch_plan.md.
+Ingest: ``scripts/data_build/ingest/redpajama/download.py``. See DATASETS.md / docs/history/docs/history/data_arch_plan.md.
 """
 from __future__ import annotations
 

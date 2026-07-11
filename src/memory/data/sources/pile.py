@@ -6,7 +6,7 @@ backbone-tokenized, ≥ ``min_len``) for the diverse-web Pile bucket. Loads a BO
 (default ``NeelNanda/pile-10k``); otherwise (offline) raises a clear "run ingest first" error — it
 never hangs. Windowing / span placement is the Task's job.
 
-Ingest: ``scripts/data_build/ingest/pile/download.py``. See DATASETS.md / docs/data_arch_plan.md.
+Ingest: ``scripts/data_build/ingest/pile/download.py``. See DATASETS.md / docs/history/docs/history/data_arch_plan.md.
 """
 from __future__ import annotations
 

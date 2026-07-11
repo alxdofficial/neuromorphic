@@ -5,7 +5,7 @@ how long each, how many distractors, how many reads, and how far back the querie
 SAME spec drives every task (reconstruction / qa / continuation / mae), so difficulty means the
 same thing across tasks. A ``Curriculum`` maps training step → spec, ratcheting length/lag/distractors.
 
-See ``docs/data_arch_plan.md`` (Layer L3). Consumed by ``tasks/`` (shapers) and ``mixes.py``.
+See ``docs/history/docs/history/data_arch_plan.md`` (Layer L3). Consumed by ``tasks/`` (shapers) and ``mixes.py``.
 """
 from __future__ import annotations
 

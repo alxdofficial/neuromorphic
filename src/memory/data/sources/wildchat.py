@@ -19,7 +19,7 @@ Resolution order (BEST-EFFORT, never hangs):
      the smaller, ungated ``allenai/WildChat`` if the -1M dump is unreachable).
   3. Else (offline / both unreachable) raise a clear "run ingest first" error — no silent hang.
 
-Ingest: ``scripts/data_build/ingest/wildchat/download.py``. See DATASETS.md / docs/data_arch_plan.md (L1).
+Ingest: ``scripts/data_build/ingest/wildchat/download.py``. See DATASETS.md / docs/history/docs/history/data_arch_plan.md (L1).
 """
 from __future__ import annotations
 

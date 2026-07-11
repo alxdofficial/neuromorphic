@@ -18,7 +18,7 @@ value in-distribution)::
 
 Consumes a ``keyed``-kind source (distinct random variables). Emits the exact per-sample dict
 ``common.collate_qa`` consumes, so ``compute_loss`` + the REAL/SHUF/OFF gate are unchanged.
-See docs/data_arch_plan.md (Layer L2).
+See docs/history/docs/history/data_arch_plan.md (Layer L2).
 """
 from __future__ import annotations
 

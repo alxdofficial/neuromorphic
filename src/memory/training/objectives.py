@@ -1,4 +1,4 @@
-"""Objective ladder: CE / in-batch InfoNCE / MCR² coding-rate / GRPO trajectory.
+"""Objective ladder: CE / in-batch InfoNCE / MCR² coding-rate / behavioral-KL.
 
 Extracted verbatim from ``scripts/train/train.py`` (harness reorg phase 2). No logic changes.
 """
@@ -162,7 +162,7 @@ def _behavioral_kl_step(model, batch, cfg, window_size):
 
 
 def _grad_cached_objective_step(model, batch, cfg, window_size):
-    """contrastive/trajectory objective step (train_mixed_variant — the trainer that actually
+    """contrastive objective step (train_mixed_variant — the trainer that actually
     runs mixed; the 2026-07-02 lesson: the legacy coef lived only in train_one_variant and was
     silently ignored here).
 
@@ -176,9 +176,6 @@ def _grad_cached_objective_step(model, batch, cfg, window_size):
               directly, memory grads accumulate on a detached leaf; each branch is freed
               before the next (passes 1/2 share RNG → identical masks → identical S).
       pass 3: memory.backward(gradient=leaf.grad) — encoder backward ONCE.
-    trajectory mode adds GRPO on the discrete read: G Gumbel-top-k sampled expansions,
-    reward = per-example binding advantage (CE_shuf − CE_shuf-free real, no-grad reads),
-    group-relative advantage × logprob REINFORCE on the ROUTER only (hybrid estimator).
 
     BACKWARD RUNS INSIDE — the caller must NOT call loss.backward(). Returns
     (out_real, total_loss_detached, extras_for_the_train_row)."""
@@ -225,45 +222,9 @@ def _grad_cached_objective_step(model, batch, cfg, window_size):
     if mem_leaf.grad is not None:
         mem.backward(gradient=mem_leaf.grad.to(mem.dtype))
     extras = {"obj_nce": float(nce), "obj_ce_real": float(ce_real)}
-    # ── trajectory: GRPO on the discrete read expansion (router-only REINFORCE) ──
-    if str(getattr(cfg, "objective_mode", "plain")) == "trajectory":
-        lat = aux.get("latents")
-        if lat is None or not hasattr(model.encoder, "sample_read_expansion"):
-            raise ValueError("objective_mode=trajectory needs a slotgraph3 encoder "
-                             "(finalize aux['latents'] + sample_read_expansion)")
-        nl, el = lat
-        rollouts, route_H = model.encoder.sample_read_expansion(
-            nl.detach(), el.detach(), int(getattr(cfg, "grpo_samples", 4)))
-        rewards, logps = [], []
-        for mem_g, keep_g, logp_g in rollouts:
-            aux_g = {"memory_mask": keep_g}
-            with torch.no_grad():
-                torch.cuda.set_rng_state(_rng)
-                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    o_real = model.compute_loss(batch, window_size=window_size,
-                                                memory_override=(mem_g, aux_g))
-            # reward = −CE_real (2026-07-03 audit: the old CE_shuf−CE_real reward had an
-            # UNBOUNDED poison lever — raise CE_shuf instead of lowering CE_real; the group
-            # baseline already strips per-example difficulty, so the shuf term was redundant
-            # for its purpose. Also halves the reward reads.)
-            rewards.append((-o_real["loss_per_example"]).float())
-            logps.append(logp_g)
-        R = torch.stack(rewards, dim=0)                # [G, B] −CE_real per rollout
-        adv = R - R.mean(dim=0, keepdim=True)          # group baseline = (G−1)/G × RLOO (unbiased dir)
-        # per-DECISION scale: logp sums K×topk ≈ 128 PL terms (summing is the correct joint
-        # log-prob — per-sample averaging would be the Dr.GRPO length bias; dividing by a
-        # CONSTANT is a pure coefficient, direction-identical) so grpo_coef=1.0 stays sane.
-        n_dec = max(1, model.encoder.K * model.encoder.read_topk)
-        pol = -(adv.detach() * torch.stack(logps, dim=0)).mean() / n_dec
-        # entropy BONUS on the router distribution — THE load-bearing regularizer for policy
-        # gradients on latent structure (entropy collapse = the documented GRPO failure mode;
-        # Gumbel noise alone stops exploring once logits sharpen).
-        ent_coef = float(getattr(cfg, "grpo_entropy_coef", 0.01))
-        (float(getattr(cfg, "grpo_coef", 1.0)) * pol - ent_coef * route_H).backward()
-        extras["obj_grpo_policy"] = float(pol)
-        extras["obj_grpo_reward"] = float(R.mean())
-        extras["obj_grpo_reward_std"] = float(R.std())
-        extras["obj_route_entropy"] = float(route_H)
+    # (The trajectory/GRPO-over-discrete-read-expansion branch was removed with slotgraph3, its only
+    #  consumer — it needed the encoder's sample_read_expansion + aux['latents']. THE slotgraph has no
+    #  discrete read to sample; if a trajectory objective is wanted later it belongs in graph_generative_memory.)
     total = float(ce_real) + coef * float(nce)
     out_real["loss"] = torch.tensor(total, device=S.device)        # detached (backward already done)
     out_real["loss_recon"] = ce_real

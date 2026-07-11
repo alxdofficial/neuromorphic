@@ -25,7 +25,7 @@ probe never share needle/filler text; the random key/value space also makes trai
 probability ~0 (same reasoning as ``mqar``/``ruler_overwrite``).
 
 Runtime-procedural: no offline build, nothing under ``data/ruler_niah/``. See DATASETS.md /
-docs/data_arch_plan.md (Layer L1).
+docs/history/docs/history/data_arch_plan.md (Layer L1).
 """
 from __future__ import annotations
 

@@ -29,14 +29,14 @@ def build_parser() -> argparse.ArgumentParser:
     # still selectable via explicit --variants for reproduction, out of the default.
     ap.add_argument("--variants", nargs="+", default=[
         # ACTIVE trainable cohort (2026-07-10): published closed-book compressors + our graph arm,
-        # matched ~7M params / M=96. Dropped from active: beacon (too close to icae/autocompressor),
-        # slotgraph3 (superseded by slotgraph4), ccm/vqicae/biomem/slotgraph(1,2) (still selectable).
+        # matched ~7M params / M=96. THE slotgraph is slotgraph_baseline;
+        # beacon/ccm/vqicae/biomem removed or non-active.
         "icae_baseline",              # ICAE (ICLR'24) — prepend
         "autocompressor_baseline",    # AutoCompressor/RMT-style recurrent summary — prepend
         "titans_baseline",            # Titans (deep-MLP test-time-autograd memory) — MAC prepend; needs --no-grad-ckpt-stream
         "gisting_baseline",           # Gisting (per-layer gist-KV) — native per-layer-KV read
         "memoryllm_baseline",         # MemoryLLM (per-layer pool + random-drop) — native per-layer-KV read
-        "slotgraph4_baseline",        # OUR arm — fixed-topology edge-state slot graph (prepend+bidir)
+        "slotgraph_baseline",         # OUR arm — THE slotgraph (prepend+bidir)
         "vanilla_llama",              # MAE loss FLOOR (band lower bound; eval-only)
         "vanilla_full_context",       # MAE loss CEILING (band upper bound; eval-only)
         "h2o_baseline",               # training-free KV eviction reference (eval-only)
@@ -114,9 +114,10 @@ def build_parser() -> argparse.ArgumentParser:
                          "after; -1 = last = recency baseline; unset = any window). Ties to "
                          "--window-size; use with --window-size < --mixed-ctx to make the streaming "
                          "windows real (e.g. --window-size 256 --mixed-ctx 1024 --bio-query-window 0).")
-    ap.add_argument("--backbone", type=str, default=None,
-                    help="override cfg.llama_model (e.g. HuggingFaceTB/SmolLM2-135M for "
-                         "the compression line). Auto-sets d_llama from the config.")
+    ap.add_argument("--backbone", type=str, default="HuggingFaceTB/SmolLM2-135M",
+                    help="cfg.llama_model backbone. DEFAULT = SmolLM2-135M (d=576) — the backbone the "
+                         "mixed cohort's param-matched ranks are calibrated for (the mixed path hard-errors "
+                         "on d≠576 unless --allow-unmatched-backbone). Auto-sets d_llama from the config.")
     ap.add_argument("--src-tokenizer", type=str, default="meta-llama/Llama-3.2-1B",
                     help="tokenizer that produced the FineWeb-EDU parquet ids (for "
                          "decode→retokenize in the sentence loader).")
@@ -149,67 +150,9 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--anomaly-from", type=int, default=-1,
                     help="debug: from this step on, run loss.backward() under torch.autograd.detect_anomaly "
                          "so the first non-finite GRADIENT halts with a traceback to the exact forward op.")
-    ap.add_argument("--slotgraph-no-structure", action="store_true",
-                    help="slotgraph: disable the MP-read structure = plain prepend of the id-tagged slots "
-                         "('id-tagged ICAE'; true pure-ICAE = the icae_baseline variant). "
-                         "Ablation: does the message-passing read add anything over id-tagged slots?")
     ap.add_argument("--biomem-no-membrane", action="store_true",
                     help="biomem: disable the LIF membrane (fire on the instantaneous readout, not the "
                          "leaky-integrated potential). Ablation: does the per-neuron membrane help?")
-    ap.add_argument("--slotgraph-no-id", action="store_true",
-                    help="slotgraph: drop the FIXED orthonormal id_embed from the slots (and routing-head "
-                         "input) = pure-ICAE-via-same-code. Pair with --slotgraph-no-structure to isolate "
-                         "the id-tag contribution: id-on vs id-off, both flat. Does the free id tagging beat ICAE?")
-    ap.add_argument("--slotgraph3-no-write-expand", action="store_true",
-                    help="slotgraph3: do NOT materialize expanded edge tokens in the WRITE context — write "
-                         "over [window; slots] only, expand edges for the READ prepend ONLY. Ablation: is the "
-                         "graph purely a read-time decode, or does the write need to see the structure? "
-                         "(Strips the write-forward pooling attractor on the routing matrix A.)")
-    ap.add_argument("--slotgraph3-write", choices=["lm", "custom"], default=None,
-                    help="slotgraph3 write mixer: 'lm' = frozen SmolLM2 attention + enc-LoRA (pretrained prior, "
-                         "~7M matched); 'custom' = frozen-LM window encode (no grad) → from-scratch graph-mixer "
-                         "blocks over [hiddens; graph] (position-free; text comprehension held constant). Probe: "
-                         "does a purpose-built graph mixer beat LM attention? (default: cfg = lm)")
-    ap.add_argument("--slotgraph3-custom-layers", type=int, default=None,
-                    help="slotgraph3 custom write: number of from-scratch transformer blocks (default cfg=4, "
-                         "d_ff=2×d → ~13M UNMATCHED capacity probe).")
-    ap.add_argument("--slotgraph3-gate-ids", action="store_true",
-                    help="slotgraph3 soft-id: endpoint labels ride INSIDE the routing weight "
-                         "(E = topv·(φ+ids)+role, Switch gate-multiplication) → router gets gradient through "
-                         "the dominant id channel; weak edges stop emitting full-loudness labels.")
-    ap.add_argument("--slotgraph3-read-topk", type=int, default=None,
-                    help="slotgraph3: edges materialized per node (default: mixed-capacity 8). Set 15 (=K-1) "
-                         "for DENSE-FORWARD training: every in-support sparsemax edge is materialized (real "
-                         "gradient to all of them; exact-zero edges auto-masked from attention) — the frozen "
-                         "top-8 boundary disappears and selection self-anneals as sparsemax sharpens.")
-    ap.add_argument("--slotgraph3-st-leak", action="store_true",
-                    help="slotgraph3 STRAIGHT-THROUGH expansion: forward = exact hard top-k edge tokens "
-                         "(context stays K·topk — no K² token growth); backward = soft mixture whose leak = "
-                         "the router's out-of-top-k sparsemax mass (self-annealing 95/5 → 100/0). Dense "
-                         "gradient to unselected destinations at zero context cost (the scalable "
-                         "alternative to --slotgraph3-read-topk 15).")
-    ap.add_argument("--slotgraph3-n-nodes", type=int, default=None,
-                    help="slotgraph3: override node count K (default: mixed-capacity M/2=16). K=128 = the "
-                         "capacity probe (state 2K=256 vectors, UNMATCHED — does binding appear once "
-                         "nodes ≥ entities-per-context?). Pair with --slotgraph3-edge-budget.")
-    ap.add_argument("--slotgraph3-edge-budget", type=int, default=None,
-                    help="slotgraph3: GLOBAL edge budget E — materialize the strongest E edges of the whole "
-                         "graph instead of top-k per node (read stays E tokens for ANY K; hubs allowed). "
-                         "Requires --slotgraph3-st-leak. E=128 keeps today's 128-token read at K=128.")
-    ap.add_argument("--slotgraph3-route-key", choices=["edge", "node"], default=None,
-                    help="slotgraph3: which latent provides routing q/k. 'node' = K/V split (route by node "
-                         "CONTENT, edge_lat freed for pure relation semantics — kills the routing-stability↔"
-                         "relation-content gradient fight on edge_lat). Default cfg: 'edge' (v1).")
-    ap.add_argument("--slotgraph3-write-layers", type=int, default=None,
-                    help="slotgraph3 LM arm depth: 0 = full ride (graph tokens through ALL layers); N>0 = "
-                         "text runs the frozen prefix no-grad, graph tokens splice in for the last N layers "
-                         "(+LoRA). N=4 is depth-matched to the custom arm and ~2× faster than full ride.")
-    ap.add_argument("--slotgraph3-read", choices=["edges", "raw"], default=None,
-                    help="slotgraph3 read: 'raw' = prepend node LATENTS as content tokens (pretrained-space, "
-                         "direct decoder→latent gradient, no φ) + edge POINTER tokens (concat [id_src;id_dst] "
-                         "+ relation tag). The literature-verdict read (kills the φ/Q-Former bottleneck, "
-                         "id-sum direction-blindness, and the missing node-token incidence channel). "
-                         "'edges' (default) = v1 φ-synthesized edge tokens.")
     ap.add_argument("--rect-prepend-mask", action="store_true",
                     help="KBLaM-style rectangular decoder mask: prepended memory tokens attend only to "
                          "themselves (no memory↔memory mixing through decoder layers); text attends into "
@@ -219,58 +162,23 @@ def build_parser() -> argparse.ArgumentParser:
                          "bidirectionally (edge tokens compose with both endpoint node tokens regardless "
                          "of emission order); text stays causal. Mutually exclusive with "
                          "--rect-prepend-mask.")
-    ap.add_argument("--slotgraph3-no-boundary", action="store_true",
-                    help="slotgraph3: DISABLE the learned <mem_start>/<mem_end> boundary tokens "
-                         "(default ON — explicit span markers, the frozen-LM-injection consensus).")
-    ap.add_argument("--slotgraph3-route-act", choices=["softmax", "sparsemax"], default=None,
-                    help="routing activation over destinations: softmax (+train-time Gumbel noise; default) "
-                         "or sparsemax (LEGACY — exact-zero support = dead-gradient ratchet).")
-    ap.add_argument("--slotgraph3-no-init-noise", action="store_true",
-                    help="DISABLE per-forward Gaussian sampling of the initial latents (slot-symmetry "
-                         "breaking, Slot-Attention style; default ON).")
-    ap.add_argument("--slotgraph3-no-write-norm-match", action="store_true",
-                    help="DISABLE scaling graph tokens to the text-hidden RMS at the write splice "
-                         "(default ON; raw tokens are ~400x quieter than layer-26 hiddens).")
-    ap.add_argument("--slotgraph3-no-write-boundary-bidir", action="store_true",
-                    help="DISABLE the write-side <mem_start> + bidirectional graph block "
-                         "(default ON — matches the read geometry).")
-    ap.add_argument("--slotgraph3-write-update", choices=["delta", "additive"], default=None,
-                    help="slot update rule: delta (per-slot content gate + competitive read + gated "
-                         "interpolation; default) or additive (LEGACY scalar-gated residual).")
-    ap.add_argument("--slotgraph3-edge-write", choices=["assoc", "slot"], default=None,
-                    help="edge-latent update: assoc (keyed delta-rule write into the persistent 24x24 "
-                         "map — files relations under partner-key addresses; default) or slot (LEGACY "
-                         "T2 interpolation). assoc needs edge_state=matrix + write_update=delta.")
-    ap.add_argument("--slotgraph3-layer-anchor", action="store_true",
-                    help="GCNII-style per-layer id/role RE-INJECTION (the 'simple version'): re-add the "
-                         "node/edge SLOT identity after each write-suffix layer (WRITE) and the edge-token "
-                         "identity before each decoder layer (READ) so the frozen LM's mixing can't smooth "
-                         "the graph tokens together through depth. Requires --slotgraph3-read edges + "
-                         "--slotgraph3-write lm + --slotgraph3-write-layers N>0.")
-    ap.add_argument("--objective-mode", choices=["plain", "contrastive", "trajectory", "behavioral_kl"], default="plain",
-                    help="training objective (mixed trainer): 'plain' = CE only; 'contrastive' = "
+    ap.add_argument("--objective-mode", choices=["plain", "contrastive", "behavioral_kl"], default="behavioral_kl",
+                    help="training objective (mixed trainer). DEFAULT = behavioral_kl (the loss-neutrality "
+                         "fix — the project's active objective). 'plain' = CE only; 'contrastive' = "
                          "+ objective_coef × in-batch InfoNCE (each example's memory must explain its "
                          "own target best vs all B-1 other memories; 1 encoder run + GradCache rolled "
-                         "reads); 'trajectory' = contrastive + GRPO on the sampled discrete read "
-                         "expansion (router-only REINFORCE, reward = binding advantage); 'behavioral_kl' "
+                         "reads); 'behavioral_kl' "
                          "= kl_ce_coef·CE + kl_coef·KL(teacher=full-context ‖ student=memory) on answer "
                          "spans (context distillation — the loss-neutrality fix; teacher stop-grad, "
                          "differentiable, no RL).")
     ap.add_argument("--objective-coef", type=float, default=0.5,
-                    help="weight of the InfoNCE term (contrastive/trajectory modes).")
+                    help="weight of the InfoNCE term (contrastive mode).")
     ap.add_argument("--kl-coef", type=float, default=2.0,
                     help="behavioral_kl: weight of the KL(teacher‖student) term (survey default α≈2).")
     ap.add_argument("--kl-ce-coef", type=float, default=1.0,
                     help="behavioral_kl: weight of the CE-to-ground-truth term (grounds the distillation).")
     ap.add_argument("--kl-temp", type=float, default=2.0,
                     help="behavioral_kl: softmax temperature on teacher/student logits (Hinton-style T≈2).")
-    ap.add_argument("--grpo-samples", type=int, default=4,
-                    help="trajectory mode: number of Gumbel-top-k read-expansion rollouts per step.")
-    ap.add_argument("--grpo-coef", type=float, default=1.0,
-                    help="trajectory mode: weight of the REINFORCE policy term (per-decision-scaled).")
-    ap.add_argument("--grpo-entropy-coef", type=float, default=0.01,
-                    help="trajectory mode: entropy bonus on the router distribution (fights policy "
-                         "collapse; A3C-standard 0.01).")
     ap.add_argument("--objective-inv-temp", type=float, default=1.0,
                     help="inverse temperature on the row-STANDARDIZED InfoNCE logits (1.0 = unit-sigma "
                          "spread; raise to sharpen).")
@@ -282,11 +190,6 @@ def build_parser() -> argparse.ArgumentParser:
                     help="decoder read: give ALL prepended memory tokens the same RoPE position (0) so they "
                          "form an unordered SET equidistant from text (removes intra-memory ordering + RoPE "
                          "distance bias); text keeps normal positions 1..T.")
-    ap.add_argument("--slotgraph3-edge-state", choices=["flat", "matrix"], default=None,
-                    help="slotgraph3: 'matrix' = view the SAME per-node edge_lat floats as a 24×24 associative "
-                         "map; rel(i→j) = M_i·rel_key(node_j) → per-PAIR relation codes (structural per-edge "
-                         "specificity; TPR/fast-weights bind-in-write). 'flat' (default) = one shared vector "
-                         "per source (per-dst relation = implicit unbinding φ must learn).")
     ap.add_argument("--graph-encoder-lora-rank", type=int, default=0,
                     help="graph: LoRA-adapt the encoder forward like the baselines (0=frozen tap). "
                          "Evens the encoder footing (the graph historically read a frozen tap).")
@@ -322,8 +225,8 @@ def build_parser() -> argparse.ArgumentParser:
                     default=False,
                     help="torch.compile(dynamic=True) the shared frozen decoder transformer — "
                          "speeds student+teacher decode for hook-free arms (icae/ccm/ac/beacon/"
-                         "slotgraph3/vqicae). Hooked arms (biomem/slotgraph reinforce) + 4-D "
-                         "rect/bidir masks graph-break; leave off for those.")
+                         "vqicae). Hooked arms (biomem) + 4-D rect/bidir masks (slotgraph) "
+                         "graph-break; leave off for those.")
     ap.add_argument("--patience", type=int, default=5,
                     help="Stop training when best.pt hasn't updated for this "
                          "many consecutive val evals past --min-step-for-stop. "
@@ -515,40 +418,11 @@ def args_to_config(args, ap):
         cfg.titans_d_mem = cfg.d_llama
         cfg.titans_n_persistent = max(1, _M // 6); cfg.titans_n_read_seeds = _M - cfg.titans_n_persistent
         cfg.titans_mem_hidden = 5448                      # 7.002M trainable (2×576×5448 + gates + persist + seeds)
-        # slotgraph (icae-write + fixed partition + RMSNorm-bounded MP read): own frozen base +
-        # encoder-LoRA + endpoint heads + the MP read modules (msg/update ≈1.0M). Encoder-LoRA rank
-        # TRIMMED to r85 (from icae's r104) to offset the MP params → total ≈ icae's ~6.9M.
-        cfg.slotgraph_n_slots = _M
-        cfg.slotgraph_n_nodes = _M // 2          # FIXED partition: half nodes, half edges
-        cfg.slotgraph_d_key = 64                 # content-addressed routing query/key dim
-        cfg.slotgraph_lora_rank = 82; cfg.slotgraph_lora_alpha = 164   # +MP +query/key heads → params ≈ icae
-        # slotgraph2 (per-layer graph transformer; soft-dst paintbrush; PREPEND read). Run as a BINDING
-        # PROBE, NOT a param-matched cohort entry: recurrent=False → 4 distinct d=576 layers ≈ 24M (~3.4×
-        # the ~7M cohort). Justified because the probe question — does routing_diversity lift / SHUF−REAL
-        # go positive — is param-ORTHOGONAL; do NOT draw a "structure beats flat at fixed params" claim from
-        # its babi-EM. For the matched comparison set cfg.slotgraph2_recurrent=True (ONE shared ~6M layer ×L).
-        cfg.slotgraph2_n_slots = _M
-        cfg.slotgraph2_n_nodes = _M // 2          # fixed partition: half nodes, half edges
-        cfg.slotgraph2_d_key = 64
-        # slotgraph3 (compressed-implicit graph, LM-attention write, expanded edge read). MATCHED on
-        # STATE: 2K = 32 latents (= baselines' M=32 memory bottleneck) and ~7.0M trainable (enc-LoRA r56).
-        # The DECODER INTERFACE is larger than the state: raw read = 16 node tokens + K×read_topk = 128
-        # pointer tokens + 2 boundary = 146 prepend positions (legacy edges read: 128) — a deterministic
-        # re-representation of the 32 stored latents, NOT extra stored memory. Report BOTH numbers when
-        # comparing budgets. A:=I control at eval only (set enc.force_identity_A).
-        cfg.slotgraph3_n_nodes = _M // 2          # K = 16 nodes → 2K = 32 stored latents (matched to M)
-        cfg.slotgraph3_read_topk = 8              # expanded read view = 128 edge tokens (re-representation of the 32 latents)
-        cfg.slotgraph3_d_key = 128                # richer routing keys; enc-LoRA r56 (config) → ~7.0M matched trainable
-        # slotgraph4 (fixed-topology sparse edge-state slot graph, propose→commit gated write, prepend read).
-        # MATCHED on ~7M trainable (recurrent single _SG4Block, d_ff tuned) + N node slots + N·k compact
-        # (d_e=64) edge states. STATE floats = N·d + N·k·d_e = 24·576 + 24·12·64 ≈ 32K (well under the ~55K
-        # prepend budget). READ = N node-centric + read_topk salience edges (+2 boundary) — an expanded
-        # re-representation of the state, NOT extra stored memory (report BOTH numbers, as for slotgraph3).
-        cfg.slotgraph4_n_nodes = max(8, _M // 4)          # N = 24 at M=96 (node-centric read → N tokens)
-        cfg.slotgraph4_edges_per_node = max(2, cfg.slotgraph4_n_nodes // 2)   # k ≈ N/2 (nearly dense at small N)
-        cfg.slotgraph4_read_topk = max(0, _M - cfg.slotgraph4_n_nodes)   # N node + (M-N) edge tokens ≈ M read
-        cfg.slotgraph4_window = args.window_size
-        cfg.slotgraph4_d_ff = 2304                        # recurrent single block ≈ 7.0M (verify param_count.py)
+        # THE slotgraph (docs/slotgraph_design.md): 96 nodes = M read budget, dense N×N edges d_e=32,
+        # two rank-16 LoRAs on the shared base. Read geometry (bidir+uniform-pos) forced in model.py.
+        cfg.slotgraph_n_nodes = _M
+        cfg.slotgraph_window = args.window_size
+        cfg.slotgraph_lora_rank = 16; cfg.slotgraph_lora_alpha = 32
         # h2o (training-free KV eviction): M = same budget; no encoder LoRA (eval-only arm).
         cfg.h2o_n_budget = _M
         # vqicae (icae + VQ-discretized slots): encoder-LoRA r96 + projns + EMA codebook (a buffer,
@@ -559,11 +433,9 @@ def args_to_config(args, ap):
         # biomem (gated fast-Hebbian grid): M seeds → prepend = the same M×d read budget as the
         # cohort; readout_h tuned to ~6.9M trainable (W is per-example fast state, NOT counted).
         cfg.biomem_n_slots = _M
-        print(f"[capacity] mixed: FIXED M={_M}, beacon_ratio={cfg.beacon_ratio} (ctx "
-              f"{args.mixed_ctx}:M = {args.mixed_ctx // _M}:1); baselines icae r104 / "
-              f"ccm r52 / ac r52 / beacon 11L / slotgraph r85+MP-read / "
-              f"vqicae r100+K{cfg.vqicae_codebook_size} (param-matched ~6.9-7.0M). "
-              f"slotgraph2 = {'~6M recurrent (matched)' if cfg.slotgraph2_recurrent else '~24M/4-distinct-layer BINDING PROBE (UNMATCHED — no fixed-param claim)'}.")
+        print(f"[capacity] mixed: FIXED M={_M} (ctx {args.mixed_ctx}:M = {args.mixed_ctx // _M}:1); "
+              f"ACTIVE cohort icae r104 / ac r52 / titans h5448 / gisting r104 / memoryllm r39 / "
+              f"slotgraph r16-LoRA×2 (param-matched ~7.0M); h2o eval-only.")
         if cfg.d_llama != 576 and not args.allow_unmatched_backbone:
             raise SystemExit(
                 f"mixed param-matched ranks are calibrated for SmolLM2-135M (d=576); "
@@ -591,59 +463,9 @@ def args_to_config(args, ap):
     if args.graph_free_endpoints:
         cfg.graph_free_endpoints = True
         print("[graph override] FREE endpoints (no bank/selection)")
-    if args.slotgraph_no_structure:
-        cfg.slotgraph_use_structure = False
-        print("[slotgraph override] structure OFF = plain prepend of id-tagged slots (id-tagged ICAE; "
-              "true pure-ICAE is the icae_baseline variant)")
-    if args.slotgraph_no_id:
-        cfg.slotgraph_use_id = False
     if args.biomem_no_membrane:
         cfg.biomem_membrane = False
         print("[biomem override] membrane OFF = fire on the instantaneous readout, not the leaky-integrated potential")
-    if args.slotgraph3_no_write_expand:
-        cfg.slotgraph3_write_expand = False
-        print("[slotgraph3 override] write-expand OFF = write over [window; slots] only; graph expanded for the READ prepend only")
-    if args.slotgraph3_write is not None:
-        cfg.slotgraph3_write = args.slotgraph3_write
-        print(f"[slotgraph3 override] write mixer = {cfg.slotgraph3_write}"
-              + (" (from-scratch blocks, NO frozen prior — UNMATCHED capacity probe)" if cfg.slotgraph3_write == "custom" else ""))
-    if args.slotgraph3_custom_layers is not None:
-        cfg.slotgraph3_custom_layers = int(args.slotgraph3_custom_layers)
-    if args.slotgraph3_gate_ids:
-        cfg.slotgraph3_gate_ids = True
-        print("[slotgraph3 override] gate-ids ON = E = topv·(φ+ids)+role (router gradient through the id channel)")
-    if args.slotgraph3_read_topk is not None:
-        cfg.slotgraph3_read_topk = int(args.slotgraph3_read_topk)
-        print(f"[slotgraph3 override] read_topk = {cfg.slotgraph3_read_topk}"
-              + (" (dense-forward: all in-support edges materialized)" if cfg.slotgraph3_read_topk >= 15 else ""))
-    if args.slotgraph3_st_leak:
-        cfg.slotgraph3_st_leak = True
-        print("[slotgraph3 override] straight-through leak ON = hard top-k forward, A-mass soft backward "
-              "(dense gradient, zero context growth)")
-    if args.slotgraph3_n_nodes is not None:
-        cfg.slotgraph3_n_nodes = int(args.slotgraph3_n_nodes)
-        print(f"[slotgraph3 override] K = {cfg.slotgraph3_n_nodes} nodes (state 2K={2*cfg.slotgraph3_n_nodes} "
-              f"vectors — CAPACITY PROBE, unmatched)")
-    if args.slotgraph3_edge_budget is not None:
-        cfg.slotgraph3_edge_budget = int(args.slotgraph3_edge_budget)
-        print(f"[slotgraph3 override] GLOBAL edge budget = {cfg.slotgraph3_edge_budget} strongest edges "
-              f"(read stays {cfg.slotgraph3_edge_budget} tokens at any K)")
-    if args.slotgraph3_route_key is not None:
-        cfg.slotgraph3_route_key = args.slotgraph3_route_key
-        print(f"[slotgraph3 override] route-by-{cfg.slotgraph3_route_key}"
-              + (" (K/V split: node content addresses, edge_lat = pure relation)" if cfg.slotgraph3_route_key == "node" else ""))
-    if args.slotgraph3_edge_state is not None:
-        cfg.slotgraph3_edge_state = args.slotgraph3_edge_state
-        print(f"[slotgraph3 override] edge_state = {cfg.slotgraph3_edge_state}"
-              + (" (per-PAIR relation codes: rel(i→j) = M_i·rel_key(n_j))" if cfg.slotgraph3_edge_state == "matrix" else ""))
-    if args.slotgraph3_write_layers is not None:
-        cfg.slotgraph3_write_layers = int(args.slotgraph3_write_layers)
-        print(f"[slotgraph3 override] LM write depth = last-{cfg.slotgraph3_write_layers} layers "
-              f"(frozen no-grad text prefix; LoRA trains only in the suffix)")
-    if args.slotgraph3_read is not None:
-        cfg.slotgraph3_read = args.slotgraph3_read
-        print(f"[slotgraph3 override] read = {cfg.slotgraph3_read}"
-              + (" (RAW node-content tokens + [id_src;id_dst] pointer edges — no φ)" if cfg.slotgraph3_read == "raw" else ""))
     if args.rect_prepend_mask:
         cfg.rect_prepend_mask = True
         print("[override] rectangular prepend mask ON (memory tokens attend to self only — KBLaM-style)")
@@ -652,33 +474,6 @@ def args_to_config(args, ap):
             raise SystemExit("--bidir-mem-attn and --rect-prepend-mask are mutually exclusive")
         cfg.bidir_mem_attn = True
         print("[override] bidirectional memory-block attention ON (Set-LLM: memory composes, text causal)")
-    if args.slotgraph3_no_boundary:
-        cfg.slotgraph3_boundary_tokens = False
-        print("[slotgraph3 override] boundary tokens OFF (<mem_start>/<mem_end> disabled)")
-    if args.slotgraph3_route_act is not None:
-        cfg.slotgraph3_route_act = args.slotgraph3_route_act
-        print(f"[slotgraph3 override] route activation = {cfg.slotgraph3_route_act}")
-    if args.slotgraph3_no_init_noise:
-        cfg.slotgraph3_init_noise = False
-        print("[slotgraph3 override] init noise OFF (deterministic shared init — LEGACY)")
-    if args.slotgraph3_no_write_norm_match:
-        cfg.slotgraph3_write_norm_match = False
-        print("[slotgraph3 override] write splice norm-match OFF (LEGACY 400x quiet tokens)")
-    if args.slotgraph3_no_write_boundary_bidir:
-        cfg.slotgraph3_write_boundary_bidir = False
-        print("[slotgraph3 override] write boundary+bidir OFF (LEGACY causal-over-graph)")
-    if args.slotgraph3_write_update is not None:
-        cfg.slotgraph3_write_update = args.slotgraph3_write_update
-        print(f"[slotgraph3 override] write update = {cfg.slotgraph3_write_update}")
-    if args.slotgraph3_edge_write is not None:
-        cfg.slotgraph3_edge_write = args.slotgraph3_edge_write
-        print(f"[slotgraph3 override] edge write = {cfg.slotgraph3_edge_write}"
-              + (" (keyed delta-rule assoc write into the persistent 24x24 map)"
-                 if cfg.slotgraph3_edge_write == "assoc" else " (LEGACY slot interpolation)"))
-    if args.slotgraph3_layer_anchor:
-        cfg.slotgraph3_layer_anchor = True
-        print("[slotgraph3 override] per-layer id/role anchor ON = GCNII re-injection each layer "
-              "(WRITE: slot identity in the suffix loop; READ: edge identity before each decoder layer)")
     cfg.objective_mode = args.objective_mode
     cfg.objective_coef = float(args.objective_coef)
     cfg.objective_inv_temp = float(args.objective_inv_temp)
@@ -686,9 +481,6 @@ def args_to_config(args, ap):
     if args.rank_reward_coef > 0:
         print(f"[objective] MCR² rank-reward ON, coef={args.rank_reward_coef} (plain mode; charges for "
               f"within-example memory rank — the a-vs-d diagnosis discriminator)")
-    cfg.grpo_samples = int(args.grpo_samples)
-    cfg.grpo_coef = float(args.grpo_coef)
-    cfg.grpo_entropy_coef = float(args.grpo_entropy_coef)
     cfg.kl_coef = float(args.kl_coef)
     cfg.kl_ce_coef = float(args.kl_ce_coef)
     cfg.kl_temp = float(args.kl_temp)
@@ -708,29 +500,30 @@ def args_to_config(args, ap):
         # AUX-LOSS-FREE prepend baselines too — valuable as a watermark CONTROL (if icae-contrastive
         # also Goodharts SHUF−REAL with flat EM, the watermark is objective-driven, not sg3-specific).
         # EXCLUDED: vqicae (emits vq_loss → silently inert under the per-example-CE surrogate); hlvocab
-        # (load_balance). trajectory stays sg3-only (needs sample_read_expansion).
-        _OBJ_OK = {"slotgraph3_baseline", "slotgraph4_baseline", "icae_baseline", "ccm_baseline",
+        # (load_balance).
+        _OBJ_OK = {"slotgraph_baseline", "icae_baseline", "ccm_baseline",
                    "autocompressor_baseline", "beacon_baseline",
                    # aux-loss-free arms added 2026-07-09 (gisting/memoryllm/titans emit no vq/load-balance
                    # aux loss, so they are valid under behavioral_kl; per-layer-KV students dispatch fine
                    # via _prefix_kv_forward). Still gated by the pre-training verification (#158).
-                   # slotgraph4 is aux-loss-free (prepend arm) → valid under behavioral_kl.
+                   # slotgraph is aux-loss-free (prepend arm) → valid under behavioral_kl.
                    "gisting_baseline", "memoryllm_baseline", "titans_baseline"}
-        if args.objective_mode == "trajectory" and set(args.variants) != {"slotgraph3_baseline"}:
-            raise SystemExit(f"--objective-mode trajectory supports --variants slotgraph3_baseline only "
-                             f"(needs sample_read_expansion); got {args.variants}.")
-        if not set(args.variants).issubset(_OBJ_OK):
-            raise SystemExit(f"--objective-mode supports {sorted(_OBJ_OK)} (aux-loss-free prepend arms); "
-                             f"got {args.variants}. vqicae/hlvocab emit aux losses inert under the "
-                             f"GradCache surrogate — excluded by design.")
-        # GradCache (contrastive/trajectory) detaches ONLY the prepend memory into mem_leaf and re-enters
+        # eval-only arms (vanilla floor/ceiling, h2o) don't train, so the training objective doesn't apply
+        # to them — exempt them from the whitelist (they're skipped in train.py's mixed_variants loop).
+        _EVAL_ONLY = {"vanilla_llama", "vanilla_full_context", "h2o_baseline"}
+        _train_variants = set(args.variants) - _EVAL_ONLY
+        if not _train_variants.issubset(_OBJ_OK):
+            raise SystemExit(f"--objective-mode supports {sorted(_OBJ_OK)} (aux-loss-free prepend arms) "
+                             f"+ eval-only {sorted(_EVAL_ONLY)}; got trainable {sorted(_train_variants)}. "
+                             f"vqicae/hlvocab emit aux losses inert under the GradCache surrogate — excluded.")
+        # GradCache (contrastive) detaches ONLY the prepend memory into mem_leaf and re-enters
         # the encoder graph exactly once (objectives.py mem.backward). The per-layer-KV arms carry their
         # DIFFERENTIABLE content in aux["past_kv"] (empty prepend), which GradCache passes verbatim to
         # every roll — so the 2nd roll's backward hits the freed encoder graph ("backward a 2nd time").
         # behavioral_kl is safe (its own CE+KL backward, no GradCache), so keep these arms whitelisted
-        # for it and block them ONLY for the GradCache modes. beacon defaults to per-layer-KV
+        # for it and block them ONLY for the GradCache mode. beacon defaults to per-layer-KV
         # (beacon_read="kv"), so it is affected too despite the "ANY prepend memory" comment above.
-        if args.objective_mode in ("contrastive", "trajectory"):
+        if args.objective_mode == "contrastive":
             _KV_ARMS = {"beacon_baseline", "gisting_baseline", "memoryllm_baseline"}
             _bad_kv = _KV_ARMS.intersection(args.variants)
             if _bad_kv:
@@ -740,13 +533,7 @@ def args_to_config(args, ap):
                     f"GradCache reuses across rolls → 2nd-backward-through-freed-graph crash. These arms "
                     f"are valid under --objective-mode behavioral_kl only. (beacon is per-layer-KV when "
                     f"beacon_read=kv, the default.)")
-        if args.objective_mode == "trajectory":
-            if (args.slotgraph3_read or "raw") != "raw" or (args.slotgraph3_edge_budget or 0) > 0:
-                raise SystemExit("--objective-mode trajectory needs the raw read and per-node top-k "
-                                 "(edge_budget=0) — sample_read_expansion supports only that config.")
-        print(f"[objective override] mode={args.objective_mode} InfoNCE coef={cfg.objective_coef}"
-              + (f" GRPO G={cfg.grpo_samples} coef={cfg.grpo_coef}"
-                 if args.objective_mode == "trajectory" else ""))
+        print(f"[objective override] mode={args.objective_mode} InfoNCE coef={cfg.objective_coef}")
     if args.uniform_mem_pos:
         cfg.uniform_mem_pos = True
         print("[override] uniform memory position-ids ON (all memory tokens at RoPE pos 0; text at 1..T)")
