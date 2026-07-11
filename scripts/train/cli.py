@@ -385,17 +385,24 @@ def args_to_config(args, ap):
         # Titans: read = N_p persistent + M_q readout = M; deep-MLP memory h sized to ~7M (2·d·h dominates).
         cfg.titans_d_mem = cfg.d_llama
         cfg.titans_n_persistent = max(1, _M // 6); cfg.titans_n_read_seeds = _M - cfg.titans_n_persistent
-        cfg.titans_mem_hidden = 5448                      # 7.002M trainable (2×576×5448 + gates + persist + seeds)
+        cfg.titans_mem_hidden = 4650                      # 6.03M ENCODER → 6.95M TOTAL (+0.92M shared decoder
+                                                          # read-LoRA), matched to the cohort. The earlier 5448
+                                                          # sized the ENCODER to 7M, ignoring the +0.92M LoRA
+                                                          # every arm carries → 7.93M total, out of band (audit).
         # THE slotgraph (docs/slotgraph_design.md): 96 nodes = M read budget, dense N×N edges d_e=32,
         # two rank-16 LoRAs on the shared base. Read geometry (bidir+uniform-pos) forced in model.py.
         cfg.slotgraph_n_nodes = _M
         cfg.slotgraph_window = args.window_size
-        cfg.slotgraph_lora_rank = 16; cfg.slotgraph_lora_alpha = 32
+        # write-LoRA rank 84 → 6.95M TOTAL trainable (encoder 6.03M + shared decoder read-LoRA 0.92M),
+        # capacity-MATCHED to the cohort (icae 6.97M / autocompressor 6.92M). Was rank 16 = 3.03M total,
+        # which under-parameterized the arm ~2.3× (audit fairness finding #4). The rank is the encoder-
+        # capacity knob (adapts the frozen LM's attention for the graph harvest), analogous to icae r104.
+        cfg.slotgraph_lora_rank = 84; cfg.slotgraph_lora_alpha = 168
         # h2o (training-free KV eviction): M = same budget; no encoder LoRA (eval-only arm).
         cfg.h2o_n_budget = _M
         print(f"[capacity] mixed: FIXED M={_M} (ctx {args.mixed_ctx}:M = {args.mixed_ctx // _M}:1); "
-              f"ACTIVE cohort icae r104 / ac r52 / titans h5448 / gisting r104 / memoryllm r39 / "
-              f"slotgraph r16-LoRA×2 (param-matched ~7.0M); h2o eval-only.")
+              f"ACTIVE cohort icae r104 / ac r52 / titans h4650 / gisting r104 / memoryllm r39 / "
+              f"slotgraph r84-LoRA×2 (param-matched ~6.95M total incl. shared decoder LoRA); h2o eval-only.")
         if cfg.d_llama != 576 and not args.allow_unmatched_backbone:
             raise SystemExit(
                 f"mixed param-matched ranks are calibrated for SmolLM2-135M (d=576); "
@@ -434,6 +441,10 @@ def args_to_config(args, ap):
     cfg.objective_mode = args.objective_mode
     cfg.objective_coef = float(args.objective_coef)
     cfg.objective_inv_temp = float(args.objective_inv_temp)
+    # early-stop knobs (were parsed but never consumed — now wired into the mixed trainer's val loop).
+    cfg.patience = int(args.patience)
+    cfg.early_stop_min_delta = float(args.early_stop_min_delta)
+    cfg.min_step_for_stop = int(args.min_step_for_stop)
     cfg.rank_reward_coef = float(args.rank_reward_coef)
     if args.rank_reward_coef > 0:
         print(f"[objective] MCR² rank-reward ON, coef={args.rank_reward_coef} (plain mode; charges for "

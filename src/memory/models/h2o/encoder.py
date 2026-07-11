@@ -1,10 +1,16 @@
-"""H2O — Heavy-Hitter Oracle KV eviction (Zhang et al. 2023, arXiv:2306.14048).
+"""H2O-inspired static heavy-hitter selector (after Zhang et al. 2023, arXiv:2306.14048).
 
-TRAINING-FREE eval-only baseline. H2O keeps the M tokens that receive the most total attention
-mass across all layers and heads (the "heavy hitters"), using the observation that a small subset
-of tokens accumulates most of the attention in autoregressive LMs. This is the natural LM-intrinsic
-competitor: no encoder training, no added params — just select M positions by attention score and
-carry their per-layer KV as the memory.
+TRAINING-FREE eval-only baseline. NOT a faithful H2O port — label it "H2O-inspired static attention
+selector" in results. FIDELITY NOTE: the real H2O dynamically evicts each layer/head's EXISTING KV
+entries during generation while PRESERVING their original contextualized, position-rotated states. This
+implementation instead (a) aggregates attention scores GLOBALLY across all layers+heads, (b) selects the
+top-M positions ONCE, then (c) RE-ENCODES those tokens as a new short sequence to get their KV — which
+changes both their context and their KV values vs. the paper's in-place per-layer/head eviction. So it is
+a static, globally-selected, re-encoded approximation, not H2O's dynamic per-head eviction. Kept as a
+cheap LM-intrinsic "which tokens matter" reference, disclosed as such.
+
+Keeps the M tokens that receive the most total attention mass across all layers and heads (the "heavy
+hitters"). No encoder training, no added params.
 
 Algorithm (our streaming adaptation):
   1. For each streaming window run the frozen LM with output_attentions=True.

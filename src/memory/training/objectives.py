@@ -102,10 +102,17 @@ def _behavioral_kl_step(model, batch, cfg, window_size):
     temp = float(getattr(cfg, "kl_temp", 2.0))          # Hinton-style T≈2 (survey default)
     embed = model.decoder.llama.get_input_embeddings()
 
-    # MAE batch: teacher reconstructs itself → KL degenerate; skip the (expensive) teacher forward.
-    if getattr(model, "task_mode", None) == "masked_reconstruction":
+    # CE-only tasks (teacher forward is degenerate/incompatible → skip it, train plain CE):
+    #  - masked_reconstruction (MAE): teacher reconstructs itself → KL degenerate.
+    #  - continuation: KL needs per-position logits (return_logits=True), but that flag DISABLES the
+    #    multi-horizon continuation dispatch (model.py) → the KL path would train only the SINGLE final
+    #    horizon while validation uses all 8 (a train/val objective mismatch). The teacher also largely
+    #    predicts the next block itself (low I(context;answer)), so KL adds little. Route continuation
+    #    through its NORMAL multi-horizon CE path (return_logits stays False) — the objective that val measures.
+    _tm = getattr(model, "task_mode", None)
+    if _tm in ("masked_reconstruction", "continuation"):
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            s_out = model.compute_loss(batch, window_size=window_size)
+            s_out = model.compute_loss(batch, window_size=window_size)   # multi-horizon for continuation
         (ce_coef * s_out["loss"]).backward()
         out_real = {k: v for k, v in s_out.items() if not torch.is_tensor(v) or not v.requires_grad}
         out_real["loss"] = torch.tensor(ce_coef * float(s_out["loss_recon"]), device=batch.context_ids.device)
@@ -120,14 +127,30 @@ def _behavioral_kl_step(model, batch, cfg, window_size):
     # the optimizer could satisfy KL by moving the teacher (flattening context-sensitivity)
     # instead of making memory sufficient. That breaks the E[KL]=I(context;answer) identity
     # this objective rests on. Match the frozen-backbone precedent at model.py _encode_for_memory.
+    # STANDARD-CAUSAL teacher geometry (LOAD-BEARING): the teacher passes the RAW context as the
+    # "memory" (memory_override), and compute_loss reads the memory-attention geometry from model.cfg.
+    # Some arms force a non-standard read geometry on their cfg — e.g. slotgraph sets bidir_mem_attn +
+    # uniform_mem_pos (its 96 memory tokens are an unordered set at RoPE 0). If the teacher inherits that,
+    # the full 2048-token context is read as a POSITIONLESS BIDIRECTIONAL SET → the "full-context teacher"
+    # is scrambled (measured KL≈6, 10% argmax agreement), breaking E[KL]=I(context;answer). The teacher
+    # must read the context as a NORMAL causal LM regardless of the arm, so force both flags OFF for this
+    # forward and restore after. (The student below keeps the arm's real geometry — that is correct.)
+    _bidir0 = getattr(model.cfg, "bidir_mem_attn", False)
+    _upos0 = getattr(model.cfg, "uniform_mem_pos", False)
     with torch.no_grad(), disable_lora():
         ctx_embeds = embed(batch.context_ids)
         ctx_embeds = ctx_embeds * batch.context_mask.unsqueeze(-1).to(ctx_embeds.dtype)  # zero pads
         t_aux = {"memory_mask": batch.context_mask,
                  "load_balance_loss": torch.zeros((), device=ctx_embeds.device, dtype=ctx_embeds.dtype)}
-        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            t_out = model.compute_loss(batch, window_size=window_size,
-                                       memory_override=(ctx_embeds, t_aux), return_logits=True)
+        try:
+            model.cfg.bidir_mem_attn = False
+            model.cfg.uniform_mem_pos = False
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                t_out = model.compute_loss(batch, window_size=window_size,
+                                           memory_override=(ctx_embeds, t_aux), return_logits=True)
+        finally:
+            model.cfg.bidir_mem_attn = _bidir0
+            model.cfg.uniform_mem_pos = _upos0
     t_logits = t_out.get("sel_logits")
 
     # ── student: encoder memory, WITH grad ──

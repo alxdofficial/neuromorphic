@@ -12,6 +12,12 @@ from ...config import ReprConfig
 class ICAEBaselineEncoder(nn.Module):
     """ICAE — In-Context Autoencoder (Ge et al., ICLR 2024) as a memory encoder.
 
+    ASTERISK (results footnote): the SINGLE-WINDOW ICAE operator is faithful, but the STREAMING path is
+    an ICAE/RMT HYBRID — each window recompresses the carried memory + new window into M slots (recurrent
+    re-compression). Official multi-span ICAE compresses each segment INDEPENDENTLY and concatenates the
+    per-segment memories. So our streaming memory is recurrent-recompressed, not concatenated-independent.
+    Disclose in the results table.
+
     Faithful port of ICAE's compressor to the streaming-encoder interface, with an
     RMT/AutoCompressor recurrence so the memory PERSISTS across streaming windows:
       * the encoder is a FROZEN Llama base + a trainable encoder-LoRA (q/v) +

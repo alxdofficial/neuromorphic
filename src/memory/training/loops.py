@@ -90,6 +90,12 @@ def train_mixed_variant(
     # .best.pt. One model serves all tasks, so a per-task best can't each own weights; the aggregate
     # is the principled selection criterion (per-task best_metric stays as informational telemetry).
     agg_best = {"metric": float("inf"), "step": -1}
+    # early-stop config (from cfg; the CLI flags were previously parsed but never consumed). Stop when
+    # `patience` consecutive val-evals show no real (> min_delta) agg_val improvement, past min_step.
+    _es_patience = int(getattr(cfg, "patience", 0) or 0)
+    _es_min_delta = float(getattr(cfg, "early_stop_min_delta", 0.01))
+    _es_min_step = int(getattr(cfg, "min_step_for_stop", 3000))
+    _no_improve = 0
 
     # ── resume: restore model + optimizer + step + best tracking from .last.pt ──
     start_step = 0
@@ -97,13 +103,22 @@ def train_mixed_variant(
         sd = torch.load(ckpt_path, map_location=device, weights_only=False)
         _meta = sd.get("metadata", {}) or {}
         _ck_cfg = _meta.get("cfg_dict", {}) or {}
-        for _field, _now in (("backbone_model", model.cfg.llama_model),
-                             ("task_mode", getattr(model.cfg, "task_mode", None))):
-            _was = _meta.get(_field, _ck_cfg.get(_field))
-            if _was is not None and _was != _now:
+        _ck_all = _meta.get("cfg_all", {}) or {}          # includes dynamically-set fields (checkpoint.py)
+        # Drift check: backbone/task_mode (weights-invalidating) PLUS the experiment-critical fields the
+        # audit flagged — objective + KL coefficients + per-arm adapter ranks/sizes. Resuming across any of
+        # these silently changes what is being trained (or rebuilds the arm with wrong capacity). cfg_all
+        # is checked first so the dynamically-attached ranks (not in cfg_dict) are caught.
+        _crit = ("backbone_model", "objective_mode", "kl_coef", "kl_ce_coef", "kl_temp",
+                 "memoryllm_lora_rank", "titans_mem_hidden", "gisting_lora_rank", "icae_lora_rank",
+                 "slotgraph_lora_rank", "slotgraph_d_edge", "slotgraph_write_layers")
+        for _field in ("backbone_model", "task_mode", *_crit):
+            _now = (model.cfg.llama_model if _field == "backbone_model"
+                    else getattr(model.cfg, _field, None))
+            _was = _meta.get(_field, _ck_all.get(_field, _ck_cfg.get(_field)))
+            if _was is not None and _now is not None and _was != _now:
                 raise RuntimeError(
                     f"[resume] {_field} drift: checkpoint has {_was!r} but this run is {_now!r}. "
-                    f"Refusing to mix objectives/backbones — use a fresh --out-tag.")
+                    f"Refusing to resume across a changed objective/backbone/capacity — use a fresh --out-tag.")
         _res = model.load_state_dict(sd["model_state_dict"], strict=False)
         _bad = [k for k in (_res.missing_keys + _res.unexpected_keys)
                 if "llama" not in k.lower() and not k.startswith("encoder.base.")
@@ -332,11 +347,24 @@ def train_mixed_variant(
             print(f"    [val @ {step}]  " + "  ".join(parts), flush=True)
             # Aggregate selection: mean val_loss across tasks → save the single .best.pt.
             agg = sum(per_task[t]["val_loss_recon"] for t in mixed_tasks) / len(mixed_tasks)
-            if agg < agg_best["metric"]:
+            if agg < agg_best["metric"] - _es_min_delta:      # a REAL improvement (past the noise floor)
                 agg_best["metric"], agg_best["step"] = agg, step
+                _no_improve = 0
                 save_checkpoint(model, opt, step, best_ckpt_path,
                                 mixed_best=best, mixed_agg_best=agg_best)
                 print(f"    [best @ {step}]  agg_val={agg:.4f} → saved {best_ckpt_path.name}", flush=True)
+            else:
+                # still save a new best if it's the lowest (for checkpoint fidelity), but don't reset patience
+                if agg < agg_best["metric"]:
+                    agg_best["metric"], agg_best["step"] = agg, step
+                    save_checkpoint(model, opt, step, best_ckpt_path,
+                                    mixed_best=best, mixed_agg_best=agg_best)
+                _no_improve += 1
+            # EARLY STOP: patience val-evals with no real improvement, past the warmup-noise floor.
+            if (_es_patience > 0 and step >= _es_min_step and _no_improve >= _es_patience):
+                print(f"    [early-stop @ {step}]  no agg_val improvement (>{_es_min_delta}) for "
+                      f"{_no_improve} val-evals since step {agg_best['step']}; stopping.", flush=True)
+                break
 
         if step > 0 and step % save_every == 0:
             save_checkpoint(model, opt, step, ckpt_path,

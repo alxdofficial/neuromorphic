@@ -24,9 +24,11 @@ class AutoCompressorBaselineEncoder(nn.Module):
     (An earlier version REPLACED a fixed single-summary carry each window — that is RMT, the
     weaker predecessor AutoCompressor beats; restored to faithful accumulation 2026-07-08.)
 
-    Adapted to a frozen backbone + LoRA (the paper fine-tunes the whole LM) — same fair-comparison
-    adaptation as ICAE/CCM/Beacon. Full BPTT across windows (project preference). Per-window κ from
-    cfg.autocompressor_summary_per_window (set in the mixed capacity preset)."""
+    ASTERISKS (results footnotes) — deviations from official AutoCompressors: (1) frozen backbone + LoRA
+    (paper fine-tunes the whole LM) — the shared fair-comparison adaptation; (2) FULL BPTT across windows
+    (paper uses randomized-substep STOP-GRADIENT); (3) FIXED seg_len segmentation (paper randomizes segment
+    boundaries); (4) final NormMatch on the emitted memory; (5) separate encoder/decoder LoRA adapters.
+    Summary accumulation itself is faithful. Per-window κ from cfg.autocompressor_summary_per_window."""
 
     def __init__(self, cfg: ReprConfig):
         super().__init__()

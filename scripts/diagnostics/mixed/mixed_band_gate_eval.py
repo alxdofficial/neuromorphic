@@ -45,14 +45,14 @@ from src.memory.data.mixes import TASK_MODE, DEFAULT_TRAIN_MIX, DEFAULT_MIXED_M
 from src.memory.data.sources.babi import DEFAULT_TASKS as BABI_DEFAULT_TASKS
 
 TRAINED_VARIANTS = [
-    "icae_baseline", "autocompressor_baseline",
-    # our memory arms (use the same mixed harness; missing ckpts are skipped gracefully)
-    "slotgraph_baseline",
+    # active trainable cohort (2026-07-11); missing ckpts are skipped gracefully
+    "icae_baseline", "autocompressor_baseline", "titans_baseline",
+    "gisting_baseline", "memoryllm_baseline", "slotgraph_baseline",
 ]
-# Campaign launch constants (must match the run that produced the checkpoints).
-MIXED_CTX = 1024
-MIXED_M = DEFAULT_MIXED_M   # follows the mixed default (mixes.DEFAULT_MIXED_M); was hardcoded 32
-WINDOW_SIZE = 1024          # min(window_size_default=1024, chunk_size=1024)
+# Campaign launch constants (must match the run that produced the checkpoints — the current 2026-07 config).
+MIXED_CTX = 2048            # was 1024 (stale)
+MIXED_M = DEFAULT_MIXED_M   # follows the mixed default (mixes.DEFAULT_MIXED_M = 96)
+WINDOW_SIZE = 256           # 8 streaming windows at ctx 2048 (was 1024 = single-shot, stale)
 PREDICT_LEN = 64
 MAE_SRC_TOK = "meta-llama/Llama-3.2-1B"
 

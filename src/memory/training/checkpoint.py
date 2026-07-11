@@ -30,9 +30,20 @@ def _ckpt_metadata(model) -> dict:
     """
     import dataclasses, hashlib
     cfg = model.cfg
+    # cfg_dict = the DECLARED dataclass fields. cfg_all = EVERY attribute on the instance, including the
+    # ~20 baseline-critical fields cli.py attaches DYNAMICALLY (memoryllm_lora_rank, titans_mem_hidden,
+    # kl_coef, slotgraph_*, gisting_*, …) that are NOT declared on ReprConfig. dataclasses.asdict() drops
+    # those silently, so a reloaded checkpoint would rebuild the arm with WRONG hyperparameters (audit #3).
+    # vars(cfg) captures both (dataclass instances store all attrs in __dict__), JSON-safe-filtered.
+    def _jsonable(v):
+        return isinstance(v, (int, float, str, bool, type(None))) or (
+            isinstance(v, (list, tuple)) and all(isinstance(x, (int, float, str, bool)) for x in v))
+    cfg_all = {k: (list(v) if isinstance(v, tuple) else v)
+               for k, v in vars(cfg).items() if _jsonable(v)}
     meta = {
         "backbone_model": cfg.llama_model,
-        "cfg_dict": dataclasses.asdict(cfg),
+        "cfg_dict": dataclasses.asdict(cfg),          # declared fields only (back-compat)
+        "cfg_all": cfg_all,                            # declared + dynamically-attached (the full truth)
         "system_intro_for_memory": cfg.system_intro_for_memory,
     }
     ct = getattr(model, "chat_template", None)

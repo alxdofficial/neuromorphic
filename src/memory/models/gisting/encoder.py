@@ -8,7 +8,16 @@ over the context; their per-layer K,V are the compressed memory. The paper's "to
 gist may attend ONLY to the gist" is realized here by the DECODER reading only the gist KV (never
 the raw context) — exactly the per-layer-KV read. Internal seg_len chunking (like AutoCompressor)
 emits κ = M/n_segments gist tokens per segment so the single-shot MAE path and the multi-window
-path both accumulate to the M budget. ASTERISK: per-layer KV byte footprint (~L× a prepend arm).
+path both accumulate to the M budget.
+
+ASTERISKS (for the results table): (1) per-layer KV byte footprint (~L× a prepend arm). (2) We capture
+the RAW k_proj/v_proj output (pre-RoPE) and inject it as a POSITION-FREE memory prefix — the shared
+per-layer-KV read policy (memory has no positional phase; only text carries RoPE, `decoder.py`
+build_prefix_cache). Official Gisting caches HF `past_key_values`, which are POST-RoPE (position-rotated
+at the gist positions); on SmolLM2 raw vs cached layer-0 keys differ ~0.44 relative norm. This is a
+deliberate deviation (all our per-layer-KV arms — gisting/memoryllm — use the same position-free policy
+for consistency), NOT a bug; disclose it, do not "fix" it in isolation (that would desync the KV arms).
+(3) Segment-wise independent gist generation + separate encoder/decoder adapter spaces.
 """
 from __future__ import annotations
 
