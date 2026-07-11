@@ -44,8 +44,12 @@ def train_mixed_variant(
     # variant loop). Titans' inner test-time-autograd (create_graph) conflicts with the outer streaming
     # activation-checkpoint → force stream-ckpt OFF for titans only (was a manual --no-grad-ckpt-stream).
     if variant == "titans_baseline" and getattr(cfg, "grad_checkpoint_stream", False):
-        import dataclasses as _dc
-        cfg = _dc.replace(cfg, grad_checkpoint_stream=False)
+        import copy as _copy
+        # copy.copy (NOT dataclasses.replace): replace() rebuilds from DECLARED fields only, silently
+        # dropping the ~20 dynamically-attached cfg attrs (kl_coef, titans_mem_hidden, per-arm ranks) —
+        # the same drop-dynamic-attrs bug as audit #3. copy.copy preserves __dict__ (all attrs).
+        cfg = _copy.copy(cfg)
+        cfg.grad_checkpoint_stream = False
         print("[titans] stream activation-checkpoint auto-disabled (create_graph incompatibility)")
     llama_arg = None if cfg.use_llama_lora else llama
     model = ReprLearningModel(cfg, variant=variant, llama_model=llama_arg).to(device)
