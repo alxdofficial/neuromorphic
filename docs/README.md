@@ -14,13 +14,24 @@ Fairness policy: **match the persistent memory-slot count M and the trainable pa
 each baseline uses the READ mechanism from its OWN paper** (not a forced-uniform read), and any
 departure from a clean fixed-footprint feed-forward memory is disclosed as an asterisk in results.
 
+Provenance policy: **every arm is REIMPLEMENTED under this matched harness — none is a drop-in of an
+official repo** (each official repo targets a 7B backbone it trains end-to-end under its own objective,
+which would confound the very axis we isolate). Two arms have their core mechanism **ported faithfully**
+using the official code as a verified reference — `h2o` (per-layer position-preserving eviction) and
+`memoryllm` (co-attention compress) — while `icae` / `autocompressor` / `gisting` are built from the
+paper (repos are 7B training programs / unlicensed / train-time-only), and `titans` has **no official
+repo** (its write kernel is already faithful; lucidrains' MIT port is the reference). Repo + paper links
+and the per-arm provenance tag are in **`REFERENCES.md`**.
+
 - **Prepend-read compressors:** `icae`, `autocompressor` (faithful summary-accumulation), `titans`
   (deep-MLP memory + test-time autograd write, MAC prepend).
 - **Per-layer-KV compressors** (native read via the shared prefix-cache path, `decoder.build_prefix_cache`
-  + `model._prefix_kv_forward`): `gisting`, `memoryllm` (per-layer pool + random-drop).
+  + `model._prefix_kv_forward`): `gisting`, `memoryllm` (per-layer pool + random-drop + **faithful
+  co-attention compress**: the window co-attends to the pool through the real layers, mechanism-ported).
 - **Our arm:** `slotgraph` — THE canonical graph memory (96 nodes / value-path plastic edge state /
   prepend+bidir read; see `slotgraph_design.md`).
-- **`h2o`** — training-free KV-cache eviction; an eval-only efficiency/KV-ratio reference (0 trainable params).
+- **`h2o`** — training-free KV-cache eviction (eval-only, 0 trainable params); **faithful per-layer
+  heavy-hitter eviction of the original position-preserved KV** (mechanism-ported from FMInference/H2O).
 - **`vanilla_llama` / `vanilla_full_context`** — loss floor (no memory) / ceiling (full context).
 
 The **active cohort** (2026-07-11) is icae · autocompressor · titans · gisting · memoryllm · slotgraph

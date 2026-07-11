@@ -18,18 +18,25 @@ the HF identifier / title is the authoritative anchor.
 
 ## Baseline compressors / memory techniques
 
-Our reimplementations live in `src/memory/models/<name>/encoder.py`; each encoder docstring also
-cites its paper. "Native read" = the memory-read mechanism from the paper; the baseline fairness /
-asterisk policy (match M-slots + params, each arm uses its own paper's read) is in `docs/README.md`.
+Every baseline is **reimplemented** in `src/memory/models/<name>/encoder.py` under our matched harness
+(frozen SmolLM2-135M, ~7M trainable, behavioral-KL) — **none is a drop-in of an official repo**, because
+each official repo targets a 7B-scale backbone it trains end-to-end under its own objective (see the
+provenance note below). "Native read" = the memory-read mechanism from the paper. Fairness / asterisk
+policy is in `docs/README.md`.
 
-| Baseline | Paper | arXiv | Native read | Our code | Official repo |
-|---|---|---|---|---|---|
-| **ICAE** | In-Context Autoencoder for Context Compression in a LLM (Ge et al., ICLR 2024) | [2307.06945](https://arxiv.org/abs/2307.06945) | prepend soft tokens | `models/icae/` | getao/icae |
-| **AutoCompressor** | Adapting Language Models to Compress Contexts (Chevalier et al., EMNLP 2023 Findings) | [2305.14788](https://arxiv.org/abs/2305.14788) | prepend (summary accumulation) | `models/autocompressor/` | princeton-nlp/AutoCompressors |
-| **Gisting** | Learning to Compress Prompts with Gist Tokens (Mu, Li & Goodman, NeurIPS 2023) | [2304.08467](https://arxiv.org/abs/2304.08467) | per-layer gist-KV | `models/gisting/` | jayelm/gisting |
-| **MemoryLLM** | MemoryLLM: Towards Self-Updatable LLMs (Wang et al., ICML 2024) | [2402.04624](https://arxiv.org/abs/2402.04624) | per-layer KV pool (random-drop) | `models/memoryllm/` | wangyu-ustc/MemoryLLM |
-| **Titans** | Titans: Learning to Memorize at Test Time (Behrouz et al., 2024) | [2501.00663](https://arxiv.org/abs/2501.00663) | prepend (MAC); deep-MLP autograd write | `models/titans/` | — |
-| **H2O** | H2O: Heavy-Hitter Oracle for Efficient Generative Inference of LLMs (Zhang et al., NeurIPS 2023) | [2306.14048](https://arxiv.org/abs/2306.14048) | raw-KV eviction (training-free) | `models/h2o/` (eval ref) | FMInference/H2O |
+**Provenance column:** *reimpl-from-paper* = built from the paper (the official repo is a 7B training
+program / unlicensed / a train-time artifact with no reusable runtime module). *mechanism-ported* = the
+core algorithm is faithfully lifted using the official code as the reference (verified against it), only
+the runtime I/O is our harness. *no official repo* = the authors released none.
+
+| Baseline | Paper | arXiv | Native read | Our code | Official repo | Provenance |
+|---|---|---|---|---|---|---|
+| **ICAE** | In-Context Autoencoder for Context Compression in a LLM (Ge et al., ICLR 2024) | [2307.06945](https://arxiv.org/abs/2307.06945) | prepend soft tokens | `models/icae/` | [getao/icae](https://github.com/getao/icae) (CC0) | reimpl-from-paper (repo = 7B DeepSpeed program) |
+| **AutoCompressor** | Adapting Language Models to Compress Contexts (Chevalier et al., EMNLP 2023 Findings) | [2305.14788](https://arxiv.org/abs/2305.14788) | prepend (summary accumulation) | `models/autocompressor/` | [princeton-nlp/AutoCompressors](https://github.com/princeton-nlp/AutoCompressors) (no license) | reimpl-from-paper (unlicensed → algorithm only; repo full-finetunes) |
+| **Gisting** | Learning to Compress Prompts with Gist Tokens (Mu, Li & Goodman, NeurIPS 2023) | [2304.08467](https://arxiv.org/abs/2304.08467) | per-layer gist-KV | `models/gisting/` | [jayelm/gisting](https://github.com/jayelm/gisting) (Apache-2.0) | reimpl-from-paper (repo full-finetunes 7B; `make_gist_mask` is a test oracle) |
+| **MemoryLLM** | MemoryLLM: Towards Self-Updatable LLMs (Wang et al., ICML 2024) | [2402.04624](https://arxiv.org/abs/2402.04624) | per-layer KV pool (random-drop) | `models/memoryllm/` | [wangyu-ustc/MemoryLLM](https://github.com/wangyu-ustc/MemoryLLM) (MIT) | **mechanism-ported** (faithful co-attention compress + random-drop + positional cue; 2026-07-11) |
+| **Titans** | Titans: Learning to Memorize at Test Time (Behrouz et al., 2024) | [2501.00663](https://arxiv.org/abs/2501.00663) | prepend (MAC); deep-MLP autograd write | `models/titans/` | **none** (ref: [lucidrains/titans-pytorch](https://github.com/lucidrains/titans-pytorch), MIT, unofficial) | reimpl-from-paper (no official repo; write kernel already faithful) |
+| **H2O** | H2O: Heavy-Hitter Oracle for Efficient Generative Inference of LLMs (Zhang et al., NeurIPS 2023) | [2306.14048](https://arxiv.org/abs/2306.14048) | per-layer heavy-hitter KV eviction (training-free) | `models/h2o/` (eval ref) | [FMInference/H2O](https://github.com/FMInference/H2O) (MIT) | **mechanism-ported** (faithful per-layer position-preserving eviction; 2026-07-11) |
 
 ### Our own arm + its lineage
 | Arm / concept | Reference | arXiv | Our code |

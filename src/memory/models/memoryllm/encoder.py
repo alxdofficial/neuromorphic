@@ -7,17 +7,31 @@ insert the candidates (so old memory decays stochastically), (3) the memory is r
 KEY/VALUE — the NATIVE per-layer-KV read (not an input prepend), via the shared prefix-cache path.
 Own frozen SmolLM2 copy + encoder-LoRA (q/k/v/o); the pool is the main trainable memory.
 
-Candidate generation uses the DECOUPLED fallback (a parameterless SDPA of the pool's last-K slots
-over this window's per-layer context hiddens) rather than MemoryLLM's exact in-model per-layer
-update where text and memory co-attend — a documented tractable approximation (see the blueprint).
-ASTERISKS for the results doc: per-layer KV byte footprint (L·N·d, ~60× a prepend arm); stochastic
-random-drop state (non-deterministic — seed for eval); native objective is loss-neutral CE.
+CANDIDATE GENERATION (faithful port, replacing the old parameterless-SDPA approximation): the window
+CO-ATTENDS to the pool through the REAL frozen+LoRA self-attention layers. Per layer l, that layer's
+last-K pool slots (`memory[l][-K:]`, MemoryLLM's recency window) are injected as a NON-CAUSAL KV prefix
+(each layer sees its OWN pool slice — matching upstream's per-layer memory), the window is run through
+the base with that prefix, and layer l's OUTPUT at the window's trailing-K valid positions becomes
+layer l's new candidate. A shared learned `new_memory_positional_emb` cue marks those carrier positions
+(upstream's `new_memory_positional_emb`; the per-position variant was "lethal" upstream → shared+zero-init).
+Drop/insert uses ONE shared random permutation across all layers (upstream default drop_memory_per_layer
+=False → same physical slot dropped at every depth).
+
+DELIBERATE deviations (documented for the results doc): (a) the positional cue is added at the input
+embeds rather than re-injected at every layer's residual (dominant effect; avoids per-layer hooks that
+fight gradient-checkpointing); (b) the KV prefix is position-free (unrotated), consistent with our read
+path and the other per-layer-KV arms, vs upstream's low real positions on the memory block; (c) frozen
+backbone + LoRA (upstream trains the whole backbone) — this port fixes the write MECHANISM, it is not a
+guarantee of an empirical win under the frozen-backbone constraint.
+ASTERISKS: per-layer KV byte footprint (L·N·d, ~60× a prepend arm); stochastic random-drop state
+(non-deterministic — seed for eval); native objective is loss-neutral CE.
 """
 from __future__ import annotations
 
 import torch
 import torch.nn as nn
 
+from ...common import _NormMatch
 from ...config import ReprConfig
 
 
@@ -54,8 +68,18 @@ class MemoryLLMBaselineEncoder(nn.Module):
         # per-layer learnable pool init: embed-table mean + noise, one pool of N vectors per layer.
         self.pool0 = nn.Parameter(mean.view(1, 1, self.d).repeat(self.L, self.N, 1)
                                   + std * torch.randn(self.L, self.N, self.d))
+        # MemoryLLM's new-memory cue: a single shared d-vector (zero-init) added at the trailing-K
+        # "will-become-memory" carrier positions during the compression forward. Shared (NOT per-position
+        # / per-K) — upstream found the per-position variant "lethal". Trains via requires_grad.
+        self.new_memory_positional_emb = nn.Parameter(torch.zeros(self.d))
+        # Candidates are RAW layer-output hiddens (deep residual-stream norms are large). Upstream's
+        # backbone is TRAINED to keep memory-token norms controlled; ours is FROZEN, so unnormalized
+        # candidates blow up the pool → huge KV → gnorm in the millions. Match them to the backbone token
+        # scale (out_norm auto-calibrated to ~3.2 in ReprModel.__init__), matching pool0's embed-scale init.
+        self.out_norm = _NormMatch(self.d)
         print(f"[MemoryLLM] encoder-LoRA {n_wrapped} layers; per-layer pool "
-              f"L={self.L}×N={self.N}×d={self.d}; random-drop K={self.K}/window (per-layer-KV read)")
+              f"L={self.L}×N={self.N}×d={self.d}; random-drop K={self.K}/window (per-layer-KV read); "
+              f"co-attention compress (faithful)")
 
     def train(self, mode: bool = True):
         super().train(mode)
@@ -68,39 +92,55 @@ class MemoryLLMBaselineEncoder(nn.Module):
 
     def streaming_write(self, state, token_embeds, attention_mask=None, chunk_offset=0, **extra):
         del chunk_offset, extra
+        from ...decoder import build_prefix_cache
         B, W, d = token_embeds.shape
+        K = self.K
         if attention_mask is None:
             attention_mask = torch.ones(B, W, device=token_embeds.device, dtype=torch.bool)
         active = attention_mask.bool().any(dim=1)
         if not active.any():
             return state, {}
-        # per-layer context hiddens for THIS window (hs[l] = input to layer l)
-        out = self.base.model(inputs_embeds=token_embeds, attention_mask=attention_mask.long(),
-                              output_hidden_states=True, use_cache=False)
-        hs = out.hidden_states                                   # tuple length L+1
         pool = state["pool"]                                     # [L, B, N, d]
-        # BATCHED candidate SDPA across the L context depths (was a 30-iteration Python loop of tiny
-        # GEMMs+softmaxes). Under the trainer's bf16 autocast the matmuls run in bf16 regardless, so the
-        # old per-layer .float() upcasts were dead (autocast recasts) — dropped. softmax stays fp32-promoted
-        # by autocast, as before. Result bit-identical to the per-layer loop.
-        H = torch.stack([hs[l] for l in range(self.L)], dim=0)   # [L, B, W, d] input to each layer
-        Q = pool[:, :, -self.K:, :]                              # [L, B, K, d] last-K slots compress the window
-        scores = torch.matmul(Q, H.transpose(-1, -2)) / (d ** 0.5)          # [L, B, K, W]
-        pad = (~attention_mask.bool()).view(1, B, 1, W)          # True where pad → mask out as keys
-        scores = scores.masked_fill(pad, float("-inf"))
-        attn_w = torch.softmax(scores, dim=-1).nan_to_num(0.0)              # all-pad → NaN → 0
-        cand = torch.matmul(attn_w, H).to(pool.dtype)                       # [L, B, K, d]
-        # RANDOM DROP K slots per layer (kept as a loop so the per-layer randperm RNG stream is
-        # bit-identical to the pre-batch version). keep N-K survivors, insert candidates; idle-row freeze.
-        new_layers = []
+
+        # ── FAITHFUL co-attention compress. The window co-attends to the pool's last-K slots (injected
+        #    as a per-layer NON-CAUSAL KV prefix — each layer sees its OWN pool[l] slice), and layer l's
+        #    OUTPUT at the window's trailing-K valid positions becomes layer l's new candidate. ──
+        # per-layer KV prefix from pool[l][:, -K:] via that layer's own (LoRA) k/v_proj (matches finalize).
+        prefixK, prefixV = [], []
         for l in range(self.L):
-            p_l = pool[l]                                        # [B, N, d]
-            perm = torch.randperm(self.N, device=p_l.device)
-            survivors = p_l[:, perm[:self.N - self.K], :]        # [B, N-K, d]
-            proposed = torch.cat([survivors, cand[l]], dim=1)    # [B, N, d]
-            proposed = torch.where(active.view(B, 1, 1), proposed, p_l)
-            new_layers.append(proposed)
-        return {"pool": torch.stack(new_layers, dim=0)}, {}
+            attn = self.base.model.layers[l].self_attn
+            p = pool[l][:, -K:, :]                               # [B, K, d]  (MemoryLLM recency window)
+            prefixK.append(attn.k_proj(p).view(B, K, self.n_kv, self.head_dim).permute(0, 2, 1, 3))
+            prefixV.append(attn.v_proj(p).view(B, K, self.n_kv, self.head_dim).permute(0, 2, 1, 3))
+
+        # trailing-K VALID positions per example (right-padding aware) = the new-memory carriers.
+        pos = torch.arange(W, device=token_embeds.device).expand(B, W)
+        vscore = torch.where(attention_mask.bool(), pos, torch.full_like(pos, -1))
+        car_idx = vscore.topk(K, dim=1).values.clamp_min(0).sort(dim=1).values     # [B, K] last-K valid
+        trailing = torch.zeros(B, W, 1, device=token_embeds.device, dtype=token_embeds.dtype)
+        trailing.scatter_(1, car_idx.unsqueeze(-1), 1.0)                            # [B, W, 1] cue mask
+        # add the new-memory positional cue at the carriers (input-embed level; see docstring deviation).
+        cue = self.new_memory_positional_emb.to(token_embeds.dtype)
+        emb_in = token_embeds + trailing * cue
+
+        # forward the window with the per-layer pool prefix; read per-layer OUTPUT hiddens.
+        cache = build_prefix_cache((prefixK, prefixV))
+        full_mask = torch.cat([torch.ones(B, K, device=token_embeds.device, dtype=torch.long),
+                               attention_mask.long()], dim=1)                       # prefix always attended
+        out = self.base.model(inputs_embeds=emb_in, attention_mask=full_mask,
+                              past_key_values=cache, use_cache=True, output_hidden_states=True)
+        hs = out.hidden_states                                   # tuple len L+1; hs[l+1] = layer-l output [B,W,d]
+        gather_idx = car_idx[:, :, None].expand(B, K, d)
+        cand = torch.stack([hs[l + 1].gather(1, gather_idx) for l in range(self.L)], dim=0)  # [L,B,K,d]
+        cand = self.out_norm(cand.float()).to(pool.dtype)        # match backbone token scale (frozen base → tame norms)
+
+        # RANDOM DROP K slots + insert candidates. ONE shared randperm across all layers (MemoryLLM
+        # default drop_memory_per_layer=False → the same physical slot is dropped/kept at every depth).
+        perm = torch.randperm(self.N, device=pool.device)
+        survivors = pool[:, :, perm[:self.N - K], :]             # [L, B, N-K, d]
+        proposed = torch.cat([survivors, cand], dim=2)          # [L, B, N, d]
+        proposed = torch.where(active.view(1, B, 1, 1), proposed, pool)             # idle-row freeze
+        return {"pool": proposed}, {}
 
     def finalize_memory(self, state):
         pool = state["pool"]                                     # [L, B, N, d]

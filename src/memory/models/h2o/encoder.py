@@ -1,31 +1,35 @@
-"""H2O-inspired static heavy-hitter selector (after Zhang et al. 2023, arXiv:2306.14048).
+"""H2O heavy-hitter KV eviction (Zhang et al. 2023, arXiv:2306.14048) — FAITHFUL per-layer port.
 
-TRAINING-FREE eval-only baseline. NOT a faithful H2O port — label it "H2O-inspired static attention
-selector" in results. FIDELITY NOTE: the real H2O dynamically evicts each layer/head's EXISTING KV
-entries during generation while PRESERVING their original contextualized, position-rotated states. This
-implementation instead (a) aggregates attention scores GLOBALLY across all layers+heads, (b) selects the
-top-M positions ONCE, then (c) RE-ENCODES those tokens as a new short sequence to get their KV — which
-changes both their context and their KV values vs. the paper's in-place per-layer/head eviction. So it is
-a static, globally-selected, re-encoded approximation, not H2O's dynamic per-head eviction. Kept as a
-cheap LM-intrinsic "which tokens matter" reference, disclosed as such.
+TRAINING-FREE eval-only baseline. Now a faithful rendering of H2O's mechanism at our scale:
+per LAYER (and per KV-head) we keep the tokens that receive the most attention mass (the "heavy
+hitters") plus a most-recent local window, and we index-select those tokens' ORIGINAL contextualized
+KEY/VALUE — i.e. the exact contextualized, real-position projections from a single full-context pass —
+rather than re-encoding a selected subset. This matches H2O's `H2OKVCache_LayerWise` selection
+(heavy-hitter + recent split, per layer/head) and its in-place eviction of the model's OWN cached KV.
 
-Keeps the M tokens that receive the most total attention mass across all layers and heads (the "heavy
-hitters"). No encoder training, no added params.
+DELIBERATE, DOCUMENTED deviations (still "H2O-inspired", not bit-identical):
+  * GQA reduction: SmolLM2 is grouped-query (9 query-heads → 3 KV-heads). H2O's released code scores
+    per query-head and would shape-crash under GQA; we sum the `group` query-heads that share a KV-head
+    into one per-KV-head score (mirrors H2O's own "sum received attention" semantics), then select once
+    per KV-head. This head→kv-head fold is our choice; upstream had no precedent (MHA-only models).
+  * Single-shot vs incremental: H2O accumulates its heavy-hitter score across autoregressive decode
+    steps and evicts a growing cache in place. We are an encoder: one eager pass over the buffered
+    context gives the complete received-attention score in one shot — no running total / re-indexing.
+  * Position-free injection: like every per-layer-KV arm here (gisting/memoryllm), the selected KV is
+    injected position-free through the shared prefix-cache path (decoder.py). We preserve the original
+    CONTEXT (no re-encode) but not H2O's original RoPE phase — consistent with the other arms so the
+    comparison stays apples-to-apples.
 
-Algorithm (our streaming adaptation):
-  1. For each streaming window run the frozen LM with output_attentions=True.
-  2. Accumulate per-token attention-received score: score[t] = Σ_{l,h} Σ_s attn[l,h,s,t]
-     (how much total attention position t receives from all query positions, across all layers/heads).
-  3. After all windows, keep the top-M positions by accumulated score.
-  4. Run a SECOND frozen forward over only those M token embeds (no causal context — just the
-     surviving tokens as a set) to get their per-layer K,V → `past_kv`.
-  5. Decoder reads those M per-layer KV pairs via the shared `_prefix_kv_forward` path.
+Algorithm:
+  1. Each streaming window appends its token embeds to a buffer (streaming_write).
+  2. finalize_memory runs the frozen LM ONCE with eager output_attentions, capturing per layer BOTH
+     the received-attention score (reduced to KV-heads) AND the original k_proj/v_proj outputs.
+  3. Per (layer, KV-head): keep top-(M−r) heavy hitters + r most-recent = M tokens, index-selecting
+     the captured ORIGINAL KV (no second forward, no re-encode).
+  4. Decoder reads those M per-layer KV pairs via the shared `_prefix_kv_forward` path.
 
-ASTERISKS (for the results table):
-  * Training-free / eval-only — no learnable encoder or decoder adapter; the trainer skips this arm.
-  * Two forward passes per encode (score pass + KV pass).
-  * Eviction uses attention scores from the LM's OWN causal context, not the decoder's.
-  * Does NOT implement H2O's optional "recent" window bias (our M budget is already fixed).
+ASTERISKS (results table): training-free / eval-only (trainer skips this arm); one forward per encode;
+eviction uses the LM's own causal attention scores; keep-count is layer/head-uniform (M).
 """
 from __future__ import annotations
 
@@ -44,23 +48,25 @@ class H2OBaselineEncoder(nn.Module):
         super().__init__()
         self.cfg = cfg
         from ...decoder import load_frozen_llama
-        # Eager attention is REQUIRED for the score pass: sdpa/flash do not
-        # return attention weights (output_attentions returns None). Eager is
-        # slower but this arm is eval-only so the cost is acceptable.
+        # Eager attention is REQUIRED for the score pass: sdpa/flash do not return attention weights
+        # (output_attentions returns None). Eager is slower but this arm is eval-only.
         base, _ = load_frozen_llama(cfg.llama_model, attn_implementation="eager")
         for p in base.parameters():
             p.requires_grad_(False)
         self.base = base
         _bc = base.config
         self.L = _bc.num_hidden_layers
+        self.n_q = _bc.num_attention_heads
         self.n_kv = getattr(_bc, "num_key_value_heads", None) or _bc.num_attention_heads
+        self.group = self.n_q // self.n_kv                 # GQA query-heads per kv-head (9//3 = 3)
         self.head_dim = getattr(_bc, "head_dim", None) or (_bc.hidden_size // _bc.num_attention_heads)
         self.d = cfg.d_llama
         self.M = int(getattr(cfg, "h2o_n_budget", 0) or cfg.n_flat_codes)
         self.recent_ratio = float(getattr(cfg, "h2o_recent_ratio", 0.1))
         # No trainable parameters — eval-only. The shared read-LoRA on the decoder is the only
         # thing that trains; this encoder is a pure attention-score KV selector.
-        print(f"[H2O] training-free KV eviction; budget M={self.M}, recent_ratio={self.recent_ratio:.2f}; "
+        print(f"[H2O] faithful per-layer heavy-hitter eviction; budget M={self.M}, "
+              f"recent_ratio={self.recent_ratio:.2f}; GQA fold {self.n_q}q→{self.n_kv}kv; "
               f"eval-only (no trainable encoder params)")
 
     def train(self, mode: bool = True):
@@ -80,105 +86,98 @@ class H2OBaselineEncoder(nn.Module):
         return {"emb": torch.cat([state["emb"], token_embeds], dim=1),
                 "mask": torch.cat([state["mask"], attention_mask.bool()], dim=1)}, {}
 
+    @staticmethod
+    def _select(score_vec, valid_mask, M, n_recent, n_heavy):
+        """H2O heavy-hitter + recent selection → sorted kept ORIGINAL indices.
+        Returns min(M, #valid) sorted positions: the r most-recent valid tokens (always kept) plus the
+        top heavy hitters among the rest. When #valid ≤ M, keep every valid position in order."""
+        valid_pos = valid_mask.nonzero(as_tuple=False).squeeze(-1)      # [#valid]
+        if valid_pos.numel() <= M:
+            return valid_pos                                           # keep all valid, in order
+        s = score_vec.clone()
+        s[~valid_mask] = float("-inf")
+        if n_recent > 0:
+            recent_pos = valid_pos[-n_recent:]
+            s[recent_pos] = float("-inf")                              # protect from heavy competition
+            heavy = s.topk(n_heavy, largest=True).indices             # #valid−r ≥ n_heavy here
+            return torch.cat([heavy, recent_pos]).sort().values
+        return s.topk(M, largest=True).indices.sort().values
+
     @torch.no_grad()
     def finalize_memory(self, state):
-        emb, mask = state["emb"], state["mask"]
+        emb, mask = state["emb"], state["mask"]                       # [B,T,d], [B,T] bool
         B, T, d = emb.shape
         if T == 0:
             raise ValueError("H2O.finalize_memory: empty context (T=0)")
         M = min(self.M, T)
-
-        # ── Pass 1: score pass — run frozen LM with output_attentions to get heavy hitters ──
-        # Each layer returns attn [B, n_heads, T, T]; score[t] = total attention received at t.
-        # Use the full causal mask so the scores reflect the LM's natural attention pattern.
+        L, n_kv, hd, group = self.L, self.n_kv, self.head_dim, self.group
         base_dtype = next(self.base.parameters()).dtype
-        # Sum-and-drop hooks: eager attention returns (attn_output, attn_weights)
-        # per layer. Each hook accumulates the received-attention score (sum over
-        # the query axis → how much attention each key position receives) then
-        # REPLACES the weights with None, so only ONE layer's [B,H,T,T] matrix is
-        # ever live (peak ~1.2GB vs ~90GB if output_attentions retained all layers).
-        score = torch.zeros(B, T, device=emb.device, dtype=torch.float32)
-        def _sd_hook(module, inp, out):
-            if not (isinstance(out, tuple) and len(out) >= 2 and torch.is_tensor(out[1])):
-                return out                                       # nothing to accumulate/drop
-            aw = out[1]                                          # [B, n_heads, T_q, T_k]
-            score.add_(aw.float().sum(dim=(1, 2)))               # received attention per key
-            return (out[0], None) + tuple(out[2:])               # drop weights → free the matrix
-        handles = [layer.self_attn.register_forward_hook(_sd_hook)
-                   for layer in self.base.model.layers]
+
+        # ── ONE eager pass: per layer capture the received-attention SCORE (folded to KV-heads) AND the
+        #    original contextualized k_proj/v_proj outputs (real context + positions preserved). ──
+        # attn hook computes the per-kv-head score immediately then DROPS the [B,H,T,T] matrix, so only
+        # one layer's attention matrix is ever live (peak ~1GB, not ×L). k/v hooks snapshot the projections.
+        score = [None] * L                                            # each [B, n_kv, T]
+        kbuf = [None] * L                                             # each [B, T, n_kv, hd]
+        vbuf = [None] * L
+
+        def _attn_hook(li):
+            def hook(module, inp, out):
+                if not (isinstance(out, tuple) and len(out) >= 2 and torch.is_tensor(out[1])):
+                    return out                                        # no weights to score
+                aw = out[1]                                           # [B, n_q, T_q, T_k]
+                s = aw.float().sum(dim=2)                             # [B, n_q, T_k] received-attention
+                score[li] = s.view(B, n_kv, group, T).sum(dim=2)     # GQA fold → [B, n_kv, T]
+                return (out[0], None) + tuple(out[2:])                # drop the matrix → free memory
+            return hook
+
+        def _proj_hook(buf, li):
+            def hook(module, inp, out):
+                buf[li] = out.view(B, T, n_kv, hd)                   # pre-RoPE, original-context K/V
+            return hook
+
+        handles = []
+        for li, layer in enumerate(self.base.model.layers):
+            handles.append(layer.self_attn.register_forward_hook(_attn_hook(li)))
+            handles.append(layer.self_attn.k_proj.register_forward_hook(_proj_hook(kbuf, li)))
+            handles.append(layer.self_attn.v_proj.register_forward_hook(_proj_hook(vbuf, li)))
         try:
             self.base.model(inputs_embeds=emb.to(base_dtype), attention_mask=mask.long(),
                             output_attentions=True, use_cache=False)
         finally:
             for hh in handles:
                 hh.remove()
-        if float(score.abs().sum()) == 0.0:
-            raise RuntimeError("H2O score pass captured no attention weights — the base is not "
-                               "returning eager attention weights (check attn_implementation='eager').")
-        # Mask out pad positions so they are never selected.
-        score = score.masked_fill(~mask, float("-inf"))
+        if score[0] is None or float(sum(s.abs().sum() for s in score)) == 0.0:
+            raise RuntimeError("H2O score pass captured no attention weights — the base is not returning "
+                               "eager attention weights (check attn_implementation='eager').")
 
-        # H2O selection: optionally protect the most-recent r = recent_ratio×M tokens as "local"
-        # (always kept regardless of score) — mirrors H2O's original local+heavy-hitter split.
+        # ── per (layer, KV-head, batch): heavy-hitter + recent selection on ORIGINAL positions ──
         n_recent = max(0, min(int(self.recent_ratio * M), M - 1))
         n_heavy = M - n_recent
-        keep_idx_list = []
-        for b in range(B):
-            s = score[b].clone()
-            if n_recent > 0:
-                # Protect the last n_recent valid positions: find their indices, zero their score
-                # so they don't compete with the heavy hitter budget.
-                valid_pos = mask[b].nonzero(as_tuple=False).squeeze(-1)
-                recent_pos = valid_pos[-n_recent:] if len(valid_pos) >= n_recent else valid_pos
-                s[recent_pos] = float("-inf")                              # exclude from heavy budget
-                heavy_pos = s.topk(min(n_heavy, int(mask[b].sum())), largest=True).indices
-                idx = torch.cat([heavy_pos, recent_pos]).unique()
-            else:
-                idx = s.topk(min(M, int(mask[b].sum())), largest=True).indices
-            keep_idx_list.append(idx.sort().values)                        # sorted for KV coherence
+        # keep-COUNT per batch row is layer/head-invariant (depends only on #valid and M) → one shared mask.
+        keep_cnt = torch.clamp(mask.sum(dim=1), max=M)                # [B]
+        max_keep = int(keep_cnt.max().item())
 
-        # Pad to the same length across the batch (use max, fill with zeros for all-pad rows).
-        max_keep = max(len(i) for i in keep_idx_list)
-        keep_mask = torch.zeros(B, max_keep, device=emb.device, dtype=torch.bool)
-        for b, idx in enumerate(keep_idx_list):
-            keep_mask[b, :len(idx)] = True
+        Ks, Vs = [], []
+        for li in range(L):
+            Kl = torch.zeros(B, n_kv, max_keep, hd, device=emb.device, dtype=base_dtype)
+            Vl = torch.zeros(B, n_kv, max_keep, hd, device=emb.device, dtype=base_dtype)
+            sc_l = score[li]                                          # [B, n_kv, T]
+            for j in range(n_kv):
+                for b in range(B):
+                    idx = self._select(sc_l[b, j], mask[b], M, n_recent, n_heavy)   # sorted, ≤ max_keep
+                    n = idx.numel()
+                    Kl[b, j, :n] = kbuf[li][b, idx, j, :]
+                    Vl[b, j, :n] = vbuf[li][b, idx, j, :]
+            Ks.append(Kl)
+            Vs.append(Vl)
+            kbuf[li] = None
+            vbuf[li] = None                                          # free the full-T buffers as we go
 
-        # ── Pass 2: KV pass — run a SECOND frozen forward over only the selected M tokens ──
-        # Each example has a DIFFERENT selection set, so we can't batch them naively. We build a
-        # padded [B, max_keep, d] sub-sequence for each example and run one batched forward.
-        sel_emb = torch.zeros(B, max_keep, d, device=emb.device, dtype=base_dtype)
-        for b, idx in enumerate(keep_idx_list):
-            sel_emb[b, :len(idx)] = emb[b, idx].to(base_dtype)
-
-        # Capture per-layer K,V via hooks (same pattern as Gisting/Beacon).
-        kbuf = [None] * self.L
-        vbuf = [None] * self.L
-        handles = []
-        for li, layer in enumerate(self.base.model.layers):
-            handles.append(layer.self_attn.k_proj.register_forward_hook(
-                (lambda i: lambda m, ip, o: kbuf.__setitem__(i, o))(li)))
-            handles.append(layer.self_attn.v_proj.register_forward_hook(
-                (lambda i: lambda m, ip, o: vbuf.__setitem__(i, o))(li)))
-        try:
-            self.base.model(
-                inputs_embeds=sel_emb,
-                attention_mask=keep_mask.long(),
-                use_cache=False,
-            )
-        finally:
-            for hh in handles:
-                hh.remove()
-
-        def _to_kv(t):
-            # raw proj output [B, max_keep, n_kv*head_dim] → [B, n_kv, max_keep, head_dim]
-            return t.view(B, max_keep, self.n_kv, self.head_dim).permute(0, 2, 1, 3)
-
-        Ks = [_to_kv(kbuf[i]) for i in range(self.L)]
-        Vs = [_to_kv(vbuf[i]) for i in range(self.L)]
-
+        # one shared per-batch mask: first keep_cnt[b] slots are real (uniform across layers/kv-heads).
+        mm = (torch.arange(max_keep, device=emb.device)[None, :] < keep_cnt[:, None]).float()  # [B, max_keep]
         empty = torch.zeros(B, 0, d, device=emb.device, dtype=torch.float32)
-        return empty, {"past_kv": (Ks, Vs), "memory_mask": keep_mask.float(),
-                       "read_mode": "per_layer_kv"}
+        return empty, {"past_kv": (Ks, Vs), "memory_mask": mm, "read_mode": "per_layer_kv"}
 
     def forward(self, token_embeds, attention_mask=None, mask_positions=None):
         del mask_positions
