@@ -9,8 +9,8 @@ SHUF gate is unreliable on babi, see notes in the doc).
 All runs MUST be from the same code commit (cross-era comparison is invalid).
 
 Seed-dir convention (matches run_overnight_seeds.sh):
-  seed 42 -> "{prefix}_{variant}"        e.g. valrun_memon_biomem_baseline
-  seed N  -> "{prefix}_s{N}_{variant}"   e.g. valrun_memon_s1_biomem_baseline
+  seed 42 -> "{prefix}_{variant}"        e.g. valrun_slotgraph_slotgraph_baseline
+  seed N  -> "{prefix}_s{N}_{variant}"   e.g. valrun_slotgraph_s1_slotgraph_baseline
 
 Usage:  .venv/bin/python scripts/diagnostics/cohort/cohort_results.py [--no-eval] [--seeds 42 1 2]
 """
@@ -25,13 +25,9 @@ TASKS = ["mae", "babi", "continuation", "condrecon_bio"]
 
 # display name -> (prefix, variant, multiseed)
 MODELS = [
-    ("biomem (membrane on)",   "valrun_memon",     "biomem_baseline",         True),
-    ("biomem (membrane off)",  "valrun_memoff",    "biomem_baseline",         True),
     ("slotgraph",              "valrun_slotgraph", "slotgraph_baseline",      True),
     ("icae",                   "valrun_icae",      "icae_baseline",           True),
-    ("ccm",                    "valrun_ccm",       "ccm_baseline",            True),
     ("autocompressor",         "valrun_autocomp",  "autocompressor_baseline", True),
-    ("beacon",                 "valrun_beacon",    "beacon_baseline",         True),
     ("vanilla floor (no mem)", "valrun_vfloor",    "vanilla_llama",           False),
     ("vanilla ceiling (full)", "valrun_vceil",     "vanilla_full_context",    False),
 ]

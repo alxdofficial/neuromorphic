@@ -45,9 +45,9 @@ from src.memory.data.mixes import TASK_MODE, DEFAULT_TRAIN_MIX, DEFAULT_MIXED_M
 from src.memory.data.sources.babi import DEFAULT_TASKS as BABI_DEFAULT_TASKS
 
 TRAINED_VARIANTS = [
-    "icae_baseline", "ccm_baseline", "autocompressor_baseline", "beacon_baseline",
+    "icae_baseline", "autocompressor_baseline",
     # our memory arms (use the same mixed harness; missing ckpts are skipped gracefully)
-    "slotgraph_baseline", "vqicae_baseline", "biomem_baseline",
+    "slotgraph_baseline",
 ]
 # Campaign launch constants (must match the run that produced the checkpoints).
 MIXED_CTX = 1024

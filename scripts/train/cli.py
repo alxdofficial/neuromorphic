@@ -29,8 +29,8 @@ def build_parser() -> argparse.ArgumentParser:
     # still selectable via explicit --variants for reproduction, out of the default.
     ap.add_argument("--variants", nargs="+", default=[
         # ACTIVE trainable cohort (2026-07-10): published closed-book compressors + our graph arm,
-        # matched ~7M params / M=96. THE slotgraph is slotgraph_baseline;
-        # beacon/ccm/vqicae/biomem removed or non-active.
+        # matched ~7M params / M=96. THE slotgraph is slotgraph_baseline.
+        # (beacon/ccm/vqicae/biomem were retired and removed 2026-07-11.)
         "icae_baseline",              # ICAE (ICLR'24) — prepend
         "autocompressor_baseline",    # AutoCompressor/RMT-style recurrent summary — prepend
         "titans_baseline",            # Titans (deep-MLP test-time-autograd memory) — MAC prepend; needs --no-grad-ckpt-stream
@@ -63,9 +63,9 @@ def build_parser() -> argparse.ArgumentParser:
                          "streaming continuation predicts at each boundary; condrecon retention-lag varies.")
     ap.add_argument("--mem-tokens", type=int, default=144,
                     help="Matched MEMORY budget: M memory tokens × d_llama, "
-                         "matched across ICAE/CCM/AutoCompressor/Beacon "
-                         "(and soft_pointer_graph if selected). Derives icae_n_slots, "
-                         "ccm_n_comp, autocompressor_n_slots, and Beacon's α.")
+                         "matched across ICAE/AutoCompressor "
+                         "(and soft_pointer_graph if selected). Derives icae_n_slots "
+                         "and autocompressor_n_slots.")
     ap.add_argument("--task", type=str, default="mixed",
                     choices=["mixed"],
                     help="mixed = ONE model trained on an equal round-robin of --mixed-tasks "
@@ -150,9 +150,6 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--anomaly-from", type=int, default=-1,
                     help="debug: from this step on, run loss.backward() under torch.autograd.detect_anomaly "
                          "so the first non-finite GRADIENT halts with a traceback to the exact forward op.")
-    ap.add_argument("--biomem-no-membrane", action="store_true",
-                    help="biomem: disable the LIF membrane (fire on the instantaneous readout, not the "
-                         "leaky-integrated potential). Ablation: does the per-neuron membrane help?")
     ap.add_argument("--rect-prepend-mask", action="store_true",
                     help="KBLaM-style rectangular decoder mask: prepended memory tokens attend only to "
                          "themselves (no memory↔memory mixing through decoder layers); text attends into "
@@ -197,16 +194,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help="graph: read the FINAL hidden (full forward) instead of the mid tap.")
     ap.add_argument("--graph-free-endpoints", action="store_true",
                     help="graph: regress FREE src/dst vectors (drop the bank/selection/topology).")
-    ap.add_argument("--beacon-param", nargs="+", default=None,
-                    help="Beacon capacity knob: which projections get a trainable copy "
-                         "(default q k v ≈ 102M). e.g. --beacon-param v shrinks toward ~17M.")
-    ap.add_argument("--beacon-wrap-layers", nargs="+", type=int, default=None,
-                    help="Beacon capacity knob: which Llama layer indices to wrap "
-                         "(default all 16). e.g. --beacon-wrap-layers 0 1 2 3 → ~4 layers.")
     ap.add_argument("--port-lora-rank", type=int, default=None,
-                    help="Capacity knob for ICAE/CCM/AutoCompressor: override their LoRA rank "
-                         "(defaults 32/8/32 ≈ 4–6M). e.g. 256 pushes them to ~27–55M (above "
-                         "Beacon's ~10M binding floor) to test capacity-vs-mechanism on conditioned-reconstruction.")
+                    help="Capacity knob for ICAE/AutoCompressor: override their LoRA rank "
+                         "(defaults 32/32 ≈ 4–6M). e.g. 256 pushes them to ~27–55M "
+                         "to test capacity-vs-mechanism on conditioned-reconstruction.")
     ap.add_argument("--probe-bs", action="store_true",
                     help="Per-arm max-batch-size VRAM probe (no training). For each --variants "
                          "arm: push BS up until OOM, report max-fitting BS + peak VRAM + samp/s, "
@@ -224,8 +215,8 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--compile-decoder", action=argparse.BooleanOptionalAction,
                     default=False,
                     help="torch.compile(dynamic=True) the shared frozen decoder transformer — "
-                         "speeds student+teacher decode for hook-free arms (icae/ccm/ac/beacon/"
-                         "vqicae). Hooked arms (biomem) + 4-D rect/bidir masks (slotgraph) "
+                         "speeds student+teacher decode for hook-free arms (icae/ac/gisting/"
+                         "memoryllm). 4-D rect/bidir masks (slotgraph) "
                          "graph-break; leave off for those.")
     ap.add_argument("--patience", type=int, default=5,
                     help="Stop training when best.pt hasn't updated for this "
@@ -331,46 +322,29 @@ def args_to_config(args, ap):
     # ── Matched MEMORY budget (decoder-read M × d_llama) ────────────────
     # mem_tokens is the single knob; the prepend conditioned-reconstruction arms all emit ~M tokens at
     # d_llama, so the decoder reads the SAME float budget from each — only the
-    # memory MECHANISM differs. Beacon (concat) derives α = chunk//M so its total
-    # ≈ M. Trainable params are NOT matched (LoRA ports vs the graph substrate
+    # memory MECHANISM differs. Trainable params are NOT matched (LoRA ports vs the graph substrate
     # differ by design, ~2.5M–48M–100M) — they are reported, not equated.
     M = args.mem_tokens
     cfg.icae_n_slots = M
-    cfg.ccm_n_comp = M
     cfg.autocompressor_n_slots = M
     cfg.n_flat_codes = M             # flat/continuous/MT prepend M too (was 192 -> mismatch)
-    cfg.beacon_ratio = max(1, args.chunk_size // M)
-    if args.beacon_param is not None:
-        cfg.beacon_param = tuple(args.beacon_param)
-    if args.beacon_wrap_layers is not None:
-        cfg.beacon_wrap_layers = tuple(args.beacon_wrap_layers)
     if args.port_lora_rank is not None:
         cfg.icae_lora_rank = args.port_lora_rank
-        cfg.ccm_lora_rank = args.port_lora_rank
         cfg.autocompressor_lora_rank = args.port_lora_rank
-        print(f"[capacity] ICAE/CCM/AutoCompressor LoRA rank → {args.port_lora_rank}")
+        print(f"[capacity] ICAE/AutoCompressor LoRA rank → {args.port_lora_rank}")
     cfg.mae_mask_ratio = args.mae_mask_ratio
     cfg.continuation_multi_horizon = not args.no_continuation_multi_horizon
     cfg.cond_recon_bio_world_seed = args.cond_recon_bio_world_seed   # threaded into _build_source (bio world)
     cfg.cond_recon_bio_query_window = args.bio_query_window   # streaming retention placement (mixed path)
-    _ceil = lambda a, b: -(-a // b)
-    _beacon_M = (_ceil(args.chunk_size, args.window_size)
-                 * _ceil(args.window_size, cfg.beacon_ratio))
     print(f"[memory budget] mem_tokens={M} × d_llama={cfg.d_llama} = "
           f"{M * cfg.d_llama:,} prepend decoder-read floats/arm")
-    for _a, _m in (("icae", M), ("ccm", M), ("autocompressor", M), ("beacon", _beacon_M)):
+    for _a, _m in (("icae", M), ("autocompressor", M)):
         print(f"   {_a:<18} M={_m:<4} → {_m * cfg.d_llama:,} floats")
     if args.task == "mixed":
         # mixed ignores --mem-tokens: the override below sets a FIXED M (mixed_M). The
-        # QA-shaped budget figures above (M, _beacon_M) do NOT describe what it emits —
-        # skip the multi-window beacon assertion.
+        # QA-shaped budget figures above (M) do NOT describe what it emits.
         print(f"   [{args.task}] the above --mem-tokens budget is IGNORED; the "
               f"compression-line override below sets the fixed memory budget.")
-    elif abs(_beacon_M - M) > max(1, M // 10):
-        raise SystemExit(
-            f"[memory budget] beacon M={_beacon_M} is >10% off mem_tokens={M} "
-            f"(α={cfg.beacon_ratio}); adjust --mem-tokens / chunk / window so the "
-            f"matched memory budget holds before launching.")
 
     # ── compression line: param-matched baselines (backbone resolved above) ───
     if args.task == "mixed":
@@ -386,12 +360,11 @@ def args_to_config(args, ap):
         cfg.llama_lora_rank = 16; cfg.llama_lora_alpha = 32
         _M = args.mixed_M                                # FIXED budget (no ceil(chunk/30))
         # MAE-calibrated, param-matched ranks (verified to hold within ~0.1M:
-        # icae 6.01M / ccm 6.01M / ac 6.03M / beacon 6.08M memory; graph ~6.9M (d_graph=256)).
+        # icae 6.01M / ac 6.03M memory; graph ~6.9M (d_graph=256)).
         # M barely affects params — the M×d slot embeddings (~37K at M=64) are negligible vs the
         # ~6M LoRA — so these ranks stay matched across the M=32↔64 change. See param_count.py.
         cfg.n_flat_codes = _M
         cfg.icae_n_slots = _M; cfg.icae_lora_rank = 104; cfg.icae_lora_alpha = 208
-        cfg.ccm_n_comp = _M; cfg.ccm_lora_rank = 52; cfg.ccm_lora_alpha = 104
         cfg.autocompressor_n_slots = _M
         cfg.autocompressor_lora_rank = 52; cfg.autocompressor_lora_alpha = 104
         # Faithful AutoCompressor accumulates κ summaries per seg_len segment → κ·n_segments ≈ M.
@@ -400,11 +373,6 @@ def args_to_config(args, ap):
         cfg.autocompressor_segment_len = args.window_size
         _ac_nwin = max(1, args.mixed_ctx // args.window_size)
         cfg.autocompressor_summary_per_window = max(1, _M // _ac_nwin)   # 96//8 = 12 at ctx2048/win256
-        cfg.beacon_ratio = max(1, args.mixed_ctx // _M)  # ratio honors the uniform ctx:M (16:1 at M=64)
-        from transformers import AutoConfig as _ACLM
-        from src.memory.common import beacon_wrap_layers as _bwlm
-        _nlayersm = _ACLM.from_pretrained(cfg.llama_model).num_hidden_layers
-        cfg.beacon_wrap_layers = _bwlm(_nlayersm, 11)
         # MemoryLLM: N=M slots/layer pool (~1.66M) + q/k/v/o LoRA all layers. r46 measured 7.88M
         # (LoRA denser than estimated); r39 ≈ 7.0M cohort match. TODO precise-calibrate w/ param_count.
         cfg.memoryllm_n_mem = _M
@@ -425,14 +393,6 @@ def args_to_config(args, ap):
         cfg.slotgraph_lora_rank = 16; cfg.slotgraph_lora_alpha = 32
         # h2o (training-free KV eviction): M = same budget; no encoder LoRA (eval-only arm).
         cfg.h2o_n_budget = _M
-        # vqicae (icae + VQ-discretized slots): encoder-LoRA r96 + projns + EMA codebook (a buffer,
-        # not gradient-trained) → ~7.0M trainable, matched to icae. Large codebook K=8192.
-        cfg.vqicae_n_slots = _M
-        cfg.vqicae_lora_rank = 100; cfg.vqicae_lora_alpha = 200
-        cfg.vqicae_codebook_size = 8192; cfg.vqicae_d_code = 256
-        # biomem (gated fast-Hebbian grid): M seeds → prepend = the same M×d read budget as the
-        # cohort; readout_h tuned to ~6.9M trainable (W is per-example fast state, NOT counted).
-        cfg.biomem_n_slots = _M
         print(f"[capacity] mixed: FIXED M={_M} (ctx {args.mixed_ctx}:M = {args.mixed_ctx // _M}:1); "
               f"ACTIVE cohort icae r104 / ac r52 / titans h5448 / gisting r104 / memoryllm r39 / "
               f"slotgraph r16-LoRA×2 (param-matched ~7.0M); h2o eval-only.")
@@ -463,9 +423,6 @@ def args_to_config(args, ap):
     if args.graph_free_endpoints:
         cfg.graph_free_endpoints = True
         print("[graph override] FREE endpoints (no bank/selection)")
-    if args.biomem_no_membrane:
-        cfg.biomem_membrane = False
-        print("[biomem override] membrane OFF = fire on the instantaneous readout, not the leaky-integrated potential")
     if args.rect_prepend_mask:
         cfg.rect_prepend_mask = True
         print("[override] rectangular prepend mask ON (memory tokens attend to self only — KBLaM-style)")
@@ -499,10 +456,9 @@ def args_to_config(args, ap):
         # contrastive is objective-level (GradCache over ANY prepend memory) so it runs for the
         # AUX-LOSS-FREE prepend baselines too — valuable as a watermark CONTROL (if icae-contrastive
         # also Goodharts SHUF−REAL with flat EM, the watermark is objective-driven, not sg3-specific).
-        # EXCLUDED: vqicae (emits vq_loss → silently inert under the per-example-CE surrogate); hlvocab
-        # (load_balance).
-        _OBJ_OK = {"slotgraph_baseline", "icae_baseline", "ccm_baseline",
-                   "autocompressor_baseline", "beacon_baseline",
+        # EXCLUDED: hlvocab (load_balance).
+        _OBJ_OK = {"slotgraph_baseline", "icae_baseline",
+                   "autocompressor_baseline",
                    # aux-loss-free arms added 2026-07-09 (gisting/memoryllm/titans emit no vq/load-balance
                    # aux loss, so they are valid under behavioral_kl; per-layer-KV students dispatch fine
                    # via _prefix_kv_forward). Still gated by the pre-training verification (#158).
@@ -515,24 +471,22 @@ def args_to_config(args, ap):
         if not _train_variants.issubset(_OBJ_OK):
             raise SystemExit(f"--objective-mode supports {sorted(_OBJ_OK)} (aux-loss-free prepend arms) "
                              f"+ eval-only {sorted(_EVAL_ONLY)}; got trainable {sorted(_train_variants)}. "
-                             f"vqicae/hlvocab emit aux losses inert under the GradCache surrogate — excluded.")
+                             f"hlvocab emits aux losses inert under the GradCache surrogate — excluded.")
         # GradCache (contrastive) detaches ONLY the prepend memory into mem_leaf and re-enters
         # the encoder graph exactly once (objectives.py mem.backward). The per-layer-KV arms carry their
         # DIFFERENTIABLE content in aux["past_kv"] (empty prepend), which GradCache passes verbatim to
         # every roll — so the 2nd roll's backward hits the freed encoder graph ("backward a 2nd time").
         # behavioral_kl is safe (its own CE+KL backward, no GradCache), so keep these arms whitelisted
-        # for it and block them ONLY for the GradCache mode. beacon defaults to per-layer-KV
-        # (beacon_read="kv"), so it is affected too despite the "ANY prepend memory" comment above.
+        # for it and block them ONLY for the GradCache mode.
         if args.objective_mode == "contrastive":
-            _KV_ARMS = {"beacon_baseline", "gisting_baseline", "memoryllm_baseline"}
+            _KV_ARMS = {"gisting_baseline", "memoryllm_baseline"}
             _bad_kv = _KV_ARMS.intersection(args.variants)
             if _bad_kv:
                 raise SystemExit(
                     f"--objective-mode {args.objective_mode} (GradCache) does NOT support the per-layer-KV "
                     f"arms {sorted(_bad_kv)}: their differentiable memory lives in aux['past_kv'], which "
                     f"GradCache reuses across rolls → 2nd-backward-through-freed-graph crash. These arms "
-                    f"are valid under --objective-mode behavioral_kl only. (beacon is per-layer-KV when "
-                    f"beacon_read=kv, the default.)")
+                    f"are valid under --objective-mode behavioral_kl only.")
         print(f"[objective override] mode={args.objective_mode} InfoNCE coef={cfg.objective_coef}")
     if args.uniform_mem_pos:
         cfg.uniform_mem_pos = True

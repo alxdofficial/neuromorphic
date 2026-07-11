@@ -1,4 +1,4 @@
-"""Debug sweep for the new arms (slotgraph, vqicae) — verify intent + no math/explosion errors.
+"""Debug sweep for the new arm (slotgraph) — verify intent + no math/explosion errors.
 
 For each variant × {mae, babi}:
   - REAL data, REAL bf16 path, BOTH compute paths (mae→masked_recon, babi→generic).
@@ -36,10 +36,6 @@ def apply_capacity(cfg, variant):
         cfg.slotgraph_n_slots = 32
         cfg.slotgraph_lora_rank = 104; cfg.slotgraph_lora_alpha = 208
         cfg.slotgraph_start_layer = 0
-    elif variant == "vqicae_baseline":
-        cfg.vqicae_n_slots = 32
-        cfg.vqicae_lora_rank = 100; cfg.vqicae_lora_alpha = 200
-        cfg.vqicae_codebook_size = 8192; cfg.vqicae_d_code = 256
 
 
 def build(variant):
@@ -96,7 +92,7 @@ def run_variant(variant):
         print(f"\n--- {t} ({TASK_MODE[t]}) ---")
         print(f"  memory: finite={finite} |max|={mx:.2f} per-tok-norm={nrm:.2f}{flag}")
         cans = {k: float(v) for k, v in aux.items() if torch.is_tensor(v) and v.numel() == 1}
-        print(f"  canaries: " + "  ".join(f"{k.replace('slotgraph_','').replace('vqicae_','')}={v:.3f}"
+        print(f"  canaries: " + "  ".join(f"{k.replace('slotgraph_','')}={v:.3f}"
                                           for k, v in sorted(cans.items())))
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             out = (m.compute_masked_reconstruction_loss(b)
@@ -147,7 +143,7 @@ def run_variant(variant):
 
 
 def main():
-    results = {v: run_variant(v) for v in ("slotgraph_baseline", "vqicae_baseline")}
+    results = {v: run_variant(v) for v in ("slotgraph_baseline",)}
     print(f"\n{'='*74}")
     for v, r in results.items():
         print(f"  {v:24} {'PASS ✓' if r else 'FAIL ✗'}")

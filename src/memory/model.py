@@ -18,12 +18,8 @@ from torch import Tensor
 from .chat_template import ChatTemplate, build_chat_template
 from .config import ReprConfig
 from .models.autocompressor import AutoCompressorBaselineEncoder
-from .models.beacon import BeaconBaselineEncoder
-from .models.ccm import CCMBaselineEncoder
 from .models.icae import ICAEBaselineEncoder
-from .models.biomem import BioMemEncoder
 from .models.slotgraph import SlotGraphEncoder
-from .models.vqicae import VQICAEEncoder
 from .models.memoryllm import MemoryLLMBaselineEncoder
 from .models.gisting import GistingBaselineEncoder
 from .models.titans import TitansEncoder
@@ -60,19 +56,12 @@ class ReprLearningModel(nn.Module):
 
     VARIANTS = {
         "icae_baseline": ICAEBaselineEncoder,  # ICAE (ICLR'24) compressor
-        "ccm_baseline": CCMBaselineEncoder,    # CCM (ICLR'24) recurrent compressor
-        "beacon_baseline": BeaconBaselineEncoder,  # Activation Beacon (BAAI) per-layer beacon attn
         "autocompressor_baseline": AutoCompressorBaselineEncoder,  # AutoCompressors/RMT recurrent summary
-        # gated fast-Hebbian cortical-column grid — memory lives in fast synaptic
-        # STATE (fast edges), read+write are signal propagation (models/biomem/).
-        "biomem_baseline": BioMemEncoder,
         # THE slotgraph — 96 node slots, NO edge tokens; ONE shared frozen LM (write-harvest + read
         # LoRAs); persistent per-edge state on the attention VALUE path, harvested from the LM's per-layer
         # attention, error-correcting/per-edge-gated/EntNet-bounded commit; prepend+bidir read shaped by
         # the edge state (models/slotgraph/; docs/slotgraph_design.md).
         "slotgraph_baseline": SlotGraphEncoder,
-        # ICAE but each slot is a VQ-VAE code from a large codebook (discreteness experiment).
-        "vqicae_baseline": VQICAEEncoder,
         # MemoryLLM (arXiv:2402.04624): fixed per-layer latent pool + compress-then-RANDOM-DROP
         # self-update, read as per-layer KV (native per-layer-KV read) (models/memoryllm/).
         "memoryllm_baseline": MemoryLLMBaselineEncoder,
@@ -283,9 +272,9 @@ class ReprLearningModel(nn.Module):
 
     # compressor variants whose memory is a [B, M, d] prepend (capacity-relative
     # slicing applies to these; vanillas pass through at M=0 / M=T).
-    _MASKED_RECON_COMPRESSORS = ("icae_baseline", "ccm_baseline",
-                        "autocompressor_baseline", "beacon_baseline",
-                        "slotgraph_baseline", "vqicae_baseline",
+    _MASKED_RECON_COMPRESSORS = ("icae_baseline",
+                        "autocompressor_baseline",
+                        "slotgraph_baseline",
                         "memoryllm_baseline", "gisting_baseline", "titans_baseline",
                         "h2o_baseline")
 
