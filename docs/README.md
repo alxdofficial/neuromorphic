@@ -15,19 +15,19 @@ each baseline uses the READ mechanism from its OWN paper** (not a forced-uniform
 departure from a clean fixed-footprint feed-forward memory is disclosed as an asterisk in results.
 
 - **Prepend-read compressors:** `icae`, `autocompressor` (faithful summary-accumulation), `titans`
-  (deep-MLP memory + test-time autograd write, MAC prepend), `vqicae` (VQ-discretized ICAE),
-  `ccm` (this port reads normalized COMP-token hidden states via prepend).
+  (deep-MLP memory + test-time autograd write, MAC prepend).
 - **Per-layer-KV compressors** (native read via the shared prefix-cache path, `decoder.build_prefix_cache`
-  + `model._prefix_kv_forward`): `beacon`, `gisting`, `memoryllm` (per-layer pool + random-drop).
+  + `model._prefix_kv_forward`): `gisting`, `memoryllm` (per-layer pool + random-drop).
+- **Our arm:** `slotgraph` — THE canonical graph memory (96 nodes / value-path plastic edge state /
+  prepend+bidir read; see `slotgraph_design.md`).
 - **`h2o`** — training-free KV-cache eviction; an eval-only efficiency/KV-ratio reference (0 trainable params).
-- **Our arms:** `slotgraph` / `slotgraph2` / `slotgraph3` (graph-over-learned-vocab) and `biomem`
-  (fast-Hebbian columns); **FurlGraph** is the next design (`furlgraph_design.md`, deferred).
 - **`vanilla_llama` / `vanilla_full_context`** — loss floor (no memory) / ceiling (full context).
 
-The **active locked set** (2026-07-09) is icae · autocompressor · gisting · titans · memoryllm ·
-beacon · h2o (+ our arms later); `ccm` / `vqicae` remain in code but are dropped from the active
-comparison. Titans requires `--no-grad-ckpt-stream` (its inner `create_graph` conflicts with the
-outer streaming checkpoint). All comparisons must be **same-backbone, matched-params**.
+The **active cohort** (2026-07-11) is icae · autocompressor · titans · gisting · memoryllm · slotgraph
+(trainable, ~7M) + h2o / vanilla×2 (eval-only). Retired + removed from the code: beacon, ccm, vqicae,
+biomem, and the exploratory slotgraph 1–4 (→ the single canonical `slotgraph`). Titans auto-disables the
+streaming activation-checkpoint per-arm (its inner `create_graph` conflicts) — one sweep command works for
+all arms. All comparisons must be **same-backbone, matched-params**.
 
 ## Docs (current)
 - **`REFERENCES.md`** — authoritative paper/dataset links for every baseline & data source (never re-search).
@@ -40,11 +40,10 @@ outer streaming checkpoint). All comparisons must be **same-backbone, matched-pa
 - **`graph_thesis.md`** — why a graph memory (the two lenses), and what the literature says about making latent topology load-bearing instead of collapsing. The standing rationale.
 - **Graph-memory arm design:** **`slotgraph_design.md` — THE slotgraph** (the canonical, converged arm:
   96 nodes / no edge tokens / persistent plastic value-path edge state / learnable inter-layer diff+product
-  operator / propose→commit / prepend+bidir read). Gated on a first behavioral-KL binding baseline before
-  the edge machinery is built. Predecessor design docs kept for provenance, NOT current: `slotgraph4_design.md`
-  (fixed WS edge-state slots — the immediate parent whose write/read machinery slotgraph inherits),
-  `furlgraph_design.md` (input-grounded chain-merge), `graph_generative_memory.md` (the "spider web" —
-  score-function/GRPO-era).
+  operator / propose→commit / prepend+bidir read; built + stabilized 2026-07-11). Companion future designs,
+  NOT current: `furlgraph_design.md` (input-grounded chain-merge), `graph_generative_memory.md` (the
+  "spider web" — score-function/GRPO-era). The exploratory slotgraph 1–4 design docs were removed with
+  their code; their lessons are folded into `slotgraph_design.md` §10 and `graph_thesis.md`.
 - **`mamba_two_lenses_memory.md`** — research note: Mamba/linear-attention lenses on compress-and-recall.
 - **`history/`** — archived records of the superseded slotgraph/biomem/treemem line and completed reorg
   plans (`cohort_results`, `slotgraph_*`, `biomem_chunkwise_plan`, `{data,harness}_reorg_plan`, …).
@@ -55,4 +54,4 @@ outer streaming checkpoint). All comparisons must be **same-backbone, matched-pa
 - `scripts/diagnostics/mixed/mixed_band_gate_eval.py` — REAL/SHUF/OFF binding gate over the cohort.
 - `scripts/diagnostics/mixed/mixed_dashboard.py` — per-task training/val dashboard from the run JSONLs.
 - See `scripts/README.md` / `HARNESS.md` for the full diagnostics layout (subject subdirs
-  `slotgraph3/`, `slotgraph/`, `biomem/`, `objective/`, `mixed/`, `cohort/`).
+  `objective/`, `mixed/`, `cohort/`).

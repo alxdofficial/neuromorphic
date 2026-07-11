@@ -14,7 +14,7 @@ Design rationale + history: `docs/history/harness_reorg_plan.md`.
 | Where is the **trainer / objective / eval** code? | `src/memory/training/` (library) |
 | Where is the **CLI**? | `scripts/train/{train.py, cli.py}` |
 
-**Data is 4 orthogonal layers** (`docs/data_arch_plan.md`, `DATASETS.md`): **Source** (where tokens
+**Data is 4 orthogonal layers** (`docs/DATA.md`, `DATASETS.md`): **Source** (where tokens
 come from) × **Task** (what's asked) × **EpisodeSpec** (`schedule.py` — how hard) × **Objective**
 (how scored). task ≠ objective — they compose as a matrix.
 
@@ -59,16 +59,15 @@ The single source of truth for *what trains and how it routes*:
   `train_mixed_variant` / `probe_bs` → write summary. ~150 lines.
 - `cli.py` — `build_parser()` (the mixed-training flags) + `args_to_config(args, ap) → (cfg, …)`.
 
-Run: `python -m scripts.train.train --task mixed --variants slotgraph3_baseline …`
-(`--backbone HuggingFaceTB/SmolLM2-135M` for the param-matched 135M setup).
+Run: `python -m scripts.train.train --task mixed` (no `--variants` → the active cohort default;
+backbone defaults to `HuggingFaceTB/SmolLM2-135M`, objective to `behavioral_kl`).
 
 ## `scripts/diagnostics/` — grouped by subject
 
 ```
 scripts/diagnostics/
-  slotgraph3/  slotgraph/  biomem/     # per-arm smokes / probes / batteries / sweeps
-  objective/                           # objective-ladder probes (objective_debug, objective_profile)
-  mixed/                               # the mixed-campaign dashboard / band-gate eval / data audit
+  slotgraph/                           # slotgraph gradient-flow canary
+  mixed/                               # the mixed-campaign dashboard / band-gate eval / data audit / episode peek
   cohort/                              # cross-arm results, new-arm sweeps, dataset analyses
 ```
 

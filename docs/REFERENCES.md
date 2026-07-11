@@ -26,19 +26,24 @@ asterisk policy (match M-slots + params, each arm uses its own paper's read) is 
 |---|---|---|---|---|---|
 | **ICAE** | In-Context Autoencoder for Context Compression in a LLM (Ge et al., ICLR 2024) | [2307.06945](https://arxiv.org/abs/2307.06945) | prepend soft tokens | `models/icae/` | getao/icae |
 | **AutoCompressor** | Adapting Language Models to Compress Contexts (Chevalier et al., EMNLP 2023 Findings) | [2305.14788](https://arxiv.org/abs/2305.14788) | prepend (summary accumulation) | `models/autocompressor/` | princeton-nlp/AutoCompressors |
-| **CCM** | Compressed Context Memory for Online LM Interaction (Kim et al., ICLR 2024) | [2312.03414](https://arxiv.org/abs/2312.03414) | per-layer KV (cond. LoRA) | `models/ccm/` | snu-mllab/Context-Memory |
-| **Activation Beacon** | Soaring from 4K to 400K: Extending LLM Context with Activation Beacon (Zhang et al., 2024) | [2401.03462](https://arxiv.org/abs/2401.03462) | per-layer KV | `models/beacon/` | FlagOpen/FlagEmbedding |
 | **Gisting** | Learning to Compress Prompts with Gist Tokens (Mu, Li & Goodman, NeurIPS 2023) | [2304.08467](https://arxiv.org/abs/2304.08467) | per-layer gist-KV | `models/gisting/` | jayelm/gisting |
 | **MemoryLLM** | MemoryLLM: Towards Self-Updatable LLMs (Wang et al., ICML 2024) | [2402.04624](https://arxiv.org/abs/2402.04624) | per-layer KV pool (random-drop) | `models/memoryllm/` | wangyu-ustc/MemoryLLM |
 | **Titans** | Titans: Learning to Memorize at Test Time (Behrouz et al., 2024) | [2501.00663](https://arxiv.org/abs/2501.00663) | prepend (MAC); deep-MLP autograd write | `models/titans/` | — |
 | **H2O** | H2O: Heavy-Hitter Oracle for Efficient Generative Inference of LLMs (Zhang et al., NeurIPS 2023) | [2306.14048](https://arxiv.org/abs/2306.14048) | raw-KV eviction (training-free) | `models/h2o/` (eval ref) | FMInference/H2O |
-| **VQ-ICAE** | in-house = ICAE + vector quantization. VQ = Neural Discrete Representation Learning (van den Oord et al., NeurIPS 2017) | [1711.00937](https://arxiv.org/abs/1711.00937) | prepend soft tokens | `models/vqicae/` | — |
 
-### Our own arms + their lineage
+### Our own arm + its lineage
 | Arm / concept | Reference | arXiv | Our code |
 |---|---|---|---|
-| slotgraph / slotgraph2 / slotgraph3 | in-house (STDP/delta-rule graph over a learned vocab) | — | `models/slotgraph{,2,3}/` |
-| biomem | in-house (fast-Hebbian cortical-column) | — | `models/biomem/` |
+| **slotgraph** (THE arm) | in-house (persistent plastic value-path edge graph over node slots; `slotgraph_design.md`) | — | `models/slotgraph/` |
+| Relational Attention (edge vectors on the value path) | Relational Attention (Diao & Loynd, ICLR 2023) | [2210.05062](https://arxiv.org/abs/2210.05062) | — |
+
+### Retired baselines (removed from code 2026-07-11 — citations kept for provenance)
+| Baseline | Paper | arXiv |
+|---|---|---|
+| CCM | Compressed Context Memory (Kim et al., ICLR 2024) | [2312.03414](https://arxiv.org/abs/2312.03414) |
+| Activation Beacon | Soaring from 4K to 400K (Zhang et al., 2024) | [2401.03462](https://arxiv.org/abs/2401.03462) |
+| VQ-ICAE | in-house = ICAE + VQ (van den Oord et al., NeurIPS 2017) | [1711.00937](https://arxiv.org/abs/1711.00937) |
+| biomem | in-house (fast-Hebbian cortical-column) | — |
 | delta-rule write lineage | DeltaNet (Yang et al., 2024) / Gated DeltaNet (Yang et al., 2024) | [2406.06484](https://arxiv.org/abs/2406.06484) / [2412.06464](https://arxiv.org/abs/2412.06464) | — |
 | Slot-Attention (anti-collapse read) | Object-Centric Learning with Slot Attention (Locatello et al., NeurIPS 2020) | [2006.15055](https://arxiv.org/abs/2006.15055) | — |
 | EntNet (keyed slot memory) | Tracking the World State with Recurrent Entity Networks (Henaff et al., ICLR 2017) | [1612.03969](https://arxiv.org/abs/1612.03969) | — |

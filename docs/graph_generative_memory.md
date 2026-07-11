@@ -3,7 +3,7 @@
 *A memory that is not compressed into slots or folded from the chain, but GENERATED: a learned policy
 builds a graph summary of the observation via discrete edits — add a strand, re-route, prune — under a
 fixed budget. "Next-token prediction, where the next token is a graph-edit." The score-function/RL upgrade
-that sits on top of a competent differentiable substrate (`docs/slotgraph4_design.md`). Read with
+that sits on top of a competent differentiable substrate (`docs/slotgraph_design.md`). Read with
 `docs/graph_thesis.md` (why free structure collapses) and `docs/OBJECTIVES.md` Rung 5 (trajectory/GRPO).*
 
 ## 0. The idea

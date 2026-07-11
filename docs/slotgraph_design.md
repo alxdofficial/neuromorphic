@@ -1,10 +1,11 @@
 # slotgraph — THE graph memory (design memo)
 
 *The canonical slotgraph. Supersedes the exploratory line (slotgraph / slotgraph2 / slotgraph3 /
-slotgraph4 — all retained on disk as history, none current). One arm, converged after the full
-edge-substrate design thread (2026-07-10). Read with `docs/graph_thesis.md` (why free structure
-collapses), `docs/OBJECTIVES.md` (why binding is an objective problem), and `docs/slotgraph4_design.md`
-(the immediate predecessor whose write/read machinery this inherits).*
+slotgraph4 — all removed 2026-07-11; their lessons are folded into §10 below and `graph_thesis.md`).
+One arm, converged after the full edge-substrate design thread (2026-07-10), then built + stabilized
+2026-07-11 (§12). Read with `docs/graph_thesis.md` (why free structure collapses) and `docs/OBJECTIVES.md`
+(why binding is an objective problem). References to "slotgraph3/4" below cite where a specific fix or
+cost was first identified in that lineage — provenance, not live docs.*
 
 ## 0. TL;DR — what slotgraph IS
 
@@ -234,11 +235,12 @@ so "learned diff + product" is the tractable, STDP-faithful form of the correlat
 
 ## 9. The decisive experiment + canaries
 
-slotgraph is unmeasured in the behavioral-KL regime — and per the "old objective voided the priors"
-argument, **we currently have NO trustworthy binding baseline at all.** The highest-value move is therefore
-NOT to build the full edge machinery first, but to get the first trustworthy number:
-1. **Baseline:** train plain nodes (or slotgraph4 as-is) to convergence and read `SHUF−REAL` +
-   node/edge effective-rank. **Run this baseline with the MEMBERSHIP+ADDRESSING objectives ACTIVE**
+slotgraph is now BUILT (§12) but UNMEASURED — and per the "old objective voided the priors" argument,
+**there is NO trustworthy binding baseline at all yet.** The build is done; the decisive experiment is not.
+The highest-value move now is to get the first trustworthy number:
+1. **Baseline:** train the arm (optionally with the edge channel ablated, `U=0`, as a plain-nodes control)
+   to convergence and read `SHUF−REAL` + node/edge effective-rank. **Run this with the MEMBERSHIP+ADDRESSING
+   objectives ACTIVE**
    (SHUF-contrastive Rung 4 + provenance-InfoNCE Rung 2), **not behavioral-KL alone (P10).** behavioral-KL
    charges *use* (`I(context;answer)`); the wall that killed babi was *membership/input-dependence*, which
    KL does not directly charge for — so a KL-only null would FALSE-NEGATIVE. Only a null under the objective
@@ -331,13 +333,24 @@ Attention (Locatello 2020) — keyed competitive slots + anti-duplication; ReZer
 ComplEx + InferSent/SBERT + xDeepFM — the operator survey (§8); Set Transformer / Perceiver — set read.
 
 ## 12. Status
-Design complete + coherent; NOT built. slotgraph = 96 nodes, no edge tokens; ONE shared frozen LM with
-**two rank-16 LoRAs** (write-harvest + read-decode); persistent plastic value-path edge state harvested from
-the write forward's per-layer attention; learnable inter-layer diff+product operator; **error-correcting,
-per-edge-gated, EntNet-bounded commit** (§4, re-adopting slotgraph4's fixes); zero-init with **write-gate-open
-to avoid the double-zero deadlock** (§5); prepend+bidir read with a **learned salience selector** (§6).
-**Gated on §9: get one binding baseline — under the MEMBERSHIP+ADDRESSING objectives, not behavioral-KL
-alone — before building the edge machinery**, armed with the three LEADING canaries (input-dependence,
-gradient-norm, per-window collapse trace) that caught every prior collapse first. That measurement is what
-turns this from an elegant design into a known-worthwhile build. The exploratory slotgraph/2/3/4 docs remain
-on disk as history; this is THE slotgraph.
+**BUILT + STABILIZED (2026-07-11)** — `src/memory/models/slotgraph/`, the canonical `slotgraph_baseline`.
+96 nodes, no edge tokens; ONE shared frozen LM with **two rank-16 LoRAs** (write-harvest + read-decode);
+persistent plastic value-path edge state harvested from the write forward's per-layer attention; learnable
+inter-layer diff+product operator; **error-correcting, per-edge-gated, EntNet-bounded commit** (§4); zero-init
+with **write-gate-open to avoid the double-zero deadlock** (§5); prepend+bidir read with a **learned salience
+selector** (§6).
+
+Stabilization landed this session (the naive first build had gnorm ~1e8 + OOM at B=2): (a) renormalize the
+harvested node-block attention `a_nn` over the node axis (it was a sub-block of a softmax over [text;nodes],
+so it never summed to 1 → unbounded residual); (b) bound the residual with `tanh(U·agg)·resid_scale`
+(small-init, not zero — else the U=0 ∧ scale=0 double-zero deadlock); (c) fold `U` after the aggregate
+(`Σ a·U(E)=U(Σ a·E)`) + factor `φ_i(x_i)+φ_j(x_j)` and per-endpoint gates → no `[B,N,N,d]`/`[B,N,N,2d]`
+tensors (only `[B,N,N,d_e]`); (d) truncated BPTT (`slotgraph_bptt_detach_every=1`) caps the recurrence
+depth. Result: **gnorm 1e8→~1e3, peak VRAM 15.3→6.3GB, 1.9→3.1 step/s; B=2/B=4 stable, EXIT=0.** All
+numerics-preserving except (a) which is *more* faithful (a weighted combination needs normalized weights).
+
+**Still open (the decisive experiment, §9):** slotgraph has NOT yet been trained to convergence — the
+binding question (`SHUF−REAL`) is unmeasured. Run it under the MEMBERSHIP+ADDRESSING objectives (not
+behavioral-KL alone — KL charges *use*, the wall is *membership*), armed with the three LEADING canaries
+(input-dependence, gradient-norm, per-window collapse trace). The exploratory slotgraph 1–4 code + design
+docs were removed 2026-07-11; this is THE slotgraph.
