@@ -99,6 +99,12 @@ pipi awscli 2>&1 | tail -1 || python3 -m pip install -q --no-input awscli
 put_status "RUNNING started=$(date -u +%FT%TZ)"
 
 # ── code ─────────────────────────────────────────────────────────────────────
+# cd to $WORK FIRST: drive.sh starts us with cwd=$REPO_DIR (it cd's there to find this script), and
+# the next line rm -rf's $REPO_DIR — deleting our own cwd → `git clone` then dies with "Unable to read
+# current working directory" (a RACE: only pods whose onstart pre-clone finished before drive.sh cd'd
+# in hit it). Worse, the trap's FAILED status write also runs from the deleted cwd and fails, leaving a
+# stale RUNNING in R2 so the watchdog never reaps. cd'ing out of $REPO_DIR before deleting it fixes both.
+cd "$WORK"
 echo "[bootstrap] cloning $REPO_URL @ $REPO_REF"
 rm -rf "$REPO_DIR"
 git clone --filter=blob:none "$REPO_URL" "$REPO_DIR"
