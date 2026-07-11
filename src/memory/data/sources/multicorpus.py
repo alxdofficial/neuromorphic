@@ -43,7 +43,8 @@ class MultiCorpusSource(_CorpusSampleMixin, Source):
     kind = "corpus"
 
     def __init__(self, tokenizer, *, split: str = "train", min_len: int = 1024, seed: int = 0,
-                 corpora=DEFAULT_CORPORA, src_tokenizer_name: str = "meta-llama/Llama-3.2-1B", **kw):
+                 corpora=DEFAULT_CORPORA, src_tokenizer_name: str = "meta-llama/Llama-3.2-1B",
+                 allow_missing: bool = False, **kw):
         self.tok = tokenizer
         self.pools = []          # [(name, docs)] — sampled corpus-uniform then doc-uniform
         self.docs = []           # concatenated (kept for any consumer that reads .docs directly)
@@ -55,8 +56,13 @@ class MultiCorpusSource(_CorpusSampleMixin, Source):
                 self.pools.append((name, src.docs))
                 self.docs.extend(src.docs)
                 loaded.append(f"{name}:{len(src.docs)}")
-            except Exception as e:                       # unreachable / not-ingested → skip, keep variety
-                skipped.append(f"{name} ({type(e).__name__})")
+            except Exception as e:                       # unreachable / not-ingested / corrupt / short
+                skipped.append(f"{name} ({type(e).__name__}: {e})")
+        # FAIL LOUD by default: a silently-dropped corpus reweights the corpus-uniform mix (audit #6).
+        if skipped and not allow_missing:
+            raise RuntimeError(
+                f"[multicorpus] {len(skipped)}/{len(corpora)} corpora FAILED to load — refusing to train "
+                f"a silently-reweighted mix: {skipped}. Fix the source(s) or pass allow_missing=True.")
         if not self.pools:
             raise ValueError(
                 f"[multicorpus] no corpus loaded from {list(corpora)} — at least fineweb should be "

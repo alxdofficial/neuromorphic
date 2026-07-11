@@ -16,23 +16,33 @@ departure from a clean fixed-footprint feed-forward memory is disclosed as an as
 
 Provenance policy: **every arm is REIMPLEMENTED under this matched harness — none is a drop-in of an
 official repo** (each official repo targets a 7B backbone it trains end-to-end under its own objective,
-which would confound the very axis we isolate). Two arms have their core mechanism **ported faithfully**
-using the official code as a verified reference — `h2o` (per-layer position-preserving eviction) and
-`memoryllm` (co-attention compress) — while `icae` / `autocompressor` / `gisting` are built from the
-paper (repos are 7B training programs / unlicensed / train-time-only), and `titans` has **no official
-repo** (its write kernel is already faithful; lucidrains' MIT port is the reference). Repo + paper links
-and the per-arm provenance tag are in **`REFERENCES.md`**.
+which would confound the very axis we isolate). Only ONE arm has its core mechanism **ported faithfully**
+using the official code as a verified reference — `memoryllm` (co-attention compress). `h2o` was
+**improved** to per-layer selection over original-context KV but stays **H2O-*inspired*** (query-blind,
+offline, pre-RoPE / position-free — not H2O's online post-RoPE eviction). `icae` / `autocompressor` /
+`gisting` are built from the paper (repos are 7B training programs / unlicensed / train-time-only), and
+`titans` has **no official repo** — its test-time-gradient write is faithful but its read is a static
+prepend, so it is **Titans-*inspired***, not MAC. `icae` streams via recurrent RMT recompression across
+the 8 windows (single-window operator is faithful ICAE) → an **ICAE/RMT hybrid**. Repo + paper links and
+the per-arm provenance tag are in **`REFERENCES.md`**.
 
-- **Prepend-read compressors:** `icae`, `autocompressor` (faithful summary-accumulation), `titans`
-  (deep-MLP memory + test-time autograd write, MAC prepend).
+- **Prepend-read compressors:** `icae` (single-window ICAE operator; recurrent-RMT across windows →
+  ICAE/RMT hybrid), `autocompressor` (faithful summary-accumulation), `titans` (deep-MLP memory +
+  test-time autograd write; static-prepend read → **Titans-inspired**, not MAC).
 - **Per-layer-KV compressors** (native read via the shared prefix-cache path, `decoder.build_prefix_cache`
-  + `model._prefix_kv_forward`): `gisting`, `memoryllm` (per-layer pool + random-drop + **faithful
-  co-attention compress**: the window co-attends to the pool through the real layers, mechanism-ported).
+  + `model._prefix_kv_forward`): `gisting` (per-layer gist-KV; final-layer `q_proj` LoRA is structurally
+  inert under KV-capture, ~120k params → effective ~6.80M trainable), `memoryllm` (per-layer pool +
+  random-drop + **faithful co-attention compress**: the window co-attends to the pool through the real
+  layers, mechanism-ported; MAE is streamed in 8 windows for this arm).
 - **Our arm:** `slotgraph` — THE canonical graph memory (96 nodes / value-path plastic edge state /
   prepend+bidir read; see `slotgraph_design.md`).
-- **`h2o`** — training-free KV-cache eviction (eval-only, 0 trainable params); **faithful per-layer
-  heavy-hitter eviction of the original position-preserved KV** (mechanism-ported from FMInference/H2O).
-- **`vanilla_llama` / `vanilla_full_context`** — loss floor (no memory) / ceiling (full context).
+- **`h2o`** — training-free KV-cache eviction (eval-only, 0 trainable params); **H2O-*inspired* static
+  per-layer heavy-hitter selection** over original-context (pre-RoPE / position-free) KV — improved from a
+  global re-encode, but query-blind + offline, so NOT a faithful online-eviction port.
+- **`vanilla_llama` / `vanilla_full_context`** — loss floor (no memory) / ceiling (full context). NB for
+  analysis: make causal memory claims from each arm's own **OFF** control (memory-zeroed), not from %band
+  vs these fresh controls — the fresh controls use *untrained* decoder-LoRA / mask-embed, so %band folds in
+  decoder-adaptation effects absent from a memory-vs-no-memory comparison.
 
 The **active cohort** (2026-07-11) is icae · autocompressor · titans · gisting · memoryllm · slotgraph
 (trainable, ~7M) + h2o / vanilla×2 (eval-only). Retired + removed from the code: beacon, ccm, vqicae,

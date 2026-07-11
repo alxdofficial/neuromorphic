@@ -127,11 +127,20 @@ def train_mixed_variant(
                     f"[resume] {_field} drift: checkpoint has {_was!r} but this run is {_now!r}. "
                     f"Refusing to resume across a changed objective/backbone/capacity — use a fresh --out-tag.")
         _res = model.load_state_dict(sd["model_state_dict"], strict=False)
-        _bad = [k for k in (_res.missing_keys + _res.unexpected_keys)
-                if "llama" not in k.lower() and not k.startswith("encoder.base.")
-                and not k.startswith("decoder.llama.")]
+        # Validate by requires_grad, NOT by name prefix: trainable LoRA adapters live UNDER the exempted
+        # prefixes (e.g. encoder.base.model.layers.N.self_attn.q_proj.lora_A, decoder.llama.…lora_B), so a
+        # prefix exemption would silently ignore a MISSING adapter → it degrades to a no-op identity
+        # (lora_B is zero-init) and the arm trains without its learned adaptation. A missing TRAINABLE key
+        # is always bad; frozen base params are legitimately absent (loaded from HF). Unexpected keys keep
+        # the frozen-prefix exemption (a stray frozen key is harmless).
+        _trainable = {n for n, p in model.named_parameters() if p.requires_grad}
+        _missing_bad = [k for k in _res.missing_keys if k in _trainable]
+        _unexp_bad = [k for k in _res.unexpected_keys
+                      if "llama" not in k.lower() and not k.startswith("encoder.base.")
+                      and not k.startswith("decoder.llama.")]
+        _bad = _missing_bad + _unexp_bad
         if _bad:
-            raise RuntimeError(f"[resume] checkpoint/arch mismatch — would leave params random: {_bad[:12]}")
+            raise RuntimeError(f"[resume] checkpoint/arch mismatch — would leave TRAINABLE params random: {_bad[:12]}")
         opt.load_state_dict(sd["optimizer_state_dict"])
         start_step = int(sd.get("step", 0)) + 1
         if "mixed_best" in sd:
@@ -140,6 +149,22 @@ def train_mixed_variant(
         if "mixed_agg_best" in sd:
             agg_best = dict(sd["mixed_agg_best"])
             _es_anchor = agg_best["metric"]      # resume the early-stop anchor (don't gift a patience reset)
+        # Restore RNG so the resumed run CONTINUES the stochastic data/augmentation stream from the crash
+        # point instead of re-seeding to the initial seed (cli.py) and replaying the same early sequence
+        # (audit #5). Runs AFTER cli.py's startup reseed, so it wins.
+        _rng = sd.get("rng_state")
+        if _rng is not None:
+            import random
+            import numpy as _np
+            try:
+                random.setstate(_rng["python"])
+                _np.random.set_state(_rng["numpy"])
+                torch.set_rng_state(_rng["torch"])
+                if _rng.get("cuda") is not None and torch.cuda.is_available():
+                    torch.cuda.set_rng_state_all(_rng["cuda"])
+                print("  [resume] RNG state restored (data stream continues from crash point)")
+            except Exception as _e:
+                print(f"  [resume] WARN could not restore RNG ({_e}); data stream may replay")
         print(f"  [resume] loaded {ckpt_path.name} @ step {start_step - 1} "
               f"(agg_best={agg_best['metric']:.4f} @ {agg_best['step']})")
     elif jsonl_path.exists() and not resume:

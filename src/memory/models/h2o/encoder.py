@@ -1,24 +1,27 @@
-"""H2O heavy-hitter KV eviction (Zhang et al. 2023, arXiv:2306.14048) — FAITHFUL per-layer port.
+"""H2O-INSPIRED static per-layer heavy-hitter KV selection (after Zhang et al. 2023, arXiv:2306.14048).
 
-TRAINING-FREE eval-only baseline. Now a faithful rendering of H2O's mechanism at our scale:
-per LAYER (and per KV-head) we keep the tokens that receive the most attention mass (the "heavy
-hitters") plus a most-recent local window, and we index-select those tokens' ORIGINAL contextualized
-KEY/VALUE — i.e. the exact contextualized, real-position projections from a single full-context pass —
-rather than re-encoding a selected subset. This matches H2O's `H2OKVCache_LayerWise` selection
-(heavy-hitter + recent split, per layer/head) and its in-place eviction of the model's OWN cached KV.
+TRAINING-FREE eval-only baseline. Improved from a global re-encode to a per-layer selection, but NOT a
+faithful H2O port — label it "H2O-inspired static heavy-hitter selection" in results. Per LAYER (and per
+KV-head) we keep the tokens that receive the most attention mass (the "heavy hitters") plus a most-recent
+local window, and index-select those tokens' ORIGINAL-CONTEXT (pre-RoPE / position-free) key/value from a
+single full-context pass — no re-encode. This is inspired by H2O's `H2OKVCache_LayerWise` heavy-hitter +
+recent split, but it is offline/one-shot and question-blind, not H2O's online post-RoPE decode eviction.
 
-DELIBERATE, DOCUMENTED deviations (still "H2O-inspired", not bit-identical):
+DELIBERATE, DOCUMENTED deviations (why it is "-inspired", not a faithful port):
+  * Query-blind / offline: H2O accumulates a heavy-hitter score across autoregressive DECODE steps
+    (driven by the actual query) and evicts a growing cache in place. We are an encoder — one eager pass
+    over the buffered CONTEXT scores by intra-context self-attention BEFORE the question exists (a
+    property shared by every memory arm here: memory is built before the question is seen).
+  * Pre-RoPE / position-free KV: we index-select the pre-RoPE k_proj output (RoPE runs inside attention,
+    after the hook) and inject it position-free through the shared prefix-cache path (decoder.py), like
+    every per-layer-KV arm here (gisting/memoryllm). So the CONTEXT is preserved (no re-encode) but NOT
+    H2O's original RoPE phase — kept consistent with the other arms so the comparison stays apples-to-apples.
   * GQA reduction: SmolLM2 is grouped-query (9 query-heads → 3 KV-heads). H2O's released code scores
     per query-head and would shape-crash under GQA; we sum the `group` query-heads that share a KV-head
     into one per-KV-head score (mirrors H2O's own "sum received attention" semantics), then select once
     per KV-head. This head→kv-head fold is our choice; upstream had no precedent (MHA-only models).
-  * Single-shot vs incremental: H2O accumulates its heavy-hitter score across autoregressive decode
-    steps and evicts a growing cache in place. We are an encoder: one eager pass over the buffered
-    context gives the complete received-attention score in one shot — no running total / re-indexing.
-  * Position-free injection: like every per-layer-KV arm here (gisting/memoryllm), the selected KV is
-    injected position-free through the shared prefix-cache path (decoder.py). We preserve the original
-    CONTEXT (no re-encode) but not H2O's original RoPE phase — consistent with the other arms so the
-    comparison stays apples-to-apples.
+  * Pad queries are excluded from the received-attention score (only valid query rows contribute), so
+    padding does not bias the heavy-hitter ranking.
 
 Algorithm:
   1. Each streaming window appends its token embeds to a buffer (streaming_write).
@@ -65,7 +68,7 @@ class H2OBaselineEncoder(nn.Module):
         self.recent_ratio = float(getattr(cfg, "h2o_recent_ratio", 0.1))
         # No trainable parameters — eval-only. The shared read-LoRA on the decoder is the only
         # thing that trains; this encoder is a pure attention-score KV selector.
-        print(f"[H2O] faithful per-layer heavy-hitter eviction; budget M={self.M}, "
+        print(f"[H2O] H2O-inspired static per-layer heavy-hitter selection; budget M={self.M}, "
               f"recent_ratio={self.recent_ratio:.2f}; GQA fold {self.n_q}q→{self.n_kv}kv; "
               f"eval-only (no trainable encoder params)")
 
@@ -114,19 +117,23 @@ class H2OBaselineEncoder(nn.Module):
         base_dtype = next(self.base.parameters()).dtype
 
         # ── ONE eager pass: per layer capture the received-attention SCORE (folded to KV-heads) AND the
-        #    original contextualized k_proj/v_proj outputs (real context + positions preserved). ──
+        #    original-context (pre-RoPE) k_proj/v_proj outputs. ──
         # attn hook computes the per-kv-head score immediately then DROPS the [B,H,T,T] matrix, so only
         # one layer's attention matrix is ever live (peak ~1GB, not ×L). k/v hooks snapshot the projections.
         score = [None] * L                                            # each [B, n_kv, T]
         kbuf = [None] * L                                             # each [B, T, n_kv, hd]
         vbuf = [None] * L
+        # Exclude PAD query rows from the received-attention score: pad queries still softmax-normalize
+        # over valid keys and would add spurious mass to the heavy-hitter ranking (only pad KEYS are
+        # masked by attention_mask). qmask zeroes their contribution before the query-axis sum.
+        qmask = mask.to(torch.float32)[:, None, :, None]              # [B,1,T_q,1]
 
         def _attn_hook(li):
             def hook(module, inp, out):
                 if not (isinstance(out, tuple) and len(out) >= 2 and torch.is_tensor(out[1])):
                     return out                                        # no weights to score
                 aw = out[1]                                           # [B, n_q, T_q, T_k]
-                s = aw.float().sum(dim=2)                             # [B, n_q, T_k] received-attention
+                s = (aw.float() * qmask).sum(dim=2)                  # [B, n_q, T_k] received-attn, valid queries only
                 score[li] = s.view(B, n_kv, group, T).sum(dim=2)     # GQA fold → [B, n_kv, T]
                 return (out[0], None) + tuple(out[2:])                # drop the matrix → free memory
             return hook

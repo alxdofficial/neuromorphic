@@ -15,11 +15,25 @@ cd "$(dirname "$0")/../.."          # repo root
 
 TRAIN_SOURCES=(fineweb_edu pile redpajama code squad triviaqa hotpot_train musique_train multiwoz)
 OUT=/tmp/neuromorphic_data.tar.gz
+MANIFEST=data/MANIFEST.txt
 
+# FATAL (not WARN) on a missing source: a partial tarball would silently train a degraded/reweighted mix
+# (audit #6). Also write a per-source manifest (file count, jsonl row count, bytes) INTO the tarball so
+# the pod can assert the untarred content matches — catching present-but-truncated dirs that a bare
+# `[ -d ]` check misses.
 echo "[pack] sources: ${TRAIN_SOURCES[*]}"
-present=(); for s in "${TRAIN_SOURCES[@]}"; do
-  if [ -d "data/$s" ]; then present+=("data/$s"); else echo "[pack] WARN missing data/$s"; fi
+: > "$MANIFEST"
+present=()
+for s in "${TRAIN_SOURCES[@]}"; do
+  [ -d "data/$s" ] || { echo "[pack] FATAL missing data/$s — refusing to build a partial tarball"; exit 1; }
+  fc=$(find "data/$s" -type f | wc -l)
+  rc=$(find "data/$s" -type f -name '*.jsonl' -exec cat {} + 2>/dev/null | wc -l)
+  by=$(du -sb "data/$s" | cut -f1)
+  printf '%s\t%s\t%s\t%s\n' "$s" "$fc" "$rc" "$by" >> "$MANIFEST"
+  present+=("data/$s")
 done
+present+=("$MANIFEST")
+echo "[pack] manifest:"; cat "$MANIFEST"
 echo "[pack] taring $(du -sch "${present[@]}" | tail -1 | cut -f1) → $OUT"
 tar czf "$OUT" "${present[@]}"
 echo "[pack] tarball size: $(du -h "$OUT" | cut -f1)"

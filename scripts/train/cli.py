@@ -378,6 +378,8 @@ def args_to_config(args, ap):
         cfg.memoryllm_n_mem = _M
         cfg.memoryllm_lora_rank = 39; cfg.memoryllm_lora_alpha = 78
         cfg.memoryllm_k_new = max(1, _M // 12)           # random-drop K/window (~half-life over 8 windows)
+        cfg.memoryllm_segment_len = args.window_size     # self-chunk the single-shot MAE span into windows
+                                                         # (so MAE runs the real streaming self-update, not 1 write)
         # Gisting: κ=M/n_seg gist tokens per seg_len segment (accumulate to M), q/v LoRA r104 = ICAE-matched.
         cfg.gisting_n_gist = _M; cfg.gisting_segment_len = args.window_size
         cfg.gisting_gist_per_seg = max(1, _M // _ac_nwin)

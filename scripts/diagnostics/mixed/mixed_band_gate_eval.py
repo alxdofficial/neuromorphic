@@ -94,11 +94,12 @@ def _eval_variant(variant, cfg, state_dict, tokenizer, val_sets, tasks,
     model = ReprLearningModel(cfg, variant=variant, llama_model=llama_arg).to(device)
     if state_dict is not None:
         res = model.load_state_dict(state_dict, strict=False)
-        # Only the frozen Llama backbone should be "missing" (it's reloaded, not saved). Any OTHER missing
-        # key = a trainable param that never loaded (shape/config mismatch → silently zero-init → invalid
-        # eval), so surface it. Unexpected keys are equally worth flagging.
-        _frozen = ("decoder.llama.", "encoder.base.")
-        missing = [k for k in res.missing_keys if not any(k.startswith(p) for p in _frozen)]
+        # Validate by requires_grad, NOT by name prefix: trainable LoRA adapters live UNDER decoder.llama.*
+        # / encoder.base.* (e.g. …q_proj.lora_A), so a prefix exemption silently ignores a MISSING adapter
+        # → it degrades to a no-op identity (lora_B zero-init) and the eval runs on an unadapted arm. Flag
+        # any missing TRAINABLE key; frozen base params are legitimately absent (reloaded from HF).
+        _trainable = {n for n, p in model.named_parameters() if p.requires_grad}
+        missing = [k for k in res.missing_keys if k in _trainable]
         if missing:
             print(f"  [WARN] {variant}: {len(missing)} TRAINABLE keys MISSING from ckpt "
                   f"(config mismatch → zero-init → results INVALID; e.g. {missing[:2]})")
@@ -157,6 +158,21 @@ def main():
             break
     if base_cfg is None:
         raise SystemExit(f"no checkpoints found under outputs/memory/{args.out_tag}_*")
+
+    # Assert this evaluator's hardcoded geometry matches what the checkpoint was TRAINED at, instead of
+    # silently evaluating at a different ctx/window/M than training (audit #5). The per-arm window/segment
+    # fields and n_flat_codes are stored in the ckpt cfg (rebuilt in _load_cfg_from_ckpt).
+    _win_ck = next((int(getattr(base_cfg, f)) for f in
+                    ("gisting_segment_len", "autocompressor_segment_len", "slotgraph_window")
+                    if getattr(base_cfg, f, None)), None)
+    if _win_ck is not None and _win_ck != WINDOW_SIZE:
+        raise SystemExit(f"[band+gate] WINDOW_SIZE drift: evaluator uses {WINDOW_SIZE} but the checkpoint "
+                         f"was trained at window {_win_ck}. Align WINDOW_SIZE or re-eval the matching ckpt.")
+    _m_ck = int(getattr(base_cfg, "n_flat_codes", 0) or 0)
+    if _m_ck and _m_ck != MIXED_M:
+        raise SystemExit(f"[band+gate] MIXED_M drift: evaluator uses {MIXED_M} but the checkpoint was "
+                         f"trained at M={_m_ck}. Align MIXED_M or re-eval the matching ckpt.")
+    print(f"[band+gate] geometry OK (window={WINDOW_SIZE}, M={MIXED_M}, ctx={MIXED_CTX}) matches ckpt")
 
     tokenizer = AutoTokenizer.from_pretrained(base_cfg.llama_model)
     if tokenizer.pad_token is None:

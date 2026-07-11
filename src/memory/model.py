@@ -1262,6 +1262,15 @@ class ReprLearningModel(nn.Module):
             _pos_qa = (self._uniform_mem_position_ids(B, M, T_total, device)
                        if (getattr(self.cfg, "uniform_mem_pos", False) and M > 0 and not zero_memory
                            and self.chat_template is None) else None)
+            if _pos_qa is None:
+                # COMPACT position_ids from the attention mask so INTERNAL right-padding does not open a
+                # RoPE gap before the question. Critical for the full-context CEILING (M=T padded memory)
+                # and the behavioral_kl TEACHER (reuses this path with M=T, uniform_mem_pos forced off):
+                # with default arange positions the question lands at absolute pos T (past 40–370 pad slots),
+                # distorting its hidden states / the KL target. cumsum → real tokens 0..valid-1, padding
+                # pinned (masked anyway), question at `valid`. No-op for dense-memory compressors
+                # (cumsum of all-ones == arange), so it does not perturb icae/ac/titans.
+                _pos_qa = (attn_mask_full.long().cumsum(dim=1) - 1).clamp_min(0)
             if (getattr(self.encoder, "reads_per_layer_kv", False) and not zero_memory
                     and finalize_aux.get("past_kv") is not None):
                 # per-layer-KV native read: M==0 above so full_embeds is memory-free ([pre,q,a]);

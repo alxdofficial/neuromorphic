@@ -18,6 +18,11 @@ at the gist positions); on SmolLM2 raw vs cached layer-0 keys differ ~0.44 relat
 deliberate deviation (all our per-layer-KV arms — gisting/memoryllm — use the same position-free policy
 for consistency), NOT a bug; disclose it, do not "fix" it in isolation (that would desync the KV arms).
 (3) Segment-wise independent gist generation + separate encoder/decoder adapter spaces.
+(4) The FINAL encoder layer's `q_proj` LoRA (A/B) is STRUCTURALLY INERT: memory is the per-layer
+k_proj/v_proj output captured by hooks, and the last layer's attention output (which q_proj@final feeds)
+influences only `last_hidden_state`, which is discarded here — so those ~119,808 params get identically-
+zero gradient (and lora_B is zero-init) and never move. Report gisting's EFFECTIVE trainable count as the
+nominal minus ~119,808 (~6.80M vs the ~7.0M ICAE-matched figure) in the capacity table.
 """
 from __future__ import annotations
 

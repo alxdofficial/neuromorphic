@@ -61,6 +61,7 @@ class MemoryLLMBaselineEncoder(nn.Module):
         self.d = cfg.d_llama
         self.N = int(getattr(cfg, "memoryllm_n_mem", 0) or cfg.n_flat_codes)   # slots per layer
         self.K = max(1, min(int(getattr(cfg, "memoryllm_k_new", 8)), self.N))  # dropped+inserted / window
+        self.seg_len = int(getattr(cfg, "memoryllm_segment_len", 0) or 256)     # self-chunk single-shot MAE
         embed = base.get_input_embeddings()
         with torch.no_grad():
             mean = embed.weight.float().mean(0)
@@ -92,14 +93,27 @@ class MemoryLLMBaselineEncoder(nn.Module):
 
     def streaming_write(self, state, token_embeds, attention_mask=None, chunk_offset=0, **extra):
         del chunk_offset, extra
+        B, W, d = token_embeds.shape
+        if attention_mask is None:
+            attention_mask = torch.ones(B, W, device=token_embeds.device, dtype=torch.bool)
+        if W <= self.seg_len:
+            return self._write_window(state, token_embeds, attention_mask), {}
+        # MAE hands the WHOLE span in one call → self-chunk into seg_len sub-windows so memoryllm runs its
+        # real streaming self-update (reaching ~50% episode content over 8 windows) instead of ONE write
+        # (only K=8/N=96 episode content, 88 slots left as pool0). Same self-chunking as AutoCompressor;
+        # per-forward memory is bounded by the base's HF gradient-checkpointing (enabled in __init__).
+        for s in range(0, W, self.seg_len):
+            e = min(s + self.seg_len, W)
+            state = self._write_window(state, token_embeds[:, s:e], attention_mask[:, s:e])
+        return state, {}
+
+    def _write_window(self, state, token_embeds, attention_mask):
         from ...decoder import build_prefix_cache
         B, W, d = token_embeds.shape
         K = self.K
-        if attention_mask is None:
-            attention_mask = torch.ones(B, W, device=token_embeds.device, dtype=torch.bool)
         active = attention_mask.bool().any(dim=1)
         if not active.any():
-            return state, {}
+            return state
         pool = state["pool"]                                     # [L, B, N, d]
 
         # ── FAITHFUL co-attention compress. The window co-attends to the pool's last-K slots (injected
@@ -138,9 +152,17 @@ class MemoryLLMBaselineEncoder(nn.Module):
         # default drop_memory_per_layer=False → the same physical slot is dropped/kept at every depth).
         perm = torch.randperm(self.N, device=pool.device)
         survivors = pool[:, :, perm[:self.N - K], :]             # [L, B, N-K, d]
+        dropped = pool[:, :, perm[self.N - K:], :]               # [L, B, K, d] the slots perm would drop
+        # A window with FEWER than K valid tokens can't supply K genuine carriers: car_idx clamped the
+        # surplus picks to a DUPLICATE of token 0. car_idx is sorted ascending, so the (K−V) clamped
+        # duplicates sit at the FRONT → the V genuine carriers are the LAST V. For the surplus positions
+        # keep the OLD (dropped) slot instead of inserting a duplicate — so only V real slots turn over.
+        V = attention_mask.bool().sum(dim=1, keepdim=True)       # [B,1]
+        real_car = torch.arange(K, device=pool.device).unsqueeze(0) >= (K - V)      # [B,K] True = genuine
+        cand = torch.where(real_car.view(1, B, K, 1), cand, dropped)
         proposed = torch.cat([survivors, cand], dim=2)          # [L, B, N, d]
         proposed = torch.where(active.view(1, B, 1, 1), proposed, pool)             # idle-row freeze
-        return {"pool": proposed}, {}
+        return {"pool": proposed}
 
     def finalize_memory(self, state):
         pool = state["pool"]                                     # [L, B, N, d]

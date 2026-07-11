@@ -131,12 +131,25 @@ r2 cp "$(key data.tar.gz)" "$WORK/data.tar.gz"
 mkdir -p "$REPO_DIR/data"
 tar xzf "$WORK/data.tar.gz" -C "$REPO_DIR"     # tar stores paths as data/<source>/...
 echo "[bootstrap] data sources: $(ls "$REPO_DIR/data" | tr '\n' ' ')"
-# Assert the expected training sources are present — pack_data.sh only WARNs on a missing source, so a
-# partial tarball would otherwise silently train a degraded mix (audit blocker #3). babi/bio are NOT
-# tarred (HF-runtime / procedural), so they are not checked here.
-_need="fineweb_edu pile redpajama code squad triviaqa hotpot_train musique_train multiwoz"
-_missing=""; for s in $_need; do [ -d "$REPO_DIR/data/$s" ] || _missing="$_missing $s"; done
-[ -z "$_missing" ] || { echo "[bootstrap] FATAL missing data sources:$_missing"; exit 1; }
+# Assert the untarred data matches the packer's MANIFEST (file count / jsonl row count / bytes per source),
+# not just directory existence (audit #6): a present-but-TRUNCATED source passes a bare `[ -d ]` check but
+# would silently train a degraded/reweighted mix. babi/bio are NOT tarred (HF-runtime / procedural).
+_manifest="$REPO_DIR/data/MANIFEST.txt"
+[ -f "$_manifest" ] || { echo "[bootstrap] FATAL no data/MANIFEST.txt in tarball (repack with pack_data.sh)"; exit 1; }
+_bad=""
+while IFS="$(printf '\t')" read -r s fc rc by; do
+  [ -n "$s" ] || continue
+  d="$REPO_DIR/data/$s"
+  if [ ! -d "$d" ]; then _bad="$_bad $s(missing)"; continue; fi
+  afc=$(find "$d" -type f | wc -l)
+  arc=$(find "$d" -type f -name '*.jsonl' -exec cat {} + 2>/dev/null | wc -l)
+  aby=$(du -sb "$d" | cut -f1)
+  if [ "$afc" != "$fc" ] || [ "$arc" != "$rc" ] || [ "$aby" != "$by" ]; then
+    _bad="$_bad $s(files:$afc/$fc rows:$arc/$rc bytes:$aby/$by)"
+  fi
+done < "$_manifest"
+[ -z "$_bad" ] || { echo "[bootstrap] FATAL data manifest mismatch:$_bad"; exit 1; }
+echo "[bootstrap] data manifest OK ($(grep -c . "$_manifest") sources verified)"
 
 # ── train ────────────────────────────────────────────────────────────────────
 # titans keeps its per-window autograd memory live across windows → disable the

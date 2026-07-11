@@ -89,6 +89,18 @@ def save_checkpoint(model, opt, step, path: Path, **extras):
             return False
         return True
 
+    # RNG state (python/numpy/torch/cuda): without it, --resume re-seeds to the INITIAL seed (cli.py does
+    # this at startup) and the resumed run REDRAWS the exact early data/augmentation sequence it already
+    # trained on, while the optimizer/LR continue mid-schedule (audit #5). Stashing + restoring the RNG on
+    # resume lets the stochastic stream continue from the crash point instead of replaying.
+    import random
+    import numpy as _np
+    rng_state = {
+        "python": random.getstate(),
+        "numpy": _np.random.get_state(),
+        "torch": torch.get_rng_state(),
+        "cuda": (torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None),
+    }
     payload = {
         "step": step,
         "model_state_dict": {
@@ -96,6 +108,7 @@ def save_checkpoint(model, opt, step, path: Path, **extras):
         },
         "optimizer_state_dict": opt.state_dict(),
         "metadata": _ckpt_metadata(model),
+        "rng_state": rng_state,
     }
     payload.update(extras)
     # Atomic write: torch.save to a temp sibling, then atomically rename. A crash
