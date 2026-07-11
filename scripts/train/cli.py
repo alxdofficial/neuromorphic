@@ -33,7 +33,7 @@ def build_parser() -> argparse.ArgumentParser:
         # (beacon/ccm/vqicae/biomem were retired and removed 2026-07-11.)
         "icae_baseline",              # ICAE (ICLR'24) — prepend
         "autocompressor_baseline",    # AutoCompressor/RMT-style recurrent summary — prepend
-        "titans_baseline",            # Titans (deep-MLP test-time-autograd memory) — MAC prepend; needs --no-grad-ckpt-stream
+        "titans_baseline",            # Titans-inspired (deep-MLP test-time-autograd memory) — prepend read (not MAC); needs --no-grad-ckpt-stream
         "gisting_baseline",           # Gisting (per-layer gist-KV) — native per-layer-KV read
         "memoryllm_baseline",         # MemoryLLM (per-layer pool + random-drop) — native per-layer-KV read
         "slotgraph_baseline",         # OUR arm — THE slotgraph (prepend+bidir)
@@ -389,26 +389,30 @@ def args_to_config(args, ap):
                                                           # read-LoRA), matched to the cohort. The earlier 5448
                                                           # sized the ENCODER to 7M, ignoring the +0.92M LoRA
                                                           # every arm carries → 7.93M total, out of band (audit).
-        # THE slotgraph (docs/slotgraph_design.md): 96 nodes = M read budget, dense N×N edges d_e=32,
-        # two rank-16 LoRAs on the shared base. Read geometry (bidir+uniform-pos) forced in model.py.
+        # THE slotgraph (docs/slotgraph_design.md): 96 nodes = M read budget, dense N×N relation d_e=32
+        # plus one dynamic confidence scalar per ordered pair,
+        # separate write/read adapters on separate frozen LM copies. Read geometry is forced in model.py.
         cfg.slotgraph_n_nodes = _M
         cfg.slotgraph_window = args.window_size
         # write-LoRA rank 84 → 6.95M TOTAL trainable (encoder 6.03M + shared decoder read-LoRA 0.92M),
-        # capacity-MATCHED to the cohort (icae 6.97M / autocompressor 6.92M). Was rank 16 = 3.03M total,
+        # parameter- and read-length-MATCHED to the cohort (icae 6.97M / autocompressor 6.92M) — NOT
+        # capacity-matched (persistent STATE floats vary ~194× across arms; see fairness axis). Was rank 16
+        # = 3.03M total,
         # which under-parameterized the arm ~2.3× (audit fairness finding #4). The rank is the encoder-
         # capacity knob (adapts the frozen LM's attention for the graph harvest), analogous to icae r104.
         cfg.slotgraph_lora_rank = 84; cfg.slotgraph_lora_alpha = 168
         # h2o (training-free KV eviction): M = same budget; no encoder LoRA (eval-only arm).
         cfg.h2o_n_budget = _M
-        print(f"[capacity] mixed: FIXED M={_M} (ctx {args.mixed_ctx}:M = {args.mixed_ctx // _M}:1); "
+        print(f"[param-match] mixed: FIXED M={_M} (ctx {args.mixed_ctx}:M = {args.mixed_ctx // _M}:1); "
               f"ACTIVE cohort icae r104 / ac r52 / titans h4650 / gisting r104 / memoryllm r39 / "
-              f"slotgraph r84-LoRA×2 (param-matched ~6.95M total incl. shared decoder LoRA); h2o eval-only.")
+              f"slotgraph r84-LoRA×2 (~6.95M trainable each). MATCHED: params + read-length; NOT persistent "
+              f"state (floats vary ~194×: titans ~10.7M vs icae 55K). h2o eval-only.")
         if cfg.d_llama != 576 and not args.allow_unmatched_backbone:
             raise SystemExit(
                 f"mixed param-matched ranks are calibrated for SmolLM2-135M (d=576); "
                 f"got d_llama={cfg.d_llama} (backbone={cfg.llama_model}). Pass "
                 f"--backbone HuggingFaceTB/SmolLM2-135M, or --allow-unmatched-backbone "
-                f"to override (capacity match will be off).")
+                f"to override (param/read-length match will be off).")
     cfg.contrastive_shuf_coef = args.contrastive_shuf_coef
     # graph experiment overrides (win over the task defaults above): wider node/edge
     # vectors (removes the read-token rank handicap) + sparse node selection (entmax).

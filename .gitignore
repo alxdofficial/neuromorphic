@@ -22,3 +22,8 @@ test_output/
 /logs/
 .openrouter_key
 data/wave1/fineweb_edu_text/
+
+# secrets + run artifacts (never commit)
+.env.*
+*.env
+scripts/pod/state/

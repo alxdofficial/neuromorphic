@@ -33,9 +33,9 @@ def apply_capacity(cfg, variant):
     cfg.use_llama_lora = True
     cfg.llama_lora_rank = 16; cfg.llama_lora_alpha = 32
     if variant == "slotgraph_baseline":
-        cfg.slotgraph_n_slots = 32
-        cfg.slotgraph_lora_rank = 104; cfg.slotgraph_lora_alpha = 208
-        cfg.slotgraph_start_layer = 0
+        cfg.slotgraph_n_nodes = 96
+        cfg.slotgraph_lora_rank = 84; cfg.slotgraph_lora_alpha = 168
+        cfg.slotgraph_write_layers = 6
 
 
 def build(variant):
@@ -69,7 +69,7 @@ def run_variant(variant):
     tot = sum(p.numel() for p in m.parameters() if p.requires_grad)
     print(f"params={tot:,} ({tot/1e6:.2f}M)  | cohort 6.91-7.01M")
     tasks = ["mae", "babi"]
-    vs = make_mixed_val_sets(tasks, tok, cfg, 1, ctx_len=1024, m_slots=32,
+    vs = make_mixed_val_sets(tasks, tok, cfg, 1, ctx_len=1024, m_slots=cfg.slotgraph_n_nodes,
                              mae_src_tok="meta-llama/Llama-3.2-1B",
                              babi_tasks=(1, 2, 3, 7, 8, 11, 12, 13, 14), predict_len=64)
     enc = m.encoder

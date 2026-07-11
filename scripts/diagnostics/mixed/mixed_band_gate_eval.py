@@ -58,14 +58,20 @@ MAE_SRC_TOK = "meta-llama/Llama-3.2-1B"
 
 
 def _ckpt_path(out_tag: str, variant: str) -> Path:
-    return REPO / f"outputs/memory/{out_tag}_{variant}/ckpts/{variant}.last.pt"
+    base = REPO / f"outputs/memory/{out_tag}_{variant}/ckpts"
+    best = base / f"{variant}.best.pt"
+    return best if best.exists() else base / f"{variant}.last.pt"   # prefer the early-stop BEST
 
 
 def _load_cfg_from_ckpt(ckpt: Path) -> tuple[ReprConfig, dict]:
     import dataclasses
     sd = torch.load(ckpt, map_location="cpu", weights_only=False)
     valid = {f.name for f in dataclasses.fields(ReprConfig)}     # drop fields removed since training
-    cfg = ReprConfig(**{k: v for k, v in sd["metadata"]["cfg_dict"].items() if k in valid})
+    # cfg_all captures the DYNAMICALLY-attached attrs (ranks, objective_mode, kl_coef, …) that
+    # dataclasses.asdict drops from cfg_dict — required to rebuild the exact trained shapes (autocompressor
+    # r52 / memoryllm r39 / titans h4650), else the rebuilt model shape-mismatches the state_dict.
+    cfg_src = sd["metadata"].get("cfg_all") or sd["metadata"]["cfg_dict"]
+    cfg = ReprConfig(**{k: v for k, v in cfg_src.items() if k in valid})
     return cfg, sd
 
 
@@ -80,12 +86,17 @@ def _eval_variant(variant, cfg, state_dict, tokenizer, val_sets, tasks,
     model = ReprLearningModel(cfg, variant=variant, llama_model=llama_arg).to(device)
     if state_dict is not None:
         res = model.load_state_dict(state_dict, strict=False)
-        # Only the frozen Llama backbone should be "missing" (it's reloaded, not saved);
-        # anything else missing/unexpected is a real mismatch worth surfacing.
-        unexpected = [k for k in res.unexpected_keys]
-        if unexpected:
-            print(f"  [warn] {variant}: {len(unexpected)} unexpected keys "
-                  f"(e.g. {unexpected[:2]})")
+        # Only the frozen Llama backbone should be "missing" (it's reloaded, not saved). Any OTHER missing
+        # key = a trainable param that never loaded (shape/config mismatch → silently zero-init → invalid
+        # eval), so surface it. Unexpected keys are equally worth flagging.
+        _frozen = ("decoder.llama.", "encoder.base.")
+        missing = [k for k in res.missing_keys if not any(k.startswith(p) for p in _frozen)]
+        if missing:
+            print(f"  [WARN] {variant}: {len(missing)} TRAINABLE keys MISSING from ckpt "
+                  f"(config mismatch → zero-init → results INVALID; e.g. {missing[:2]})")
+        if res.unexpected_keys:
+            print(f"  [warn] {variant}: {len(res.unexpected_keys)} unexpected keys "
+                  f"(e.g. {res.unexpected_keys[:2]})")
     model.train(False)
 
     out = {}
@@ -169,6 +180,11 @@ def main():
         results[v] = _eval_variant(v, cfg, sd["model_state_dict"], tokenizer,
                                    val_sets, tasks, device, gate=True)
 
+    # --- H2O: training-free KV-eviction reference (no checkpoint; still a memory method → gate it) ---
+    print(f"\n[eval] h2o_baseline (training-free) ...", flush=True)
+    results["h2o_baseline"] = _eval_variant("h2o_baseline", base_cfg, None, tokenizer,
+                                            val_sets, tasks, device, gate=True)
+
     _print_tables(results, tasks)
 
     out_json = args.out_json or str(REPO / f"outputs/memory/{args.out_tag}_band_gate.json")
@@ -179,21 +195,27 @@ def main():
 
 
 def _print_tables(results, tasks):
-    higher = {"continuation": False}  # all losses: lower is better
+    display = [v for v in TRAINED_VARIANTS + ["h2o_baseline"] if v in results]
     for t in tasks:
         floor = results.get("vanilla_llama", {}).get(t, {}).get("real")
         ceil = results.get("vanilla_full_context", {}).get(t, {}).get("real")
         band = (floor - ceil) if (floor is not None and ceil is not None) else None
+        # A valid band needs full-context to actually BEAT no-memory. On reconstruct/MAE the memory can hurt
+        # (full-ctx ≥ no-mem → band ≤ 0), so %band would divide by a non-positive number → meaningless.
+        band_ok = band is not None and band > 1e-3
         print(f"\n{'='*92}")
-        print(f"TASK: {t}   FLOOR(no-mem)={floor:.3f}  CEIL(full-ctx)={ceil:.3f}  "
-              f"band={band:.3f}" if band else f"TASK: {t}")
+        if band is not None:
+            flag = "" if band_ok else "  ⚠ INVALID (full-ctx not a ceiling → %band n/a)"
+            print(f"TASK: {t}   FLOOR(no-mem)={floor:.3f}  CEIL(full-ctx)={ceil:.3f}  band={band:.3f}{flag}")
+        else:
+            print(f"TASK: {t}")
         print(f"{'='*92}")
         hdr = f"{'variant':<26} {'REAL':>7} {'OFF':>7} {'OFF-REAL':>9} {'SHUF-REAL':>10} {'%band':>7}"
         if t == "babi":
-            hdr += f" {'EM':>6}"
+            hdr += f" {'TF-EM':>6}"      # teacher-forced span match, NOT autoregressive exact-match
         print(hdr)
         print("-" * len(hdr))
-        for v in TRAINED_VARIANTS:
+        for v in display:
             r = results.get(v, {}).get(t)
             if r is None:
                 continue
@@ -201,9 +223,9 @@ def _print_tables(results, tasks):
             off = r.get("off", float("nan"))
             offmr = r.get("off_minus_real", float("nan"))
             shufmr = r.get("shuf_minus_real", float("nan"))
-            pct = (100.0 * (floor - real) / band) if band else float("nan")
+            pct = f"{100.0 * (floor - real) / band:>6.1f}%" if band_ok else f"{'n/a':>7}"
             line = (f"{v:<26} {real:>7.3f} {off:>7.3f} {offmr:>+9.3f} "
-                    f"{shufmr:>+10.3f} {pct:>6.1f}%")
+                    f"{shufmr:>+10.3f} {pct}")
             if t == "babi":
                 line += f" {100*r.get('babi_em', float('nan')):>5.1f}%"
             print(line)

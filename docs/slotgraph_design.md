@@ -9,30 +9,33 @@ cost was first identified in that lineage — provenance, not live docs.*
 
 ## 0. TL;DR — what slotgraph IS
 
-**N=96 node slots, NO explicit edge tokens, and a persistent plastic per-edge state that lives INSIDE the
-attention (on the value path), accumulated from how the write layers' attention evolves across depth.**
+**N=96 node slots, NO explicit edge tokens, and a persistent plastic state for every ordered pair: a unit
+relation vector `R[i,j]` plus scalar confidence `C[i,j]`. Their product lives on the attention value path and
+is updated from how write-layer attention evolves across depth.**
 
-- **ONE LoRA'd LM does the write AND the read.** The write is a single forward of the shared frozen LM
+- **A LoRA'd LM does the write AND the read.** The write is a single forward of a frozen SmolLM2
   (write-LoRA) over `[text ; 96 nodes]`; we HARVEST its per-layer attention rather than building custom
   attention layers (the project thesis: the LM already forms the graph — harvest it). The read is the same
-  shared frozen LM (read-LoRA) decoding over the prepended memory. Two rank-16 LoRAs, one shared base — so
-  slotgraph4's two-frozen-copies (featurizer + decoder) collapse to one base + two adapters (§2, §6).
+  LM (read-LoRA) decoding over the prepended memory.
+  > **Impl status (2026-07):** the *design intent* is one shared base + two adapters (a VRAM win). The
+  > **current implementation keeps two frozen copies** — the encoder builds its own base
+  > (`encoder.py` `load_frozen_llama`), the decoder its own (`model.py`) — i.e. ICAE **option-A**, which
+  > avoids write/read adapter collision at the cost of a second frozen 135M. Collapsing to a genuine single
+  > shared base (toggling write-LoRA vs read-LoRA on one instance) is an **unrealized optimization**, not
+  > done yet (§2, §6).
 - **Nodes only in the forward.** The write processes 96 node tokens (+ text as keys/values). There are NO
   N·k edge tokens — that was the dominant cost of slotgraph4 (288 edge tokens outnumbering the text), and
   it is gone. Edges are not tokens; they are a state that *modifies what nodes transmit*.
-- **Edges live on the value path.** When node i attends to node j, it receives j's value *modified by the
-  edge state* `E[i,j]`: `out_i = Σ_j a_ij·(V(x_j) + U·E[i,j])` = the LM's own attention output + a cheap
-  additive residual `U·(Σ_j a_ij·E[i,j])`. This is Relational Attention (Diao & Loynd, ICLR 2023) done as a
-  harvest-plus-correction on the frozen LM, NOT an attention-logit bias (which is absorbable — §6).
-- **The edge state is a persistent, plastic, temporal trace.** `E` is a streaming state (per-episode,
-  carried across the 8 windows), NOT learned weights. Within a window it is accumulated from how the L
-  write-layers' inter-node attention *changes across depth* (an STDP-flavored trace); at the window
-  boundary ONE commit writes it into the single persistent `E` — and that commit is **error-correcting
-  (delta, not raw EMA), content-gated per-edge (idle edges freeze), and magnitude-bounded (EntNet norm)**,
-  re-adopting three fixes slotgraph4 / the write-audit already landed (§4). Two-timescale: fast node
-  content `x` (per-window propose→commit) + slow relational memory `E`.
-- **Self-consistent read/write of the edge.** The same attention op both *reads* `E[i,j]` (injects it into
-  the value) and *writes* it (its score `a_ij` is the coincidence gate for `E`'s plasticity update). No
+- **Edges live on the value path.** Query/receiver `i` receives sender `j`'s value plus the effective edge
+  `C[i,j]R[i,j]`: `out_i = Σ_j a_ij·(V(x_j) + U·C[i,j]R[i,j])`. `R` carries relation type; `C∈[0,1]`
+  carries existence/strength. This is inspired by Relational Attention, but narrower: SlotGraph adds only
+  the edge value residual rather than conditioning all Q/K/V projections.
+- **The pair state is persistent and plastic within an episode.** `R,C` recur across the 8 internal windows,
+  but reset for each `finalize_memory` call. The semantic proposal comes from consecutive-layer attention-
+  weighted endpoint features. A separate learned evidence head, calibrated by absolute pair attention,
+  proposes confidence. Separate data-dependent gates commit both at each window boundary (§4).
+- **Self-consistent read/write of the edge.** The same attention op reads `C[i,j]R[i,j]` and supplies evidence
+  for its next update. No
   separate edge-materialization pass.
 
 **No Watts-Strogatz topology.** Dense attention over the 96 nodes IS the topology; the graph is
@@ -48,32 +51,36 @@ gate (§9).
 
 - **Nodes** `X : [N, d]`, N=96, d=576 (LM dim). Invented free latents; per-forward init noise breaks slot
   symmetry (Slot Attention). Frozen orthonormal id buffers give reusable entity identity (EntNet).
-- **Edges** `E : [N, N, d_e]`, d_e=**32**. Persistent streaming state, **initialized to ZERO** at window 0
-  (§5). Directed (`E[i,j] ≠ E[j,i]`). Dense (no fixed topology). Footprint = N²·d_e ≈ 96²·32 ≈ **295K
-  floats/example** — internal STATE (modifies values), NOT read budget (never prepended). Sits on the
+- **Relation semantics** `R : [N, N, d_e]`, d_e=**32**. Unit-norm when populated and initialized to zero.
+- **Confidence/strength** `C : [N, N, 1]`, bounded to `[0,1]` and initialized to zero. The effective edge is
+  `C·R`, so zero confidence is a real no-edge state and `||C·R||=C`.
+- Both are directed: index `(i,j)` means sender `j →` receiver/query `i`, matching Relational Attention's
+  convention. They recur only within one episode. Footprint is N²·(d_e+1) ≈ **304K floats/example** —
+  internal STATE (modifies values), NOT read budget (never prepended). This sits on the
   "state floats" fairness axis where it is modest (Titans carries ~11M there). **Keep d_e small — do not
   let it creep to 64** (that blows past the prepend-equivalent budget and doubles BPTT memory).
 
 ## 2. Write — ONE LoRA'd LM forward, edges harvested from its attention
 
-**We do NOT build custom attention layers. We run the shared frozen LM (with a write-side LoRA) over
-`[text ; 96 nodes]` and HARVEST its per-layer attention.** This is the project's whole thesis made literal:
+**We do NOT build custom attention layers. We run the encoder's frozen LM copy (with a write-side LoRA) over
+`[text ; 96 nodes]` and HARVEST its per-layer attention.** This is the project's thesis made literal:
 the LM already forms the in-context graph — harvest it, don't reinvent it. The write is one LM forward per
-window; the only trainable write-side params are the write-LoRA + the small edge machinery (`U, φ, W, γ, η`).
+window; trainable write-side params are the write-LoRA plus the relation/confidence machinery.
 
 The relational read/write of the edge decomposes into the LM's own output PLUS a cheap additive residual —
 so it needs NO custom kernel. For query node i, per layer l:
 ```
-out_i = Σ_j a_ij·(v_j + U·E[i,j])  =  Σ_j a_ij·v_j   +   U·(Σ_j a_ij·E[i,j])
-                                      └ the LM's own attention output ┘   └ edge residual, added to the hidden ┘
+out_i = Σ_j a_ij·(v_j + U·C[i,j]R[i,j])
+      = Σ_j a_ij·v_j + U·(Σ_j a_ij·C[i,j]R[i,j])
+        └ native output ┘   └ confidence-scaled relation residual ┘
 ```
 - **Harvest, then correct.** Run the LoRA'd LM with `output_attentions` (cheap here — the write window is
   256 text + 96 nodes ≈ **352 tokens**, NOT the 2048-ctx forward that makes eager attention slow in H2O;
   <~1GB held-for-grad at B=4). Take the per-layer node-block scores `a_ij`, add the residual
-  `U·(Σ_j a_ij·E[i,j])` to the node hiddens via a per-layer hook (the `_lm_suffix`/anchor-injection pattern
+  `U·(Σ_j a_ij·C[i,j]R[i,j])` to the node hiddens via a per-layer hook
   slotgraph3 already used). The edge aggregation is N²·d_e < N²·d; `U` hits only N vectors after.
 - **The harvested `a_ij` do triple duty from ONE forward:** (1) contextualize the nodes, (2) form the
-  emergent graph, (3) feed BOTH the edge residual above AND the STDP trace (§3) — all differentiable, all
+  emergent graph, (3) feed both the edge residual and depth-wise relation trace (§3) — all differentiable,
   free from the same forward. Gradient reaches the node states through the (frozen-but-differentiable +
   LoRA) q/k/v projections.
 - **Why LoRA, not frozen-harvest-only OR custom layers.** Frozen-only can't *adapt* the graph toward
@@ -86,30 +93,29 @@ out_i = Σ_j a_ij·(v_j + U·E[i,j])  =  Σ_j a_ij·v_j   +   U·(Σ_j a_ij·E[i
   on accumulated structure), but the "harvest the authentic graph" framing is retired: it is an adapted graph.
 - **TWO LoRAs (write + read).** The write forward's job ("form a good graph over nodes+text") and the read
   forward's job ("answer from memory", §6) are different objectives; a shared adapter couples them. Use a
-  separate rank-16 write-LoRA and read-LoRA (~0.9M each) so the write-graph adaptation is not pulled around
-  by the read loss. Both wrap the SAME shared frozen base → slotgraph4's two-frozen-LM-copies problem
-  (featurizer + decoder) collapses to **one shared base + two small adapters** (a real VRAM win).
-- `U` is **zero-init** (ReZero) → with `E=0` at window 0 AND `U=0` at step 0, the write is a plain LM
-  forward; the edge channel earns influence as `U, φ, W` train. Competitive assignment (softmax over the
-  SLOT axis) is retained — the anti-duplication / reuse mechanism (§7), and the thing the diversity
-  literature (RealFormer/Re-attention) says actually helps.
+  separate write and read adapters so the write-graph adaptation is not pulled around by the read loss.
+  Mixed capacity matching currently sets the write rank to 84; the decoder uses the cohort read adapter.
+  The current option-A implementation keeps separate frozen encoder/decoder copies so their adapters cannot
+  collide. Sharing one frozen base remains a possible VRAM optimization, not current behavior.
+- `U` is **zero-init** (ReZero), so window 0 starts as a plain LM write. The nonzero confidence/semantic
+  commit and direct graph read give `U, φ, W` a gradient path. This encoder does ordinary attention over
+  text/nodes; it does **not** currently implement Slot Attention's token-over-slot competition.
 - **Absorption stays controlled.** The write-LoRA *can* reshape `a_ij`, and the edge state also shapes node
   values — but the edge injection is an **additive value residual**, not a score bias, so it is not
   absorbable into the scores (§6). Keep it there.
 
-## 3. The edge feature — a small vector from consecutive layers' attention
+## 3. Pair observations — relation semantics plus confidence evidence
 
-The raw material per pair (i,j) is a **sequence of L scalars** `a_1[i,j] … a_L[i,j]` (plus heads). The
-target is a **32-d vector**. Width does NOT come from the timing rule — it comes from three sources, which
-factorize d_e:
-1. **Heads × timescales (the backbone).** H attention heads give H independent score sequences; a small
-   filterbank of learnable decay time-constants reads each at multiple temporal scales. `d_e ≈ n_heads ×
-   n_timescales`. This is the cleanest width — genuinely distinct measurements, not correlated views.
-2. **Multi-scale temporal kernels (STDP-native).** Per-channel decay constants integrate the score history
-   over different spans (fast = late-depth structure, slow = early-depth). Learnable (e-prop eligibility
-   traces; Backpropamine for the amplitudes). Alone, too thin over L≈4–6 layers — needs source 1.
-3. **Content projection (relation TYPE).** `φ(x_i^l, x_j^l)` — a learned projection of the endpoint states,
-   attention-gated. This is what lets an edge carry "is-capital-of" vs "is-located-in," not just strength.
+The implementation averages the node-block attention over heads. It keeps two versions:
+```
+a_raw^l[i,j] = mean_h attention^l[h,i,j]                 # absolute mass in the full [text;nodes] softmax
+a_rel^l[i,j] = a_raw^l[i,j] / Σ_k a_raw^l[i,k]           # topology conditional on attending to a node
+e^l[i,j]     = a_rel^l[i,j] · (φ_i(y_i^l) + φ_j(y_j^l)) # d_e-dimensional relation observation
+```
+`y_i^l` is the self-attention branch output at node `i`, not the individual value `v_j` and not the full
+post-MLP residual state. `a_rel` stabilizes value aggregation; `a_raw` preserves the absolute evidence that
+renormalization would otherwise discard. Heads are currently averaged and there is no multi-timescale
+filterbank. Those are possible extensions, not implemented properties.
 
 **The inter-layer operator (do NOT use bare subtraction).** Given consecutive-layer edge features `e^l`,
 `e^{l+1}`, combine them with a **learnable, content-in-the-inputs operator** — the survey verdict (§8):
@@ -123,83 +129,66 @@ feat(e^l, e^{l+1}) = W · [ (e^{l+1} − e^l)  ‖  (e^l ⊙ e^{l+1})  ‖  e^{l
 - `W` is a **FIXED learned matrix** (content lives in the INPUTS, not the operator — see §6, the absorption
   trap). It learns *once, globally* how to weigh diff vs product vs raw; it can become pure-difference
   (TransE) or pure-product (DistMult) per-dim if the data wants.
+- `W` has **no bias**, so every dense pair does not receive the same content-free relation proposal.
+
+A separate evidence head reads the same concatenated feature plus `[a_raw^l, a_raw^{l+1}, node_mass^l,
+node_mass^{l+1}]`. Its sigmoid is multiplied by `N·sqrt(a_raw^l a_raw^{l+1})`, clipped at one. Thus uniform
+node attention gives evidence equal to the row's absolute node-attention mass; text-dominated rows stay weak.
+The pairwise observations are averaged over harvested layer pairs to produce semantic proposal `S[i,j]` and
+confidence observation `O[i,j]∈[0,1]`.
 
 Bare subtraction is the *TransE* of this design: the simplest operator, and the exact thing the entire
 relation-learning literature was built to improve on (it can't represent 1-to-many / symmetric relations;
 the product captures the "same/co-active" case where difference vanishes). §8.
 
-## 4. Persistence — accumulate in scratch, commit once (ERROR-CORRECTING, per-edge gated, bounded)
+## 4. Persistence — separate semantic direction from confidence/strength
 
-Mirror the node write. One persistent `E`; the per-layer information is NOT persisted as L copies (that
-defeats the inter-layer-change signal AND costs L× storage) and NOT updated inside the inner loop (that
-makes E's recurrence depth #windows×L — the deep-BPTT + last-layer→first-layer wraparound problem). The
-commit is NOT a plain EMA — that regresses three fixes slotgraph4 / the write-audit already landed. It is
-an **error-correcting, content-gated, magnitude-bounded** write:
+Per-layer observations remain scratch state; persistent `R,C` move only at window boundaries, keeping
+recurrence depth equal to the number of windows. The commits are:
 ```
-within window:   S[i,j]  ← Σ_l  feat(e_ij^l, e_ij^{l+1})            # scratch trace over the L layers; reset per window
-at boundary:      α, β   = per-edge gates from the window's write hidden (content-dependent)   # NOT a global scalar
-                  ΔE      = S[i,j] − read(E[i,j])                    # ERROR-correcting (retrieve, then write the residual)
-                  E[i,j]  ← norm( α ⊙ E[i,j] + β ⊙ ΔE )             # gated commit + EntNet post-norm (bounds ‖E‖)
+ΔR      = S[i,j] − K R[i,j]                              # K is identity-initialized, then learned
+R[i,j]  = unit_norm( α_r⊙R[i,j] + β_r⊙O[i,j]⊙ΔR )        # semantic direction
+
+retained = α_c·C[i,j]
+C[i,j]   = retained + (1−retained)·β_c·O[i,j]             # bounded confidence in [0,1]
 ```
-Three carry-forward fixes over a plain `E ← γE + ηS` EMA (all solved upstream — see §10, prior lessons):
+All four gates are factored per endpoint and data-dependent. Confidence evidence additionally opens writing
+and replacement directly (`O` enters the confidence gate logits). With no evidence, confidence decays by
+`α_c`; repeated evidence fills its remaining capacity. Relation magnitude cannot impersonate confidence:
+populated `R` has unit norm and every use site consumes `C·R`. This makes weak, absent, and strong edges
+representable while retaining a vector-valued relation type.
 
-- **Error-correcting delta, not raw additive (P3 / write-audit #5).** A plain EMA never reads `E` before
-  writing, so a second fact on the same directed pair *superposes* onto the decayed old one → the
-  averaging fixed point that gives `REAL==SHUF`. Subtracting the current read `S − read(E)` writes only the
-  RESIDUAL, so a repeat/overwrite converges to the new value in place (DeltaNet / Gated-DeltaNet;
-  `docs/OBJECTIVES.md` sidecar note). Drive it with the already-ported `mamba_delta_rule` primitive.
-  (Titans' EMA is of a *surprise/error* term ‖Mk−v‖ — our raw-feature EMA was strictly weaker; this closes
-  the gap.)
-- **Content-gated per-edge retention, not a global decay (P4).** `α, β` are per-edge, content-dependent
-  (computed from the window's write hidden), NOT global per-channel scalars. A global `γ` decays EVERY edge
-  every window, so a fact written in window 1 and never re-mentioned is `γ⁷` by the query window — uniform
-  forced-forgetting of exactly the retain-under-interference (T2) signal. Per-edge gating lets an IDLE edge
-  (S≈0) FREEZE (α≈1) while an active one updates. This is slotgraph4's decoupled α/β, applied per-edge.
-- **EntNet post-write norm bounds ‖E‖ (P12).** `α≈1` (which retention wants) makes an unbounded additive
-  write grow without limit — additive saturation. Normalizing after the commit bounds magnitude (retention
-  becomes directional, magnitude re-pinned). NOTE the consequence: under unit-norm E, a `‖E[i,j]‖`-based
-  read selector is DEGENERATE (all ties) — so the read top-k uses a **learned salience head**, not ‖E‖ (§6).
-
-Recurrence depth stays = #windows (wraparound dissolves — E only moves at boundaries); the scratch trace S
-still captures all L layers' inter-layer dynamics; timing asymmetry in `feat` + directed `read(E[i,j])`
-keeps E directed.
+The semantic update is **delta-style**, not a key-addressed DeltaNet rule and not guaranteed to overwrite at
+an exact fixed point. Identity-initializing `K` gives it an interpretable `S−R` starting point; overwrite,
+contradiction, and lag behavior remain empirical canaries.
 
 ## 5. Initialization
 
 - **Scratch `S`** → 0 at the start of every window (trivial).
-- **Persistent `E`** → 0 at window 0 of each episode. NOT a learned per-pair init: at window 0 the slots are
-  exchangeable (no content has landed), so a learned `E₀[i,j]` would assert a relationship between slots
-  with no identity yet — meaningless, the same reason we dropped WS. Zero is the only per-pair value that
-  respects the symmetry, and it gives a clean bootstrap (window-1 runs pure native attention → STDP
-  observes it → window-2+ feels it). (Contrast Titans' learned `M₀`: fine there because it is a shared MLP
-  not indexed by exchangeable pair-identity.)
-- **`U` (the value-path injection)** → zero-init (ReZero) — so step-0 is a plain LM forward regardless of E.
-- **AVOID the double-zero gradient deadlock (P8).** `E=0` AND `U=0` AND a throttled write gate is NOT clean
-  ReZero — proper ReZero keeps the branch's *content* alive so the scalar still earns gradient, but here
-  both the state (E) and the injection (U) are zero, so neither earns gradient from the read path at init.
-  The ONLY thing that breaks the deadlock is the commit `E ← …β⊙ΔE`, which fires only if the write gate
-  inits OPEN. So: init the **write gate β OPEN** (logit-space, effective ≈0.5–1.0; Jozefowicz +1 forget-init
-  wisdom), init the **retention α near 1** (γ≈1), and apply ReZero to **at most ONE** of {U, β} — never both.
-  Give `φ, W` an **independent gradient path** by routing E into the read-side graph-conv without a zero
-  gain, so they don't wait on U's lift-off. Do **NOT** use a single learned scalar gain on the injection
-  (scalars don't move under Adam — the frozen-scalar-temp trap, `feedback_frozen_scalar_temp`); put any
-  gain in per-channel β or the q/k projections.
+- **Persistent `R,C`** → zero at window 0 of each episode. A learned pair-specific initial relation would
+  assert structure before exchangeable slots have content. Window 1 observes the native write; later windows
+  receive confidence-scaled feedback.
+- **Confidence observation** starts low (`sigmoid(-2)≈0.12`) and is further scaled by absolute attention
+  evidence. It is not zero, so relation/confidence heads receive gradient through the direct graph read.
+- **`U` (the value-path injection)** → zero-init (ReZero). Semantic and confidence write gates initialize
+  open; confidence retention initializes near 0.95. `K` starts as identity.
 
 ## 6. Read — the shared LM (read-LoRA), prepend + bidirectional
 
-The read is the **same shared frozen LM with the read-LoRA** (§2's second adapter) decoding over the
-prepended memory tokens — identical to how every other prepend arm reads. `E` is an OPERATOR (N×N weights),
-not a payload — you do not prepend it. It shapes the node read, in the two roles slotgraph4's read already had:
-- **Node-centric tokens** (N of them): each node token folds in its E-weighted neighbor blend
-  `Σ_j E-driven aggregate of X_j` — one graph-conv readout with the learned relational adjacency. `E²` (a
-  small persistent N×N op) gives 2-hop reachability for free.
-- **Top-k explicit pointer tokens** (optional budget): the strongest edges by a **learned salience head**
-  `Linear(d_e, 1)` (soft-gated), NOT by `‖E[i,j]‖` — under the EntNet post-write norm (§4) all edges have
-  unit norm, so a ‖E‖ selector is degenerate (all ties). This is slotgraph4's settled answer. The selected
-  edges become PURE pointers `tok_proj([content? ‖ id_i ‖ id_j ‖ type])` — content resolved by the decoder
+The read uses the **decoder's frozen LM copy with its read-LoRA** (§2) over prepended memory tokens. `R,C`
+are internal graph state, not N² payload tokens:
+- **Node-centric tokens** (N): each node receives `Σ_j A_ij·(X_j + up(C[i,j]R[i,j]))`. Routing depends on
+  confidence-scaled relation keys and neighbor content. A second hop reuses the first-hop node states.
+- **Top-k explicit pointer tokens** (optional): ranking is `learned_relation_salience(R)+log(C)`, so semantic
+  importance cannot select a nonexistent edge and confidence alone need not define relation type. Pointers
+  encode source `j` before receiver `i`, matching message direction. Content is resolved by the decoder
   attending back to the endpoints. This is exactly why the read is **prepend + bidirectional** (Set-LLM,
   `uniform_mem_pos`), NOT per-layer KV: the relational read needs intra-memory attention, which keys-only
   KV cannot provide.
+
+`force_no_edges` sets `C=0`; the bias-free edge lift then produces exactly zero edge messages while retaining
+the content-only `X_j` message path. This is the node-only graph-read control. `U=0` is a different ablation:
+it removes edge feedback during writing but leaves the final edge read active.
 
 ## 7. The load-bearing part is STILL the objective
 
@@ -230,15 +219,17 @@ Three literatures ran essentially this experiment and converge:
 - **Feature interaction** (xDeepFM-2018): explicit vector-wise **products** capture combinatorial
   interactions additive/difference forms miss.
 
-Element-wise product = the diagonal of the Hebbian outer product `e^l ⊗ e^{l+1}` at d_e (not d_e²) cost —
-so "learned diff + product" is the tractable, STDP-faithful form of the correlation we wanted.
+Element-wise product is the diagonal of the lag-one outer product `e^l ⊗ e^{l+1}` at d_e rather than d_e²
+cost. This is a depth-wise autocorrelation feature. It is Hebbian/STDP-inspired, but not literal STDP: layers
+are not biological time, and the implementation does not compare separate pre-before-post and post-before-pre
+events.
 
 ## 9. The decisive experiment + canaries
 
 slotgraph is now BUILT (§12) but UNMEASURED — and per the "old objective voided the priors" argument,
 **there is NO trustworthy binding baseline at all yet.** The build is done; the decisive experiment is not.
 The highest-value move now is to get the first trustworthy number:
-1. **Baseline:** train the arm (optionally with the edge channel ablated, `U=0`, as a plain-nodes control)
+1. **Baseline:** train the arm with `force_no_edges=True` as the content-only node control
    to convergence and read `SHUF−REAL` + node/edge effective-rank. **Run this with the MEMBERSHIP+ADDRESSING
    objectives ACTIVE**
    (SHUF-contrastive Rung 4 + provenance-InfoNCE Rung 2), **not behavioral-KL alone (P10).** behavioral-KL
@@ -246,41 +237,41 @@ The highest-value move now is to get the first trustworthy number:
    KL does not directly charge for — so a KL-only null would FALSE-NEGATIVE. Only a null under the objective
    that actually charges for membership licenses the "structure won't save it" verdict.
 2. **Then** A/B the edge machinery — and the bar is to **BEAT, not tie (P9):** the edge arm must beat both
-   (a) plain-nodes with the IDENTICAL prepend+bidir read (`U=0`), and (b) a flat ICAE/jun24-style memory
+   (a) content-only nodes with the identical prepend+bidir read, and (b) a flat ICAE-style memory
    given the identical read. The readout-not-substrate lesson (`project_readout_not_substrate`) is that a
    rich query-conditioned read manufactures an advantage a flat memory gets too; beating the no-memory
    floor is the WEAK bar. Report SHUF−REAL + task metric for all three in one table.
-3. **Gate #0 — path-ablation** (`project_graph_edge_state_bypass`): zero-E vs zero-nodes. Require
+3. **Gate #0 — path-ablation** (`project_graph_edge_state_bypass`): zero-confidence vs zero-nodes. Require
    node-only to beat the no-memory floor AND edge-only to be strictly WORSE than REAL. If 100% of the
-   memory rides the free E vector and nodes are vestigial, the "graph" is a flat bank in disguise — the
+   memory rides the free `C·R` bank and nodes are vestigial, the "graph" is a flat bank in disguise — the
    exact prior failure. This is a HARD gate before trusting any edge result.
 
 ### Canaries — LEADING indicators first (every prior collapse was visible here FIRST)
 The three signals below caught every collapse in the slotgraph/furlgraph line *before* the outcome metrics
 moved. §9 must ship them, not just the lagging outcomes:
-1. **Input-dependence of E / `a_ij` across examples** (per-pair participation-ratio of `E[i,j]` and the
+1. **Input-dependence of `R`, `C`, `C·R`, and `a_ij` across examples** (per-pair participation ratios and the
    harvested `a_ij`, on BINDING tasks specifically — babi, not aggregate). THE leading indicator — the
    `routing_diversity` analog; SHUF−REAL *lags* it. Without this, a SHUF−REAL≈0 result is undiagnosable
-   ("did E fail to become input-dependent, or did something downstream break?"). `depthtime_trace` called
-   this "the key metric going forward." If `S`/`a_ij` is input-invariant on babi, E is DOA regardless of
-   objective (`project_graph_write_collapse`: the parser emitted one input-invariant edge ×128, edge-cos
+   ("did semantics, confidence, or downstream use fail?"). If `S,O`/`a_ij` are input-invariant on babi,
+   the edge is dead regardless of objective (`project_graph_write_collapse`: the parser emitted one
+   input-invariant edge ×128, edge-cos
    ≈0.999, BEFORE the read).
-2. **Gradient-norm per edge-module** — `‖∂L/∂{U, W, φ, E}‖` as grad/param ratios vs the read-LoRA, every
-   val step (infra: `scripts/diagnostics/slotgraph/slotgraph_gradflow.py`). The prior 1000× write
+2. **Gradient-norm per edge-module** — include `U, W, φ, confidence-observer, R/C gates` versus read-LoRA at
+   every val step. `slotgraph_gradflow.py` now reports these groups separately. The prior 1000× write
    starvation (`project_graph_internals_diag`: q_dst 1.4e-4 vs decoder-LoRA 1.8e-1) was visible ONLY at the
    gradient level. Gate: edge-machinery grad/param >~100× below the read-LoRA in the first few hundred
    steps = fail (the P8 deadlock, live).
-3. **Per-window streaming collapse trace** — per window emit ID-subtracted edge-effrank(`E_w`), inter-edge
-   cosine, and fixed-pair drift `cos(E_w[i,j], E_0[i,j])`. Over-smoothing COMPOUNDS across the 8-window
+3. **Per-window streaming collapse trace** — emit effective-edge rank, `C` mean/std/active fraction, and
+   fixed-pair relation drift. Over-smoothing COMPOUNDS across the 8-window
    recurrence — furlgraph's `node_wcos 0.34→0.94` was the #1 documented risk. (infra: `collect_layer_metrics`.)
 
 ### Canaries — lagging outcomes + design-validators (all cheap, @no_grad, GPU-scalar)
 - **learned-`W` block weights** — did the diff/product columns survive, or did `W` collapse to raw-only?
 - **edge-state effective rank** (ID-subtracted, content-only — NOT id-spoofed).
-- **`U=0` ablation** — are edges load-bearing or decorative?
+- **Three path ablations** — `U=0` (no write feedback), `C=0` (no edge read), and zero nodes (edge-only).
 - **overwrite canary** — write fact → overwrite same pair → test old-fact suppression (validates the
   error-correcting delta of §4; a pure EMA would fail this).
-- **direction canary** — `E[i,j]` vs `E[j,i]` distinguishability (the diagonal-product DistMult symmetry risk).
+- **direction canary** — `R[i,j]` vs `R[j,i]` distinguishability (the diagonal-product symmetry risk).
 - **retention-vs-lag** — bio query-window sweep 0..7; uniform idle-decay shows as monotonic degradation with
   lag (validates the per-edge gated retention of §4).
 - **week-0 persistence/BPTT** — bind at window 0, query at window 7, loss only at end; confirm ∂L reaches
@@ -288,7 +279,7 @@ moved. §9 must ship them, not just the lagging outcomes:
 - **SHUF−REAL and OFF−REAL** per-task — does memory bind / contribute.
 - **node-order shuffle invariance** — validates the set-invariance (no-PE) design (within-example
   order-invariance — DISTINCT from the cross-batch SHUF binding control).
-- **write telemetry** — `‖S‖`, `‖E‖`, α/β gate means per window (is the commit alive + bounded?).
+- **write telemetry** — `‖S‖`, `O`, `C`, effective `‖C·R‖`, and both gate families per window.
 
 ## 10. Considered and rejected (the design thread, recorded)
 
@@ -307,8 +298,8 @@ moved. §9 must ship them, not just the lagging outcomes:
   routing_diversity≈0.02 collapse; a scalar post-softmax gate is algebraically the same log-bias, no
   escape); (b) higher-order/rollout structure fed back as a feature is redundant-with-depth (Reuse
   Transformers 2021; rollout = the composition the stack already computes) — feeding attention back helps
-  only when it adds DIVERSITY (RealFormer/Re-attention) or GATES compute (FastV), which competitive
-  assignment already provides. So the edge state must ride the VALUE path (non-absorbable), not the bias.
+  only when it adds DIVERSITY (RealFormer/Re-attention) or GATES compute (FastV). So the edge state must ride
+  the VALUE path (non-absorbable), not the bias.
 - **Content-dependent OPERATOR** (`W_ij = g(x_i,x_j)`) — the absorption trap in a new outfit: an operator
   generated from node content makes the edge reconstructable from the nodes → collapse. Keep `W` fixed;
   content lives in the inputs only.
@@ -323,31 +314,40 @@ moved. §9 must ship them, not just the lagging outcomes:
   a differentiable temporal filter) but makes no bio claim and gates everything on the objective.
 
 ## 11. Prior art
-Relational Attention (Diao & Loynd, ICLR 2023, 2210.05062 — edge vectors on the value path; slotgraph adds
-PERSISTENT + PLASTIC edges); eligibility-trace learning (e-prop, Bellec 2020) / Backpropamine + differentiable
-plasticity (Miconi 2018, 2002.10585) — the learnable temporal-trace machinery; EntNet (Henaff 2017) / Slot
-Attention (Locatello 2020) — keyed competitive slots + anti-duplication; ReZero (Bachlechner 2020); Titans
-(Behrouz 2024, 2501.00663) — in-cohort EMA-with-momentum memory (the persistence precedent); RealFormer
-(He 2020) / Re-attention (Zhou 2021) — feeding attention forward helps via DIVERSITY; Reuse Transformers
-(Bhojanapalli 2021) — cross-layer attention redundancy (why rollout-feedback is inert); TransE/DistMult/
-ComplEx + InferSent/SBERT + xDeepFM — the operator survey (§8); Set Transformer / Perceiver — set read.
+The individual ingredients are established:
+- **Relational Attention** (Diao & Loynd, ICLR 2023) has directed vector edges, full Q/K/V conditioning, and
+  per-layer edge updates from both endpoints and the reverse edge. It permits edge-presence flags inside the
+  vector, but does not separate a recurrent confidence state or harvest relations from attention evolution.
+- **EGT** has evolving edge channels and scalar edge gates; **NRI** infers categorical edge type/existence
+  probabilities; temporal GNNs add recurrent node memory around timestamped edges.
+- **Differentiable plasticity / Backpropamine / e-prop** motivate learned local traces and modulated writes;
+  **Gated DeltaNet** supplies data-dependent decay plus residual correction; **EntNet** motivates normalized
+  semantic memory; **Slot Attention** motivates competitive binding, which this implementation lacks.
+
+SlotGraph's claim is therefore a **novel synthesis candidate**, not a first-principles invention: relation
+semantics harvested from consecutive LM layers, explicit recurrent confidence, cross-window pair persistence,
+and confidence-scaled value feedback in a compressed LM memory. Do not claim first-of-kind without a broader
+systematic review. The diff/product operator itself is project-specific and should be presented as a learned
+heuristic, not an established STDP rule.
 
 ## 12. Status
-**BUILT + STABILIZED (2026-07-11)** — `src/memory/models/slotgraph/`, the canonical `slotgraph_baseline`.
-96 nodes, no edge tokens; ONE shared frozen LM with **two rank-16 LoRAs** (write-harvest + read-decode);
-persistent plastic value-path edge state harvested from the write forward's per-layer attention; learnable
-inter-layer diff+product operator; **error-correcting, per-edge-gated, EntNet-bounded commit** (§4); zero-init
-with **write-gate-open to avoid the double-zero deadlock** (§5); prepend+bidir read with a **learned salience
-selector** (§6).
+**BUILT; R/C REVISION FORWARD/BACKWARD VERIFIED (2026-07-11)** — `src/memory/models/slotgraph/`, the canonical
+`slotgraph_baseline`.
+96 nodes, no edge tokens; separate frozen write/read LM copies with separate LoRAs (mixed training overrides
+write rank to 84 for capacity matching); persistent unit relation `R` plus scalar confidence `C`; confidence-aware value-path
+feedback; learnable inter-layer diff/product semantics; and separate data-dependent commits (§4).
 
-Stabilization landed this session (the naive first build had gnorm ~1e8 + OOM at B=2): (a) renormalize the
-harvested node-block attention `a_nn` over the node axis (it was a sub-block of a softmax over [text;nodes],
-so it never summed to 1 → unbounded residual); (b) bound the residual with `tanh(U·agg)·resid_scale`
-(small-init, not zero — else the U=0 ∧ scale=0 double-zero deadlock); (c) fold `U` after the aggregate
-(`Σ a·U(E)=U(Σ a·E)`) + factor `φ_i(x_i)+φ_j(x_j)` and per-endpoint gates → no `[B,N,N,d]`/`[B,N,N,2d]`
-tensors (only `[B,N,N,d_e]`); (d) truncated BPTT (`slotgraph_bptt_detach_every=1`) caps the recurrence
-depth. Result: **gnorm 1e8→~1e3, peak VRAM 15.3→6.3GB, 1.9→3.1 step/s; B=2/B=4 stable, EXIT=0.** All
-numerics-preserving except (a) which is *more* faithful (a weighted combination needs normalized weights).
+The earlier single-vector build stabilized node-block normalization, bounded value injection, factored pair
+features, and memory use. The R/C revision additionally preserves absolute attention for confidence, removes
+the semantic-operator bias, identity-initializes `K`, makes the edge lift bias-free, and defaults to full
+BPTT. Its bounded recurrence and inactive-row behavior have focused CPU tests. A real bf16 encoder
+forward/backward at the active geometry (`N=96`, `d_e=32`, rank-84 write LoRA, 2048 tokens/eight windows,
+full BPTT, batch 1) was finite, reached every semantic/confidence module, and peaked at 4.15 GiB allocated on
+an RTX 4090. End-to-end task-loss and batch-size sweeps remain required before convergence runs.
+
+**Checkpoint boundary:** pre-R/C SlotGraph checkpoints are not valid resumptions for this architecture.
+Non-strict loading would silently leave the confidence heads/gates untrained and cannot recover the old
+single-vector normalization semantics. Start R/C experiments from a fresh initialization.
 
 **Still open (the decisive experiment, §9):** slotgraph has NOT yet been trained to convergence — the
 binding question (`SHUF−REAL`) is unmeasured. Run it under the MEMBERSHIP+ADDRESSING objectives (not

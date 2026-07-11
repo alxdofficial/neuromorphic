@@ -1,15 +1,18 @@
-"""Titans (Behrouz et al. 2024, arXiv:2501.00663) — a neural long-term memory that LEARNS TO
-MEMORIZE AT TEST TIME. The memory is a DEEP MLP M whose weights are updated per window by a
-GRADIENT STEP on the associative loss ‖M(kₜ)−vₜ‖² with data-dependent forget (α), momentum (η)
+"""Titans-INSPIRED neural long-term memory (after Behrouz et al. 2024, arXiv:2501.00663) — a memory
+that LEARNS TO MEMORIZE AT TEST TIME. The memory is a DEEP MLP M whose weights are updated per window
+by a GRADIENT STEP on the associative loss ‖M(kₜ)−vₜ‖² with data-dependent forget (α), momentum (η)
 and learning-rate (θ) gates; the OUTER training loop backprops THROUGH those inner updates
-(create_graph) — that is Titans' "learning to learn" signal and the whole point of the arm.
+(create_graph) — that is Titans' "learning to learn" signal and the whole point of the arm. This WRITE
+is faithful to Titans' neural-memory core.
 
-Read = MAC (Memory-as-Context), realized as an input-PREPEND: N_p persistent tokens (input-
-independent, Eq.19) ‖ M_q memory-readout tokens = learned query seeds run through the FINAL
-(test-time-adapted) memory MLP. Deep-MLP + autograd is the paper's claim; the closed-form matrix
-variant reduces to a delta-rule (= our slotgraph), so this is the version that makes Titans a
-distinct arm. ASTERISKS: test-time gradient write (not feed-forward) + create_graph meta-cost.
-No frozen base copy — writes on raw token embeds. persistent state = the memory-MLP weights.
+Read = a SIMPLIFIED prepend readout, NOT faithful MAC (Memory-as-Context): N_p persistent tokens
+(input-independent, Eq.19) ‖ M_q memory-readout tokens = learned query seeds run through the FINAL
+(test-time-adapted) memory MLP, then prepended. Published MAC instead has the CURRENT segment query
+the memory, local attention over persistent+current context, an update from the attention output, and
+a post-update gated read — none of that is here. So the arm is faithful to Titans' test-time-gradient
+WRITE but its read is a static prepend → call it "Titans-inspired neural memory," not MAC.
+ASTERISKS: test-time gradient write (not feed-forward) + create_graph meta-cost; simplified non-MAC
+read; no frozen base copy (writes on raw token embeds); persistent state = the memory-MLP weights.
 """
 from __future__ import annotations
 
@@ -22,7 +25,7 @@ from ...config import ReprConfig
 
 
 class TitansEncoder(nn.Module):
-    # MAC = prepend read; write on raw embeds; Titans' surprise is the assoc-loss gradient (intrinsic).
+    # Simplified prepend read (NOT faithful MAC); write on raw embeds; surprise = assoc-loss gradient.
     is_conditioned_read = False
     wants_surprise = False
 
@@ -100,9 +103,14 @@ class TitansEncoder(nn.Module):
             W1, b1, W2, b2 = state["W1"], state["b1"], state["W2"], state["b2"]
             pred = self._mem_forward(W1, b1, W2, b2, k)
             err = ((pred - v) ** 2).sum(-1) * attention_mask.to(pred.dtype)   # [B,W], pad-masked
-            # MEAN per valid token (not sum): a .sum() over the 256-token window makes the inner grad
-            # ~256× too large and explodes across the 8-window recurrence (observed NaN).
-            loss = err.sum() / attention_mask.to(pred.dtype).sum().clamp_min(1.0)
+            # PER-EXAMPLE mean, then SUM over examples (not a single batch-wide mean): each example's
+            # fast-weight gradient must be normalized by ITS OWN token count, not the batch total. Dividing
+            # by the whole-batch token sum made example b's update scale ~1/B (a B=2 duplicate halved it —
+            # a batch-dependent memory update). Summing per-example means keeps ∂loss/∂W1[b] a function of
+            # example b alone. (Still a per-token mean → the 256× inner-grad blowup stays fixed; identical
+            # at B=1, corrects the silent B>1 under-update.)
+            _tok = attention_mask.to(pred.dtype).sum(1).clamp_min(1.0)         # [B] valid tokens per example
+            loss = (err.sum(1) / _tok).sum()
             # retain_graph defaults to create_graph: in train (create_graph=True) the graph the outer
             # backward needs is kept; in eval it's freed right after this grad call (frees per-window
             # loss-graph buffers). Was an explicit retain_graph=True → held eval buffers needlessly.

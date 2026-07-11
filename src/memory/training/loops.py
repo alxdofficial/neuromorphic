@@ -100,6 +100,9 @@ def train_mixed_variant(
     _es_min_delta = float(getattr(cfg, "early_stop_min_delta", 0.01))
     _es_min_step = int(getattr(cfg, "min_step_for_stop", 3000))
     _no_improve = 0
+    _es_anchor = float("inf")     # FIXED min_delta reference: moves ONLY on a real improvement, never on a
+                                  # micro-gain (the old bug: updating it every micro-gain makes steady slow
+                                  # progress read as 'no improvement' and stops early).
 
     # ── resume: restore model + optimizer + step + best tracking from .last.pt ──
     start_step = 0
@@ -136,6 +139,7 @@ def train_mixed_variant(
                     for t in mixed_tasks}
         if "mixed_agg_best" in sd:
             agg_best = dict(sd["mixed_agg_best"])
+            _es_anchor = agg_best["metric"]      # resume the early-stop anchor (don't gift a patience reset)
         print(f"  [resume] loaded {ckpt_path.name} @ step {start_step - 1} "
               f"(agg_best={agg_best['metric']:.4f} @ {agg_best['step']})")
     elif jsonl_path.exists() and not resume:
@@ -170,6 +174,7 @@ def train_mixed_variant(
                  if float(getattr(cfg, 'contrastive_shuf_coef', 0.0)) > 0 else ""),
               flush=True)
     rotation = []   # diagnostic: the realized task sequence (capped for the smoke print)
+    step = start_step - 1                          # bound even if the loop never runs (resume past end)
     for step in range(start_step, n_steps):
         task = mixed_tasks[step % len(mixed_tasks)]   # equal round-robin
         if len(rotation) < 24:
@@ -332,7 +337,7 @@ def train_mixed_variant(
                 jsonl_fp.write(json.dumps(row) + "\n")
                 tag = f"{t}={vm['val_loss_recon']:.3f}"
                 if "val_babi_em" in vm:
-                    tag += f"(EM={vm['val_babi_em']*100:.0f}%)"
+                    tag += f"(TF-EM={vm['val_babi_em']*100:.0f}%)"   # teacher-forced span match, not AR exact-match
                 if "val_cont_early_loss" in vm:
                     tag += f"(early={vm['val_cont_early_loss']:.3f})"
                 if "val_graph_edge_cos" in vm:          # write/read collapse at a glance
@@ -351,18 +356,19 @@ def train_mixed_variant(
             print(f"    [val @ {step}]  " + "  ".join(parts), flush=True)
             # Aggregate selection: mean val_loss across tasks → save the single .best.pt.
             agg = sum(per_task[t]["val_loss_recon"] for t in mixed_tasks) / len(mixed_tasks)
-            if agg < agg_best["metric"] - _es_min_delta:      # a REAL improvement (past the noise floor)
+            # Checkpoint fidelity: save the lowest agg_val seen (ANY new low), independent of early-stop.
+            if agg < agg_best["metric"]:
                 agg_best["metric"], agg_best["step"] = agg, step
-                _no_improve = 0
                 save_checkpoint(model, opt, step, best_ckpt_path,
                                 mixed_best=best, mixed_agg_best=agg_best)
                 print(f"    [best @ {step}]  agg_val={agg:.4f} → saved {best_ckpt_path.name}", flush=True)
+            # Early-stop patience: reset ONLY on a REAL improvement past the noise floor, measured against a
+            # FIXED anchor. Steady sub-min_delta gains accumulate against the anchor until they cross it →
+            # they DON'T trip early-stop (the fix); genuine plateaus still do.
+            if agg < _es_anchor - _es_min_delta:
+                _es_anchor = agg
+                _no_improve = 0
             else:
-                # still save a new best if it's the lowest (for checkpoint fidelity), but don't reset patience
-                if agg < agg_best["metric"]:
-                    agg_best["metric"], agg_best["step"] = agg, step
-                    save_checkpoint(model, opt, step, best_ckpt_path,
-                                    mixed_best=best, mixed_agg_best=agg_best)
                 _no_improve += 1
             # EARLY STOP: patience val-evals with no real improvement, past the warmup-noise floor.
             if (_es_patience > 0 and step >= _es_min_step and _no_improve >= _es_patience):
@@ -374,13 +380,13 @@ def train_mixed_variant(
             save_checkpoint(model, opt, step, ckpt_path,
                             mixed_best=best, mixed_agg_best=agg_best)
 
-    save_checkpoint(model, opt, max(n_steps - 1, 0), ckpt_path,
-                    mixed_best=best, mixed_agg_best=agg_best)
+    save_checkpoint(model, opt, step, ckpt_path,       # ACTUAL final step (correct after early-stop; was
+                    mixed_best=best, mixed_agg_best=agg_best)   # falsely n_steps-1 → broke resume + misreported length
     final = run_mixed_val(model, mixed_tasks, val_sets, device, val_batches, window_size,
                           gate_batches=int(getattr(cfg, "mixed_gate_batches", 0)))
     for t in mixed_tasks:
         vm = final[t]
-        row = {"phase": "val", "step": n_steps, "variant": variant, "task": t,
+        row = {"phase": "val", "step": step, "variant": variant, "task": t,   # actual final step, not n_steps
                "final": True, "val_loss": vm["val_loss_recon"], "top1": vm["val_top1_acc"],
                "best_step": best[t]["step"], "best_metric": best[t]["metric"]}
         if "val_babi_em" in vm:

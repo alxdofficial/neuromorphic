@@ -38,8 +38,8 @@ all arms. All comparisons must be **same-backbone, matched-params**.
   (headline table, the 4 comparison axes, run matrix, invariants). *Merged `PHASE_PLAN.md` into this.*
 - **`OBJECTIVES.md`** — the binding objective ladder (MAE-CE → behavioral-KL → provenance-InfoNCE → bypass-gap → GRPO), with math + citations. Why binding is an *objective* problem.
 - **`graph_thesis.md`** — why a graph memory (the two lenses), and what the literature says about making latent topology load-bearing instead of collapsing. The standing rationale.
-- **Graph-memory arm design:** **`slotgraph_design.md` — THE slotgraph** (the canonical, converged arm:
-  96 nodes / no edge tokens / persistent plastic value-path edge state / learnable inter-layer diff+product
+- **Graph-memory arm design:** **`slotgraph_design.md` — THE slotgraph** (the canonical arm:
+  96 nodes / no edge tokens / unit relation vector + dynamic confidence per pair / value-path feedback
   operator / propose→commit / prepend+bidir read; built + stabilized 2026-07-11). Companion future designs,
   NOT current: `furlgraph_design.md` (input-grounded chain-merge), `graph_generative_memory.md` (the
   "spider web" — score-function/GRPO-era). The exploratory slotgraph 1–4 design docs were removed with

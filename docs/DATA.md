@@ -7,7 +7,8 @@ data layer, read this first; **if it disagrees with the code, the code wins — 
 `DATA_PHASES_PLAN.md` — that is a different scope (what's *planned*, not what runs now).
 
 > **What we're measuring.** A **frozen** SmolLM2-135M decoder (d=576) reads `M=96` memory tokens produced by
-> a small **trainable** encoder (~7M params, capacity-matched across arms). We compress a 2048-token context
+> a small **trainable** encoder (~7M params — **parameter- and read-length-matched** across arms, though NOT
+> persistent-state-matched: state floats vary ~194× across arms). We compress a 2048-token context
 > into those 96 tokens and train end-to-end (default objective: **behavioral-KL**). The open problem is
 > **loss-neutrality** (plain CE barely rewards *binding*). The sweep compares encoder architectures on a
 > mixed objective stressing **fidelity** (can memory store) and **addressing** (can memory be selectively read).
@@ -258,4 +259,5 @@ un-guessability — the answer requires the compressed context (distractors neve
 prior can't produce it); (3) bio value-span scoring — loss only on un-guessable value fragments; (4)
 train/val firewall — hotpot/musique use TRAIN splits disjoint from the eval readers' val; bio val is a
 different world with a name-collision firewall; (5) fixed compression denominator — every context is exactly
-`total_len`; `M` uniform across arms (the capacity-matched fairness anchor).
+`total_len`; `M` uniform across arms (the read-length fairness anchor — one of two matched axes with
+trainable-param count; persistent state is deliberately NOT matched).

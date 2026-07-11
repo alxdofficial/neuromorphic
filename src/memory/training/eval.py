@@ -46,20 +46,30 @@ def _continuation_early_loss(model, val_set, device, n_batches, window_size) -> 
     generic compute_loss, so loss_recon is restricted to those positions."""
     import dataclasses
     model.train(False)
+    # Per-batch seeding gives a STABLE metric, but reseeding the GLOBAL RNG leaks into training —
+    # every validation would perturb subsequent train masks / slotgraph init-noise / memoryllm drops.
+    # Snapshot and restore the RNG so validation is side-effect-free (reproducibility fix).
+    _rng_cpu = torch.get_rng_state()
+    _rng_cuda = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
     losses = []
-    for i, batch in enumerate(val_set):
-        if i >= n_batches:
-            break
-        torch.manual_seed(20260527 + i)
-        batch = to_device(batch, device)
-        # restrict the content mask to the first CONT_EARLY_TOKENS valid positions
-        cm = batch.answer_content_mask.clone()
-        cm[:, CONT_EARLY_TOKENS:] = False
-        early = dataclasses.replace(batch, answer_content_mask=cm)
-        with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            out = model.compute_loss(early, window_size=window_size)
-        losses.append(float(out["loss_recon"]))
-    model.train(True)
+    try:
+        for i, batch in enumerate(val_set):
+            if i >= n_batches:
+                break
+            torch.manual_seed(20260527 + i)
+            batch = to_device(batch, device)
+            # restrict the content mask to the first CONT_EARLY_TOKENS valid positions
+            cm = batch.answer_content_mask.clone()
+            cm[:, CONT_EARLY_TOKENS:] = False
+            early = dataclasses.replace(batch, answer_content_mask=cm)
+            with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                out = model.compute_loss(early, window_size=window_size)
+            losses.append(float(out["loss_recon"]))
+    finally:
+        torch.set_rng_state(_rng_cpu)
+        if _rng_cuda is not None:
+            torch.cuda.set_rng_state_all(_rng_cuda)
+        model.train(True)
     return sum(losses) / max(len(losses), 1)
 
 

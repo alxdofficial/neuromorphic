@@ -57,10 +57,10 @@ class ReprLearningModel(nn.Module):
     VARIANTS = {
         "icae_baseline": ICAEBaselineEncoder,  # ICAE (ICLR'24) compressor
         "autocompressor_baseline": AutoCompressorBaselineEncoder,  # AutoCompressors/RMT recurrent summary
-        # THE slotgraph — 96 node slots, NO edge tokens; ONE shared frozen LM (write-harvest + read
-        # LoRAs); persistent per-edge state on the attention VALUE path, harvested from the LM's per-layer
-        # attention, error-correcting/per-edge-gated/EntNet-bounded commit; prepend+bidir read shaped by
-        # the edge state (models/slotgraph/; docs/slotgraph_design.md).
+        # THE slotgraph — 96 node slots, NO edge tokens; separate frozen write/read LM copies + LoRAs;
+        # persistent unit relation + scalar confidence per pair on the attention VALUE path,
+        # harvested from the LM's per-layer attention; prepend+bidir read shaped by confidence-scaled
+        # relation state (models/slotgraph/; docs/slotgraph_design.md).
         "slotgraph_baseline": SlotGraphEncoder,
         # MemoryLLM (arXiv:2402.04624): fixed per-layer latent pool + compress-then-RANDOM-DROP
         # self-update, read as per-layer KV (native per-layer-KV read) (models/memoryllm/).
@@ -68,8 +68,8 @@ class ReprLearningModel(nn.Module):
         # Gisting (arXiv:2304.08467): learnable gist tokens compress context into their per-layer
         # KV ("gist caching") — native per-layer-KV read (models/gisting/).
         "gisting_baseline": GistingBaselineEncoder,
-        # Titans (arXiv:2501.00663): deep-MLP neural memory updated by a TEST-TIME gradient step
-        # (learns to memorize at test time); MAC prepend read (models/titans/).
+        # Titans-inspired (arXiv:2501.00663): deep-MLP neural memory updated by a TEST-TIME gradient step
+        # (learns to memorize at test time); SIMPLIFIED prepend read, not faithful MAC (models/titans/).
         "titans_baseline": TitansEncoder,
         # H2O — Heavy-Hitter Oracle training-free KV eviction (Zhang 2023, arXiv:2306.14048).
         # Keeps the M tokens with the highest cumulative attention-received score; no encoder
@@ -278,6 +278,40 @@ class ReprLearningModel(nn.Module):
                         "memoryllm_baseline", "gisting_baseline", "titans_baseline",
                         "h2o_baseline")
 
+    def _chunked_lm_head_ce(self, sel_hidden, sel_targets, chunk: int = 2048):
+        """fp32 ``lm_head`` + per-token CE over the selected positions, computed in
+        position-chunks with backward recompute (``checkpoint``) so the ``[chunk, V]``
+        fp32 logits never materialize for the whole selection at once — in EITHER the
+        forward (allocation) or the backward (softmax-grad twin). Returns
+        ``(per_tok [N] with grad, top1 scalar)``, math-identical to a dense
+        ``lm_head → cross_entropy``; only the peak memory differs.
+
+        Motivation: the reconstruct (MAE) task predicts the full ~2048-token passage, so
+        at B=8/ctx=2048 it selects N≈14k positions and the dense ``[N, 49152]`` fp32
+        logits alone are ~2.5GB — which tips a 24GB pod over at this line. Chunking to
+        2048 positions caps the CE working set at ~0.4GB regardless of N."""
+        lm_head = self.decoder.llama.lm_head
+        N = sel_hidden.shape[0]
+        if N <= chunk:
+            logits = lm_head(sel_hidden).float()                       # [N,V]
+            per_tok = F.cross_entropy(logits, sel_targets, reduction="none")
+            with torch.no_grad():
+                top1 = (logits.argmax(-1) == sel_targets).float().mean()
+            return per_tok, top1
+
+        def _chunk_ce(h, t):
+            lg = lm_head(h).float()                                    # [chunk,V] (recomputed in backward)
+            return F.cross_entropy(lg, t, reduction="none"), (lg.argmax(-1) == t)
+
+        pt_parts, correct_parts = [], []
+        for h, t in zip(sel_hidden.split(chunk), sel_targets.split(chunk)):
+            pt, correct = torch.utils.checkpoint.checkpoint(_chunk_ce, h, t, use_reentrant=False)
+            pt_parts.append(pt)
+            correct_parts.append(correct)
+        per_tok = torch.cat(pt_parts)                                  # [N] with grad
+        top1 = torch.cat(correct_parts).float().mean()
+        return per_tok, top1
+
     def compute_masked_reconstruction_loss(
         self,
         batch,                          # sentence-pair batch (data_masked_reconstruction.py)
@@ -417,8 +451,9 @@ class ReprLearningModel(nn.Module):
             loss_mask[:, 0] = batch.context_mask[:, 1]
         sel_hidden = pred_hidden[loss_mask]                            # [N,d]
         sel_targets = targets[loss_mask]                              # [N]
-        logits = self.decoder.llama.lm_head(sel_hidden).float()        # [N,V]
-        per_tok = F.cross_entropy(logits, sel_targets, reduction="none")
+        # chunked + backward-recomputed lm_head→CE (peak ~one chunk of [chunk,V], not the
+        # full ~14k-position reconstruct span) so B=8/ctx=2048 fits 24GB pods; math-identical.
+        per_tok, top1 = self._chunked_lm_head_ce(sel_hidden, sel_targets)
         loss_recon = per_tok.mean()
         # differentiable per-example CE (mean per-token NLL per row) — the objective modes' InfoNCE
         # logits are built from these across memory rolls; the detached copy keeps telemetry unchanged.
@@ -430,7 +465,6 @@ class ReprLearningModel(nn.Module):
         loss_per_example = pe_sum / pe_cnt.clamp_min(1.0)              # [B], WITH grad
 
         with torch.no_grad():
-            top1 = (logits.argmax(-1) == sel_targets).float().mean()
             per_ex = loss_per_example.detach()
 
         # keep mask_embed in-graph even when no positions select it
@@ -572,10 +606,23 @@ class ReprLearningModel(nn.Module):
         # width Mmem + T: the mask keeps M memory columns even though inputs_embeds does not,
         # because the DynamicCache prefix adds Mmem keys. cache_position defaults to arange(T)+Mmem.
         attn = torch.cat([mm[:, :Mmem].to(base_mask.dtype), base_mask.to(base_mask.dtype)], dim=1).long()
-        cache = build_prefix_cache((K, V))
-        out = self.decoder.llama.model(inputs_embeds=inputs_embeds, attention_mask=attn,
-                                       past_key_values=cache, use_cache=True)
-        return out.last_hidden_state
+        L = len(K)
+
+        def _run(emb, at, *kv):
+            # rebuild the DynamicCache inside so a checkpoint recompute re-injects the prefix
+            cache = build_prefix_cache((list(kv[:L]), list(kv[L:])))
+            o = self.decoder.llama.model(inputs_embeds=emb, attention_mask=at,
+                                         past_key_values=cache, use_cache=True)
+            return o.last_hidden_state
+
+        # Activation-checkpoint the decode (recompute in backward): the reconstruct task decodes the
+        # whole ~2048-token passage with a 30-layer KV prefix and retains it for backward → the
+        # per-layer-KV arms (gisting/memoryllm) OOM at B=8 on 24GB. This path installs NO forward
+        # hooks, so the recompute is exact (math-identical). K/V carry grad, so checkpoint is active.
+        if self.training and getattr(self.cfg, "grad_checkpoint_decode", True):
+            return torch.utils.checkpoint.checkpoint(
+                _run, inputs_embeds, attn, *K, *V, use_reentrant=False)
+        return _run(inputs_embeds, attn, *K, *V)
 
     def _install_conditioned_read_hook(self, zero_memory: bool, shuffle_memory: bool, B=None):
         """Query-conditioned READ (biomem): register a pre-hook at the encoder's

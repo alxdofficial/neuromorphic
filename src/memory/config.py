@@ -138,6 +138,11 @@ class ReprConfig:
     # for the full-context ceiling arm).
     grad_checkpoint_stream: bool = True
     grad_checkpoint_llama: bool = False
+    # grad_checkpoint_decode: activation-checkpoint the per-layer-KV read decode
+    # (_prefix_kv_forward). The reconstruct task decodes the whole ~2048-token passage
+    # with a 30-layer KV prefix and retains it for backward, so the per-layer-KV arms
+    # (gisting/memoryllm) OOM at B=8 on 24GB. That path is hook-free ⇒ exact recompute.
+    grad_checkpoint_decode: bool = True
 
     # ── Tokenizer specials ─────────────────────────────────────────────────
     # SmolLM2 / Llama-3.2 have no dedicated pad id; we reuse a special token for
@@ -163,26 +168,34 @@ class ReprConfig:
 
     # ── slotgraph — THE graph memory (models/slotgraph/; docs/slotgraph_design.md) ──────────────
     # 96 node slots, NO edge tokens. ONE shared frozen LM (two rank-16 LoRAs: write-harvest + read-decode).
-    # WRITE = harvest the LoRA'd LM's per-layer node-block attention a_ij; inject a persistent per-edge
-    # state E[i,j] (d_e-vec) on the VALUE path as an additive residual U*(sum_j a_ij E[i,j]). E is a
-    # streaming state (across windows), init ZERO, updated by an error-correcting, per-edge-gated,
-    # EntNet-bounded commit of a within-window inter-layer diff+product trace. READ = prepend+bidir,
-    # E shapes the node tokens (graph-conv blend + learned-salience pointers), not tokenized.
+    # WRITE = harvest per-layer node attention. Each ordered pair has a unit semantic relation R[i,j]
+    # (d_e-wide) plus scalar confidence C[i,j] in [0,1]; both recur across internal windows and update
+    # from the input. C controls semantic writes, value-path feedback, graph messages, and pointer salience.
+    # READ = prepend+bidir; pair state shapes node tokens but is never emitted as N² edge tokens.
     slotgraph_n_nodes: int = 96          # N node slots (= M read budget; dense N×N edges, no fixed topology)
-    slotgraph_d_edge: int = 32           # d_e — per-edge state width (heads×timescales + content proj; keep small)
+    slotgraph_d_edge: int = 32           # semantic relation width; confidence is a separate scalar (not in d_e)
     slotgraph_window: int = 256          # streaming window size (input tokens per write/harvest step)
     slotgraph_write_layers: int = 6      # LM depth harvested for the write (last-N; later=more semantic +
                                          # bounds retained attention matrices. 0 = all 30 layers = OOM-prone).
-    slotgraph_bptt_detach_every: int = 1  # detach persistent E/X every K committed windows (truncated BPTT).
-                                         # 1 = per-window state (design granularity); K>1 keeps some cross-
-                                         # window credit; 0 = full 8-deep recurrence (gnorm-compounding).
-    slotgraph_lora_rank: int = 16        # write-LoRA + read-LoRA rank (two adapters on the shared base)
+    slotgraph_bptt_detach_every: int = 0  # detach persistent R/C/X every K committed windows (truncated BPTT).
+                                         # 0 = FULL BPTT (default): the end-of-episode loss traces credit all
+                                         # the way back to window 0 — required for delayed-retention learning
+                                         # (a window-0 write learning from a window-7 retrieval failure). Kept
+                                         # feasible by SMALL batch; the newer stabilizers (a_nn renorm, tanh-
+                                         # capped injection, unit R, bounded C) replace detach as gnorm control.
+                                         # K>0 = truncate every K windows (the old band-aid; only if OOM).
+    slotgraph_lora_rank: int = 16        # write-LoRA rank (encoder copy); read-LoRA is the decoder copy's
+                                         # adapter — two frozen copies, NOT one shared base. The mixed-training
+                                         # preset overrides write rank to 84 (~7M trainable, capacity-matched).
     slotgraph_lora_alpha: int = 32
     slotgraph_read_topk: int = 0         # explicit edge-pointer tokens in the read (0 = node-centric only)
-    slotgraph_read_hops: int = 1         # graph-conv read hops (1 until rank confirmed; 2 enables E^2 reach)
+    slotgraph_read_hops: int = 1         # graph-conv read hops (1 until rank confirmed; 2 enables two-hop reach)
     slotgraph_d_key: int = 128           # read-side node-pool / salience query dim
     slotgraph_init_noise: bool = True    # per-forward Gaussian slot init (symmetry break, Slot Attention)
     slotgraph_layer_pair_gap: int = 0    # inter-layer operator: 0 = consecutive (l,l+1); k>0 = distant (l,l+k)
+    slotgraph_flash_harvest: bool = True # True: SDPA/flash forward + recompute ONLY the [N,S] node-query
+                                         # attention for the harvest (no [S,S] eager matrix → the B=8 memory
+                                         # fix). False: eager forward + output_attentions (reference path).
 
     # ── h2o (Heavy-Hitter Oracle KV eviction; models/h2o/) ────────────────────
     # Training-free eval-only baseline. Keeps the M tokens with highest cumulative
