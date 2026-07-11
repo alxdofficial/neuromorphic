@@ -58,14 +58,19 @@ key() { echo "s3://$R2_BUCKET/$R2_PREFIX/$1"; }
 put_status() {                      # write a one-line status marker to R2
   local msg="$1"; echo "$msg" | r2 cp - "$(key "$RES/_STATUS")" >/dev/null 2>&1 || true
 }
-upload_results() {                  # push whatever exists (best-effort; called on every exit)
+upload_results() {                  # push whatever exists (best-effort; called periodically + on exit)
   local d="$REPO_DIR/outputs/memory/${OUT_TAG}_${ARM}"
   r2 cp "$LOG" "$(key "$RES/bootstrap.log")" >/dev/null 2>&1 || true
-  [ -f "$d/jsonl/${ARM}.jsonl" ]     && r2 cp "$d/jsonl/${ARM}.jsonl"   "$(key "$RES/run.jsonl")"     >/dev/null 2>&1 || true
-  [ -f "$d/ckpts/${ARM}.last.pt" ]   && r2 cp "$d/ckpts/${ARM}.last.pt" "$(key "$RES/${ARM}.last.pt")" >/dev/null 2>&1 || true
-  [ -f "$d/ckpts/${ARM}.best.pt" ]   && r2 cp "$d/ckpts/${ARM}.best.pt" "$(key "$RES/${ARM}.best.pt")" >/dev/null 2>&1 || true
+  # MIRROR the local layout on R2 (jsonl/ + ckpts/ subdirs) so a single `aws s3 sync` reconstructs the
+  # run exactly where the evaluator expects it. `sync` (no --delete) uploads only new/changed objects:
+  #  - jsonl/<arm>.jsonl        per-step train + per-val val loss/stats
+  #  - ckpts/<arm>.last.pt      resume target (overwritten each save_every)
+  #  - ckpts/<arm>.best.pt      best-on-val
+  #  - ckpts/<arm>.step<N>.pt   RETAINED every-save_every milestones (the reproducibility archive)
+  [ -d "$d/jsonl" ] && r2 sync "$d/jsonl" "$(key "$RES/jsonl")" >/dev/null 2>&1 || true
+  [ -d "$d/ckpts" ] && r2 sync "$d/ckpts" "$(key "$RES/ckpts")" >/dev/null 2>&1 || true
   local summ="$REPO_DIR/outputs/memory/${OUT_TAG}_summary.json"
-  [ -f "$summ" ]                     && r2 cp "$summ"                    "$(key "$RES/summary.json")"  >/dev/null 2>&1 || true
+  [ -f "$summ" ]    && r2 cp "$summ" "$(key "$RES/summary.json")" >/dev/null 2>&1 || true
 }
 
 # Ensure a terminal status + log upload no matter how we exit (crash, OOM, timeout).
@@ -149,6 +154,11 @@ EXTRA=()
 
 echo "[bootstrap] training $ARM for $STEPS steps (behavioral_kl, B=$BATCH)"
 cd "$REPO_DIR"
+# Crash-safe artifacts: sync checkpoints + metrics to R2 every 120s DURING training, so a mid-run OOM/
+# timeout still leaves every completed milestone (+ the jsonl) on R2, not just whatever the final
+# on_exit upload catches. `|| true` keeps a transient R2 hiccup from killing the loop.
+( while sleep 120; do upload_results || true; done ) &
+SYNC_PID=$!
 set +e
 timeout "${MAX_HOURS}h" python3 scripts/train/train.py \
   --task mixed --variants "$ARM" \
@@ -159,6 +169,7 @@ timeout "${MAX_HOURS}h" python3 scripts/train/train.py \
   "${EXTRA[@]}"
 TRAIN_CODE=$?
 set -e
+kill "$SYNC_PID" 2>/dev/null || true      # stop the periodic syncer; on_exit does the final upload
 echo "[bootstrap] training exit=$TRAIN_CODE"
 
 if [ "$TRAIN_CODE" -eq 0 ]; then

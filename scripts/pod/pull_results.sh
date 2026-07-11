@@ -2,12 +2,10 @@
 # PULL — download a run's results from R2 into outputs/memory/ so the local band/gate
 # eval and diagnostics see them exactly as a local run would.
 #
-# R2 layout: results/<run_id>/<arm>/{run.jsonl, <arm>.last.pt, summary.json, bootstrap.log, _STATUS}
-# Local layout it writes (matches the trainer's own):
-#   outputs/memory/<run_id>_<arm>/jsonl/<arm>.jsonl
-#   outputs/memory/<run_id>_<arm>/ckpts/<arm>.last.pt
-#   outputs/memory/<run_id>_<arm>/bootstrap.log
-#   outputs/memory/<run_id>_summary.json   (last arm's summary; per-arm kept too)
+# R2 layout MIRRORS the local run dir: results/<run_id>/<arm>/{jsonl/<arm>.jsonl,
+#   ckpts/<arm>.{last,best,step<N>}.pt, bootstrap.log, _STATUS, summary.json}
+# This down-SYNCs each arm's prefix into outputs/memory/<run_id>_<arm>/ so the local band/gate eval +
+# diagnostics see it exactly as a local run would — ckpts/ + jsonl/ subdirs, including EVERY milestone.
 #
 # Usage:
 #   scripts/pod/pull_results.sh <run_id>            # all arms
@@ -31,16 +29,15 @@ if [ "${1:-}" = "--status" ]; then
 fi
 
 ARMS=("$@"); [ ${#ARMS[@]} -gt 0 ] || ARMS=("${DEFAULT_ARMS[@]}")
+set -a; source ~/.config/r2/credentials; set +a
+S3="s3://$R2_BUCKET/${R2_PREFIX:-neuromorphic}"
 for a in "${ARMS[@]}"; do
-  base="results/$RUN_ID/$a"
   dst="outputs/memory/${RUN_ID}_${a}"
-  mkdir -p "$dst/jsonl" "$dst/ckpts"
+  mkdir -p "$dst"
   echo "[pull] $a → $dst"
-  $R2 down "$base/run.jsonl"      "$dst/jsonl/$a.jsonl"   2>/dev/null || echo "   (no run.jsonl yet)"
-  $R2 down "$base/${a}.last.pt"   "$dst/ckpts/$a.last.pt" 2>/dev/null || echo "   (no last checkpoint yet)"
-  $R2 down "$base/${a}.best.pt"   "$dst/ckpts/$a.best.pt" 2>/dev/null || true
-  $R2 down "$base/summary.json"   "outputs/memory/${RUN_ID}_summary.json" 2>/dev/null || true
-  $R2 down "$base/bootstrap.log"  "$dst/bootstrap.log"    2>/dev/null || true
+  # mirror the arm's R2 prefix: jsonl/, ckpts/ (last/best + every .step<N>.pt), bootstrap.log, _STATUS
+  $R2 raw sync "$S3/results/$RUN_ID/$a/" "$dst/" --no-progress 2>/dev/null || echo "   (nothing on R2 yet)"
+  [ -f "$dst/summary.json" ] && cp "$dst/summary.json" "outputs/memory/${RUN_ID}_summary.json" || true
 done
 echo "[pull] done. Evaluate with:"
 echo "  python scripts/diagnostics/mixed/mixed_band_gate_eval.py --out-tag $RUN_ID"

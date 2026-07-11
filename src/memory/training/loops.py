@@ -379,6 +379,13 @@ def train_mixed_variant(
         if step > 0 and step % save_every == 0:
             save_checkpoint(model, opt, step, ckpt_path,
                             mixed_best=best, mixed_agg_best=agg_best)
+            # RETAINED milestone (never overwritten) so EVERY save_every window is preserved on disk —
+            # the pod syncs these to R2, letting us evaluate/reproduce any intermediate model. .last.pt
+            # (overwritten) stays the resume target; .best.pt is best-on-val; .step<N>.pt are the archive.
+            milestone = out_dir / f"ckpts/{variant}.step{step}.pt"
+            save_checkpoint(model, opt, step, milestone,
+                            mixed_best=best, mixed_agg_best=agg_best)
+            print(f"    [ckpt @ {step}]  {ckpt_path.name} + retained {milestone.name}", flush=True)
 
     save_checkpoint(model, opt, step, ckpt_path,       # ACTUAL final step (correct after early-stop; was
                     mixed_best=best, mixed_agg_best=agg_best)   # falsely n_steps-1 → broke resume + misreported length
