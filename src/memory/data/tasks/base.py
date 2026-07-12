@@ -3,7 +3,7 @@
 A Task knows *what we present and ask* (reconstruction / qa / continuation / mae). It draws items
 from a Source, applies the EpisodeSpec's difficulty knobs (length, distractors, query lag), and
 emits the exact per-sample dict ``common.collate_qa`` consumes — so ``compute_loss`` + the
-REAL/SHUF/OFF gate are unchanged. See ``docs/history/docs/history/data_arch_plan.md`` (Layer L2).
+REAL/SHUF/OFF gate are unchanged. See ``docs/DATA.md`` (Layer L2).
 
 ``TaskDataset`` is the generic (source × task × spec) IterableDataset that replaces the per-reader
 datasets; ``make_task_dataloader`` wires it to ``collate_qa``.

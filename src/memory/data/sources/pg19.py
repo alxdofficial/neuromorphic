@@ -22,7 +22,7 @@ local ``data/pg19/val.jsonl`` staged from the real upstream validation split (se
 takes priority over the skip-carve once ingested.
 
 Ingest: ``scripts/data_build/ingest/pg19/download.py`` (bounded to ~500 books by default — full books
-are huge, so even a few hundred is already a sizeable local cache). See DATASETS.md / docs/history/docs/history/data_arch_plan.md.
+are huge, so even a few hundred is already a sizeable local cache). See DATASETS.md / docs/DATA.md.
 """
 from __future__ import annotations
 

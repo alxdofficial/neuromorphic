@@ -1,7 +1,7 @@
 """Source registry — name → Source factory. Sources yield raw items; Tasks shape them.
 
 Lazy so importing the package never pulls heavy deps (datasets/pyarrow) until a source is built.
-See ``docs/history/docs/history/data_arch_plan.md`` (Layer L1).
+See ``docs/DATA.md`` (Layer L1).
 """
 from __future__ import annotations
 

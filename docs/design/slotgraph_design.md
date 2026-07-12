@@ -1,9 +1,9 @@
 # slotgraph — THE graph memory (design memo)
 
 *The canonical slotgraph. Supersedes the exploratory line (slotgraph / slotgraph2 / slotgraph3 /
-slotgraph4 — all removed 2026-07-11; their lessons are folded into §10 below and `graph_thesis.md`).
+slotgraph4 — all removed 2026-07-11; their lessons are folded into §10 below and `docs/design/graph_thesis.md`).
 One arm, converged after the full edge-substrate design thread (2026-07-10), then built + stabilized
-2026-07-11 (§12). Read with `docs/graph_thesis.md` (why free structure collapses) and `docs/OBJECTIVES.md`
+2026-07-11 (§12). Read with `docs/design/graph_thesis.md` (why free structure collapses) and `docs/design/OBJECTIVES.md`
 (why binding is an objective problem). References to "slotgraph3/4" below cite where a specific fix or
 cost was first identified in that lineage — provenance, not live docs.*
 
@@ -194,8 +194,8 @@ it removes edge feedback during writing but leaves the final edge read active.
 
 Every result in the design thread converges on: **legibility ≠ leverage.** Making the graph richer / more
 dynamical / more bio-plausible makes it more USABLE; it does not make the model USE it. Under a
-loss-neutral objective the edge state decays to zero exactly like slotgraph4's did (`graph_thesis.md`;
-NRI; Williams-2018). So slotgraph ships with the objective ladder (`docs/OBJECTIVES.md`):
+loss-neutral objective the edge state decays to zero exactly like slotgraph4's did (`docs/design/graph_thesis.md`;
+NRI; Williams-2018). So slotgraph ships with the objective ladder (`docs/design/OBJECTIVES.md`):
 - **behavioral-KL** (`E[KL] = I(context; answer)`) — the shared backbone. NOTE: this is a *different kind*
   of objective from the MAE-CE regime that produced every prior collapse result, so those priors are
   **void as evidence here** (§9). behavioral-KL directly charges for the memory carrying answer-relevant

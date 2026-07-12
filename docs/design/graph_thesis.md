@@ -1,7 +1,7 @@
 # Why a graph memory — the thesis, and what the literature says about making it work
 
 Standing rationale for the graph-memory line (slotgraph3 / FurlGraph), grounded in a 2026-07-09
-literature sweep. Read alongside `docs/OBJECTIVES.md` (the binding ladder) and `docs/furlgraph_design.md`.
+literature sweep. Read alongside `docs/design/OBJECTIVES.md` (the binding ladder) and `docs/design/furlgraph_design.md`.
 
 ## Two lenses that motivate graphs
 
@@ -60,7 +60,7 @@ emerges **only** when several of these hold (anti-collapse mechanics alone are n
    already does this (competitive slot-read); keep it.
 3. **Reward the structure DIRECTLY**: supervision or posterior-regularization is what made latent trees work
    (URNNG's CRF guide, DIORA's inside-outside chart). Our version = **provenance-supervised InfoNCE**
-   (`docs/OBJECTIVES.md` Rung 2) + tasks that *provably* can't be solved structureless (compositional
+   (`docs/design/OBJECTIVES.md` Rung 2) + tasks that *provably* can't be solved structureless (compositional
    generalization: SCAN, COGS, CFQ; bAbI multi-hop).
 4. **Discrete, addressable, REUSABLE node identity** (the strongest positive precedent): **EntNet** (Henaff
    et al., ICLR 2017) — keyed, competitive, *independent* slots — first to solve all 20 bAbI. Entities as

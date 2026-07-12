@@ -9,7 +9,7 @@ key + a random value each, non-parametric so it can't be language-guessed) — a
 
 Runtime-procedural: no offline build. Random alnum strings (shared helper with ``mqar``) that
 round-trip through BPE for exact-match scoring. Generator stub:
-``scripts/data_build/generate/ruler_overwrite/README.md``. See DATASETS.md / docs/history/docs/history/data_arch_plan.md.
+``scripts/data_build/generate/ruler_overwrite/README.md``. See DATASETS.md / docs/DATA.md.
 """
 from __future__ import annotations
 

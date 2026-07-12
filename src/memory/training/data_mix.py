@@ -6,7 +6,7 @@ per task through ``SOURCE_REGISTRY × get_task × make_task_dataloader``. Adding
 longer edits this file — only the per-source construction kwargs (the genuinely source-specific
 bits: fineweb min_len/src-tok, babi tasks, bio world/n_facts) live in ``_build_source``.
 
-See ``docs/history/docs/history/data_arch_plan.md`` (Orchestration). Replaces the old hardcoded per-task branches.
+See ``docs/data/DATA.md`` (Orchestration). Replaces the old hardcoded per-task branches.
 """
 from __future__ import annotations
 

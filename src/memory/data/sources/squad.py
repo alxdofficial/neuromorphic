@@ -12,7 +12,7 @@ Resolution order (BEST-EFFORT, never hangs):
   2. Else HF-stream a BOUNDED sample of ``rajpurkar/squad_v2`` (train / validation).
   3. Else (offline) raise a clear "run ingest first" error — no silent hang.
 
-Ingest: ``scripts/data_build/ingest/squad/download.py``. See DATASETS.md / docs/history/docs/history/data_arch_plan.md (L1).
+Ingest: ``scripts/data_build/ingest/squad/download.py``. See DATASETS.md / docs/DATA.md (L1).
 """
 from __future__ import annotations
 

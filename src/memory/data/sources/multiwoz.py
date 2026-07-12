@@ -13,7 +13,7 @@ the raw dialogue JSON the script itself points at — the MultiWOZ 2.2 files on 
 (``budzianowski/multiwoz .../MultiWOZ_2.2/{train,dev}/dialogues_NNN.json``). Bounded local-cache-first:
 ``data/multiwoz/<split>.jsonl`` (slim records written by the ingest script) is used if present, else a
 bounded GitHub fetch of ``n_docs`` dialogues. Ingest:
-``scripts/data_build/ingest/multiwoz/download.py``. See DATASETS.md / docs/history/docs/history/data_arch_plan.md (Layer L1).
+``scripts/data_build/ingest/multiwoz/download.py``. See DATASETS.md / docs/DATA.md (Layer L1).
 
 Answer-in-context is guaranteed by construction: at load time we keep only (slot, value) candidates
 whose value appears VERBATIM (case-insensitive) in the (length-capped) dialogue text, so the answer is

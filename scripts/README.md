@@ -30,8 +30,7 @@ python scripts/diagnostics/mixed/episode_peek.py             # decode real episo
 python scripts/diagnostics/slotgraph/slotgraph_gradflow.py   # per-module grad/param ratios (slotgraph canary)
 ```
 
-(The slotgraph1/2/3 and biomem/objective probe scripts were removed 2026-07-11 with their arms; the
-`docs/history/slotgraph_*` docs they regenerated are now frozen snapshots.)
+(The slotgraph1/2/3 and biomem/objective probe scripts were removed 2026-07-11 with their arms.)
 
 ## train/
 

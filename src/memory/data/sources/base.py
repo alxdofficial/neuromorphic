@@ -1,6 +1,6 @@
 """Source base — raw item streams. A Source knows *where tokens come from*, nothing about
 windows, queries, or distractors (that is the Task's job). It yields typed *items* that Tasks
-consume. See ``docs/history/docs/history/data_arch_plan.md`` (Layer L1).
+consume. See ``docs/DATA.md`` (Layer L1).
 
 Item kinds + the interface Tasks rely on:
   - CorpusItem : ``.tokens``                              (fineweb, pile, redpajama, code)

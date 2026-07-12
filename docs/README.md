@@ -35,7 +35,7 @@ the per-arm provenance tag are in **`REFERENCES.md`**.
   random-drop + **faithful co-attention compress**: the window co-attends to the pool through the real
   layers, mechanism-ported; MAE is streamed in 8 windows for this arm).
 - **Our arm:** `slotgraph` — THE canonical graph memory (96 nodes / value-path plastic edge state /
-  prepend+bidir read; see `slotgraph_design.md`).
+  prepend+bidir read; see `docs/design/slotgraph_design.md`).
 - **`h2o`** — training-free KV-cache eviction (eval-only, 0 trainable params); **H2O-*inspired* static
   per-layer heavy-hitter selection** over original-context (pre-RoPE / position-free) KV — improved from a
   global re-encode, but query-blind + offline, so NOT a faithful online-eviction port.
@@ -51,24 +51,37 @@ streaming activation-checkpoint per-arm (its inner `create_graph` conflicts) —
 all arms. All comparisons must be **same-backbone, matched-params**.
 
 ## Docs (current)
+
+The docs are grouped into subfolders: **`design/`** (architecture & objectives), **`data/`** (what the
+data is + the phase plan), **`baselines/`** (competitor menu), **`ops/`** (remote-training runbook). Two
+cross-cutting indexes live at the docs root: this `README.md` and `REFERENCES.md`.
+
+**Root**
 - **`REFERENCES.md`** — authoritative paper/dataset links for every baseline & data source (never re-search).
-- **`DATA.md`** — THE authoritative "what runs now": sources, the 5 tasks (with worked examples), the shared
+
+**`data/`**
+- **`data/DATA.md`** — THE authoritative "what runs now": sources, the 5 tasks (with worked examples), the shared
   packer, multi-horizon continuation, the per-task objective dispatch (MAE→CE / QA→KL / continuation-fallback),
   and the current sweep config. Consolidates the former SCRUTINY_PHASE_DATA + DATA_TASK_GUIDE + data_arch_plan.
-- **`DATA_PHASES_PLAN.md`** — the FUTURE phase plan: Phase-1 full-corpus training + Phase-2 test-eval
+- **`data/DATA_PHASES_PLAN.md`** — the FUTURE phase plan: Phase-1 full-corpus training + Phase-2 test-eval
   (headline table, the 4 comparison axes, run matrix, invariants). *Merged `PHASE_PLAN.md` into this.*
-- **`OBJECTIVES.md`** — the binding objective ladder (MAE-CE → behavioral-KL → provenance-InfoNCE → bypass-gap → GRPO), with math + citations. Why binding is an *objective* problem.
-- **`graph_thesis.md`** — why a graph memory (the two lenses), and what the literature says about making latent topology load-bearing instead of collapsing. The standing rationale.
-- **Graph-memory arm design:** **`slotgraph_design.md` — THE slotgraph** (the canonical arm:
+
+**`baselines/`**
+- **`baselines/FROZEN_COMPETITORS.md`** — the Phase-2 competitor menu (2026-07-12 survey): which frozen/off-the-shelf
+  SOTA memory systems to compare against (long-context / RAG / agent-memory / compression cousins), which
+  actually ship weights, the LongMemEval anchor numbers, and the vendor-number red flags. Frames the
+  "Phase-0 reimplement vs Phase-2 frozen-SOTA" split.
+
+**`design/`**
+- **`design/OBJECTIVES.md`** — the binding objective ladder (MAE-CE → behavioral-KL → provenance-InfoNCE → bypass-gap → GRPO), with math + citations. Why binding is an *objective* problem.
+- **`design/graph_thesis.md`** — why a graph memory (the two lenses), and what the literature says about making latent topology load-bearing instead of collapsing. The standing rationale.
+- **Graph-memory arm design:** **`design/slotgraph_design.md` — THE slotgraph** (the canonical arm:
   96 nodes / no edge tokens / unit relation vector + dynamic confidence per pair / value-path feedback
   operator / propose→commit / prepend+bidir read; built + stabilized 2026-07-11). Companion future designs,
-  NOT current: `furlgraph_design.md` (input-grounded chain-merge), `graph_generative_memory.md` (the
+  NOT current: `design/furlgraph_design.md` (input-grounded chain-merge), `design/graph_generative_memory.md` (the
   "spider web" — score-function/GRPO-era). The exploratory slotgraph 1–4 design docs were removed with
-  their code; their lessons are folded into `slotgraph_design.md` §10 and `graph_thesis.md`.
-- **`mamba_two_lenses_memory.md`** — research note: Mamba/linear-attention lenses on compress-and-recall.
-- **`history/`** — archived records of the superseded slotgraph/biomem/treemem line and completed reorg
-  plans (`cohort_results`, `slotgraph_*`, `biomem_chunkwise_plan`, `{data,harness}_reorg_plan`, …).
-  Point-in-time snapshots at their own fixed config; kept for provenance, not current.
+  their code; their lessons are folded into `design/slotgraph_design.md` §10 and `design/graph_thesis.md`.
+- **`design/mamba_two_lenses_memory.md`** — research note: Mamba/linear-attention lenses on compress-and-recall.
 
 ## Harness / diagnostics
 - `scripts/train/train.py` — trainer (`--task mixed`, `--objective-mode behavioral_kl`); `--variants` selects arms.
@@ -76,3 +89,5 @@ all arms. All comparisons must be **same-backbone, matched-params**.
 - `scripts/diagnostics/mixed/mixed_dashboard.py` — per-task training/val dashboard from the run JSONLs.
 - See `scripts/README.md` / `HARNESS.md` for the full diagnostics layout (subject subdirs
   `objective/`, `mixed/`, `cohort/`).
+- **`ops/runpod_workflow.md`** — the remote-training runbook (RunPod + R2): the flow, GPU selection, the
+  CPU-launch-bound perf finding, and every gotcha already solved. Command list in `scripts/pod/README.md`.

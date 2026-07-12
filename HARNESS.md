@@ -2,7 +2,6 @@
 
 How training is organized, mirroring the data layer's split (see `DATASETS.md`):
 **importable logic lives in `src/memory/`; executable entrypoints live in `scripts/`.**
-Design rationale + history: `docs/history/harness_reorg_plan.md`.
 
 ## The three questions this answers
 
@@ -14,7 +13,7 @@ Design rationale + history: `docs/history/harness_reorg_plan.md`.
 | Where is the **trainer / objective / eval** code? | `src/memory/training/` (library) |
 | Where is the **CLI**? | `scripts/train/{train.py, cli.py}` |
 
-**Data is 4 orthogonal layers** (`docs/DATA.md`, `DATASETS.md`): **Source** (where tokens
+**Data is 4 orthogonal layers** (`docs/data/DATA.md`, `DATASETS.md`): **Source** (where tokens
 come from) × **Task** (what's asked) × **EpisodeSpec** (`schedule.py` — how hard) × **Objective**
 (how scored). task ≠ objective — they compose as a matrix.
 
@@ -89,4 +88,4 @@ on `sys.path` and import the harness from `src.memory.training` + the spec from
   `Path(__file__).resolve().parents[3]` for the repo root.
 
 Deliberately **not** restructured (high blast radius, unrelated to the harness): `ReprConfig`
-(`config.py`) and the core `model.py` — see `docs/history/harness_reorg_plan.md`.
+(`config.py`) and the core `model.py`.

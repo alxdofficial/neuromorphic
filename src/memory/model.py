@@ -60,7 +60,7 @@ class ReprLearningModel(nn.Module):
         # THE slotgraph — 96 node slots, NO edge tokens; separate frozen write/read LM copies + LoRAs;
         # persistent unit relation + scalar confidence per pair on the attention VALUE path,
         # harvested from the LM's per-layer attention; prepend+bidir read shaped by confidence-scaled
-        # relation state (models/slotgraph/; docs/slotgraph_design.md).
+        # relation state (models/slotgraph/; docs/design/slotgraph_design.md).
         "slotgraph_baseline": SlotGraphEncoder,
         # MemoryLLM (arXiv:2402.04624): fixed per-layer latent pool + compress-then-RANDOM-DROP
         # self-update, read as per-layer KV (native per-layer-KV read) (models/memoryllm/).
@@ -97,7 +97,7 @@ class ReprLearningModel(nn.Module):
             cfg = copy.copy(cfg)
         if variant == "slotgraph_baseline":
             # THE slotgraph read geometry is prepend + Set-LLM bidirectional at a uniform memory position
-            # (the relational read needs intra-memory attention; see docs/slotgraph_design.md §6).
+            # (the relational read needs intra-memory attention; see docs/design/slotgraph_design.md §6).
             if getattr(cfg, "rect_prepend_mask", False):
                 raise ValueError("slotgraph_baseline requires bidir_mem_attn; rect_prepend_mask is incompatible")
             cfg.bidir_mem_attn = True

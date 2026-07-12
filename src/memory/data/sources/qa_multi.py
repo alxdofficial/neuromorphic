@@ -7,7 +7,7 @@ ROBUST: a sub-source that can't load (unreachable / not ingested) is skipped wit
 
 QuALITY is intentionally EXCLUDED from the default set — it's long-document (stories >4k tok) and
 needs `total_len>=4096`; mixing it at the default 1024 would tail-truncate the story away. Use it
-as a standalone long-context qa source. See DATASETS.md / docs/history/docs/history/data_arch_plan.md.
+as a standalone long-context qa source. See DATASETS.md / docs/DATA.md.
 """
 from __future__ import annotations
 

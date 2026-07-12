@@ -29,7 +29,7 @@ Each of these is a `<name>/download.py` that pulls from HF, cleans, and writes
   `doc_qa` via `qa_multi`, corpus variety for `continuation` via `multicorpus`, etc.).
 - **Phase-1 full-corpus sources (shipped 2026-07-08, not yet in the scrutiny-phase mix):**
   `babilong_train/`, `govreport/`, `lmsys_chat/` (gated), `longcite/`, `msc/`, `perltqa/`, `pg19/`,
-  `qasper/`, `swe_trajectories/`, `wikibigedit/`, `wildchat/`. See `docs/DATA_PHASES_PLAN.md`.
+  `qasper/`, `swe_trajectories/`, `wikibigedit/`, `wildchat/`. See `docs/data/DATA_PHASES_PLAN.md`.
 
 ## TODO — scripts to add (Tier-B)
 - `fineweb.py`  — build `data/fineweb_edu/{train,val}.parquet` (the mae/

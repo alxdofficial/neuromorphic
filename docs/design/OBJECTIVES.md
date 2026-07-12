@@ -54,7 +54,7 @@ L_addr = − log  exp(sim(q, k+)/τ)  /  Σ_k exp(sim(q, k)/τ)          k+ = me
 ```
 `sim` = cosine or scaled dot; `τ` ≈ 0.07–0.2. Provenance labels are **free in our synthetic data** (we
 know which token/window each fact was written from — bio/babi/mqar). Directly rewards **addressing** — for
-slotgraph, positives = the node/edge state written from the target span (see `slotgraph_design.md` §5).
+slotgraph, positives = the node/edge state written from the target span (see `docs/design/slotgraph_design.md` §5).
 Refs: **M+ 2502.00592** (co-trained retriever, positives = tokens written from target context);
 **EMAT 2210.16773** (query→key InfoNCE + KAE/VAE); TRIME (retrieval key inside the joint CE).
 
@@ -73,7 +73,7 @@ Compressive-Transformer stop-grad attention-reconstruction aux (Rae 1911.05507);
 Promote the eval gate to a training signal: each example's memory must out-score every *other* example's
 rolled memory on its own answer (in-batch negatives = the SHUF control). "Comparative advantage of the
 *right* memory." This is the MEMBERSHIP objective the slotgraph binding baseline should run under (§9 of
-`slotgraph_design.md`). Use a SupCon same-answer mask to avoid false negatives on shared answers (bAbI locations).
+`docs/design/slotgraph_design.md`). Use a SupCon same-answer mask to avoid false negatives on shared answers (bAbI locations).
 
 ### Rung 5 — trajectory / GRPO (write+read sequence). *Deferred — only once the memory is competent.*
 Outcome-driven RL over a memory *trajectory* (a sequence of writes+reads across streaming windows).
@@ -82,7 +82,7 @@ Outcome-driven RL over a memory *trajectory* (a sequence of writes+reads across 
   shuffle). Sample the *group over memory encodings* (encoder stochasticity), not decoder rollouts.
 - **Decoupled decision/content (Mem-π 2605.21463):** split advantage into a **decision** term (whether/how
   to route — credit to the routing tokens) and a **content** term — the natural fit for a graph-generative
-  memory's discrete edits (`graph_generative_memory.md`), the score-function twin of the current slotgraph.
+  memory's discrete edits (`docs/design/graph_generative_memory.md`), the score-function twin of the current slotgraph.
 - **Full write/read episode (Memory-R1 2508.19828, Mem-α 2509.25911):** an ADD/UPDATE/DELETE/NOOP manager +
   answer agent, GRPO on downstream QA reward (GRPO > PPO here: +28% F1, faster convergence).
 Keep behavioral-KL as the DENSE primary loss; GRPO only for the exact-match/execution residual.
@@ -103,5 +103,5 @@ bit, no reward model, no rollouts — a cheap, stable stand-in for GRPO on our c
 
 ## Sequencing
 KL + MAE-CE on both arms first (decisive, differentiable, fair) → add the bypass-gap term → provenance-InfoNCE
-on slotgraph3's router (with a rank guard) → decoupled-counterfactual GRPO last. See `docs/DATA_PHASES_PLAN.md`
+on slotgraph3's router (with a rank guard) → decoupled-counterfactual GRPO last. See `docs/data/DATA_PHASES_PLAN.md`
 (Phase-1c GRPO) and `memory`/[[research_memory_landscape_objective]] for the full landscape.

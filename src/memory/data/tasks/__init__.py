@@ -1,6 +1,6 @@
 """Task registry — style → Task. Tasks shape source items into the on-the-wire sample dict.
 
-See ``docs/history/docs/history/data_arch_plan.md`` (Layer L2).
+See ``docs/DATA.md`` (Layer L2).
 """
 from __future__ import annotations
 

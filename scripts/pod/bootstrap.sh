@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
-# POD BOOTSTRAP — runs ON a rented vast.ai pod. Trains ONE arm, pushes results to
-# R2, signals done. It does NOT hold the vast.ai key and does NOT self-destruct by
-# default: the LOCAL watchdog (scripts/pod/watchdog.py) destroys pods. This keeps
+# POD BOOTSTRAP — runs ON a rented RunPod pod. Trains ONE arm, pushes results to
+# R2, signals done. It does NOT hold the RunPod key and does NOT self-destruct by
+# default: `runpod.py reap` destroys pods. This keeps
 # the billing-capable key off the rented machine.
 #
-# Invoked by the pod's onstart (see launch.py), which sets these env vars:
+# Invoked by the pod's onstart (see runpod.py drive), which sets these env vars:
 #   ARM               required. one variant, e.g. slotgraph_baseline
 #   R2_ACCESS_KEY_ID  required. R2 creds (data pull + result push)
 #   R2_SECRET_ACCESS_KEY / R2_ENDPOINT / R2_BUCKET   required
@@ -25,7 +25,7 @@
 #   results/<RUN_ID>/<ARM>/summary.json      per-variant summary
 #   results/<RUN_ID>/<ARM>/bootstrap.log     full stdout/stderr of this script
 #   results/<RUN_ID>/<ARM>/_STATUS           one line: RUNNING|DONE|FAILED (+code)
-# The watchdog polls _STATUS and destroys the instance on DONE/FAILED/timeout.
+# `runpod.py reap` polls _STATUS and destroys the instance on DONE/FAILED/timeout.
 # ─────────────────────────────────────────────────────────────────────────────
 set -uo pipefail
 
@@ -62,7 +62,7 @@ RES="results/$RUN_ID/$ARM"
 r2() { aws s3 --endpoint-url "$R2_ENDPOINT" "$@"; }
 key() { echo "s3://$R2_BUCKET/$R2_PREFIX/$1"; }
 put_status() {                      # write a one-line status marker to R2 (RETRIED)
-  # The watchdog reaps on the TERMINAL _STATUS (DONE/FAILED/TIMEOUT). A single best-effort write that
+  # `runpod.py reap` reaps on the TERMINAL _STATUS (DONE/FAILED/TIMEOUT). A single best-effort write that
   # dropped on a transient R2 hiccup would leave a finished pod billing to the 8.5h wall-cap (audit).
   # Retry a few times with backoff so a finished pod is reliably reaped promptly.
   local msg="$1" i
@@ -106,9 +106,9 @@ trap on_exit EXIT
 set -e
 
 # ── python env ───────────────────────────────────────────────────────────────
-# Vast's own images (vastai/pytorch) ship torch in a venv at /venv/main. ACTIVATE it, or `python3`
+# RunPod's images (runpod/pytorch) ship torch in a venv at /venv/main. ACTIVATE it, or `python3`
 # is the system interpreter with NO torch → pip would reinstall torch (gigabytes, minutes of billed
-# idle). Also prefer `uv` (present on the vast image) → installs in seconds (~55s for the whole set).
+# idle). Also prefer `uv` (present on the pod image) → installs in seconds (~55s for the whole set).
 if [ -f /venv/main/bin/activate ]; then
   source /venv/main/bin/activate
   echo "[bootstrap] activated venv /venv/main (python=$(command -v python))"
@@ -125,11 +125,11 @@ aws configure set default.s3.max_queue_size 2000 2>/dev/null || true
 put_status "RUNNING started=$(date -u +%FT%TZ)"
 
 # ── code ─────────────────────────────────────────────────────────────────────
-# cd to $WORK FIRST: drive.sh starts us with cwd=$REPO_DIR (it cd's there to find this script), and
+# cd to $WORK FIRST: runpod.py drive starts us with cwd=$REPO_DIR (it cd's there to find this script), and
 # the next line rm -rf's $REPO_DIR — deleting our own cwd → `git clone` then dies with "Unable to read
-# current working directory" (a RACE: only pods whose onstart pre-clone finished before drive.sh cd'd
+# current working directory" (a RACE: only pods whose onstart pre-clone finished before runpod.py drive cd'd
 # in hit it). Worse, the trap's FAILED status write also runs from the deleted cwd and fails, leaving a
-# stale RUNNING in R2 so the watchdog never reaps. cd'ing out of $REPO_DIR before deleting it fixes both.
+# stale RUNNING in R2 so `runpod.py reap` never reaps. cd'ing out of $REPO_DIR before deleting it fixes both.
 cd "$WORK"
 echo "[bootstrap] cloning $REPO_URL @ $REPO_REF"
 rm -rf "$REPO_DIR"
@@ -138,7 +138,7 @@ git -C "$REPO_DIR" checkout "$REPO_REF"
 echo "[bootstrap] HEAD=$(git -C "$REPO_DIR" rev-parse --short HEAD)"
 
 # ── python deps ──────────────────────────────────────────────────────────────
-# vast.ai pytorch images ship torch+CUDA. Install only what the repo adds on top.
+# RunPod pytorch images ship torch+CUDA. Install only what the repo adds on top.
 echo "[bootstrap] installing python deps"
 if [ -f "$REPO_DIR/requirements.txt" ]; then
   pipi -r "$REPO_DIR/requirements.txt" 2>&1 | tail -3
@@ -197,9 +197,9 @@ EXTRA=()
 [ "$ARM" = "titans_baseline" ] && EXTRA+=(--no-grad-ckpt-stream)
 
 # Gated HF dep: the FineWeb src-tokenizer is meta-llama/Llama-3.2-1B (GATED — needs a Meta-approved
-# HF token) for the reconstruct/continuation tasks. The vast image sets HF_HOME=/workspace/.hf_home,
+# HF token) for the reconstruct/continuation tasks. The pod image sets HF_HOME=/workspace/.hf_home,
 # so a token file under ~/.cache is ignored → export HF_TOKEN (path-independent, highest priority).
-# drive.sh ships the token to /root/.config/hf_token over the SSH channel (never vast metadata).
+# runpod.py drive ships the token to /root/.config/hf_token over the SSH channel (never pod metadata).
 [ -f /root/.config/hf_token ] && export HF_TOKEN="$(cat /root/.config/hf_token)"
 [ -n "${HF_TOKEN:-}" ] && echo "[bootstrap] HF_TOKEN present (gated FineWeb tokenizer enabled)" \
                        || echo "[bootstrap] WARNING no HF_TOKEN — meta-llama/Llama-3.2-1B will 401 (reconstruct/continuation fail)"

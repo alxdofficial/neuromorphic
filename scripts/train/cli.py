@@ -391,7 +391,7 @@ def args_to_config(args, ap):
                                                           # read-LoRA), matched to the cohort. The earlier 5448
                                                           # sized the ENCODER to 7M, ignoring the +0.92M LoRA
                                                           # every arm carries → 7.93M total, out of band (audit).
-        # THE slotgraph (docs/slotgraph_design.md): 96 nodes = M read budget, dense N×N relation d_e=32
+        # THE slotgraph (docs/design/slotgraph_design.md): 96 nodes = M read budget, dense N×N relation d_e=32
         # plus one dynamic confidence scalar per ordered pair,
         # separate write/read adapters on separate frozen LM copies. Read geometry is forced in model.py.
         cfg.slotgraph_n_nodes = _M

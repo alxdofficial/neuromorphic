@@ -1,4 +1,4 @@
-"""slotgraph — THE graph memory (docs/slotgraph_design.md).
+"""slotgraph — THE graph memory (docs/design/slotgraph_design.md).
 
 96 node slots, NO edge tokens. The write runs a frozen SmolLM2-135M — the ENCODER's OWN copy — with a
 write-side LoRA, HARVESTING its per-layer attention; the read decodes over the DECODER's frozen copy of the

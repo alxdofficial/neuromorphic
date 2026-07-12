@@ -166,7 +166,7 @@ class ReprConfig:
 
     mixed_gate_batches: int = 0        # mixed val: REAL/SHUF/OFF binding gate on the first N batches/task (0=off)
 
-    # ── slotgraph — THE graph memory (models/slotgraph/; docs/slotgraph_design.md) ──────────────
+    # ── slotgraph — THE graph memory (models/slotgraph/; docs/design/slotgraph_design.md) ──────────────
     # 96 node slots, NO edge tokens. ONE shared frozen LM (two rank-16 LoRAs: write-harvest + read-decode).
     # WRITE = harvest per-layer node attention. Each ordered pair has a unit semantic relation R[i,j]
     # (d_e-wide) plus scalar confidence C[i,j] in [0,1]; both recur across internal windows and update

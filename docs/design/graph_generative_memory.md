@@ -3,8 +3,8 @@
 *A memory that is not compressed into slots or folded from the chain, but GENERATED: a learned policy
 builds a graph summary of the observation via discrete edits — add a strand, re-route, prune — under a
 fixed budget. "Next-token prediction, where the next token is a graph-edit." The score-function/RL upgrade
-that sits on top of a competent differentiable substrate (`docs/slotgraph_design.md`). Read with
-`docs/graph_thesis.md` (why free structure collapses) and `docs/OBJECTIVES.md` Rung 5 (trajectory/GRPO).*
+that sits on top of a competent differentiable substrate (`docs/design/slotgraph_design.md`). Read with
+`docs/design/graph_thesis.md` (why free structure collapses) and `docs/design/OBJECTIVES.md` Rung 5 (trajectory/GRPO).*
 
 ## 0. The idea
 
@@ -37,11 +37,11 @@ This front-loads every problem the project has been fighting:
   edges). This is the gradient trap, chosen deliberately.
 - **There is NO target graph.** Text next-token has a ground truth; the spider web does not. Williams-Drozdov-
   Bowman (TACL 2018) is the standing warning: a freely-built structure with no target and a loss-neutral
-  objective **collapses to a trivial web** (`docs/graph_thesis.md`). So the built graph must be made
+  objective **collapses to a trivial web** (`docs/design/graph_thesis.md`). So the built graph must be made
   *load-bearing*: it only earns gradient by being the exclusive channel that reconstructs/answers, or by a
   downstream reward.
 - **Therefore it is the GRPO-era design.** The build sequence *is* a memory trajectory; training it is the
-  trajectory/GRPO objective (`docs/OBJECTIVES.md` Rung 5) — which we hold until the memory is competent.
+  trajectory/GRPO objective (`docs/design/OBJECTIVES.md` Rung 5) — which we hold until the memory is competent.
 
 ## 3. How it's trained (when we get there)
 - **Bootstrap differentiably first:** the graph state + read is the `slotgraph4` substrate (node slots +
@@ -66,7 +66,7 @@ This front-loads every problem the project has been fighting:
 - **Memory-management policies (the edits):** Memory-R1 (2508.19828, ADD/UPDATE/DELETE/NOOP + GRPO), Mem-α
   (2509.25911), Mem-π (2605.21463, decoupled decision/content) — "spin / re-route / prune" trained by RL.
 - **Memory-as-summary:** AutoCompressor (2305.14788), MemGPT context compaction, recursive summarization.
-- **The two lenses + collapse:** `docs/graph_thesis.md` (AMR reentrancy; NRI; Williams-2018; EntNet).
+- **The two lenses + collapse:** `docs/design/graph_thesis.md` (AMR reentrancy; NRI; Williams-2018; EntNet).
 
 ## 5. Open questions / risks
 - **The no-target problem** is the crux — without a load-bearing objective the web collapses; needs the

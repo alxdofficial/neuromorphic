@@ -43,7 +43,7 @@ See `HARNESS.md` for the training wiring.
 
 ## `bio` internal builders (NOT separate composite task families — that design was removed)
 
-An earlier plan (`docs/history/data_reorg_plan.md`, historical) had `bio` alongside eight sibling
+An earlier plan (historical) had `bio` alongside eight sibling
 *task-family* generators (`boxes`/`revisions`/`calendar`/`knights`/`preferences`/`theory_of_mind`/
 `passphrase`/`triage`) meant to graduate into their own readers. **That composite-sibling design was
 removed** — those eight generator directories no longer exist under `scripts/data_build/generate/`.
@@ -57,7 +57,7 @@ mix-task entries and never will be (no `src/memory/data/<name>.py` reader is pla
 `data/eval/` holds eval-only static sets: `locomo10.json` (LoCoMo) and the pre-generated
 `needle*.parquet` (needle-in-a-haystack) sets.
 
-## Phase-1 & Phase-2 sources (2026-07-08) — see `docs/DATA_PHASES_PLAN.md`
+## Phase-1 & Phase-2 sources (2026-07-08) — see `docs/data/DATA_PHASES_PLAN.md`
 
 **Phase-1 training sources** (`SOURCE_REGISTRY`, `sources/`): long real conversations — `wildchat`
 (allenai/WildChat-1M), `lmsys_chat` (lmsys/lmsys-chat-1m — **GATED**, needs HF access), `msc`

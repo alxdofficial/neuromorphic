@@ -49,7 +49,7 @@ Diagnostics on the slotgraph line established:
   relational binding signal never formed, because the loss never demanded input-dependent structure.
 - **Forcing structure regressed binding.** jun24 (≈ ICAE + identity, inert graph) was the best binder
   (mae SHUF−REAL 0.46); the graph redesign halved it — learned topology inert at best, harmful at worst.
-- **The 2026-07-04 slotgraph3 audit** (`docs/history/slotgraph3_simple_version_audit.md`) named **two walls**:
+- **The 2026-07-04 slotgraph3 audit** named **two walls**:
   **Wall A** = over-smoothing / pooling-is-free (loss-neutrality); **Wall B** = pool-then-address (binding
   must be installed as key-indexed structure — a PMA theorem, not tuning).
 - **Keep:** graph dimension = LM dimension (**d = 576**); a **prepend** read (easiest to train).
@@ -379,6 +379,6 @@ bidirectional memory attention.
 ---
 
 *Status: operator + tokenization + gradient design specified and sweep-hardened; build-later but buildable.
-Supersedes the slotgraph line for the binding goal (`docs/history/slotgraph3_simple_version_audit.md`). Reuses its
+Supersedes the slotgraph line for the binding goal. Reuses its
 tooling (TokenGT concat-project, identity embeddings, bidir memory attention, the per-layer tracer, the T3
 delta-write pattern).*

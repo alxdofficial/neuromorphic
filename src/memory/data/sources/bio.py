@@ -15,7 +15,7 @@ Train/val disjointness: train and val build worlds from different ``world_seed``
 drops any entity whose canonical name collides with a train name (entity-level firewall).
 
 Generator: ``scripts/data_build/generate/bio/`` (``build_scenario``); render templates in
-``bio_render.py``; composite store: ``data/bio/``. See DATASETS.md / docs/history/docs/history/data_arch_plan.md.
+``bio_render.py``; composite store: ``data/bio/``. See DATASETS.md / docs/DATA.md.
 """
 from __future__ import annotations
 

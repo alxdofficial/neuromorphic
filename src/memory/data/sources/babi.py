@@ -5,7 +5,7 @@ synthesizes task-1), splits stories into fact sentences, and exposes a noise poo
 sentences for the qa task to pad with. The distractor-insertion / packing is the qa Task's job.
 
 Data/build: HF ``Muennighoff/babi`` (1k), auto-downloaded; 10k ingest =
-``scripts/data_build/ingest/babi_10k.py`` (TODO). See DATASETS.md / docs/history/docs/history/data_arch_plan.md.
+``scripts/data_build/ingest/babi_10k.py`` (TODO). See DATASETS.md / docs/DATA.md.
 """
 from __future__ import annotations
 

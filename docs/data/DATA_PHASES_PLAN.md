@@ -1,13 +1,13 @@
 # Data Plan — Full-Corpus Training & Test-Eval Phases
 
 Plan for the two phases *after* the architecture-scrutiny phase, synthesizing a research sweep (2025-era
-memory/compression literature) with our prior data audit. Companion to `DATA.md` (phase-0
-data) and `DATA.md`. **Status: PLAN — not yet TRAINED on / not yet evaluated.** Dataset
+memory/compression literature) with our prior data audit. Companion to `docs/data/DATA.md` (phase-0
+data) and `docs/data/DATA.md`. **Status: PLAN — not yet TRAINED on / not yet evaluated.** Dataset
 numbers/licenses were research-gathered; verify before ingesting (see "Verify-before-use" at the end).
 
 > **UPDATE (2026-07-08): the Phase-1 sources + Phase-2 eval readers below have SHIPPED as code** (they
 > exist in `SOURCE_REGISTRY`/`REGISTRY` and can be loaded), but are **not yet in `DEFAULT_TRAIN_MIX`** —
-> the architecture-scrutiny sweep (`DATA.md`) still trains only on the 5-task mix. Shipped
+> the architecture-scrutiny sweep (`docs/data/DATA.md`) still trains only on the 5-task mix. Shipped
 > Phase-1 sources: `wildchat`, `lmsys_chat` (gated), `msc`, `qasper`, `longcite`, `govreport`, `pg19`,
 > `ruler_niah`, `babilong_train`, `wikibigedit`, `swe_trajectories`, `perltqa`. Shipped Phase-2 eval
 > readers: `longmemeval`, `longbench`, `infinitebench`, `niah`. Still NOT built: `streaming_update`/
@@ -217,6 +217,15 @@ compression paper used it).
   dominates), TriviaQA (parametric confound), single-needle NIAH (saturated), 2Wiki (prefer MuSiQue).
 
 ### 2d. Competitor head-to-heads (shared benchmark to beat them on)
+> **Full frozen-competitor menu + released-checkpoint status: `docs/baselines/FROZEN_COMPETITORS.md` (2026-07-12 survey).**
+> Key point from it: the SOTA memory *mechanisms* are almost all **unreleased** (Titans/ATLAS/Miras,
+> Infini-attention, RMT/ARMT — no weights), which is *why* Phase-0 re-implements them. For the frozen
+> Phase-2 headline, add these (missing from the table below): **MemoryLLM-8B / M+** (`YuWangX/mplus-8b` —
+> the ONLY parametric-memory mechanism with weights, our closest analog), **ARC-Encoder** (`kyutai/arc-encoders`
+> — architecturally our nearest sibling), and **EM-LLM** (training-free episodic, wraps any frozen LM).
+> Red flag baked in there: all post-2024 LongMemEval/LoCoMo vendor numbers are self-reported + contradictory
+> (Mem0 "94.4%" → 40–54% independent; Zep 84%→58%) → cite only original-paper baselines, re-run the rest.
+
 | competitor | approach | shared benchmark for head-to-head |
 |---|---|---|
 | Mem0, MemGPT/Letta | agent-memory (RAG-ish + summaries) | **LoCoMo, LongMemEval, DMR/MSC** |
@@ -351,7 +360,7 @@ memory vs RAG; fix + name the judge model in every table caption.
 7. Agentic task + sources + agent evals → most novel/expensive; after the text+code foundation is proven.
 (1–3 low-risk parallel; 4 is the keystone; 5–7 stack on top.)
 
-## Invariants (across both new phases; inherited from `DATA.md` §8)
+## Invariants (across both new phases; inherited from `docs/data/DATA.md` §8)
 1. **Causality** — a queried fact is always written before the query (session/turn N's query after its write).
 2. **Un-guessability** — the answer requires the compressed context; distractors never contain it.
 3. **Fixed compression denominator** — every context is exactly `total_len` (phase-scheduled); `M` uniform across arms.

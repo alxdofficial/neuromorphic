@@ -4,7 +4,7 @@ Unions the doc pools of several corpus sources (fineweb + pile + redpajama + cod
 corpus source, so a single `continuation`/`mae` task sees varied text instead of fineweb-only.
 ROBUST: a corpus that can't load (HF unreachable, not yet ingested) is skipped with a warning
 rather than failing the whole source — you get variety from whatever is available (fineweb is
-always local). See DATASETS.md / docs/history/docs/history/data_arch_plan.md.
+always local). See DATASETS.md / docs/DATA.md.
 """
 from __future__ import annotations
 

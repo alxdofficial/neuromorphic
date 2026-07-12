@@ -4,7 +4,7 @@ This is the single reference for **how the training data works right now**: ever
 generated, the objectives, the per-task objective dispatch, and the current sweep config. If you touch the
 data layer, read this first; **if it disagrees with the code, the code wins — fix the doc.** For the
 *future* full-corpus training + test-eval roadmap (Phase 1 / Phase 2, GRPO, benchmark panels) see
-`DATA_PHASES_PLAN.md` — that is a different scope (what's *planned*, not what runs now).
+`docs/data/DATA_PHASES_PLAN.md` — that is a different scope (what's *planned*, not what runs now).
 
 > **What we're measuring.** A **frozen** SmolLM2-135M decoder (d=576) reads `M=96` memory tokens produced by
 > a small **trainable** encoder (~7M params — **parameter- and read-length-matched** across arms, though NOT
@@ -118,7 +118,7 @@ triviaqa: "In which decade did Billboard first publish an American hit chart?" �
   splits firewalled from the eval readers' val splits). `quality` registered but needs ctx≥4096 (not in mix).
 - **Registered but NOT in this mix:** the 12 Phase-1 full-corpus sources (`wildchat`, `lmsys_chat`, `msc`,
   `qasper`, `longcite`, `govreport`, `pg19`, `ruler_niah`, `babilong_train`, `wikibigedit`,
-  `swe_trajectories`, `perltqa`) back the *next* phase (`DATA_PHASES_PLAN.md`), plus inert scaffolding
+  `swe_trajectories`, `perltqa`) back the *next* phase (`docs/data/DATA_PHASES_PLAN.md`), plus inert scaffolding
   (`mqar`, `ruler_overwrite`).
 
 **The shared streaming packer** (`tasks/_pack.py`) — `qa` and `reconstruction` are both "pack facts, ask
@@ -183,7 +183,7 @@ optimizer satisfy KL by moving the teacher, breaking `E[KL]=I(context;answer)`).
 memory matters — the published fix for loss-neutrality (plain CE targets none of USE / ADDRESSING /
 MEMBERSHIP). MAE is the legitimate CE exception: the target *is* the passage, so token-CE already forces
 high-rank storage. Other objective modes exist (`plain`, `contrastive` InfoNCE) but behavioral-KL is the
-active cohort objective. See `OBJECTIVES.md` for the full ladder + the membership/addressing rungs.
+active cohort objective. See `docs/design/OBJECTIVES.md` for the full ladder + the membership/addressing rungs.
 
 **The REAL / SHUF / OFF binding gate** (eval) measures whether memory is used *structurally*: REAL = normal;
 SHUF = decode with another example's memory; OFF = no memory. REAL ≪ SHUF is the goal; REAL ≈ SHUF = memory

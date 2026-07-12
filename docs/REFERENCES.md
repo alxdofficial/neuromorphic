@@ -41,7 +41,7 @@ the runtime I/O is our harness. *no official repo* = the authors released none.
 ### Our own arm + its lineage
 | Arm / concept | Reference | arXiv | Our code |
 |---|---|---|---|
-| **slotgraph** (THE arm) | in-house (persistent plastic value-path edge graph over node slots; `slotgraph_design.md`) | — | `models/slotgraph/` |
+| **slotgraph** (THE arm) | in-house (persistent plastic value-path edge graph over node slots; `docs/design/slotgraph_design.md`) | — | `models/slotgraph/` |
 | Relational Attention (edge vectors on the value path) | Relational Attention (Diao & Loynd, ICLR 2023) | [2210.05062](https://arxiv.org/abs/2210.05062) | — |
 
 ### Retired baselines (removed from code 2026-07-11 — citations kept for provenance)
@@ -139,5 +139,5 @@ Loaders in `src/memory/data/sources/` (train) and `src/memory/data/*.py` (eval);
 ---
 
 *Maintenance:* when you add a baseline or data source, add a row here **and** cite the paper in the
-encoder/source docstring. See `docs/DATA_PHASES_PLAN.md` for the phase plan and `docs/README.md`
+encoder/source docstring. See `docs/data/DATA_PHASES_PLAN.md` for the phase plan and `docs/README.md`
 for the baseline cohort + fairness policy.

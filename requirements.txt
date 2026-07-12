@@ -5,7 +5,7 @@
 # pyarrow 25) that were never run against — a fresh pod would then train/eval a different stack than
 # the one the results were validated on (audit blocker #3). Bump these deliberately, then re-validate.
 
-# PyTorch: FLOOR ONLY — never pin. Pods use the image's prebuilt CUDA build (vastai/pytorch ships
+# PyTorch: FLOOR ONLY — never pin. Pods use the image's prebuilt CUDA build (runpod/pytorch ships
 # torch 2.12/cu130 for Blackwell); a hard pin would reinstall a wrong/non-Blackwell build.
 # See: https://pytorch.org/get-started/locally/
 torch>=2.0.0

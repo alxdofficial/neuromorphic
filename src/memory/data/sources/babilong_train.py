@@ -27,7 +27,7 @@ Resolution order (BEST-EFFORT, never hangs):
   3. Else (offline) raise a clear "run ingest first" error — no silent hang.
 
 Ingest: ``scripts/data_build/ingest/babilong_train/download.py`` (~2000 samples).
-See DATASETS.md / docs/history/docs/history/data_arch_plan.md (Layer L1).
+See DATASETS.md / docs/DATA.md (Layer L1).
 """
 from __future__ import annotations
 
