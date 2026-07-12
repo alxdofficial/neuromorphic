@@ -951,8 +951,17 @@ class ReprLearningModel(nn.Module):
             # window of encoder activations instead of all n_windows at once (the
             # chunk=8192 OOM for the windowed encoders flat/continuous/MT). Exact
             # gradients; recompute in backward. Skipped under no_grad (eval).
+            # BUT: if the encoder's base LM ALREADY self-checkpoints (icae/autocompressor/gisting/
+            # memoryllm/slotgraph call base.model.gradient_checkpointing_enable in __init__), this outer
+            # checkpoint is REDUNDANT — it recomputes the whole windowed forward AGAIN on top of the
+            # inner per-layer recompute (2-3× the base-LM forward per step for the same memory goal). The
+            # inner HF checkpointing already bounds each window's working set to ~one layer; skip the
+            # outer level for those arms (~20-30% step compute). (~15 lines of audit; verified VRAM-safe.)
+            _bm = getattr(getattr(self.encoder, "base", None), "model", None)
+            _enc_self_ckpt = bool(getattr(_bm, "is_gradient_checkpointing", False))
             ckpt_stream = (getattr(self.cfg, "grad_checkpoint_stream", True)
-                           and self.training and torch.is_grad_enabled())
+                           and self.training and torch.is_grad_enabled()
+                           and not _enc_self_ckpt)
             del ctx_surprise   # retired surprise/contextualization plumbing
             for w in range(n_windows):
                 s = w * window_size

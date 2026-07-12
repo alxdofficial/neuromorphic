@@ -31,6 +31,10 @@ def local_jsonl(name: str, split: str) -> Optional[Path]:
     return p if p.exists() else None
 
 
+_TOKIDS_MEMO: dict = {}   # (cache_path, mtime) → doc list, so the ~1GB fineweb npz is loaded ONCE per
+                          # process, not 4× (mae/continuation × train/val each construct a Source; audit).
+
+
 def _tokenize_cached(source_path: Path, tokenizer, texts_fn: Callable[[], Iterator[str]]) -> List[np.ndarray]:
     """Backbone-tokenize every text once and DISK-CACHE the token ids next to the source, so the many
     diagnostics / per-variant startups don't retokenize the full corpus each construction (the slow
@@ -42,11 +46,17 @@ def _tokenize_cached(source_path: Path, tokenizer, texts_fn: Callable[[], Iterat
     tag = hashlib.md5(fp.encode()).hexdigest()[:10]
     cache = source_path.parent / "cache" / f"{source_path.stem}.{tag}.tokids.npz"
     if cache.exists() and cache.stat().st_mtime >= source_path.stat().st_mtime:
+        _mkey = (str(cache), cache.stat().st_mtime)
+        _hit = _TOKIDS_MEMO.get(_mkey)
+        if _hit is not None:
+            return _hit                                             # loaded this exact cache already → share
         try:
             z = np.load(cache)                                       # allow_pickle=False by default → safe
             flat, lengths = z["flat"], z["lengths"]
             offs = np.concatenate([[0], np.cumsum(lengths)]).astype(np.int64)
-            return [flat[offs[i]:offs[i + 1]] for i in range(len(lengths))]
+            docs = [flat[offs[i]:offs[i + 1]] for i in range(len(lengths))]
+            _TOKIDS_MEMO[_mkey] = docs                               # callers filter by min_len (read-only) → safe to share
+            return docs
         except Exception:
             pass                                                     # corrupt/incompatible → re-tokenize
     docs = [np.asarray(tokenizer(t, add_special_tokens=False).input_ids, dtype=np.int64) for t in texts_fn()]

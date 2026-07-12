@@ -84,14 +84,27 @@ def _build_loader(mix_task, tokenizer, cfg, *, split, ctx_len, m_slots, mae_src_
                                 pad_token_id=pad, seed=seed, num_workers=num_workers)
 
 
+def _default_workers() -> int:
+    """Per-task-loader worker count, scaled to the host (there are len(mixed_tasks) loaders, each
+    spawning this many). Capped so a big box (256 vCPUs) doesn't spawn hundreds; floored at 2 so even a
+    small host overlaps tokenization with the GPU step. Was hardcoded 1 → single-threaded tokenization
+    starved the GPU (util ~25% on a cold-cache pod)."""
+    import os
+    return min(4, max(2, (os.cpu_count() or 8) // 16))
+
+
 def make_mixed_train_dataloaders(mixed_tasks, tokenizer, cfg, *, ctx_len: int,
                                  m_slots: int, mae_src_tok: str, babi_tasks,
-                                 predict_len: int, num_workers: int = 1,
+                                 predict_len: int, num_workers: int = None,
                                  train_seed: int = 42, window_size: int = None,
                                  bio_query_window: int = None) -> dict:
     """One TRAIN dataloader per mixed task (uniform interface: context_len/chunk = ctx_len, M =
     m_slots). ``bio_query_window`` (+ ``window_size``) turns condrecon_bio into a streaming-write
     retention probe (queried pair pinned to a window; the rest are distractors)."""
+    if num_workers is None:
+        num_workers = _default_workers()
+        print(f"  [data] {num_workers} loader workers/task × {len(mixed_tasks)} tasks "
+              f"(persistent + prefetch; parallel tokenization)", flush=True)
     # Per-task seed OFFSET: without it, tasks that share a doc pool (mae=fineweb, continuation=
     # multicorpus⊇fineweb) draw the SAME doc+offset in lockstep from an identical RNG, correlating the
     # two objectives and halving effective corpus diversity. i*10_007 (prime) decorrelates the streams.
@@ -112,11 +125,15 @@ def make_mixed_val_sets(mixed_tasks, tokenizer, cfg, val_batches, *, ctx_len: in
                         bio_query_window: int = None) -> dict:
     """One materialized (fixed) VAL set per mixed task — disjoint val seed (7) so eval never overlaps
     the training stream. ``bio_query_window`` mirrors the train-side streaming retention placement."""
+    # Parallelize the one-time val-set BUILD: it drains val_batches×5 tasks synchronously at STARTUP with
+    # the GPU fully idle (audit). Workers overlap the tokenization; the loader is drained then discarded so
+    # persistent workers don't matter, but >0 workers still cut the serial startup stall.
+    _vw = _default_workers()
     sets = {}
     for i, t in enumerate(mixed_tasks):
         dl = _build_loader(t, tokenizer, cfg, split="val", ctx_len=ctx_len, m_slots=m_slots,
                            mae_src_tok=mae_src_tok, babi_tasks=babi_tasks, predict_len=predict_len,
                            window_size=window_size, bio_query_window=bio_query_window,
-                           seed=(7 + i * 10_007) * 2 + 1, num_workers=0)   # ODD → disjoint from even train seeds
+                           seed=(7 + i * 10_007) * 2 + 1, num_workers=_vw)   # ODD → disjoint from even train seeds
         sets[t] = materialize_val_set(dl, val_batches)
     return sets

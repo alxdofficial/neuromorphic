@@ -35,7 +35,10 @@ done
 present+=("$MANIFEST")
 echo "[pack] manifest:"; cat "$MANIFEST"
 echo "[pack] taring $(du -sch "${present[@]}" | tail -1 | cut -f1) → $OUT"
-tar czf "$OUT" "${present[@]}"
+# --exclude dead weight from the tarball (audit): fw_cache_bak/ = a stale 2GB cache backup (no code refs);
+# *.tmp = partial cache writes. The ACTIVE fineweb caches (cache/cache/*.tokids.npz + the *.meta-llama*.jsonl
+# decode files the mtime-check needs) are KEPT. Parquets are kept as a regenerate-on-invalidation fallback.
+tar czf "$OUT" --exclude='*fw_cache_bak*' --exclude='*.tmp' "${present[@]}"
 echo "[pack] tarball size: $(du -h "$OUT" | cut -f1)"
 
 echo "[pack] uploading to R2 (neuromorphic/data.tar.gz)…"

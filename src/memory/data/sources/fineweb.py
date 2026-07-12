@@ -44,6 +44,15 @@ def _decode_cache(parquet_path: Path, split: str, src_tokenizer_name: str) -> Pa
     out = TEXT_CACHE / f"{split}.{key}.jsonl"
     meta = out.with_name(out.name + ".meta")
 
+    # FAST PATH (audit): if the decode jsonl + its .meta already exist and the meta records THIS tokenizer
+    # NAME, reuse the cache WITHOUT loading the (gated, network) src-tokenizer. `_decode_cache` is called
+    # 4×/pod (mae/continuation × train/val); loading meta-llama/Llama-3.2-1B just to re-read vocab_size on
+    # a cache HIT is 4 wasted gated-HF round-trips (latency + a network SPOF that can stall/fail the run).
+    # The .meta already pins the exact (name|vocab) the cache was built with, and a pinned model's vocab is
+    # stable — so trust it. The tokenizer is loaded only below, on a genuine miss/legacy/mismatch.
+    if out.exists() and meta.exists() and meta.read_text().strip().startswith(f"{src_tokenizer_name}|vocab="):
+        return out
+
     import pyarrow.parquet as pq
     from transformers import AutoTokenizer
     src_tok = AutoTokenizer.from_pretrained(src_tokenizer_name)

@@ -99,5 +99,12 @@ def make_task_dataloader(source, task: Task, spec: EpisodeSpec, tokenizer, *,
                          batch_size: int, pad_token_id: int, seed: int = 0,
                          num_workers: int = 2) -> DataLoader:
     ds = TaskDataset(source, task, spec, tokenizer, pad_token_id=pad_token_id, seed=seed)
+    # PARALLEL data loading: with 0/1 workers the (expensive) per-batch tokenization runs in the main
+    # process and the GPU blocks on it (measured: GPU util ~25-85% instead of ~100%). >0 workers +
+    # prefetch overlap tokenization with the GPU step; persistent_workers keeps them warm across the
+    # trainer's round-robin re-arming; pin_memory speeds the host→GPU copy. TaskDataset.__iter__ shards
+    # by worker id, so workers do NOT duplicate data.
+    extra = {"persistent_workers": True, "prefetch_factor": 4} if num_workers > 0 else {}
     return DataLoader(ds, batch_size=batch_size, num_workers=num_workers,
-                      collate_fn=lambda s: _collate(s, pad_token_id))
+                      collate_fn=lambda s: _collate(s, pad_token_id),
+                      pin_memory=torch.cuda.is_available(), **extra)

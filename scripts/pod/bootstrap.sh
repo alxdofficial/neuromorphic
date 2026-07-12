@@ -55,20 +55,30 @@ R2_BUCKET="${R2_BUCKET:?need R2_BUCKET}"
 RES="results/$RUN_ID/$ARM"
 r2() { aws s3 --endpoint-url "$R2_ENDPOINT" "$@"; }
 key() { echo "s3://$R2_BUCKET/$R2_PREFIX/$1"; }
-put_status() {                      # write a one-line status marker to R2
-  local msg="$1"; echo "$msg" | r2 cp - "$(key "$RES/_STATUS")" >/dev/null 2>&1 || true
+put_status() {                      # write a one-line status marker to R2 (RETRIED)
+  # The watchdog reaps on the TERMINAL _STATUS (DONE/FAILED/TIMEOUT). A single best-effort write that
+  # dropped on a transient R2 hiccup would leave a finished pod billing to the 8.5h wall-cap (audit).
+  # Retry a few times with backoff so a finished pod is reliably reaped promptly.
+  local msg="$1" i
+  for i in 1 2 3 4; do
+    echo "$msg" | r2 cp - "$(key "$RES/_STATUS")" >/dev/null 2>&1 && return 0
+    sleep 3
+  done
+  return 0                          # best-effort; never fatal to the run
 }
 upload_results() {                  # push whatever exists (best-effort; called periodically + on exit)
   local d="$REPO_DIR/outputs/memory/${OUT_TAG}_${ARM}"
   r2 cp "$LOG" "$(key "$RES/bootstrap.log")" >/dev/null 2>&1 || true
-  # MIRROR the local layout on R2 (jsonl/ + ckpts/ subdirs) so a single `aws s3 sync` reconstructs the
-  # run exactly where the evaluator expects it. `sync` (no --delete) uploads only new/changed objects:
-  #  - jsonl/<arm>.jsonl        per-step train + per-val val loss/stats
-  #  - ckpts/<arm>.last.pt      resume target (overwritten each save_every)
-  #  - ckpts/<arm>.best.pt      best-on-val
-  #  - ckpts/<arm>.step<N>.pt   RETAINED every-save_every milestones (the reproducibility archive)
-  [ -d "$d/jsonl" ] && r2 sync "$d/jsonl" "$(key "$RES/jsonl")" >/dev/null 2>&1 || true
-  [ -d "$d/ckpts" ] && r2 sync "$d/ckpts" "$(key "$RES/ckpts")" >/dev/null 2>&1 || true
+  # MIRROR the local layout on R2 (jsonl/ + ckpts/). `sync` (no --delete) uploads only new/changed objects:
+  #   jsonl/<arm>.jsonl (metrics), ckpts/<arm>.{last,best,step<N>}.pt (last/best + retained milestones).
+  # Ckpts are 55-175MB each and some hosts have a GLACIAL uplink → BOUND each sync with a timeout so the
+  # final on_exit upload can't stall pod teardown/billing (observed 15+ min idle). The periodic sync already
+  # ships the milestones, so a timed-out final sync loses at most the last <120s of .last.pt. Failures are
+  # LOGGED (not silently swallowed) so a lagging uplink is visible in bootstrap.log.
+  [ -d "$d/jsonl" ] && { timeout 120 r2 sync "$d/jsonl" "$(key "$RES/jsonl")" >/dev/null 2>&1 \
+                         || echo "[upload] WARN jsonl sync timed out/failed"; }
+  [ -d "$d/ckpts" ] && { timeout 300 r2 sync "$d/ckpts" "$(key "$RES/ckpts")" >/dev/null 2>&1 \
+                         || echo "[upload] WARN ckpts sync timed out/failed (partial; periodic sync has milestones)"; }
   local summ="$REPO_DIR/outputs/memory/${OUT_TAG}_summary.json"
   [ -f "$summ" ]    && r2 cp "$summ" "$(key "$RES/summary.json")" >/dev/null 2>&1 || true
 }
@@ -101,6 +111,11 @@ pipi() { if command -v uv >/dev/null 2>&1; then uv pip install -q "$@"; else pyt
 
 # Install a lightweight aws CLI early so status markers work even if later steps fail.
 pipi awscli 2>&1 | tail -1 || python3 -m pip install -q --no-input awscli
+# Tune S3 upload concurrency so checkpoint syncs saturate the uplink (default 10 → 32 parallel parts);
+# helps the periodic + final ckpt sync finish faster on bandwidth-available hosts (audit: slow uploads
+# blocked teardown). No effect on a truly starved uplink, but free upside where bandwidth exists.
+aws configure set default.s3.max_concurrent_requests 32 2>/dev/null || true
+aws configure set default.s3.max_queue_size 2000 2>/dev/null || true
 put_status "RUNNING started=$(date -u +%FT%TZ)"
 
 # ── code ─────────────────────────────────────────────────────────────────────
@@ -129,11 +144,15 @@ fi
 echo "[bootstrap] pulling data.tar.gz from R2"
 r2 cp "$(key data.tar.gz)" "$WORK/data.tar.gz"
 mkdir -p "$REPO_DIR/data"
-tar xzf "$WORK/data.tar.gz" -C "$REPO_DIR"     # tar stores paths as data/<source>/...
+# --no-same-owner: pods run as root but the tarball is packed as the local uid → without this, tar tries
+# (and fails) to chown every file, spamming "Cannot change ownership" warnings + wasted syscalls (audit).
+tar xzf "$WORK/data.tar.gz" -C "$REPO_DIR" --no-same-owner     # tar stores paths as data/<source>/...
 echo "[bootstrap] data sources: $(ls "$REPO_DIR/data" | tr '\n' ' ')"
-# Assert the untarred data matches the packer's MANIFEST (file count / jsonl row count / bytes per source),
-# not just directory existence (audit #6): a present-but-TRUNCATED source passes a bare `[ -d ]` check but
-# would silently train a degraded/reweighted mix. babi/bio are NOT tarred (HF-runtime / procedural).
+# Assert the untarred data matches the packer's MANIFEST by FILE COUNT + jsonl ROW COUNT per source (NOT
+# byte totals) — a present-but-TRUNCATED source passes a bare `[ -d ]` check but would silently train a
+# degraded/reweighted mix. Bytes are NOT compared: `du -sb` counts directory apparent-size, which differs
+# between the ext4 pack host and the pod's overlayfs → a byte check false-FATALs the pod BEFORE any GPU
+# work (audit). File+row counts are filesystem-invariant. babi/bio are NOT tarred (HF-runtime/procedural).
 _manifest="$REPO_DIR/data/MANIFEST.txt"
 [ -f "$_manifest" ] || { echo "[bootstrap] FATAL no data/MANIFEST.txt in tarball (repack with pack_data.sh)"; exit 1; }
 _bad=""
@@ -143,13 +162,27 @@ while IFS="$(printf '\t')" read -r s fc rc by; do
   if [ ! -d "$d" ]; then _bad="$_bad $s(missing)"; continue; fi
   afc=$(find "$d" -type f | wc -l)
   arc=$(find "$d" -type f -name '*.jsonl' -exec cat {} + 2>/dev/null | wc -l)
-  aby=$(du -sb "$d" | cut -f1)
-  if [ "$afc" != "$fc" ] || [ "$arc" != "$rc" ] || [ "$aby" != "$by" ]; then
-    _bad="$_bad $s(files:$afc/$fc rows:$arc/$rc bytes:$aby/$by)"
+  if [ "$afc" != "$fc" ] || [ "$arc" != "$rc" ]; then
+    _bad="$_bad $s(files:$afc/$fc rows:$arc/$rc)"
   fi
 done < "$_manifest"
 [ -z "$_bad" ] || { echo "[bootstrap] FATAL data manifest mismatch:$_bad"; exit 1; }
 echo "[bootstrap] data manifest OK ($(grep -c . "$_manifest") sources verified)"
+
+# ── pre-seed HF cache ─────────────────────────────────────────────────────────
+# Pull the ~207MB models.tar.gz (SmolLM2-135M backbone + meta-llama/Llama-3.2-1B TOKENIZER, no Llama
+# weights) and unpack into the HF hub cache, so the first training step doesn't (a) download SmolLM2 per
+# pod (GPU-idle) or (b) depend on a live GATED-HF fetch of the Llama tokenizer (a network SPOF that can
+# stall/fail the run). Best-effort: if absent/fails, training falls back to downloading from HF.
+_HFHUB="${HF_HOME:-$HOME/.cache/huggingface}/hub"
+mkdir -p "$_HFHUB"
+if r2 cp "$(key models.tar.gz)" "$WORK/models.tar.gz" >/dev/null 2>&1; then
+  tar xzf "$WORK/models.tar.gz" -C "$_HFHUB" --no-same-owner 2>/dev/null \
+    && echo "[bootstrap] pre-seeded HF cache → $_HFHUB (SmolLM2 + Llama tokenizer)" \
+    || echo "[bootstrap] WARN models.tar.gz untar failed — will download from HF at first step"
+else
+  echo "[bootstrap] no models.tar.gz on R2 — will download from HF at first step"
+fi
 
 # ── train ────────────────────────────────────────────────────────────────────
 # titans keeps its per-window autograd memory live across windows → disable the
@@ -173,11 +206,15 @@ cd "$REPO_DIR"
 ( while sleep 120; do upload_results || true; done ) &
 SYNC_PID=$!
 set +e
+# In-training val is a SANITY GATE + best.pt selector here — the real cross-arm comparison is the separate
+# local band-gate eval on the pulled ckpts. So run val LEANER on pods (default every 1000 steps × 16 batches
+# vs the 500×32 default) → ~4× less validation overhead (~22min → ~5min/arm; audit). Override via env.
 timeout "${MAX_HOURS}h" python3 scripts/train/train.py \
   --task mixed --variants "$ARM" \
   --objective-mode behavioral_kl \
   --backbone HuggingFaceTB/SmolLM2-135M \
   --steps "$STEPS" --batch-size "$BATCH" \
+  --val-every "${VAL_EVERY:-1000}" --val-batches "${VAL_BATCHES:-16}" \
   --out-tag "$OUT_TAG" \
   "${EXTRA[@]}"
 TRAIN_CODE=$?
