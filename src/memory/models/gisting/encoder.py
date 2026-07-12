@@ -84,6 +84,11 @@ class GistingBaselineEncoder(nn.Module):
         inp = torch.cat([seg, g], dim=1)
         attn = torch.cat([seg_mask.long(),
                           torch.ones(B, self.k, device=seg.device, dtype=torch.long)], dim=1)
+        # COMPACTED positions (fidelity): trailing pad must not push the κ gist tokens to a later RoPE
+        # position than the real tokens warrant, else the captured gist K/V (and thus the compressed
+        # prompt) depend on the segment's pad count. cumsum(attn)-1 places the gist right after the last
+        # real token; pad positions freeze but are masked out of attention.
+        pos = torch.clamp(attn.cumsum(dim=1) - 1, min=0)
         kbuf, vbuf, handles = [None] * self.L, [None] * self.L, []
         for _li, _layer in enumerate(self.base.model.layers):
             handles.append(_layer.self_attn.k_proj.register_forward_hook(
@@ -91,7 +96,7 @@ class GistingBaselineEncoder(nn.Module):
             handles.append(_layer.self_attn.v_proj.register_forward_hook(
                 (lambda i: (lambda m, ip, o: vbuf.__setitem__(i, o)))(_li)))
         try:
-            self.base.model(inputs_embeds=inp, attention_mask=attn, use_cache=False)
+            self.base.model(inputs_embeds=inp, attention_mask=attn, position_ids=pos, use_cache=False)
         finally:
             for _hh in handles:
                 _hh.remove()

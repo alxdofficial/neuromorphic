@@ -91,7 +91,11 @@ class AutoCompressorBaselineEncoder(nn.Module):
         else:                                                 # prepend ALL prior summaries (accumulation)
             inp = torch.cat([acc, seg, slots], dim=1)
             attn = torch.cat([valid.long(), seg_mask.long(), _ones(self.k)], dim=1)
-        h = self.base.model(inputs_embeds=inp, attention_mask=attn).last_hidden_state
+        # COMPACTED positions (fidelity): trailing segment-pad must not push the κ summary slots to a
+        # later RoPE position than the real tokens warrant — cumsum(attn)-1 places the slots right after
+        # the last real token, so the emitted summaries are invariant to the segment's pad count.
+        pos = torch.clamp(attn.cumsum(dim=1) - 1, min=0)
+        h = self.base.model(inputs_embeds=inp, attention_mask=attn, position_ids=pos).last_hidden_state
         sigma = h[:, -self.k:, :].to(seg.dtype)               # this segment's κ summaries
         # An all-pad segment contributes no real content: keep its κ slots (uniform length across the
         # batch → clean batching) but mark them invalid so the decoder never attends to them.

@@ -9,7 +9,7 @@ R2 creds: `~/.config/r2/credentials`. HF token: `~/.cache/huggingface/token`.
 
 Usage:
   python scripts/pod/runpod.py create <arm> [--gpu 4090]      # one pod, GPU fallback chain
-  python scripts/pod/runpod.py drive  <pod_id> <arm> <run_id> # ship creds + launch bootstrap in tmux
+  python scripts/pod/runpod.py drive  <pod_id> <arm> <run_id> [ref]  # ship creds + launch bootstrap in tmux (ref=SHA to pin; default HEAD)
   python scripts/pod/runpod.py list                           # pods + ssh endpoints
   python scripts/pod/runpod.py reap   <run_id>                # terminate pods whose R2 _STATUS is terminal
   python scripts/pod/runpod.py terminate <pod_id|all>
@@ -115,10 +115,23 @@ def _scp(host, port, src, dst):
     return subprocess.run(["scp", *opts, src, f"root@{host}:{dst}"], capture_output=True, text=True, timeout=120)
 
 
-def cmd_drive(pod_id: str, arm: str, run_id: str, steps=8000, batch=6):
+def _resolve_ref(ref: str | None) -> str:
+    """Pin to an immutable SHA so every arm of a sweep trains the SAME code. Default = local HEAD (the
+    commit you just pushed). Passing a floating branch (`main`) is allowed but discouraged — arms driven
+    at different times could then clone different tips and silently mix code versions in the bake-off."""
+    import subprocess as _sp
+    r = _sp.run(["git", "rev-parse", ref or "HEAD"], capture_output=True, text=True,
+                cwd=str(Path(__file__).resolve().parents[2]))
+    return r.stdout.strip() or (ref or "HEAD")
+
+
+def cmd_drive(pod_id: str, arm: str, run_id: str, ref: str | None = None, steps=8000, batch=6):
     """Ship creds + code, then launch bootstrap.sh in a detached tmux (the ONLY reliable detach on RunPod —
-    setsid/`& disown` die when the one-shot ssh closes)."""
+    setsid/`& disown` die when the one-shot ssh closes). Pins the training commit via REPO_REF=<sha> so
+    all arms of a run_id train identical code (defaults to local HEAD; pass a SHA to pin explicitly)."""
     rp = _rp()
+    sha = _resolve_ref(ref)
+    print(f"  [pin] {arm}: REPO_REF={sha}")
     pod = next((p for p in rp.get_pods() if p.get("id") == pod_id), None)
     if not pod:
         sys.exit(f"pod {pod_id} not found")
@@ -142,7 +155,7 @@ def cmd_drive(pod_id: str, arm: str, run_id: str, steps=8000, batch=6):
     _ssh(host, port, "apt-get update -y >/dev/null 2>&1 && apt-get install -y tmux >/dev/null 2>&1")
     launch = (
         f"tmux new-session -d -s {arm} \"bash -lc 'set -a; source /root/.config/r2/credentials; set +a; "
-        f"export ARM={arm} STEPS={steps} BATCH={batch} OUT_TAG={run_id} RUN_ID={run_id} MAX_HOURS=8; "
+        f"export ARM={arm} STEPS={steps} BATCH={batch} OUT_TAG={run_id} RUN_ID={run_id} REPO_REF={sha} MAX_HOURS=8; "
         f"exec bash /workspace/bootstrap.sh' > /workspace/{arm}.log 2>&1\"")
     _ssh(host, port, launch)
     r = _ssh(host, port, "tmux ls")
@@ -187,7 +200,7 @@ if __name__ == "__main__":
         gpu = a[a.index("--gpu") + 1] if "--gpu" in a else None
         cmd_create(a[1], gpu)
     elif cmd == "drive":
-        cmd_drive(a[1], a[2], a[3])
+        cmd_drive(a[1], a[2], a[3], a[4] if len(a) > 4 else None)   # drive <pod> <arm> <run> [ref/sha]
     elif cmd == "list":
         cmd_list()
     elif cmd == "reap":

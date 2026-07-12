@@ -85,12 +85,15 @@ def _build_loader(mix_task, tokenizer, cfg, *, split, ctx_len, m_slots, mae_src_
 
 
 def _default_workers() -> int:
-    """Per-task-loader worker count, scaled to the host (there are len(mixed_tasks) loaders, each
-    spawning this many). Capped so a big box (256 vCPUs) doesn't spawn hundreds; floored at 2 so even a
-    small host overlaps tokenization with the GPU step. Was hardcoded 1 → single-threaded tokenization
-    starved the GPU (util ~25% on a cold-cache pod)."""
+    """Per-task-loader worker count. FIXED (host-independent) for REPRODUCIBILITY: the IterableDataset
+    seeds each worker stream by worker-id (`seed + wid`, tasks/base.py), so the emitted data sequence
+    depends on the worker COUNT. A cpu_count-scaled value (the old `min(4, max(2, cpu//16))`) meant a
+    12-vCPU pod (2 workers) and a 96-core host (4 workers) trained on DIFFERENT data and selected best.pt
+    on different val examples — so arms compared across machines weren't comparable. Pinning to a constant
+    makes the stream identical everywhere; override with NEURO_DATA_WORKERS only if all arms of a
+    comparison use the SAME value. (4 overlaps tokenization with the GPU step without oversubscribing.)"""
     import os
-    return min(4, max(2, (os.cpu_count() or 8) // 16))
+    return int(os.environ.get("NEURO_DATA_WORKERS", "4"))
 
 
 def make_mixed_train_dataloaders(mixed_tasks, tokenizer, cfg, *, ctx_len: int,

@@ -304,7 +304,12 @@ def train_mixed_variant(
             # the #1 historical failure mode — in the trainer the objective modes run in
             "grad_norm_memory": float(gn_mem),
             "grad_norm_lora": float(gn_lora),
+            # memory_M = PREPEND read-length; legitimately 0 for KV-read arms (gisting/memoryllm read via
+            # the per-layer prefix cache, not a prepend) and on memory-off steps — so it is NOT a valid
+            # cross-arm capacity number. memory_M_budget = the MATCHED logical read budget (96 for every
+            # arm); use THIS for capacity plots/tables so KV arms aren't misreported as M=0.
             "memory_M": out["memory_shape"][1],
+            "memory_M_budget": int(getattr(cfg, "n_flat_codes", 0) or 0),
             "lr": lr,
         }
         # arm collapse/health canaries at train frequency (biomem edge/decay/beta/sat/mem_effrank/…, etc.)

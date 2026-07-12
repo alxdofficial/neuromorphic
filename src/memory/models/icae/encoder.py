@@ -121,10 +121,16 @@ class ICAEBaselineEncoder(nn.Module):
         inp = torch.cat([prev, token_embeds, slots], dim=1)  # [B, M_prev + W + M, d]
         _ones = lambda n: torch.ones(B, n, device=attention_mask.device, dtype=torch.long)
         attn = torch.cat([_ones(prev.shape[1]), attention_mask.long(), _ones(self.M)], dim=1)
+        # COMPACTED positions (fidelity): pad sits between the real tokens and the appended slots, so
+        # default sequential position_ids would push the slots to RoPE position W (=window_size) even when
+        # only n<W tokens are real — making the compressed memory depend on the pad count. cumsum(attn)-1
+        # gives every real token a contiguous position and places the slots immediately after the last
+        # real token (pad positions freeze, but they're masked out anyway), so the memory is pad-invariant.
+        pos = torch.clamp(attn.cumsum(dim=1) - 1, min=0)
         # Inner LlamaModel → last_hidden_state (skip lm_head). Causal: the slots at the END read
         # over prev-memory + window. base.training=False → HF per-layer ckpt is inert; the trainer's
         # per-window activation-checkpoint (grad_checkpoint_stream) covers this whole forward.
-        h = self.base.model(inputs_embeds=inp, attention_mask=attn,
+        h = self.base.model(inputs_embeds=inp, attention_mask=attn, position_ids=pos,
                             use_cache=False).last_hidden_state   # else HF builds+pins a 30-layer KV cache it discards
         # Norm in fp32 for stability, then cast back to the running dtype so the memory
         # carried into next window's cat([prev, token_embeds, slots]) matches (bf16 under

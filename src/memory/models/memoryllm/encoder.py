@@ -1,9 +1,10 @@
 """MemoryLLM (Wang et al. 2024, arXiv:2402.04624) — fixed-size per-layer latent memory pool
 with a compress-then-RANDOM-DROP self-update, read as per-layer KV.
 
-Faithful to MemoryLLM's defining axes: (1) a FIXED-SIZE pool of N latent vectors PER LAYER,
-(2) self-update = compress the new text into K candidate vectors + RANDOMLY DROP K old slots +
-insert the candidates (so old memory decays stochastically), (3) the memory is read as per-layer
+Ports MemoryLLM's defining WRITE axes (this is MemoryLLM-ADAPTED, NOT a faithful reproduction — the
+init/persistence deviations under (d) below are material): (1) a FIXED-SIZE pool of N latent vectors
+PER LAYER, (2) self-update = compress the new text into K candidate vectors + RANDOMLY DROP K old slots
++ insert the candidates (so old memory decays stochastically), (3) the memory is read as per-layer
 KEY/VALUE — the NATIVE per-layer-KV read (not an input prepend), via the shared prefix-cache path.
 Own frozen SmolLM2 copy + encoder-LoRA (q/k/v/o); the pool is the main trainable memory.
 
@@ -22,7 +23,14 @@ embeds rather than re-injected at every layer's residual (dominant effect; avoid
 fight gradient-checkpointing); (b) the KV prefix is position-free (unrotated), consistent with our read
 path and the other per-layer-KV arms, vs upstream's low real positions on the memory block; (c) frozen
 backbone + LoRA (upstream trains the whole backbone) — this port fixes the write MECHANISM, it is not a
-guarantee of an empirical win under the frozen-backbone constraint.
+guarantee of an empirical win under the frozen-backbone constraint. (d) POOL INIT + PERSISTENCE (the
+material fidelity gap): upstream's pool is NON-trainable and initially EMPTY (the first injection fills
+it), and it PERSISTS across texts (lifelong self-update). Ours is a TRAINABLE learned init (embed-mean +
+noise, `pool0`) that RESETS per episode (the per-episode compression setting) — so with K=8/window over
+8 windows on N=96, only ~half the slots turn over and ~half the final memory is learned pool-init rather
+than injected content. The trainable pool is also load-bearing for param-matching (L·N·d ≈ 1.66M of the
+arm's ~7M matched trainable budget), so it can't simply be frozen/emptied without under-parameterizing
+the arm. Report this arm as "MemoryLLM-adapted", not "faithful".
 ASTERISKS: per-layer KV byte footprint (L·N·d, ~60× a prepend arm); stochastic random-drop state
 (non-deterministic — seed for eval); native objective is loss-neutral CE.
 """
@@ -80,7 +88,7 @@ class MemoryLLMBaselineEncoder(nn.Module):
         self.out_norm = _NormMatch(self.d)
         print(f"[MemoryLLM] encoder-LoRA {n_wrapped} layers; per-layer pool "
               f"L={self.L}×N={self.N}×d={self.d}; random-drop K={self.K}/window (per-layer-KV read); "
-              f"co-attention compress (faithful)")
+              f"co-attention compress (MemoryLLM-adapted: trainable/per-episode pool, ~half slots keep learned init)")
 
     def train(self, mode: bool = True):
         super().train(mode)

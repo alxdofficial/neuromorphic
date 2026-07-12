@@ -60,7 +60,14 @@ MAE_SRC_TOK = "meta-llama/Llama-3.2-1B"
 def _ckpt_path(out_tag: str, variant: str) -> Path:
     base = REPO / f"outputs/memory/{out_tag}_{variant}/ckpts"
     best = base / f"{variant}.best.pt"
-    return best if best.exists() else base / f"{variant}.last.pt"   # prefer the early-stop BEST
+    chosen = best if best.exists() else base / f"{variant}.last.pt"   # prefer the early-stop BEST
+    # Provenance: record WHICH checkpoint fed each published row (best vs last, + mtime) so a comparison
+    # table is reproducible and a stale/wrong ckpt is auditable rather than silently picked.
+    if chosen.exists():
+        import time as _t
+        print(f"  [ckpt] {variant}: {chosen.relative_to(REPO)} "
+              f"({'best' if chosen == best else 'last'}, mtime={_t.strftime('%Y-%m-%d %H:%M', _t.localtime(chosen.stat().st_mtime))})")
+    return chosen
 
 
 def _load_cfg_from_ckpt(ckpt: Path) -> tuple[ReprConfig, dict]:
@@ -101,8 +108,10 @@ def _eval_variant(variant, cfg, state_dict, tokenizer, val_sets, tasks,
         _trainable = {n for n, p in model.named_parameters() if p.requires_grad}
         missing = [k for k in res.missing_keys if k in _trainable]
         if missing:
-            print(f"  [WARN] {variant}: {len(missing)} TRAINABLE keys MISSING from ckpt "
-                  f"(config mismatch → zero-init → results INVALID; e.g. {missing[:2]})")
+            raise SystemExit(
+                f"  [ABORT] {variant}: {len(missing)} TRAINABLE keys MISSING from ckpt (config "
+                f"mismatch → zero-init → results would be INVALID; e.g. {missing[:2]}). Re-train or "
+                f"fix the config before including this arm in a comparison — do NOT publish this row.")
         if res.unexpected_keys:
             print(f"  [warn] {variant}: {len(res.unexpected_keys)} unexpected keys "
                   f"(e.g. {res.unexpected_keys[:2]})")
@@ -172,6 +181,10 @@ def main():
     if _m_ck and _m_ck != MIXED_M:
         raise SystemExit(f"[band+gate] MIXED_M drift: evaluator uses {MIXED_M} but the checkpoint was "
                          f"trained at M={_m_ck}. Align MIXED_M or re-eval the matching ckpt.")
+    _ctx_ck = int(getattr(base_cfg, "ctx_len", 0) or 0)
+    if _ctx_ck and _ctx_ck != MIXED_CTX:
+        raise SystemExit(f"[band+gate] MIXED_CTX drift: evaluator uses {MIXED_CTX} but the checkpoint was "
+                         f"trained at ctx={_ctx_ck}. Align MIXED_CTX or re-eval the matching ckpt.")
     print(f"[band+gate] geometry OK (window={WINDOW_SIZE}, M={MIXED_M}, ctx={MIXED_CTX}) matches ckpt")
 
     tokenizer = AutoTokenizer.from_pretrained(base_cfg.llama_model)
