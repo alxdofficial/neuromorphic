@@ -14,7 +14,8 @@
 #   REPO_REF          optional. branch or sha to train (default main)
 #   OUT_TAG           optional. run tag (default podrun)
 #   STEPS             optional. training steps (default 2000)
-#   BATCH             optional. batch size (default 8; fits 24GB)
+#   BATCH             optional. batch size (default 6; fits a 24GB 4090 for ALL arms incl. the KV
+#                     ones. B=8 peaks ~22GB + fragmentation → OOM on a pod's ~23.5GB usable; B=6 = ~18GB.)
 #   MAX_HOURS         optional. hard wall-clock cap on training (default 8)
 #   RUN_ID            optional. label used in R2 result paths (default OUT_TAG)
 #
@@ -34,7 +35,7 @@ REPO_REF="${REPO_REF:-main}"
 OUT_TAG="${OUT_TAG:-podrun}"
 RUN_ID="${RUN_ID:-$OUT_TAG}"
 STEPS="${STEPS:-2000}"
-BATCH="${BATCH:-8}"
+BATCH="${BATCH:-6}"
 MAX_HOURS="${MAX_HOURS:-8}"
 R2_PREFIX="${R2_PREFIX:-neuromorphic}"
 WORK="${WORK_DIR:-/workspace}"
@@ -42,6 +43,11 @@ REPO_DIR="$WORK/neuromorphic"
 LOG="$WORK/bootstrap.log"
 
 mkdir -p "$WORK"
+# Raise the open-file soft limit to the hard cap up front: multi-worker DataLoaders + pin_memory hold
+# hundreds of shared-memory FDs, and the container default (soft 1024) triggers "Too many open files"
+# / "received 0 items of ancdata". The trainer also raises it in-process, but doing it here covers every
+# child. No privilege needed to raise soft→hard; ignore if the shell disallows it.
+ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 # Tee everything to a log we upload at the end (so failures are diagnosable off-pod).
 exec > >(tee -a "$LOG") 2>&1
 echo "[bootstrap] $(date -u +%FT%TZ) arm=$ARM ref=$REPO_REF steps=$STEPS batch=$BATCH max_hours=$MAX_HOURS"
@@ -200,6 +206,9 @@ EXTRA=()
 
 echo "[bootstrap] training $ARM for $STEPS steps (behavioral_kl, B=$BATCH)"
 cd "$REPO_DIR"
+# expandable_segments avoids the fragmentation OOM seen at the VRAM edge (a B=6 KV arm peaks ~18GB but
+# fragments the last ~300MB over a ~23.5GB-usable 4090 → OOM without this). Free; recommended by torch.
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 # Crash-safe artifacts: sync checkpoints + metrics to R2 every 120s DURING training, so a mid-run OOM/
 # timeout still leaves every completed milestone (+ the jsonl) on R2, not just whatever the final
 # on_exit upload catches. `|| true` keeps a transient R2 hiccup from killing the loop.

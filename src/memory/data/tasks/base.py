@@ -95,6 +95,30 @@ def _collate(samples, pad_token_id):
     return batch
 
 
+_FD_LIMIT_RAISED = False
+
+
+def _raise_fd_soft_limit() -> None:
+    """Raise this process's open-file SOFT limit to its HARD limit (once, best-effort). A multi-worker
+    DataLoader with pin_memory hands every prefetched batch tensor to the next stage as a shared-memory
+    file descriptor; with 5 tasks × 4 workers × prefetch_factor 4 that is hundreds of live FDs, which
+    blows past a default soft limit of 1024 → 'Too many open files' / 'received 0 items of ancdata' /
+    'Pin memory thread exited unexpectedly' (observed on a 96-core pod; invisible locally where the soft
+    limit is already high). Raising soft→hard needs no privilege, workers inherit it on fork, and it uses
+    the OS's own hard cap rather than a hardcoded number."""
+    global _FD_LIMIT_RAISED
+    if _FD_LIMIT_RAISED:
+        return
+    _FD_LIMIT_RAISED = True
+    try:
+        import resource
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if soft < hard:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
+    except Exception:
+        pass                                          # unsupported platform / sandbox → leave as-is
+
+
 def make_task_dataloader(source, task: Task, spec: EpisodeSpec, tokenizer, *,
                          batch_size: int, pad_token_id: int, seed: int = 0,
                          num_workers: int = 2) -> DataLoader:
@@ -104,6 +128,8 @@ def make_task_dataloader(source, task: Task, spec: EpisodeSpec, tokenizer, *,
     # prefetch overlap tokenization with the GPU step; persistent_workers keeps them warm across the
     # trainer's round-robin re-arming; pin_memory speeds the host→GPU copy. TaskDataset.__iter__ shards
     # by worker id, so workers do NOT duplicate data.
+    if num_workers > 0:
+        _raise_fd_soft_limit()                        # else many workers × prefetch exhaust the FD limit
     extra = {"persistent_workers": True, "prefetch_factor": 4} if num_workers > 0 else {}
     return DataLoader(ds, batch_size=batch_size, num_workers=num_workers,
                       collate_fn=lambda s: _collate(s, pad_token_id),
