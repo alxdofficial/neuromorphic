@@ -62,6 +62,10 @@ class ReprLearningModel(nn.Module):
         # harvested from the LM's per-layer attention; prepend+bidir read shaped by confidence-scaled
         # relation state (models/slotgraph/; docs/design/slotgraph_design.md).
         "slotgraph_baseline": SlotGraphEncoder,
+        # slotgraph v1 read-experiment: SAME graph encoder, but the read is a PER-LAYER-KV prefix
+        # (nodes run through the LM node-block with the write's C·R value-path injection, per-layer k/v
+        # captured) instead of prepend+bidir. Isolates the read-surface axis vs gisting/memoryllm.
+        "slotgraph_kv_baseline": SlotGraphEncoder,
         # MemoryLLM (arXiv:2402.04624): fixed per-layer latent pool + compress-then-RANDOM-DROP
         # self-update, read as per-layer KV (native per-layer-KV read) (models/memoryllm/).
         "memoryllm_baseline": MemoryLLMBaselineEncoder,
@@ -93,7 +97,7 @@ class ReprLearningModel(nn.Module):
             raise ValueError(
                 f"Unknown variant {variant!r}. Must be one of {list(self.VARIANTS)}."
             )
-        if variant in {"slotgraph_baseline", "h2o_baseline"}:
+        if variant in {"slotgraph_baseline", "slotgraph_kv_baseline", "h2o_baseline"}:
             cfg = copy.copy(cfg)
         if variant == "slotgraph_baseline":
             # THE slotgraph read geometry is prepend + Set-LLM bidirectional at a uniform memory position
@@ -102,6 +106,10 @@ class ReprLearningModel(nn.Module):
                 raise ValueError("slotgraph_baseline requires bidir_mem_attn; rect_prepend_mask is incompatible")
             cfg.bidir_mem_attn = True
             cfg.uniform_mem_pos = True
+        if variant == "slotgraph_kv_baseline":
+            # v1 experiment: per-layer-KV read (passive prefix) — NO prepend geometry (bidir/uniform stay
+            # off; the model routes this arm through _prefix_kv_forward because reads_per_layer_kv is True).
+            cfg.slotgraph_kv_read = True
         if variant == "h2o_baseline":
             cfg.use_llama_lora = False
         self.cfg = cfg
@@ -274,7 +282,7 @@ class ReprLearningModel(nn.Module):
     # slicing applies to these; vanillas pass through at M=0 / M=T).
     _MASKED_RECON_COMPRESSORS = ("icae_baseline",
                         "autocompressor_baseline",
-                        "slotgraph_baseline",
+                        "slotgraph_baseline", "slotgraph_kv_baseline",
                         "memoryllm_baseline", "gisting_baseline", "titans_baseline",
                         "h2o_baseline")
 

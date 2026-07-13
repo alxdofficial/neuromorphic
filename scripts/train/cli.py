@@ -480,7 +480,8 @@ def args_to_config(args, ap):
                    # aux loss, so they are valid under behavioral_kl; per-layer-KV students dispatch fine
                    # via _prefix_kv_forward). Still gated by the pre-training verification (#158).
                    # slotgraph is aux-loss-free (prepend arm) → valid under behavioral_kl.
-                   "gisting_baseline", "memoryllm_baseline", "titans_baseline"}
+                   "gisting_baseline", "memoryllm_baseline", "titans_baseline",
+                   "slotgraph_kv_baseline"}   # v1 per-layer-KV read variant of slotgraph (aux-loss-free)
         # eval-only arms (vanilla floor/ceiling, h2o) don't train, so the training objective doesn't apply
         # to them — exempt them from the whitelist (they're skipped in train.py's mixed_variants loop).
         _EVAL_ONLY = {"vanilla_llama", "vanilla_full_context", "h2o_baseline"}

@@ -196,6 +196,12 @@ class ReprConfig:
     slotgraph_flash_harvest: bool = True # True: SDPA/flash forward + recompute ONLY the [N,S] node-query
                                          # attention for the harvest (no [S,S] eager matrix → the B=8 memory
                                          # fix). False: eager forward + output_attentions (reference path).
+    slotgraph_kv_read: bool = False      # EXPERIMENT (v1): read the graph as a PER-LAYER-KV prefix instead of
+                                         # prepend+bidir. finalize runs the final nodes through the LM node-block
+                                         # (nodes-only, same per-layer C·R value-path injection as the write) and
+                                         # captures each layer's node k/v → passive KV prefix. Edges shape the
+                                         # node KV via the injection; they never become tokens. Isolates the
+                                         # read-surface axis vs gisting/memoryllm at matched M=N read length.
 
     # ── h2o (Heavy-Hitter Oracle KV eviction; models/h2o/) ────────────────────
     # Training-free eval-only baseline. Keeps the M tokens with highest cumulative

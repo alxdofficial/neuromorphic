@@ -95,6 +95,21 @@ class SlotGraphEncoder(nn.Module):
         _bc = base.config
         self.L = _bc.num_hidden_layers
         self.n_heads = _bc.num_attention_heads
+        self.n_kv = getattr(_bc, "num_key_value_heads", None) or _bc.num_attention_heads
+        self.head_dim = getattr(_bc, "head_dim", None) or (d // self.n_heads)
+        # v1 read-mechanism experiment: per-layer-KV read (vs the class default prepend+bidir). Instance
+        # attribute shadows the class `reads_per_layer_kv=False` so model.py routes this arm through the
+        # shared prefix-cache path (_prefix_kv_forward) when the flag is set.
+        self.reads_per_layer_kv = bool(getattr(cfg, "slotgraph_kv_read", False))
+        if self.reads_per_layer_kv:
+            # Node states run ~14× the embedding scale (|X|≈46 vs ~3.2). The prepend read tames this with
+            # `self.norm` after the message pass; the KV read feeds the LM directly, so an un-normalized X
+            # blows the tok_proj/node grads to ~1e8 (memoryllm hit the identical "unnormalized→huge KV→
+            # gnorm in the millions"). NormMatch the node state to the backbone token scale before the read.
+            self.kv_in_norm = _NormMatch(d)
+            with torch.no_grad():
+                self.kv_in_norm.scale.data.fill_(
+                    base.get_input_embeddings().weight.float().norm(dim=-1).mean().item())
         # which layers to harvest: 0 = all; N>0 = last-N (fewer = cheaper, later = more semantic)
         self.write_layers = int(cfg.slotgraph_write_layers)
         embed = base.get_input_embeddings()
@@ -439,6 +454,60 @@ class SlotGraphEncoder(nn.Module):
             C_new = torch.where(row_active, C_new, C0)
         return R_new, C_new
 
+    def _materialize_kv(self, X, R, C, B):
+        """PER-LAYER-KV read (v1 experiment): run the final graph nodes through the LM node-block — nodes-only,
+        dense node↔node attention, with the SAME per-layer C·R value-path injection the write uses — and
+        capture each layer's node k_proj/v_proj as the memory. The edges shape the node KV via the injection
+        (they never become tokens); the decoder attends to it passively (no intra-memory attention). Returns
+        (K, V), each a length-L list of [B, n_kv, N, head_dim], plus an all-valid memory mask."""
+        N, de, L = self.N, self.de, self.L
+        X = self.kv_in_norm(X)                                           # tame node-state magnitude (|X|≈46 → embed scale)
+        seq = self._node_tokens(X, B)                                    # [B,N,d] graph nodes → tokens
+        dev, dt = seq.device, seq.dtype
+        # nodes-only + DENSE: all-zero additive mask overrides HF's default causal so every node sees every
+        # node. UNIFORM position 0 → permutation-symmetric set (matches the write's node block); captured k/v
+        # are pre-RoPE (position-free), consistent with the other per-layer-KV arms.
+        add_mask = seq.new_zeros(B, 1, N, N)
+        pos = torch.zeros(B, N, dtype=torch.long, device=dev)
+        R_de = self.U_ln(R.reshape(B, N * N, de)).reshape(B, N, N, de)
+        E_de = C * R_de                                                  # effective edge = confidence × relation
+        Kbuf, Vbuf = [None] * L, [None] * L
+
+        def _mk_hook(li):
+            def hook(module, args, kwargs, out):
+                hidden = args[0] if args else kwargs["hidden_states"]    # [B,N,d] post-LN layer input
+                cos, sin = kwargs["position_embeddings"]
+                hd = self.head_dim
+                # Explicit projections of the layer input (pre-RoPE) — these ARE the K/V the decoder attends
+                # to. Computed from the residual stream arriving at layer li, so they carry the edge injections
+                # of all layers below (depth-specialized), exactly like gisting's per-layer capture.
+                k = module.k_proj(hidden).view(B, N, self.n_kv, hd)
+                v = module.v_proj(hidden).view(B, N, self.n_kv, hd)
+                Kbuf[li] = k.permute(0, 2, 1, 3)                         # [B,n_kv,N,hd]
+                Vbuf[li] = v.permute(0, 2, 1, 3)
+                # node↔node attention a_nn (all keys are nodes → softmax IS the conditional topology), then
+                # inject U·(Σ_j a_nn_ij · E_de_ij) into the node hiddens — the write's value-path edge op.
+                q = module.q_proj(hidden).view(B, N, self.n_heads, hd).transpose(1, 2)
+                qk = _apply_rope(q, cos, sin)
+                kk = repeat_kv(_apply_rope(k.transpose(1, 2), cos, sin), module.num_key_value_groups)
+                scores = torch.matmul(qk, kk.transpose(2, 3)) * module.scaling          # [B,H,N,N]
+                a_nn = torch.softmax(scores.float(), dim=-1).to(qk.dtype).mean(1)        # [B,N,N]
+                agg = torch.einsum("bij,bije->bie", a_nn, E_de)                          # [B,N,d_e]
+                resid = torch.tanh(self.U(agg)) * self.resid_scale                       # [B,N,d] (0 at init: ReZero)
+                hsout = (out[0] if isinstance(out, tuple) else out) + resid
+                return (hsout,) + tuple(out[1:]) if isinstance(out, tuple) else hsout
+            return hook
+
+        handles = [self.base.model.layers[li].self_attn.register_forward_hook(_mk_hook(li), with_kwargs=True)
+                   for li in range(L)]
+        try:
+            self.base.model(inputs_embeds=seq, attention_mask=add_mask, position_ids=pos, use_cache=False)
+        finally:
+            for hh in handles:
+                hh.remove()
+        mm = torch.ones(B, N, device=dev, dtype=torch.float32)
+        return Kbuf, Vbuf, mm
+
     def finalize_memory(self, state):
         # All the per-window harvest/commit already happened in streaming_write (incremental) — finalize is
         # now just the READ over the final graph state. This is why continuation snapshots are cheap: each
@@ -447,6 +516,14 @@ class SlotGraphEncoder(nn.Module):
             raise ValueError("slotgraph.finalize_memory: no windows written (empty context)")
         X, R, C = state["X"], state["R"], state["C"]
         B = X.shape[0]
+        if self.reads_per_layer_kv:                                       # v1 per-layer-KV read
+            K, V, mm = self._materialize_kv(X, R, C, B)
+            aux = self._canaries(X, X, R, C, state["win_metrics"], X.device)   # canaries on node states X
+            aux["memory_mask"] = mm
+            aux["past_kv"] = (K, V)
+            aux["read_mode"] = "per_layer_kv"
+            empty = torch.zeros(B, 0, self.d, device=X.device, dtype=torch.float32)   # M=0 prepend
+            return empty, aux
         with torch.autocast("cuda", enabled=False):
             memory, keep_read = self._build_read(X, R, C, B)
         aux = self._canaries(memory, X, R, C, state["win_metrics"], X.device)
