@@ -62,6 +62,9 @@ cross-cutting indexes live at the docs root: this `README.md` and `REFERENCES.md
 
 **Root**
 - **`REFERENCES.md`** — authoritative paper/dataset links for every baseline & data source (never re-search).
+- **`RESULTS.md`** — the **running Phase-0 results log**: band-gate (REAL/SHUF/OFF) scores, %band, per-run
+  configs, and the interpreted observations. Append a run section per campaign; the metric caveats live at
+  the top. Raw dumps stay in `outputs/memory/<run>_band_gate.json`.
 
 **`data/`**
 - **`data/DATA.md`** — THE authoritative "what runs now": sources, the 5 tasks (with worked examples), the shared
