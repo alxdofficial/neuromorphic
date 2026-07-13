@@ -189,6 +189,7 @@ class SlotGraphEncoder(nn.Module):
         # Cross-window BPTT: K=1 detaches each window, K>1 keeps a bounded span, and 0 keeps the full
         # eight-window differentiable recurrence (the default needed for delayed-retention credit).
         self.bptt_detach_every = int(getattr(cfg, "slotgraph_bptt_detach_every", 0))
+        self.inject_harvest_only = bool(getattr(cfg, "slotgraph_inject_harvest_only", False))  # PERF (see config)
 
         # ── read heads ──
         self.read_q = nn.Linear(d, self.dk)                               # node-centric pool query
@@ -330,6 +331,12 @@ class SlotGraphEncoder(nn.Module):
 
         def _mk_hook(li):
             def hook(module, args, kwargs, out):
+                if self.inject_harvest_only and li not in harvest_layers:
+                    # PERF: skip the a_ij recompute + value-path injection on non-harvest layers (deferred to
+                    # the harvest layers only). Drop the eager attn matrix if present, pass the stream through.
+                    if isinstance(out, tuple):
+                        return (out[0], None) + tuple(out[2:])
+                    return out
                 hs = out[0] if isinstance(out, tuple) else out            # [B, T+N, d] attention output
                 nb = hs[:, Toff:Toff + N]                                 # node hiddens this layer [B,N,d]
                 aw = out[1] if (isinstance(out, tuple) and len(out) > 1 and torch.is_tensor(out[1])) else None
@@ -359,9 +366,11 @@ class SlotGraphEncoder(nn.Module):
                 a_nn = a_raw / node_mass.clamp_min(1e-6)                  # [B,N,N], conditional topology
                 agg = torch.einsum("bij,bije->bie", a_nn, E_de)          # [B,N,d_e]
                 resid = torch.tanh(self.U(agg)) * self.resid_scale       # [B,N,d]  (0 at init: ReZero + scale)
-                hs = hs.clone()
-                hs[:, Toff:Toff + N] = nb + resid
-                nb = hs[:, Toff:Toff + N]
+                # PERF (launch-bound): the node block is the LAST N positions (Toff+N == S), and only it
+                # changes — so one `cat` reconstructs the stream instead of clone + scatter-assign + re-slice
+                # (3 kernels → 1). Numerically identical; the text prefix [:, :Toff] is unchanged.
+                nb = nb + resid
+                hs = torch.cat([hs[:, :Toff], nb], dim=1)
                 if li in harvest_layers:
                     # per-edge content feature this layer = a_ij · (φ_i(x_i) + φ_j(x_j)) — FACTORED so
                     # no [B,N,N,2d] intermediate is materialized (only the [B,N,N,d_e] result exists).

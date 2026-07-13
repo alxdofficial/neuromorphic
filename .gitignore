@@ -27,3 +27,6 @@ data/wave1/fineweb_edu_text/
 .env.*
 *.env
 scripts/pod/state/
+
+# Independent nested Git repository for publication reproductions.
+/literature-reproductions/

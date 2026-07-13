@@ -178,6 +178,11 @@ class ReprConfig:
     slotgraph_write_layers: int = 6      # LM depth harvested for the write (last-N; later=more semantic +
                                          # bounds retained attention matrices. 0 = all 30 layers = OOM-prone).
     slotgraph_bptt_detach_every: int = 0  # detach persistent R/C/X every K committed windows (truncated BPTT).
+    slotgraph_inject_harvest_only: bool = False  # PERF: run the per-layer a_ij recompute + value-path edge
+                                         # injection ONLY on the harvested layers (last write_layers), not all
+                                         # L. The write's dominant cost is the flash attn-recompute on every
+                                         # layer while only write_layers are harvested (30-vs-6 asymmetry).
+                                         # Semantic change (early-layer injection is dropped) → validate via A/B.
                                          # 0 = FULL BPTT (default): the end-of-episode loss traces credit all
                                          # the way back to window 0 — required for delayed-retention learning
                                          # (a window-0 write learning from a window-7 retrieval failure). Kept
