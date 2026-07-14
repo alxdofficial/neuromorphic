@@ -178,11 +178,22 @@ class ReprConfig:
     slotgraph_write_layers: int = 6      # LM depth harvested for the write (last-N; later=more semantic +
                                          # bounds retained attention matrices. 0 = all 30 layers = OOM-prone).
     slotgraph_bptt_detach_every: int = 0  # detach persistent R/C/X every K committed windows (truncated BPTT).
-    slotgraph_inject_harvest_only: bool = False  # PERF: run the per-layer a_ij recompute + value-path edge
-                                         # injection ONLY on the harvested layers (last write_layers), not all
-                                         # L. The write's dominant cost is the flash attn-recompute on every
-                                         # layer while only write_layers are harvested (30-vs-6 asymmetry).
-                                         # Semantic change (early-layer injection is dropped) → validate via A/B.
+    slotgraph_inject_harvest_only: bool = True   # MOVE 1 (default ON): run the per-layer a_ij recompute +
+                                         # value-path edge injection ONLY on the harvested layers (last
+                                         # write_layers), not all L — inject WHERE you harvest. Principled
+                                         # (relations are a late-layer phenomenon; injecting into early local-
+                                         # feature layers is the wrong representational level) AND the big speed
+                                         # win (kills the 30-vs-6 flash attn-recompute asymmetry). Early-layer
+                                         # injection is dropped — a semantic change, so keep the flag to A/B.
+    slotgraph_live_read: bool = False    # OPTION B (faithful live read): read the memory as PREPENDED node
+                                         # tokens whose node↔node attention is edge-MODULATED live inside the
+                                         # decoder's own last-K self-attention (the write's injection reused at
+                                         # read), with a bidir memory mask. Unlike the KV read (edges frozen into
+                                         # KV) or the old prepend (edges baked once via a side message-pass, then
+                                         # smeared), the edge state R/C is re-injected FRESH from the store at
+                                         # every modulated layer → the relational structure is never smeared, and
+                                         # "edges modify inter-node attention" is exercised in the DECODER's real
+                                         # attention at read time. ≈ prepend cost (no materialize pass).
                                          # 0 = FULL BPTT (default): the end-of-episode loss traces credit all
                                          # the way back to window 0 — required for delayed-retention learning
                                          # (a window-0 write learning from a window-7 retrieval failure). Kept
@@ -197,6 +208,13 @@ class ReprConfig:
     slotgraph_read_hops: int = 1         # graph-conv read hops (1 until rank confirmed; 2 enables two-hop reach)
     slotgraph_d_key: int = 128           # read-side node-pool / salience query dim
     slotgraph_init_noise: bool = True    # per-forward Gaussian slot init (symmetry break, Slot Attention)
+    slotgraph_diverse_node_init: bool = False  # ANTI-OVERSMOOTHING: init the N node slots to N DISTINCT
+                                         # embedding vectors (on-manifold, high-rank, low-cosine) instead of one
+                                         # shared mean + small noise (which starts near-collapsed at cos≈0.91).
+                                         # Rationale: the nodes are re-attended over themselves 30 layers × ~9
+                                         # forwards ≈ 270 self-mixing passes — a low-pass filter (Dong et al.
+                                         # 2021 rank collapse). Starting UNCOLLAPSED gives the write distinct
+                                         # content to preserve rather than create against the smear.
     slotgraph_layer_pair_gap: int = 0    # inter-layer operator: 0 = consecutive (l,l+1); k>0 = distant (l,l+k)
     slotgraph_flash_harvest: bool = True # True: SDPA/flash forward + recompute ONLY the [N,S] node-query
                                          # attention for the harvest (no [S,S] eager matrix → the B=8 memory

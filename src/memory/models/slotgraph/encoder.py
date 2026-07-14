@@ -127,7 +127,18 @@ class SlotGraphEncoder(nn.Module):
         self.tok_proj = nn.Linear(d + 3 * h, d)                            # [content ‖ id_a ‖ id_b ‖ type] → d
 
         # ── node slots (free latents; per-forward noise breaks symmetry) ──
-        self.node_init = nn.Parameter(mean_vec.view(1, d).repeat(N, 1) + emb_std * torch.randn(N, d))
+        if bool(getattr(cfg, "slotgraph_diverse_node_init", False)):
+            # DIVERSE on-manifold init: N distinct token embeddings → high-rank, low pairwise cosine, but still
+            # on the frozen LM's token manifold (unlike orthogonal noise, which is off-manifold). The nodes are
+            # re-attended over themselves ~270 times (30 layers × 8 write + 1 read) — a low-pass smear — so
+            # starting UNCOLLAPSED lets the write preserve distinct content instead of having to create it
+            # against oversmoothing. Fixed generator → reproducible slot assignment.
+            W = embed.weight.detach().float()
+            gen = torch.Generator().manual_seed(0)
+            idx = torch.randperm(W.shape[0], generator=gen)[:N]
+            self.node_init = nn.Parameter(W[idx].clone())
+        else:
+            self.node_init = nn.Parameter(mean_vec.view(1, d).repeat(N, 1) + emb_std * torch.randn(N, d))
         if self.init_noise:
             self.node_logsig = nn.Parameter(torch.full((d,), math.log(max(emb_std, 1e-4))))
         # per-channel GATED residual for the cross-window node carry (finding-2: gated update, not raw replace)
@@ -152,6 +163,12 @@ class SlotGraphEncoder(nn.Module):
         # an unseen edge weak without closing the gradient path; random weights preserve input-dependence.
         self.conf_W = nn.Linear(3 * de, 1)
         self.conf_attn_W = nn.Linear(4, 1, bias=False)                    # [raw_l, raw_prev, mass_l, mass_prev]
+        # LEARNED aggregation over the harvested layer-PAIRS: replace the uniform mean (1/n_pairs) of the
+        # per-pair relation/confidence proposals with a softmax-weighted (convex) combination, so the model
+        # can down-weight noisy layers before the SINGLE error-correcting commit. One logit per layer; init 0
+        # → uniform softmax → exactly the previous mean AT INIT (behavior only departs from uniform if it
+        # helps, so this is a strictly safe, init-neutral change for both the prepend and KV arms).
+        self.layer_agg_logits = nn.Parameter(torch.zeros(_bc.num_hidden_layers))
         nn.init.constant_(self.conf_W.bias, -2.0)                         # initial observation ≈0.12
         # value-path injection U: edge aggregate (Σ_j a_ij C[i,j]R[i,j]) → d, added to node hiddens. Applied
         # after the aggregate, so confidence-scaled pair state is never lifted per edge; the [B,N,N,d] tensor
@@ -334,6 +351,20 @@ class SlotGraphEncoder(nn.Module):
                  "O": we.new_zeros(B, N, N, 1),
                  "prev_e": None, "prev_raw": None, "prev_mass": None, "prev_l": None}
         Toff = T                                                          # node positions start at T
+        # softmax the per-pair aggregation weights over the PAIR-FORMING layers (simulate the hook's pairing
+        # once, up front — deterministic given harvest_layers + pair_gap). init logits 0 → uniform = the old
+        # 1/n_pairs mean. agg_w[li] scales the proposal harvested AT the pair whose current layer is li.
+        _pl, _pv = None, []
+        for _li in sorted(harvest_layers):
+            if _pl is not None and (_li - _pl) >= self.pair_gap:
+                _pv.append(_li); _pl = _li
+            elif _pl is None:
+                _pl = _li
+        if _pv:
+            _w = torch.softmax(self.layer_agg_logits[torch.tensor(_pv, device=dev)], dim=0)
+            agg_w = {li: _w[i] for i, li in enumerate(_pv)}
+        else:
+            agg_w = {}
 
         def _mk_hook(li):
             def hook(module, args, kwargs, out):
@@ -401,8 +432,9 @@ class SlotGraphEncoder(nn.Module):
                         # attention goes to nodes uniformly, <1 when text dominates, capped at 1.
                         mass_evidence = (N * (a_raw * store["prev_raw"]).clamp_min(0).sqrt()).clamp_max(1.0)
                         obs = learned_evidence * mass_evidence.unsqueeze(-1)
-                        store["S"] = store["S"] + feat
-                        store["O"] = store["O"] + obs
+                        _wl = agg_w[li].to(feat.dtype)                    # learned per-pair aggregation weight
+                        store["S"] = store["S"] + _wl * feat
+                        store["O"] = store["O"] + _wl * obs
                         store["prev_e"] = e_l; store["prev_l"] = li
                         store["prev_raw"] = a_raw; store["prev_mass"] = node_mass
                     elif store["prev_e"] is None:
@@ -426,15 +458,15 @@ class SlotGraphEncoder(nn.Module):
         finally:
             for hh in handles:
                 hh.remove()
-        # normalize the trace by the number of harvested layer-PAIRS (S summed one feat per pair) so its
-        # scale is invariant to how many layers we harvest — keeps the commit + gnorm well-conditioned.
-        n_pairs = max(1, (len(harvest_layers) - 1) // self.pair_gap)
+        # S/O are now a CONVEX (softmax) combination over the layer-pairs (weights sum to 1), so they're
+        # already scale-invariant to how many layers we harvest — no /n_pairs needed (that was the uniform-mean
+        # normalizer this learned weighting replaces).
         # node_h = the FULL final hidden (post residual+MLP+final-norm) for the node block — NOT the attention-
         # branch output the hook sees (finding-2 fix: out[0] of self_attn discards the residual stream + MLP,
         # ~1.7 rel-diff from the true hidden). The value-path injection still rode through every layer, so this
         # final hidden already reflects the edge residual.
         node_h = out.last_hidden_state[:, T:T + N]                        # [B,N,d] true node representation
-        return node_h, store["S"] / n_pairs, store["O"] / n_pairs
+        return node_h, store["S"], store["O"]
 
     def _commit(self, X, R, C, node_h, S, observation, active, R0, C0):
         """Commit semantic direction R and confidence C with separate data-dependent gates.
