@@ -51,11 +51,14 @@ def main():
     print("Loading Llama (shared across variants, frozen)...")
     llama, _ = load_frozen_llama(cfg.llama_model, dtype=torch.bfloat16)
     if getattr(args, "compile_decoder", False):
-        # Compile the shared frozen decoder transformer once; dynamic=True absorbs the variable
-        # padding/answer-span lengths into one guard instead of recompiling per T_total. Both the
-        # student decode and the behavioral_kl teacher decode reuse this module.
-        llama.model = torch.compile(llama.model, dynamic=True)
-        print("[compile] torch.compile(dynamic=True) on shared decoder transformer")
+        # DEFER compile to AFTER each variant's decoder is built + LoRA-wrapped (loops.py). Under
+        # use_llama_lora (the mixed path) the model self-loads its OWN decoder (llama_arg=None), so
+        # compiling the shared `llama` here would be silently discarded — the bug that made
+        # --compile-decoder a no-op. loops.py compiles model.decoder.llama.model (the actual post-LoRA
+        # decoder the student decode + behavioral_kl teacher both run). dynamic=True absorbs the variable
+        # padding/answer-span lengths into one guard.
+        cfg.compile_decoder = True
+        print("[compile] --compile-decoder → deferred to the post-LoRA decoder (per-variant, loops.py)")
 
     if args.probe_bs:
         print(f"\n[probe-bs] per-arm max batch size, conditioned-reconstruction N={args.cond_recon_n_pairs}, "
