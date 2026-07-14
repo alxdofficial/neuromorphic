@@ -103,8 +103,12 @@ def save_checkpoint(model, opt, step, path: Path, **extras):
     }
     payload = {
         "step": step,
+        # Normalize torch.compile's `._orig_mod.` prefix out of the keys → a compile-AGNOSTIC checkpoint.
+        # Without this, a run with --compile-decoder saves the read-LoRA as decoder.llama.model._orig_mod.*
+        # and an uncompiled eval/reload can't match it (with the eval's missing-trainable-key guard it
+        # ABORTS; without it, silently runs an unadapted decoder). No-op when nothing is compiled.
         "model_state_dict": {
-            k: v for k, v in model.state_dict().items() if keep(k)
+            k.replace("._orig_mod.", "."): v for k, v in model.state_dict().items() if keep(k)
         },
         "optimizer_state_dict": opt.state_dict(),
         "metadata": _ckpt_metadata(model),
