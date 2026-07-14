@@ -153,17 +153,23 @@ class SlotGraphEncoder(nn.Module):
         self.conf_W = nn.Linear(3 * de, 1)
         self.conf_attn_W = nn.Linear(4, 1, bias=False)                    # [raw_l, raw_prev, mass_l, mass_prev]
         nn.init.constant_(self.conf_W.bias, -2.0)                         # initial observation ≈0.12
-        # value-path injection U: edge aggregate (Σ_j a_ij C[i,j]R[i,j]) → d, added to node hiddens. ZERO-init
-        # (ReZero). Applied after the aggregate, so confidence-scaled pair state is never lifted per edge;
-        # the [B,N,N,d] tensor is avoided and only the [B,N,d_e] aggregate reaches U.
+        # value-path injection U: edge aggregate (Σ_j a_ij C[i,j]R[i,j]) → d, added to node hiddens. Applied
+        # after the aggregate, so confidence-scaled pair state is never lifted per edge; the [B,N,N,d] tensor
+        # is avoided and only the [B,N,d_e] aggregate reaches U.
         self.U_ln = nn.LayerNorm(de)
         self.U = nn.Linear(de, d, bias=False)
-        nn.init.zeros_(self.U.weight)
+        # NONZERO-init (std = 1/√fan_in), NOT ReZero-zero. The gradient the edges receive is ∂(inject)/∂edge
+        # ∝ U, so a ZERO U closes the ONLY door by which the read returns gradient to the edges / harvest
+        # heads — the arm can't learn and the edges go inert (the prepend arm hid this via edge_up; the KV
+        # read has no such crutch). Init stability does NOT need U=0: the edge confidence C starts at 0 →
+        # agg=0 → tanh(U·0)=0 for ANY U, so the injection is EXACTLY 0 at init and the frozen LM runs clean
+        # regardless. resid_scale (below) is the magnitude gate; U carries direction + the edges' gradient.
+        nn.init.normal_(self.U.weight, std=de ** -0.5)
         # bounded residual output: a per-channel scale (tanh-gated) so the injection into the LM stream
-        # stays bounded even as U trains — the loop-gain cap that stops the gnorm feedback blowup. Init
-        # SMALL but NONZERO (not zero): with U also zero-init, a zero resid_scale would be a double-zero
-        # deadlock (∂L/∂U = ∂L/∂resid_scale = 0 — the design-review P8 trap). At small init the injection
-        # is ~0 (U=0 → tanh(0)=0) but U earns gradient from step 1, then resid_scale bounds the magnitude.
+        # stays bounded even as U trains — the loop-gain cap that stops the gnorm feedback blowup. SMALL but
+        # NONZERO: ∂(inject)/∂edge ∝ resid_scale·U, so a zero scale would re-close the edge-gradient door
+        # (the design-review P8 trap) even with U nonzero. 0.1 keeps the injection small early, then bounds
+        # magnitude as the edges grow.
         self.resid_scale = nn.Parameter(torch.full((d,), 0.1))
         # ── relation-vector commit — gates factored per endpoint (memory-efficient) ──
         self.gate_a_i = nn.Linear(d, de); self.gate_a_j = nn.Linear(d, de)  # retain α ← φ_ln(x_i)+φ_ln(x_j)
