@@ -178,6 +178,13 @@ class ReprConfig:
     slotgraph_write_layers: int = 6      # LM depth harvested for the write (last-N; later=more semantic +
                                          # bounds retained attention matrices. 0 = all 30 layers = OOM-prone).
     slotgraph_bptt_detach_every: int = 0  # detach persistent R/C/X every K committed windows (truncated BPTT).
+    slotgraph_decouple_write: bool = False  # PERF (hookless-ish): run the node-block LM forward CLEAN (no
+                                         # per-layer edge injection — edges FROZEN within the window), collect
+                                         # each harvested layer's node hiddens via collect-only hooks, and
+                                         # compute the harvest AFTER the forward. Removes the injection swarm +
+                                         # leaves the forward unmutated (flash/compile-friendly). EXACT at init
+                                         # (U=0 → injection is 0); the only semantic delta is the dropped
+                                         # within-window edge→LM feedback (an A/B). Supersedes inject_harvest_only.
     slotgraph_inject_harvest_only: bool = False  # PERF: run the per-layer a_ij recompute + value-path edge
                                          # injection ONLY on the harvested layers (last write_layers), not all
                                          # L. The write's dominant cost is the flash attn-recompute on every

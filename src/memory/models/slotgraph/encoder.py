@@ -190,6 +190,7 @@ class SlotGraphEncoder(nn.Module):
         # eight-window differentiable recurrence (the default needed for delayed-retention credit).
         self.bptt_detach_every = int(getattr(cfg, "slotgraph_bptt_detach_every", 0))
         self.inject_harvest_only = bool(getattr(cfg, "slotgraph_inject_harvest_only", False))  # PERF (see config)
+        self.decouple_write = bool(getattr(cfg, "slotgraph_decouple_write", False))            # PERF (see config)
 
         # ── read heads ──
         self.read_q = nn.Linear(d, self.dk)                               # node-centric pool query
@@ -260,11 +261,12 @@ class SlotGraphEncoder(nn.Module):
                 R = R.detach(); C = C.detach(); X = X.detach()
             wi += 1; seen = True
             R0, C0 = R, C
+            harvest_fn = self._harvest_window_decoupled if self.decouple_write else self._harvest_window
             if ckpt_sub:
                 node_h, S, observation = _ckpt.checkpoint(
-                    self._harvest_window, we, wm, X, R, C, active, use_reentrant=False)
+                    harvest_fn, we, wm, X, R, C, active, use_reentrant=False)
             else:
-                node_h, S, observation = self._harvest_window(we, wm, X, R, C, active)
+                node_h, S, observation = harvest_fn(we, wm, X, R, C, active)
             with torch.autocast("cuda", enabled=False):
                 node_h = node_h.float(); S = S.float(); observation = observation.float()
                 R, C = self._commit(X, R, C, node_h, S, observation, active, R0, C0)
@@ -428,6 +430,89 @@ class SlotGraphEncoder(nn.Module):
         # ~1.7 rel-diff from the true hidden). The value-path injection still rode through every layer, so this
         # final hidden already reflects the edge residual.
         node_h = out.last_hidden_state[:, T:T + N]                        # [B,N,d] true node representation
+        return node_h, store["S"] / n_pairs, store["O"] / n_pairs
+
+    def _harvest_window_decoupled(self, we, wm, X, R, C, active):
+        """DECOUPLED write: identical harvest math to _harvest_window, but the node-block LM forward runs
+        CLEAN (no per-layer edge injection — edges frozen in-window) with collect-only hooks that just snapshot
+        each harvested layer's post-LN input + attention-output node hiddens; the harvest (S, O) is then
+        computed AFTER the forward. Bit-exact to _harvest_window at init (U=0 ⇒ injection is 0); the only
+        semantic delta is the dropped within-window edge→LM feedback. Returns (node_h, S, O), same contract."""
+        B, T, d = we.shape
+        N, de = self.N, self.de
+        S_len = T + N
+        node_tok = self._node_tokens(X, B)
+        seq = torch.cat([we, node_tok.to(we.dtype)], dim=1)
+        wm_enc = wm.clone(); wm_enc[:, 0] |= ~active
+        dev = we.device
+        idx = torch.arange(S_len, device=dev)
+        is_node_q = (idx >= T)[:, None]; is_txt_k = (idx < T)[None, :]
+        causal_txt = (idx[:, None] >= idx[None, :])
+        allow = ((is_node_q & torch.ones(1, S_len, dtype=torch.bool, device=dev))
+                 | ((~is_node_q) & is_txt_k & causal_txt))
+        key_ok = torch.cat([wm_enc, torch.ones(B, N, dtype=torch.bool, device=dev)], dim=1)
+        allow = allow[None] & key_ok[:, None, :]
+        neg = torch.finfo(we.dtype).min
+        add_mask = torch.where(allow.unsqueeze(1), we.new_zeros(()), we.new_full((), neg))
+        pos = torch.cat([torch.arange(T, device=dev), torch.full((N,), T, device=dev)])[None].expand(B, S_len)
+        harvest_layers = sorted(range(self.L - self.write_layers, self.L) if self.write_layers > 0
+                                else range(self.L))
+        Toff = T
+        # ── clean forward + collect-only snapshots (no injection, no state mutation) ──
+        cap = {}   # li -> (post-LN input hidden, position_embeddings, attention-output node hidden)
+        def _mk(li):
+            def hook(module, args, kwargs, out):
+                hs = out[0] if isinstance(out, tuple) else out
+                hidden = args[0] if args else kwargs["hidden_states"]
+                cap[li] = (hidden, kwargs["position_embeddings"], hs[:, Toff:Toff + N])
+                if isinstance(out, tuple):
+                    return (hs, None) + tuple(out[2:])
+                return hs
+            return hook
+        handles = [self.base.model.layers[li].self_attn.register_forward_hook(_mk(li), with_kwargs=True)
+                   for li in harvest_layers]
+        try:
+            out = self.base.model(inputs_embeds=seq, attention_mask=add_mask, position_ids=pos,
+                                  output_attentions=False, use_cache=False)
+        finally:
+            for hh in handles:
+                hh.remove()
+        node_h = out.last_hidden_state[:, T:T + N]
+        # ── harvest AFTER the forward (same math as the hook path, minus injection) ──
+        store = {"S": we.new_zeros(B, N, N, de), "O": we.new_zeros(B, N, N, 1),
+                 "prev_e": None, "prev_raw": None, "prev_mass": None, "prev_l": None}
+        for li in harvest_layers:
+            module = self.base.model.layers[li].self_attn
+            hidden, (cos, sin), nb = cap[li]
+            hd = module.head_dim; Hkv = module.config.num_key_value_heads
+            qn = module.q_proj(hidden[:, Toff:Toff + N]).view(B, N, self.n_heads, hd).transpose(1, 2)
+            ka = module.k_proj(hidden).view(B, S_len, Hkv, hd).transpose(1, 2)
+            qn = _apply_rope(qn, cos[:, Toff:Toff + N], sin[:, Toff:Toff + N])
+            ka = repeat_kv(_apply_rope(ka, cos, sin), module.num_key_value_groups)
+            scores = torch.matmul(qn, ka.transpose(2, 3)) * module.scaling
+            scores = scores + add_mask[:, :, Toff:Toff + N, :]
+            a_raw = torch.softmax(scores, dim=-1, dtype=torch.float32).to(qn.dtype)[:, :, :, Toff:Toff + N].mean(1)
+            node_mass = a_raw.sum(-1, keepdim=True)
+            a_nn = a_raw / node_mass.clamp_min(1e-6)
+            nbl = self.phi_ln(nb)
+            ei = self.phi_i(nbl).unsqueeze(2); ej = self.phi_j(nbl).unsqueeze(1)
+            e_l = a_nn.unsqueeze(-1) * (ei + ej)
+            if store["prev_e"] is not None and (li - store["prev_l"]) >= self.pair_gap:
+                pe = store["prev_e"]
+                pair_feat = torch.cat([e_l - pe, pe * e_l, e_l], dim=-1)
+                feat = self.op_W(pair_feat)
+                stats = torch.stack([a_raw, store["prev_raw"], node_mass.expand(-1, -1, N),
+                                     store["prev_mass"].expand(-1, -1, N)], dim=-1)
+                learned_evidence = torch.sigmoid(self.conf_W(pair_feat) + self.conf_attn_W(stats))
+                mass_evidence = (N * (a_raw * store["prev_raw"]).clamp_min(0).sqrt()).clamp_max(1.0)
+                obs = learned_evidence * mass_evidence.unsqueeze(-1)
+                store["S"] = store["S"] + feat; store["O"] = store["O"] + obs
+                store["prev_e"] = e_l; store["prev_l"] = li
+                store["prev_raw"] = a_raw; store["prev_mass"] = node_mass
+            elif store["prev_e"] is None:
+                store["prev_e"] = e_l; store["prev_l"] = li
+                store["prev_raw"] = a_raw; store["prev_mass"] = node_mass
+        n_pairs = max(1, (len(harvest_layers) - 1) // self.pair_gap)
         return node_h, store["S"] / n_pairs, store["O"] / n_pairs
 
     def _commit(self, X, R, C, node_h, S, observation, active, R0, C0):
