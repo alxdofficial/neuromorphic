@@ -66,6 +66,11 @@ class ReprLearningModel(nn.Module):
         # (nodes run through the LM node-block with the write's C·R value-path injection, per-layer k/v
         # captured) instead of prepend+bidir. Isolates the read-surface axis vs gisting/memoryllm.
         "slotgraph_kv_baseline": SlotGraphEncoder,
+        # slotgraph Option B (faithful live read): SAME graph encoder, read = PREPEND node tokens whose
+        # node↔node attention is edge-MODULATED live in the decoder's last-K self-attention (edges re-injected
+        # fresh from the store, never smeared). The only read that exercises "edges modify inter-node attention"
+        # in the decoder's real attention at read time. ≈ prepend cost.
+        "slotgraph_liveread_baseline": SlotGraphEncoder,
         # MemoryLLM (arXiv:2402.04624): fixed per-layer latent pool + compress-then-RANDOM-DROP
         # self-update, read as per-layer KV (native per-layer-KV read) (models/memoryllm/).
         "memoryllm_baseline": MemoryLLMBaselineEncoder,
@@ -97,7 +102,8 @@ class ReprLearningModel(nn.Module):
             raise ValueError(
                 f"Unknown variant {variant!r}. Must be one of {list(self.VARIANTS)}."
             )
-        if variant in {"slotgraph_baseline", "slotgraph_kv_baseline", "h2o_baseline"}:
+        if variant in {"slotgraph_baseline", "slotgraph_kv_baseline",
+                       "slotgraph_liveread_baseline", "h2o_baseline"}:
             cfg = copy.copy(cfg)
         if variant == "slotgraph_baseline":
             # THE slotgraph read geometry is prepend + Set-LLM bidirectional at a uniform memory position
@@ -110,6 +116,10 @@ class ReprLearningModel(nn.Module):
             # v1 experiment: per-layer-KV read (passive prefix) — NO prepend geometry (bidir/uniform stay
             # off; the model routes this arm through _prefix_kv_forward because reads_per_layer_kv is True).
             cfg.slotgraph_kv_read = True
+        if variant == "slotgraph_liveread_baseline":
+            # Option B: prepend node tokens + edge-modulated decoder attention (live_read installs the hooks
+            # and forces bidir + uniform memory geometry in compute_loss).
+            cfg.slotgraph_live_read = True
         if variant == "h2o_baseline":
             cfg.use_llama_lora = False
         self.cfg = cfg
@@ -282,7 +292,7 @@ class ReprLearningModel(nn.Module):
     # slicing applies to these; vanillas pass through at M=0 / M=T).
     _MASKED_RECON_COMPRESSORS = ("icae_baseline",
                         "autocompressor_baseline",
-                        "slotgraph_baseline", "slotgraph_kv_baseline",
+                        "slotgraph_baseline", "slotgraph_kv_baseline", "slotgraph_liveread_baseline",
                         "memoryllm_baseline", "gisting_baseline", "titans_baseline",
                         "h2o_baseline")
 
@@ -420,14 +430,17 @@ class ReprLearningModel(nn.Module):
         else:
             full = torch.cat([memory, dec_in], dim=1)                  # [B, M+T, d]
             attn = torch.cat([mem_mask, batch.context_mask.float()], dim=1).long()
-            if getattr(self.cfg, "rect_prepend_mask", False) and getattr(self.cfg, "bidir_mem_attn", False):
+            # live read (Option B) forces bidir memory + uniform node positions, like slotgraph_baseline.
+            _live = getattr(self.encoder, "live_read", False) and M > 0
+            _bidir = getattr(self.cfg, "bidir_mem_attn", False) or _live
+            if getattr(self.cfg, "rect_prepend_mask", False) and _bidir:
                 raise ValueError("rect_prepend_mask and bidir_mem_attn are mutually exclusive read geometries")
             if getattr(self.cfg, "rect_prepend_mask", False) and M > 0:
                 attn = self._rect_prepend_mask(attn, M, full.dtype)    # [B,1,L,L] 4-D additive
-            elif getattr(self.cfg, "bidir_mem_attn", False) and M > 0:
+            elif _bidir and M > 0:
                 attn = self._bidir_prepend_mask(attn, M, full.dtype)   # Set-LLM: bidirectional memory block
             pos_ids = (self._uniform_mem_position_ids(B, M, full.shape[1], device)
-                       if getattr(self.cfg, "uniform_mem_pos", False) and M > 0 else None)
+                       if (getattr(self.cfg, "uniform_mem_pos", False) or _live) and M > 0 else None)
 
             # biomem: query-conditioned READ — a zero-init pre-hook at the tap layer reads
             # every position's hidden through the frozen written edges and fuses the recall
@@ -439,12 +452,17 @@ class ReprLearningModel(nn.Module):
             reinforce = self._install_prepend_reinforce_hooks(mem_aux, M, 0, shuffle_memory)
             # biomem-prepend: re-read W at every layer with the current slot hiddens (no-op for others).
             refresh = self._install_prepend_refresh_hooks(M, 0, zero_memory, shuffle_memory)
+            # slotgraph Option B: edge-modulate the decoder's last-K node↔node attention (OFF drops it).
+            live_inject = (self._install_live_inject_hooks(mem_aux, M, 0, shuffle_memory)
+                           if not zero_memory else [])
             try:
                 base_out = self.decoder.llama.model(
                     inputs_embeds=full, attention_mask=attn, position_ids=pos_ids, use_cache=False)
             finally:
                 if hook_handle is not None:
                     hook_handle.remove()
+                for hh in live_inject:
+                    hh.remove()
                 for hh in reinforce:
                     hh.remove()
                 for hh in refresh:
@@ -690,6 +708,44 @@ class ReprLearningModel(nn.Module):
             return _hook
         return [layer.register_forward_pre_hook(_mk(), with_kwargs=True)
                 for layer in self.decoder.llama.model.layers]
+
+    def _install_live_inject_hooks(self, mem_aux, M: int, offset: int, shuffle_memory: bool):
+        """OPTION B (faithful live read): on the DECODER's last-K self-attn layers, edge-MODULATE the node↔
+        node attention over the M prepend positions [offset:offset+M] — the write's value-path injection
+        reused at read (out_i += U·Σ_j a_nn_ij·C·R). The edge state R/C is read FRESH from mem_aux each layer,
+        so the relational structure is never smeared through depth. SHUF rolls the edge state (wrong example's
+        graph); OFF is handled by zero_memory upstream (no prepend → hook no-ops). Returns hook handles."""
+        enc = self.encoder
+        if not getattr(enc, "live_read", False) or M <= 0 or not mem_aux:
+            return []
+        if mem_aux.get("read_mode") != "live_inject":
+            return []
+        R, C = mem_aux.get("edge_R"), mem_aux.get("edge_C")
+        if R is None or C is None:
+            return []
+        if shuffle_memory and R.shape[0] > 1:            # SHUF: modulate with the WRONG example's edges
+            R = torch.roll(R, shifts=1, dims=0); C = torch.roll(C, shifts=1, dims=0)
+        E_de = enc._effective_edge(R, C)                 # [B,M,M,d_e] — computed once, re-used every layer
+        L = len(self.decoder.llama.model.layers)
+        wl = int(getattr(enc, "write_layers", 0))
+        inject_layers = set(range(L - wl, L)) if wl > 0 else set(range(L))   # last-K, matches the harvest taps
+
+        def _mk(li):
+            def _hook(module, args, kwargs, out):
+                hidden = args[0] if args else kwargs.get("hidden_states")
+                if hidden is None or hidden.shape[1] < offset + M:
+                    return None
+                cos, sin = kwargs["position_embeddings"]
+                node_h = hidden[:, offset:offset + M]
+                resid = enc._edge_resid(module, node_h, cos[:, offset:offset + M],
+                                        sin[:, offset:offset + M], E_de)
+                hs = out[0] if isinstance(out, tuple) else out
+                hs = torch.cat([hs[:, :offset], hs[:, offset:offset + M] + resid.to(hs.dtype),
+                                hs[:, offset + M:]], dim=1)
+                return (hs,) + tuple(out[1:]) if isinstance(out, tuple) else hs
+            return _hook
+        return [self.decoder.llama.model.layers[li].self_attn.register_forward_hook(_mk(li), with_kwargs=True)
+                for li in sorted(inject_layers)]
 
     def _install_prepend_refresh_hooks(self, M: int, offset: int, zero_memory: bool,
                                        shuffle_memory: bool):
@@ -1248,6 +1304,10 @@ class ReprLearningModel(nn.Module):
         # biomem-prepend per-layer refresh (memory at [0:M] only with no chat scaffold).
         refresh = (self._install_prepend_refresh_hooks(M, 0, zero_memory, shuffle_memory)
                    if self.chat_template is None else [])
+        # slotgraph Option B (live read): edge-modulate the decoder's last-K node↔node attention. Gated on
+        # not-zero_memory so the OFF band-gate control (memory suppressed) also drops the live edge injection.
+        live_inject = (self._install_live_inject_hooks(finalize_aux, M, 0, shuffle_memory)
+                       if (self.chat_template is None and not zero_memory) else [])
         if (self.chat_template is not None and not zero_memory
                 and getattr(self.encoder, "wants_prepend_refresh", False)
                 and not getattr(self, "_warned_refresh_suppressed", False)):
@@ -1268,7 +1328,10 @@ class ReprLearningModel(nn.Module):
             _attn_qa = attn_mask_full.to(torch.long)
             _rect_qa = (getattr(self.cfg, "rect_prepend_mask", False) and M > 0 and not zero_memory
                         and self.chat_template is None)      # memory sits at [0:M) only without a chat scaffold
-            _bidir_qa = (getattr(self.cfg, "bidir_mem_attn", False) and M > 0 and not zero_memory
+            # live read (Option B) forces BIDIR memory attention (dense node↔node, matching the write's graph)
+            # and UNIFORM node positions (permutation-symmetric SET, matching the write's node block).
+            _live = bool(live_inject)
+            _bidir_qa = ((getattr(self.cfg, "bidir_mem_attn", False) or _live) and M > 0 and not zero_memory
                          and self.chat_template is None)
             if _rect_qa and _bidir_qa:
                 raise ValueError("rect_prepend_mask and bidir_mem_attn are mutually exclusive read geometries")
@@ -1277,7 +1340,7 @@ class ReprLearningModel(nn.Module):
             elif _bidir_qa:
                 _attn_qa = self._bidir_prepend_mask(_attn_qa, M, full_embeds.dtype)
             _pos_qa = (self._uniform_mem_position_ids(B, M, T_total, device)
-                       if (getattr(self.cfg, "uniform_mem_pos", False) and M > 0 and not zero_memory
+                       if ((getattr(self.cfg, "uniform_mem_pos", False) or _live) and M > 0 and not zero_memory
                            and self.chat_template is None) else None)
             if _pos_qa is None:
                 # COMPACT position_ids from the attention mask so INTERNAL right-padding does not open a
@@ -1306,6 +1369,8 @@ class ReprLearningModel(nn.Module):
         finally:
             if hook_handle is not None:
                 hook_handle.remove()
+            for hh in live_inject:
+                hh.remove()
             for hh in reinforce:
                 hh.remove()
             for hh in refresh:

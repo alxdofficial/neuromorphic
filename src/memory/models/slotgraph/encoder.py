@@ -110,6 +110,12 @@ class SlotGraphEncoder(nn.Module):
             with torch.no_grad():
                 self.kv_in_norm.scale.data.fill_(
                     base.get_input_embeddings().weight.float().norm(dim=-1).mean().item())
+        # OPTION B (faithful live read): read = PREPEND node tokens whose node↔node attention is edge-modulated
+        # live inside the DECODER's own last-K self-attention (model.py installs the hook + a bidir mem mask,
+        # and calls self._edge_resid). The edge state R/C is re-injected fresh from the store at each modulated
+        # layer, so the relational structure is never smeared (unlike the KV read's frozen KV or the old
+        # prepend's baked-once message-pass). ≈ prepend cost, no materialize pass.
+        self.live_read = bool(getattr(cfg, "slotgraph_live_read", False))
         # which layers to harvest: 0 = all; N>0 = last-N (fewer = cheaper, later = more semantic)
         self.write_layers = int(cfg.slotgraph_write_layers)
         embed = base.get_input_embeddings()
@@ -555,6 +561,29 @@ class SlotGraphEncoder(nn.Module):
         mm = torch.ones(B, N, device=dev, dtype=torch.float32)
         return Kbuf, Vbuf, mm
 
+    def _effective_edge(self, R, C):
+        """E_de = C · U_ln(R) — the confidence-scaled, LN'd relation used by every injection site. Public so
+        the model can precompute it ONCE before the live-read decoder hooks (Option B)."""
+        B, N, de = R.shape[0], self.N, self.de
+        R_de = self.U_ln(R.reshape(B, N * N, de)).reshape(B, N, N, de)
+        return C * R_de
+
+    def _edge_resid(self, module, node_hidden, cos, sin, E_de):
+        """The write's value-path edge injection, reusable on ANY llama self-attn `module` — the encoder base
+        OR the DECODER (Option B live read). Given a layer's node hiddens [B,N,d], this layer's RoPE cos/sin
+        for the node positions, and E_de=[B,N,N,d_e], compute the node↔node attention a_nn and return the
+        residual U·(Σ_j a_nn_ij·E_de_ij) [B,N,d] to add to the node hiddens. Identical math to _materialize_kv
+        (module carries whichever LoRA it was wrapped with — write-LoRA on the encoder, read-LoRA on decoder)."""
+        B, N = node_hidden.shape[:2]; hd = self.head_dim
+        q = module.q_proj(node_hidden).view(B, N, self.n_heads, hd).transpose(1, 2)
+        k = module.k_proj(node_hidden).view(B, N, self.n_kv, hd).transpose(1, 2)
+        qk = _apply_rope(q, cos, sin)
+        kk = repeat_kv(_apply_rope(k, cos, sin), module.num_key_value_groups)
+        scores = torch.matmul(qk, kk.transpose(2, 3)) * module.scaling          # [B,H,N,N]
+        a_nn = torch.softmax(scores.float(), dim=-1).to(qk.dtype).mean(1)        # [B,N,N]
+        agg = torch.einsum("bij,bije->bie", a_nn, E_de)                          # [B,N,d_e]
+        return torch.tanh(self.U(agg)) * self.resid_scale                       # [B,N,d]
+
     def finalize_memory(self, state):
         # All the per-window harvest/commit already happened in streaming_write (incremental) — finalize is
         # now just the READ over the final graph state. This is why continuation snapshots are cheap: each
@@ -563,6 +592,16 @@ class SlotGraphEncoder(nn.Module):
             raise ValueError("slotgraph.finalize_memory: no windows written (empty context)")
         X, R, C = state["X"], state["R"], state["C"]
         B = X.shape[0]
+        if self.live_read:                                               # Option B: prepend nodes, edges LIVE
+            # prepend node tokens (scale-matched like the prepend read), NO edge_up message-pass — the edges
+            # ride the DECODER's own last-K self-attention via the injection hook (model.py), using edge_R/C.
+            node_tok = self.norm(self._node_tokens(X, B))                # [B,N,d]
+            aux = self._canaries(node_tok, X, R, C, state["win_metrics"], X.device)
+            aux["memory_mask"] = torch.ones(B, self.N, device=X.device, dtype=torch.float32)
+            aux["read_mode"] = "live_inject"
+            aux["edge_R"] = R
+            aux["edge_C"] = C
+            return node_tok, aux
         if self.reads_per_layer_kv:                                       # v1 per-layer-KV read
             K, V, mm = self._materialize_kv(X, R, C, B)
             aux = self._canaries(X, X, R, C, state["win_metrics"], X.device)   # canaries on node states X
