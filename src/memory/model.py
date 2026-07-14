@@ -453,7 +453,7 @@ class ReprLearningModel(nn.Module):
             # biomem-prepend: re-read W at every layer with the current slot hiddens (no-op for others).
             refresh = self._install_prepend_refresh_hooks(M, 0, zero_memory, shuffle_memory)
             # slotgraph Option B: edge-modulate the decoder's last-K node↔node attention (OFF drops it).
-            live_inject = (self._install_live_inject_hooks(mem_aux, M, 0, shuffle_memory)
+            live_inject = (self._install_live_inject_hooks(mem_aux, M, 0, shuffle_memory, shuffle_roll)
                            if not zero_memory else [])
             try:
                 base_out = self.decoder.llama.model(
@@ -709,12 +709,17 @@ class ReprLearningModel(nn.Module):
         return [layer.register_forward_pre_hook(_mk(), with_kwargs=True)
                 for layer in self.decoder.llama.model.layers]
 
-    def _install_live_inject_hooks(self, mem_aux, M: int, offset: int, shuffle_memory: bool):
-        """OPTION B (faithful live read): on the DECODER's last-K self-attn layers, edge-MODULATE the node↔
+    def _install_live_inject_hooks(self, mem_aux, M: int, offset: int, shuffle_memory: bool,
+                                   shuffle_roll: int = 1):
+        """OPTION B (faithful live read): on the DECODER's late self-attn layers, edge-MODULATE the node↔
         node attention over the M prepend positions [offset:offset+M] — the write's value-path injection
         reused at read (out_i += U·Σ_j a_nn_ij·C·R). The edge state R/C is read FRESH from mem_aux each layer,
-        so the relational structure is never smeared through depth. SHUF rolls the edge state (wrong example's
-        graph); OFF is handled by zero_memory upstream (no prepend → hook no-ops). Returns hook handles."""
+        so the relational structure is never smeared through depth. SHUF rolls the edge state by the SAME
+        shuffle_roll as the node memory (else nodes and edges would be from different wrong examples); OFF is
+        handled by zero_memory upstream (no prepend → hook no-ops). Returns hook handles.
+
+        The FINAL layer is EXCLUDED: its injection is added post-attention to node rows that no later layer
+        reads (loss is on text logits), so it would be a structurally-dead tap (zero gradient)."""
         enc = self.encoder
         if not getattr(enc, "live_read", False) or M <= 0 or not mem_aux:
             return []
@@ -724,11 +729,13 @@ class ReprLearningModel(nn.Module):
         if R is None or C is None:
             return []
         if shuffle_memory and R.shape[0] > 1:            # SHUF: modulate with the WRONG example's edges
-            R = torch.roll(R, shifts=1, dims=0); C = torch.roll(C, shifts=1, dims=0)
+            R = torch.roll(R, shifts=int(shuffle_roll), dims=0)
+            C = torch.roll(C, shifts=int(shuffle_roll), dims=0)
         E_de = enc._effective_edge(R, C)                 # [B,M,M,d_e] — computed once, re-used every layer
         L = len(self.decoder.llama.model.layers)
         wl = int(getattr(enc, "write_layers", 0))
-        inject_layers = set(range(L - wl, L)) if wl > 0 else set(range(L))   # last-K, matches the harvest taps
+        # last write_layers EXCLUDING the final layer (dead); aligns with the harvest taps minus layer L-1.
+        inject_layers = set(range(L - wl, L - 1)) if wl > 0 else set(range(L - 1))
 
         def _mk(li):
             def _hook(module, args, kwargs, out):
@@ -1306,7 +1313,7 @@ class ReprLearningModel(nn.Module):
                    if self.chat_template is None else [])
         # slotgraph Option B (live read): edge-modulate the decoder's last-K node↔node attention. Gated on
         # not-zero_memory so the OFF band-gate control (memory suppressed) also drops the live edge injection.
-        live_inject = (self._install_live_inject_hooks(finalize_aux, M, 0, shuffle_memory)
+        live_inject = (self._install_live_inject_hooks(finalize_aux, M, 0, shuffle_memory, shuffle_roll)
                        if (self.chat_template is None and not zero_memory) else [])
         if (self.chat_template is not None and not zero_memory
                 and getattr(self.encoder, "wants_prepend_refresh", False)

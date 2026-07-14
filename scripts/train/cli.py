@@ -498,14 +498,18 @@ def args_to_config(args, ap):
         # behavioral_kl is safe (its own CE+KL backward, no GradCache), so keep these arms whitelisted
         # for it and block them ONLY for the GradCache mode.
         if args.objective_mode == "contrastive":
-            _KV_ARMS = {"gisting_baseline", "memoryllm_baseline"}
+            # Arms whose DIFFERENTIABLE memory lives in aux tensors GradCache reuses verbatim across rolls
+            # (not in the detached mem_leaf) → the 2nd roll backwards through the freed encoder graph.
+            # KV arms carry it in aux['past_kv']; slotgraph live-read carries edge_R/edge_C attached.
+            _KV_ARMS = {"gisting_baseline", "memoryllm_baseline",
+                        "slotgraph_kv_baseline",        # differentiable memory in aux['past_kv']
+                        "slotgraph_liveread_baseline"}  # attached edge_R/edge_C in aux (live injection)
             _bad_kv = _KV_ARMS.intersection(args.variants)
             if _bad_kv:
                 raise SystemExit(
-                    f"--objective-mode {args.objective_mode} (GradCache) does NOT support the per-layer-KV "
-                    f"arms {sorted(_bad_kv)}: their differentiable memory lives in aux['past_kv'], which "
-                    f"GradCache reuses across rolls → 2nd-backward-through-freed-graph crash. These arms "
-                    f"are valid under --objective-mode behavioral_kl only.")
+                    f"--objective-mode {args.objective_mode} (GradCache) does NOT support {sorted(_bad_kv)}: "
+                    f"their differentiable memory lives in aux tensors that GradCache reuses across rolls → "
+                    f"2nd-backward-through-freed-graph crash. Valid under --objective-mode behavioral_kl only.")
         print(f"[objective override] mode={args.objective_mode} InfoNCE coef={cfg.objective_coef}")
     if args.uniform_mem_pos:
         cfg.uniform_mem_pos = True

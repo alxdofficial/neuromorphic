@@ -514,6 +514,8 @@ class SlotGraphEncoder(nn.Module):
         (they never become tokens); the decoder attends to it passively (no intra-memory attention). Returns
         (K, V), each a length-L list of [B, n_kv, N, head_dim], plus an all-valid memory mask."""
         N, de, L = self.N, self.de, self.L
+        if self.force_no_edges:
+            C = torch.zeros_like(C)                                      # edge-off ablation → content-only KV
         X = self.kv_in_norm(X)                                           # tame node-state magnitude (|X|≈46 → embed scale)
         seq = self._node_tokens(X, B)                                    # [B,N,d] graph nodes → tokens
         dev, dt = seq.device, seq.dtype
@@ -593,6 +595,8 @@ class SlotGraphEncoder(nn.Module):
         X, R, C = state["X"], state["R"], state["C"]
         B = X.shape[0]
         if self.live_read:                                               # Option B: prepend nodes, edges LIVE
+            if self.force_no_edges:
+                C = torch.zeros_like(C)                                   # edge-off ablation → content-only read
             # prepend node tokens (scale-matched like the prepend read), NO edge_up message-pass — the edges
             # ride the DECODER's own last-K self-attention via the injection hook (model.py), using edge_R/C.
             node_tok = self.norm(self._node_tokens(X, B))                # [B,N,d]

@@ -54,12 +54,20 @@ def train_mixed_variant(
     llama_arg = None if cfg.use_llama_lora else llama
     model = ReprLearningModel(cfg, variant=variant, llama_model=llama_arg).to(device)
     if getattr(cfg, "compile_decoder", False):
-        # Compile the ACTUAL post-LoRA decoder transformer (fixes the discarded-compile bug: train.py
-        # compiled the shared llama, but the LoRA path self-loads its own decoder). Both the student
-        # decode and the disable_lora teacher decode run through this module → dynamic=True + first-step
-        # warmup covers both graphs.
-        model.decoder.llama.model = torch.compile(model.decoder.llama.model, dynamic=True)
-        print("[compile] torch.compile(dynamic=True) on the post-LoRA decoder transformer")
+        # slotgraph variants dynamically install per-forward hooks ON the decoder (live-read edge injection)
+        # or route through _prefix_kv_forward — compiling would silently drop hooks installed after the first
+        # (lazy) compiled call, fragment into per-hook Dynamo graphs, and break compiled resume (the ckpt is
+        # ._orig_mod-normalized). Skip compile for these arms rather than train a silently-different arch.
+        if str(variant).startswith("slotgraph"):
+            print(f"[compile] SKIPPED for {variant}: it installs decoder hooks / routes via _prefix_kv_forward "
+                  f"— compiling would silently drop the graph mechanism. Running uncompiled.")
+        else:
+            # Compile the ACTUAL post-LoRA decoder transformer (fixes the discarded-compile bug: train.py
+            # compiled the shared llama, but the LoRA path self-loads its own decoder). Both the student
+            # decode and the disable_lora teacher decode run through this module → dynamic=True + first-step
+            # warmup covers both graphs.
+            model.decoder.llama.model = torch.compile(model.decoder.llama.model, dynamic=True)
+            print("[compile] torch.compile(dynamic=True) on the post-LoRA decoder transformer")
     n_trainable = model.n_trainable_params()
     print(f"\n{'='*78}")
     print(f"Variant: {variant}  ({n_trainable:,} trainable, {n_steps} steps, "
