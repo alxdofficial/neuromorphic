@@ -343,9 +343,15 @@ class SlotGraphEncoder(nn.Module):
         allow = allow[None] & key_ok[:, None, :]                         # AND key validity → [B,S,S]
         neg = torch.finfo(we.dtype).min
         add_mask = torch.where(allow.unsqueeze(1), we.new_zeros(()), we.new_full((), neg))     # [B,1,S,S]
-        # UNIFORM node position: text at 0..T-1, ALL nodes at one position (T) → the node block is a SET, not
-        # RoPE-ordered, so node-node attention is permutation-symmetric (order-equivariance).
-        pos = torch.cat([torch.arange(T, device=dev), torch.full((N,), T, device=dev)])[None].expand(B, S)
+        # UNIFORM node position, padding-INVARIANT (audit #1): node pos was pinned to the PADDED length T, so
+        # the node→text RoPE distances (and thus the whole memory) depended on how much padding a row carried.
+        # Fix: COMPACT valid-text positions (0..valid-1 via cumsum → no RoPE gap over internal/tail padding)
+        # and place ALL nodes at ONE position = the per-row valid-text length (right after the valid text).
+        # The node block stays a permutation-symmetric SET; distances now depend only on content. No-op for a
+        # full (unpadded) window: cumsum(ones)-1 == arange and valid==T.
+        text_pos = (wm_enc.long().cumsum(dim=1) - 1).clamp_min(0)            # [B,T] compact valid positions
+        node_pos = wm_enc.long().sum(dim=1, keepdim=True)                    # [B,1] valid count = node slot pos
+        pos = torch.cat([text_pos, node_pos.expand(B, N)], dim=1)           # [B, T+N]
 
         # Per-layer state captured by the hooks. Normalize relation CONTENT first, then apply C; applying LN
         # after C·R would erase the confidence magnitude. U stays after the aggregate, so no [N,N,d] lift.

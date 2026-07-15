@@ -209,6 +209,16 @@ class ReprLearningModel(nn.Module):
                 memory      : [B, M, d_llama] memory tokens (for inspection)
                 **aux       : any extras from the encoder
         """
+        # forward() runs a PLAIN prepend via FrozenLlamaDecoder — it does NOT install the slotgraph
+        # live-read edge hooks / KV prefix / bidir-uniform geometry (those live in compute_loss and
+        # compute_masked_reconstruction_loss). Refuse rather than silently evaluate a different architecture
+        # (audit #10). The training + eval harness uses compute_loss, so this only guards ad-hoc model(...).
+        if getattr(self.encoder, "live_read", False) or getattr(self.encoder, "reads_per_layer_kv", False):
+            raise NotImplementedError(
+                "ReprLearningModel.forward() does not implement the slotgraph live-read / per-layer-KV read "
+                "(it runs a plain prepend). Use compute_loss / compute_masked_reconstruction_loss for these "
+                "variants.")
+
         # 1. Get Llama's frozen token embeddings as encoder input
         with torch.no_grad():
             embed_layer = self.decoder.llama.get_input_embeddings()
