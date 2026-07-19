@@ -16,9 +16,11 @@ import argparse
 import csv
 import glob
 import json
+import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO))
 OUT = REPO / "outputs" / "baselines"
 
 
@@ -102,12 +104,19 @@ def to_csv(rows, cols, cells, path: Path):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--glob", default="*.json", help="filename glob under outputs/baselines/")
+    ap.add_argument("--no-published", action="store_true",
+                    help="omit the CITED published-reference block (judge-scored, not comparable)")
     args = ap.parse_args()
     rows, cols, cells = collect(args.glob)
     md = to_markdown(rows, cols, cells)
+    if not args.no_published:
+        # append the CITED published numbers as a SEPARATE labeled block (LLM-judge, NOT our deterministic
+        # scale) — never merged into the table above.
+        from src.memory.eval.published_baselines import render_published_markdown
+        md = md + "\n" + render_published_markdown()
     OUT.mkdir(parents=True, exist_ok=True)
     (OUT / "report.md").write_text(md + "\n")
-    to_csv(rows, cols, cells, OUT / "report.csv")
+    to_csv(rows, cols, cells, OUT / "report.csv")   # CSV stays deterministic-only (our runs)
     print(md)
     print(f"\n[report] wrote {OUT}/report.md and report.csv")
 
