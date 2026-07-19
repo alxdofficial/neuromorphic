@@ -38,6 +38,139 @@ The band-gate (`scripts/diagnostics/mixed/mixed_band_gate_eval.py`) reports, per
 
 ## Runs
 
+### Run: `localrun-0005` — KV read + **identity re-injection** (fixed) (2026-07-18)
+
+**Config:** `slotgraph_kv_baseline` + `SLOTGRAPH_ID_REINJECT=1`, `id_strength=1.0` (RMS-match). Same harness
+as 0003 (KV read, behavioral_kl, 6000 steps, ctx 2048, M=96, win 256×6, batch 6). 117 min / 16.6 GB peak on
+RTX 4090. Working tree carried the audit fixes (id-accumulation #2, drift-guard #12, entmax req #15, canaries,
+etc.) — uncommitted; commit base 0ff3186. **Directly comparable to 0003 → isolates the id_reinject effect.**
+
+**Context:** supersedes killed `localrun-0004` (same run but with the #2 accumulation bug live → identity
+was id-DOMINATED ~2.9:1 (~11% content energy), confounded; killed at step ~1300 after an external audit
+flagged it). 0005 re-ran with the fix: scale reference = id-FREE content norm → true 50/50 at the stamp,
+non-accumulating (unit-tested in `tests/test_slotgraph_id_reinject.py`).
+
+**Decisive result — collapse FIXED, binding still FLAT (negative):**
+
+| Metric | 0003 (no id) | **0005 (id fixed)** | Read |
+|---|---|---|---|
+| node_cos | ~0.76 | **0.41** | ✅ slots much more distinct, HELD under 6000 steps |
+| node_effrank | — | **29.4** | ✅ high rank (was ~2 collapsed) |
+| id_frac (emitted) | n/a | **0.45** | ✅ content-majority; #2 fix held (not id-dominated) |
+| edge_effrank | ~4.4 | 4.83 | ~ edges form |
+| **edge_inputdep** | ~2.79 | **2.90** | ✗ **unchanged — memory still GENERIC** |
+| babi **SHUF−REAL** | ~−0.01 | **0.0002** | ✗ **FLAT** |
+| doc_qa SHUF−REAL | ~0 | **0.007** | ✗ **FLAT** |
+| fact_recall SHUF−REAL | ~0 | **0.001** | ✗ **FLAT** |
+| babi OFF−REAL | large | **5.48** | memory IS used (as a prior) |
+
+(reconstruct SHUF−REAL 0.10 / continuation 0.35 = known free-signal tasks, not diagnostic.)
+
+**Conclusion — refutes "distinct slots is the binding lever."** We cleanly fixed the collapse (distinct,
+high-rank, content-majority slots that persist under training) and it STILL doesn't bind: SHUF−REAL flat on
+all decisive tasks, `edge_inputdep` unchanged. Memory varies with input but the decoder reads it generically
+(shuffling one example's memory onto another's query costs nothing; only removing it hurts). Combined with the
+read-axis runs (0002 liveread, 0003 KV — both flat), the wall is now triangulated: **not the read surface,
+not slot collapse → the OBJECTIVE (loss-neutrality of behavioral_kl).** A generic-prior solution ties on KL
+with a binding solution, so SGD takes the generic one. **Next lever = non-loss-neutral objective** (SHUF−REAL
+/ free-bits / contrastive in the loss), per [[research_memory_landscape_objective]]. Audit fixes shipped
+(config/encoder/loops/model/requirements/tests) — see the audit-fix batch; commit pending user go.
+
+### Run: `localrun-0003` — slotgraph **per-layer-KV read** (2026-07-17)
+
+**Config:** single arm `slotgraph_kv_baseline` × 6000 steps × B=6, `behavioral_kl`, same harness as
+0001/0002. Commit `0ff3186`. 110 min train on RTX 4090. **The genuine read-surface test:** per-layer-KV
+is the ONLY read that binds in the cohort (gisting/memoryllm, SHUF−REAL +0.1…+0.6); does it rescue
+slotgraph? Ran as v1 (inject at all layers = max binding shot). `M=0` (KV injection, no prepend tokens).
+
+**SHUF−REAL — FLAT, does NOT bind:**
+
+| task | **KV** | liveread | old prepend | gisting (KV binder) |
+|---|---|---|---|---|
+| reconstruct | −0.001 | +0.013 | +0.01 | +0.60 |
+| babi | −0.014 | −0.000 | +0.00 | +0.09 |
+| doc_qa | +0.007 | −0.006 | −0.00 | +0.11 |
+| continuation | −0.001 | +0.159 | +0.19 | +0.56 |
+| fact_recall | −0.002 | +0.001 | +0.00 | +0.08 |
+| babi EM | 3.6% | 1.0% | 1.6% | 4.2% |
+
+**TRAP:** in-training babi TF-EM held at 6% (steps 3000–5000), band-gate babi EM 3.6% (≈ gisting) — but
+babi SHUF−REAL = **−0.014**. The KV read got better at babi from the tiny-vocab answer PRIOR, not from
+example memory. Textbook TF-EM-vs-SHUF−REAL distinction.
+
+**Collapse canary — KV did NOT collapse (opposite of liveread):**
+
+| canary | init | **KV @6k** | liveread @6k | want |
+|---|---|---|---|---|
+| node_cos | 0.910 | **0.759** | 0.9999 | ↓ |
+| edge_effrank | 3.35 | **4.36** | 2.45 | ↑ |
+| relation_effrank | 3.52 | **4.15** | 2.35 | ↑ |
+| conf_active_frac | 0.00 | **0.057** | 0.00 | ↑ |
+| edge_inputdep | 2.75 | **2.79** | 3.57 | ↑ |
+
+**Verdict (decisive, reframes the diagnosis):** the richer per-layer-KV read **fixed the representation
+collapse** — nodes differentiate (cos 0.76 vs liveread 0.9999), edge/relation RANK ROSE (4.36/4.15 vs
+2.3), edges FORM (5.7% active vs 0%). Confirms "richer read ⇒ more gradient pathways ⇒ healthier write."
+**Yet SHUF−REAL is still flat** — because `edge_inputdep` barely moved (2.75→2.79): the memory is now
+high-rank but GENERIC (same structure across examples), not example-keyed. Two failure modes, one root:
+liveread = input-responsive but rank-collapsed; KV = high-rank but not input-specific. Neither gets the
+combination binding needs (high-rank AND example-specific), because loss-neutral `behavioral_kl` provides
+NO gradient pressure toward example-specificity (decoder hits the same KL either way). **Cleanest evidence
+yet that the wall is the OBJECTIVE, not the read surface or collapse.** Fixing the read fixes collapse but
+not binding. → LEVER = a non-loss-neutral objective (SHUF−REAL-in-loss / free-bits / use-address-store-
+marginalize remedies, per `research_memory_landscape_objective`). NOT more read-surface / architecture work.
+
+---
+
+### Run: `localrun-0002` — slotgraph **live edge-modulated read** (2026-07-17)
+
+**Config:** single arm `slotgraph_liveread_baseline` × 6000 steps × B=6, `behavioral_kl`, frozen
+SmolLM2-135M + shared read-LoRA, M=96, ctx 2048, 8×256 windows. Commit `0ff3186` (post peer-audit
+fixes + Move-1 tap-limited injection). 85.9 min train on RTX 4090. Same harness as localrun-0001.
+**Hypothesis:** the faithful live read (edges modulate the decoder's REAL last-K self-attention live,
+re-injected fresh each layer — never smeared) unlocks example-specific binding the way per-layer-KV
+does for gisting/memoryllm.
+
+**Final val loss (≈ old prepend slotgraph — behavioral_kl is loss-neutral to binding, as expected):**
+recon 6.605 · babi 2.582 · doc_qa 3.748 · continuation 3.265 · fact_recall 2.945.
+
+**SHUF−REAL (THE binding metric) — FLAT, membership wall persists:**
+
+| task | **liveread** | old slotgraph prepend (0001) | gisting (KV binder) |
+|---|---|---|---|
+| reconstruct | +0.013 | +0.01 | +0.60 |
+| babi | −0.000 | +0.00 | +0.09 |
+| doc_qa | −0.006 | −0.00 | +0.11 |
+| continuation | +0.159 | +0.19 | +0.56 |
+| fact_recall | +0.001 | +0.00 | +0.08 |
+| babi TF-EM | 1.0% | 1.6% | 4.2% |
+
+OFF−REAL positive everywhere (+0.13…+3.70) → memory is USED, but as a generic prior. Only continuation
+shows SHUF−REAL life (+0.159), the known "carries-content-vs-nothing" free signal (data audit = filler).
+
+**Collapse canary on the trained ckpt (mechanistic cause):**
+
+| canary | init | liveread @6k | want |
+|---|---|---|---|
+| node_cos | 0.910 | **0.9999** | ↓ |
+| edge_effrank | 3.35 | **2.45** | ↑ |
+| relation_effrank | 3.52 | **2.35** | ↑ |
+| edge_inputdep | 2.75 | 3.57 | ↑ |
+| conf_active_frac | 0.00 | 0.00 | ↑ |
+
+**Verdict (decisive negative):** the live edge-modulated read does NOT break the membership wall —
+statistically identical to the old prepend slotgraph. Mechanism: the 96 node slots **oversmooth to
+cos 0.9999** (one repeated vector) and edge/relation rank falls to ~2.3–2.5 (rank-2 blur, same as the
+KV warmup's ~2.0). Input-dependence rises (memory responds to input → OFF−REAL>0) but the content is
+rank-2 blurred across degenerate nodes → nothing example-specific for the edges to carry. The KV read
+hit the SAME wall, so this is **not read-surface-specific**: root cause = representation collapse under
+the loss-neutral `behavioral_kl` objective (+ collapsed node init). Corroborates the 2×2 diagnosis
+(binding is primarily an OBJECTIVE problem). Untested levers: diverse on-manifold node init (flag built,
+not enabled), anti-collapse/decorrelation on nodes, a non-loss-neutral objective. **Reinforces the
+Phase-2 pivot** — establish baselines now; treat the objective (not read geometry) as the real lever.
+
+---
+
 ### Run: `localrun-0001` — first full cohort (2026-07-12)
 
 **Config:** 6 trainable arms × **6000 steps** × B=6, `behavioral_kl`, frozen SmolLM2-135M + shared

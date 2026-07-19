@@ -6,6 +6,7 @@ Llama decoder, and produces the reconstruction loss for training.
 from __future__ import annotations
 import copy
 import math
+import os
 from dataclasses import replace
 from typing import Optional
 
@@ -120,6 +121,20 @@ class ReprLearningModel(nn.Module):
             # Option B: prepend node tokens + edge-modulated decoder attention (live_read installs the hooks
             # and forces bidir + uniform memory geometry in compute_loss).
             cfg.slotgraph_live_read = True
+        if str(variant).startswith("slotgraph"):
+            # EXPERIMENT toggles (env-gated so any slotgraph variant can enable them without new-variant
+            # plumbing): identity re-injection (root anti-collapse) + entmax sparse relation (optional add-on).
+            if os.environ.get("SLOTGRAPH_ID_REINJECT") == "1":
+                cfg.slotgraph_id_reinject = True
+            if os.environ.get("SLOTGRAPH_SPARSE_RELATION") == "1":
+                cfg.slotgraph_sparse_relation = True
+            if os.environ.get("SLOTGRAPH_DIVERSE_NODE_INIT") == "1":
+                cfg.slotgraph_diverse_node_init = True
+            # numeric knobs (reproducible from the launch command via `export`); ignored if unset.
+            if os.environ.get("SLOTGRAPH_ID_STRENGTH"):
+                cfg.slotgraph_id_strength = float(os.environ["SLOTGRAPH_ID_STRENGTH"])
+            if os.environ.get("SLOTGRAPH_REL_INIT_SCALE"):
+                cfg.slotgraph_rel_init_scale = float(os.environ["SLOTGRAPH_REL_INIT_SCALE"])
         if variant == "h2o_baseline":
             cfg.use_llama_lora = False
         self.cfg = cfg

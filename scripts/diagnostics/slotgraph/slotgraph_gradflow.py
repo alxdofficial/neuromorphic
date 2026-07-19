@@ -35,6 +35,7 @@ GROUPS = {
     "REL phi":         "encoder.phi",          # phi_i / phi_j / phi_ln
     "REL gates":       "encoder.gate_",        # gate_a_i/j, gate_b_i/j (+ biases)
     "REL rd_k":        "encoder.rd_k",
+    "REL rel_q/k":     "encoder.rel_",         # sparse-relation routing projections (rel_q/rel_k/rel_ln)
     "REL edge_norm":   "encoder.edge_norm",
     "CONF conf_W":     "encoder.conf_W",
     "CONF conf_attn":  "encoder.conf_attn_W",

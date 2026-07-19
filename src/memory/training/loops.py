@@ -132,7 +132,11 @@ def train_mixed_variant(
         # is checked first so the dynamically-attached ranks (not in cfg_dict) are caught.
         _crit = ("backbone_model", "objective_mode", "kl_coef", "kl_ce_coef", "kl_temp",
                  "memoryllm_lora_rank", "titans_mem_hidden", "gisting_lora_rank", "icae_lora_rank",
-                 "slotgraph_lora_rank", "slotgraph_d_edge", "slotgraph_write_layers")
+                 "slotgraph_lora_rank", "slotgraph_d_edge", "slotgraph_write_layers",
+                 # id_d is a FROZEN buffer: strict=False silently accepts a re-randomized basis on resume,
+                 # and id_strength/sparse flags change behavior without changing state-dict shape → guard them.
+                 "slotgraph_id_reinject", "slotgraph_id_strength",
+                 "slotgraph_sparse_relation", "slotgraph_rel_init_scale")
         for _field in ("backbone_model", "task_mode", *_crit):
             _now = (model.cfg.llama_model if _field == "backbone_model"
                     else getattr(model.cfg, _field, None))

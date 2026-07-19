@@ -31,6 +31,11 @@ import torch.utils.checkpoint as _ckpt
 from torch import Tensor
 from transformers.models.llama.modeling_llama import rotate_half, repeat_kv
 
+try:                                    # optional: only needed for slotgraph_sparse_relation
+    from entmax import entmax15
+except ImportError:                     # pragma: no cover
+    entmax15 = None
+
 from ...common import _NormMatch
 from ...config import ReprConfig
 
@@ -116,6 +121,12 @@ class SlotGraphEncoder(nn.Module):
         # layer, so the relational structure is never smeared (unlike the KV read's frozen KV or the old
         # prepend's baked-once message-pass). ≈ prepend cost, no materialize pass.
         self.live_read = bool(getattr(cfg, "slotgraph_live_read", False))
+        self.sparse_relation = bool(getattr(cfg, "slotgraph_sparse_relation", False))
+        if self.sparse_relation and entmax15 is None:
+            raise ImportError("slotgraph_sparse_relation=True requires the `entmax` package "
+                              "(`pip install entmax`).")
+        self.id_reinject = bool(getattr(cfg, "slotgraph_id_reinject", False))
+        self.id_strength = float(getattr(cfg, "slotgraph_id_strength", 0.4))
         # which layers to harvest: 0 = all; N>0 = last-N (fewer = cheaper, later = more semantic)
         self.write_layers = int(cfg.slotgraph_write_layers)
         embed = base.get_input_embeddings()
@@ -126,6 +137,9 @@ class SlotGraphEncoder(nn.Module):
         # ── frozen orthonormal ids (anti-collapse basis / reusable entity keys) + token former ──
         idh = torch.empty(N, h); nn.init.orthogonal_(idh)
         self.register_buffer("id_half", F.normalize(idh, dim=-1), persistent=True)
+        if self.id_reinject:                                               # per-node orthonormal id in d-space,
+            id_d = torch.empty(N, d); nn.init.orthogonal_(id_d)            # re-stamped into node hiddens each layer
+            self.register_buffer("id_d", F.normalize(id_d, dim=-1), persistent=True)
         self.type_embed = nn.Parameter(torch.empty(2, h))                  # [node, pointer]
         nn.init.orthogonal_(self.type_embed)
         with torch.no_grad():
@@ -164,6 +178,19 @@ class SlotGraphEncoder(nn.Module):
         # learnable inter-layer operator W·[ (e^{l+gap}-e^l) ‖ (e^l ⊙ e^{l+gap}) ‖ e^{l+gap} ] → d_e.
         # No bias: a relation proposal must be supported by pair evidence, not a shared all-edge constant.
         self.op_W = nn.Linear(3 * de, de, bias=False)
+        # ── SPARSE relational operator (slotgraph_sparse_relation) ──
+        # A DECOUPLED entmax-1.5 topology over the node hiddens replaces the LM's dense node↔node softmax
+        # (a_nn). rel_q/rel_k carry the sharpness (learnable, not a scalar temp — a frozen scalar can't
+        # sharpen under Adam); LN first so addressing is content- not magnitude-driven (same rationale as
+        # phi_ln). Small init gain → soft entmax at init (sparsity emerges as the projections learn, rather
+        # than over-sparsifying to one neighbour before there is any signal).
+        self.rel_init_scale = float(getattr(cfg, "slotgraph_rel_init_scale", 0.5))  # for startup log + repro
+        if self.sparse_relation:
+            self.rel_ln = nn.LayerNorm(d)
+            self.rel_q = nn.Linear(d, de, bias=False)
+            self.rel_k = nn.Linear(d, de, bias=False)
+            for _p in (self.rel_q, self.rel_k):
+                nn.init.normal_(_p.weight, std=(d ** -0.5) * self.rel_init_scale)
         # A separate learned evidence head observes the SAME relation feature plus absolute attention
         # statistics. Its sigmoid output is the current confidence observation in [0,1]. Biasing it low makes
         # an unseen edge weak without closing the gradient path; random weights preserve input-dependence.
@@ -235,9 +262,12 @@ class SlotGraphEncoder(nn.Module):
         self.force_no_edges = False                                       # eval canary: C=0 (content-only graph read)
 
         hv = f"last-{self.write_layers}" if self.write_layers > 0 else "all"
+        _topo = (f"sparse-entmax(init×{self.rel_init_scale})" if self.sparse_relation else f"dense {N}×{N}")
+        _idc = (f"id_reinject(strength {self.id_strength})" if self.id_reinject else "id_reinject OFF")
+        _dvi = " +diverse_init" if bool(getattr(cfg, "slotgraph_diverse_node_init", False)) else ""
         print(f"[slotgraph] {N} nodes, NO edge tokens; shared LM + write-LoRA r{cfg.slotgraph_lora_rank} "
               f"({self._write_lora_n} linears); harvest {hv} layers' attention → value-path edge residual "
-              f"(d_e={de}, dense {N}×{N}); unit relation + dynamic scalar confidence commit; "
+              f"(d_e={de}, {_topo}); {_idc}{_dvi}; unit relation + dynamic scalar confidence commit; "
               f"prepend+bidir read ({self.M} tokens: {N} node-centric"
               f"{f' + {self.read_topk} pointers' if self.read_topk>0 else ''})")
 
@@ -412,7 +442,20 @@ class SlotGraphEncoder(nn.Module):
                 # a_nn is a proper convex combination over node keys (the full softmax denominator cancels);
                 # node_mass keeps the absolute node-vs-text split as CONFIDENCE evidence.
                 node_mass = a_raw.sum(-1, keepdim=True)                   # [B,N,1], absolute node attention
-                a_nn = a_raw / node_mass.clamp_min(1e-6)                  # [B,N,N], conditional topology
+                if self.sparse_relation:
+                    # DECOUPLED entmax-1.5 SPARSE topology from this layer's node hiddens (nb): each node
+                    # relates to only a few neighbours (a real sparse graph), replacing the LM's dense
+                    # ~uniform node↔node softmax that pooled all slots into one address. Self-relation
+                    # excluded (a node relates to OTHERS). node_mass (from a_raw) is still kept as the
+                    # absolute-attention CONFIDENCE evidence — only the TOPOLOGY is decoupled.
+                    nbl_rel = self.rel_ln(nb)
+                    rq = self.rel_q(nbl_rel); rk = self.rel_k(nbl_rel)    # [B,N,d_e]
+                    rel_scores = torch.matmul(rq, rk.transpose(-1, -2)) * (self.de ** -0.5)  # [B,N,N]
+                    eye = torch.eye(N, dtype=torch.bool, device=dev)
+                    rel_scores = rel_scores.masked_fill(eye, -1e9)        # no self-relation
+                    a_nn = entmax15(rel_scores.float(), dim=-1).to(nb.dtype)  # [B,N,N] SPARSE, rows→1
+                else:
+                    a_nn = a_raw / node_mass.clamp_min(1e-6)              # [B,N,N], dense LM topology
                 agg = torch.einsum("bij,bije->bie", a_nn, E_de)          # [B,N,d_e]
                 resid = torch.tanh(self.U(agg)) * self.resid_scale       # [B,N,d]  (0 at init: ReZero + scale)
                 # PERF (launch-bound): the node block is the LAST N positions (Toff+N == S), and only it
@@ -444,6 +487,12 @@ class SlotGraphEncoder(nn.Module):
                         # attention goes to nodes uniformly, <1 when text dominates, capped at 1.
                         mass_evidence = (N * (a_raw * store["prev_raw"]).clamp_min(0).sqrt()).clamp_max(1.0)
                         obs = learned_evidence * mass_evidence.unsqueeze(-1)
+                        if self.sparse_relation:
+                            # CONSISTENCY: topology (a_nn) is sparse but obs is built from DENSE a_raw, so
+                            # without this the persistent R/C store stays dense and self-edges (a_nn diag=0)
+                            # still accrue confidence. Gate obs by the sparse support → genuinely sparse store,
+                            # self-relation excluded from confidence too.
+                            obs = obs * (a_nn > 0).unsqueeze(-1).to(obs.dtype)
                         _wl = agg_w[li].to(feat.dtype)                    # learned per-pair aggregation weight
                         store["S"] = store["S"] + _wl * feat
                         store["O"] = store["O"] + _wl * obs
@@ -458,6 +507,27 @@ class SlotGraphEncoder(nn.Module):
                 return hs
             return hook
 
+        # IDENTITY RE-INJECTION: re-stamp a fixed orthonormal per-node id into the node rows at EVERY layer's
+        # INPUT (forward-PRE hook), so the id survives the 30-layer transform (finding-4: id was added once at
+        # token-formation and diluted away by the growing content). Stamped at id_strength × content-norm
+        # (scale-immune) with the prior id-component projected out first (no accumulation over depth). Keeps the
+        # slots distinct → the LM's dense node↔node attention concentrates instead of averaging to uniform.
+        def _mk_prehook():
+            def prehook(module, args, kwargs):
+                h = args[0] if args else kwargs.get("hidden_states")
+                if h is None or h.shape[1] < Toff + N:
+                    return None
+                nh = h[:, Toff:Toff + N]                                   # [B,N,d] node rows (the last N)
+                idn = self.id_d.to(h.dtype).unsqueeze(0)                   # [1,N,d] orthonormal per-node id
+                nh = self._restamp_id(nh, idn, self.id_strength)          # project out old id, stamp fresh
+                h = torch.cat([h[:, :Toff], nh], dim=1)                    # nodes are the last N rows
+                if args:
+                    return (h,) + tuple(args[1:]), kwargs
+                kw = dict(kwargs); kw["hidden_states"] = h
+                return args, kw
+            return prehook
+        pre_handles = ([self.base.model.layers[li].register_forward_pre_hook(_mk_prehook(), with_kwargs=True)
+                        for li in range(self.L)] if self.id_reinject else [])
         handles = [self.base.model.layers[li].self_attn.register_forward_hook(_mk_hook(li), with_kwargs=True)
                    for li in range(self.L)]
         try:
@@ -469,6 +539,8 @@ class SlotGraphEncoder(nn.Module):
                                   output_attentions=not self.flash_harvest, use_cache=False)
         finally:
             for hh in handles:
+                hh.remove()
+            for hh in pre_handles:
                 hh.remove()
         # S/O are now a CONVEX (softmax) combination over the layer-pairs (weights sum to 1), so they're
         # already scale-invariant to how many layers we harvest — no /n_pairs needed (that was the uniform-mean
@@ -678,6 +750,17 @@ class SlotGraphEncoder(nn.Module):
         st, _ = self.streaming_write(st, token_embeds, attention_mask)
         return self.finalize_memory(st)
 
+    @staticmethod
+    def _restamp_id(nh, idn, strength):
+        """Re-stamp orthonormal per-node identity `idn` into node hiddens `nh` at `strength`×content-norm.
+        The old id component is projected out FIRST and the scale reference is the id-FREE content norm, so
+        identity does NOT accumulate over depth and strength=1.0 is a true 50/50 (id:content) energy split.
+        (Extracted so the non-accumulation invariant is unit-testable without loading an LM.)"""
+        comp = (nh * idn).sum(-1, keepdim=True)                          # current id projection (to remove)
+        content = nh - comp * idn                                        # strip old id FIRST (no accumulation)
+        cnrm = content.norm(dim=-1, keepdim=True)                        # CONTENT norm (id-free) = scale reference
+        return content + (strength * cnrm) * idn                         # stamp fresh at strength×content-norm
+
     @torch.no_grad()
     def _canaries(self, memory, X, R, C, win_metrics, device):
         B = memory.shape[0]
@@ -727,6 +810,14 @@ class SlotGraphEncoder(nn.Module):
             "slotgraph_conf_std": C.std(),
             "slotgraph_conf_active_frac": (C > 0.5).float().mean(),
         }
+        if self.id_reinject:
+            # id-energy fraction of the EMITTED node memory: |proj onto own id| / ‖node‖.
+            # The stamp point is a true 50/50 (id_frac 0.71) but the emitted memory is measured AFTER the
+            # final write layer's transform re-grows content, so a healthy value is ~0.4–0.7 (content-majority
+            # to balanced). →0.95 = id-DOMINATED (the pre-fix accumulation bug: content drowned, no binding).
+            idn = self.id_d.to(X.dtype).unsqueeze(0)                     # [1,N,d]
+            idamp = (X * idn).sum(-1).abs()                              # [B,N] |own-id amplitude|
+            aux["slotgraph_id_frac"] = (idamp / X.norm(dim=-1).clamp_min(1e-6)).mean()
         if win_metrics:                                                  # per-window collapse trace (last window)
             aux["slotgraph_edge_effrank_final"] = win_metrics[-1][0]
             aux["slotgraph_edge_norm_final"] = win_metrics[-1][1]

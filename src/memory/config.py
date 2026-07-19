@@ -215,6 +215,36 @@ class ReprConfig:
                                          # forwards ≈ 270 self-mixing passes — a low-pass filter (Dong et al.
                                          # 2021 rank collapse). Starting UNCOLLAPSED gives the write distinct
                                          # content to preserve rather than create against the smear.
+    slotgraph_id_reinject: bool = False  # IDENTITY RE-INJECTION (ROOT anti-collapse, primary fix): re-stamp a
+                                         # fixed orthonormal per-node id into the node hiddens at EVERY LM layer
+                                         # — like a positional encoding, re-applied not carried. Two tricks make
+                                         # it robust: (1) stamped at a FRACTION of the content norm so it's never
+                                         # swamped as content grows (finding-4 fix), (2) the prior id-component is
+                                         # projected out first so it does NOT accumulate over 30 layers. Keeps the
+                                         # slots DISTINCT → dense softmax addresses them selectively (the baseline
+                                         # recipe: memoryllm/gisting bind with dense attn over distinct slots).
+                                         # Content updates handle only content; identity is re-added. Makes the
+                                         # entmax/mask changes optional. Pairs with slotgraph_diverse_node_init.
+    slotgraph_id_strength: float = 1.0   # id-RMS : content-RMS ratio for the re-stamp. 1.0 = true RMS-MATCH
+                                         # (id and content equal RMS → 50/50 energy split), the principled
+                                         # zero-magic-number default. Frozen q/k can't reweight id-vs-content, so
+                                         # this ratio is a real knob: tune DOWN (0.4/0.7) only if content needs
+                                         # more room. (matched to each node's OWN content norm per-layer, so it's
+                                         # scale-immune to Llama's large layer-varying hidden RMS.)
+    slotgraph_sparse_relation: bool = False  # SPARSE ADDRESSING (anti-homogenization): replace the LM's DENSE
+                                         # node↔node softmax topology (a_nn, ~uniform 1/N → pools all slots into
+                                         # one address) with a DECOUPLED entmax-1.5 operator over the node
+                                         # hiddens. entmax-1.5 gives exact zeros (each node relates to only a few
+                                         # neighbors = a real sparse graph) WITH live gradients (unlike sparsemax's
+                                         # dead-gradient ratchet). Sharpness lives in the learnable rel_q/rel_k
+                                         # projections, not a scalar temp. Feeds both the edge feature and the
+                                         # value-path injection. Pair with slotgraph_diverse_node_init.
+    slotgraph_rel_init_scale: float = 0.5  # rel_q/rel_k init = (1/√d)·scale. Sets INITIAL entmax sparsity.
+                                         # NOTE the score std ≈ scale² (dot-product of two ~scale-std vectors,
+                                         # ×d_e^-0.5), so support falls FAST: ×0.5≈56 neighbours/96, ×1≈12,
+                                         # ×2≈3, ×3≈1.7 (near one-hot). 0.5 = moderate start; projections are
+                                         # learnable so training sharpens from here. (Was 3.0 = accidental
+                                         # near-hard random graph before the projections learn anything.)
     slotgraph_layer_pair_gap: int = 0    # inter-layer operator: 0 = consecutive (l,l+1); k>0 = distant (l,l+k)
     slotgraph_flash_harvest: bool = True # True: SDPA/flash forward + recompute ONLY the [N,S] node-query
                                          # attention for the harvest (no [S,S] eager matrix → the B=8 memory

@@ -48,6 +48,8 @@ TRAINED_VARIANTS = [
     # active trainable cohort (2026-07-11); missing ckpts are skipped gracefully
     "icae_baseline", "autocompressor_baseline", "titans_baseline",
     "gisting_baseline", "memoryllm_baseline", "slotgraph_baseline",
+    # slotgraph read-variant arms (2026-07-17): per-layer-KV + live edge-modulated read
+    "slotgraph_kv_baseline", "slotgraph_liveread_baseline",
 ]
 # Campaign launch constants (must match the run that produced the checkpoints — the current 2026-07 config).
 MIXED_CTX = 2048            # was 1024 (stale)

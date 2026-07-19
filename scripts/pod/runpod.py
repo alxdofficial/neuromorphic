@@ -39,7 +39,8 @@ GPU_ALIAS = {"4090": "NVIDIA GeForce RTX 4090", "a40": "NVIDIA A40", "a6000": "N
              "a5000": "NVIDIA RTX A5000", "3090": "NVIDIA GeForce RTX 3090"}
 
 DEFAULT_ARMS = ["icae_baseline", "autocompressor_baseline", "titans_baseline",
-                "gisting_baseline", "memoryllm_baseline", "slotgraph_baseline"]
+                "gisting_baseline", "memoryllm_baseline", "slotgraph_baseline",
+                "slotgraph_kv_baseline", "slotgraph_liveread_baseline"]
 
 
 def _rp():
