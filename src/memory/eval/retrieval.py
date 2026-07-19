@@ -34,17 +34,28 @@ class DenseRetriever:
     def __init__(self, model_name: str = "sentence-transformers/all-MiniLM-L6-v2", device: str = "cpu"):
         self.model_name = model_name
         self.device = device
+        self._emb_cache: dict = {}          # passages-fingerprint -> passage embeddings
 
     @functools.cached_property
     def _model(self):
         from sentence_transformers import SentenceTransformer
         return SentenceTransformer(self.model_name, device=self.device)
 
+    def _encode_passages(self, passages: list[str]):
+        """Encode a passage list ONCE per unique context. MemoryAgentBench reuses ~36 contexts across ~3071
+        questions ("inject once, query many"); without this cache dense retrieval re-embeds every context per
+        question (~1.4M chunk encodings instead of ~16k) and blocks the async loop. Keyed by a content hash."""
+        key = hash(tuple(passages))
+        emb = self._emb_cache.get(key)
+        if emb is None:
+            emb = self._model.encode(passages, normalize_embeddings=True, show_progress_bar=False)
+            self._emb_cache[key] = emb
+        return emb
+
     def topk(self, passages: list[str], query: str, k: int) -> list[int]:
         if len(passages) <= k:
             return list(range(len(passages)))
-        import numpy as np
-        emb = self._model.encode(passages, normalize_embeddings=True, show_progress_bar=False)
+        emb = self._encode_passages(passages)   # cached across questions sharing this context
         q = self._model.encode([query], normalize_embeddings=True, show_progress_bar=False)[0]
         scores = emb @ q
         top = sorted(range(len(passages)), key=lambda i: scores[i], reverse=True)[:k]

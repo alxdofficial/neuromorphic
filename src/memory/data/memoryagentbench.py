@@ -14,6 +14,7 @@ from __future__ import annotations
 from typing import Optional
 
 _SPLITS = ("Accurate_Retrieval", "Test_Time_Learning", "Long_Range_Understanding", "Conflict_Resolution")
+_SMOKE_TARGET_SOURCES = 12   # a bounded sample aims to span ~this many source variants (per-source cap sizing)
 
 # Shared system prompt + per-sub-dataset query templates, VERBATIM from MemoryAgentBench utils/templates.py
 # (long_context_agent variant — the canonical one for a full-context / RAG panel). `{question}` is substituted
@@ -135,15 +136,21 @@ def load_memoryagentbench_text(variant: str = "s", max_examples: Optional[int] =
     del variant
     from datasets import load_dataset
 
+    import math
     by_comp_source: dict[str, dict[str, list]] = {}
-    comp_counts: dict[str, int] = {}
     skipped_size: dict[str, int] = {}
     loaded_splits: list[str] = []
     failed_splits: dict[str, str] = {}
-    # per-COMPETENCY soft cap when sampling: bounds materialization to ~= n_competencies × max_examples
-    # (NOT n_sources × max_examples), while still letting one competency fill the whole sample if others
-    # are absent. _round_robin_stratified then draws the balanced subset.
-    cap = max_examples
+    # per-SOURCE soft cap when sampling — so a bounded --max-examples spans MANY source variants, not just
+    # the first source of each competency (a per-competency cap let ruler_qa1 alone fill Accurate_Retrieval,
+    # starving ruler_qa2/eventqa). But when the caller has already NARROWED via `sources`, don't sub-cap (a
+    # single-source filter must still fill max_examples, not ceil(max_examples/N)). None ⇒ full load.
+    if max_examples is None:
+        per_source_cap = None
+    elif sources:
+        per_source_cap = max_examples                        # user narrowed → let the selected sources fill
+    else:
+        per_source_cap = max(2, math.ceil(max_examples / _SMOKE_TARGET_SOURCES))
 
     for split in splits:
         try:
@@ -161,8 +168,9 @@ def load_memoryagentbench_text(variant: str = "s", max_examples: Optional[int] =
                 continue
             if sources and not any(s in source for s in sources):
                 continue
-            if cap is not None and comp_counts.get(competency, 0) >= cap:
-                continue                                     # this competency already has enough
+            if per_source_cap is not None and \
+                    len(by_comp_source.get(competency, {}).get(source, [])) >= per_source_cap:
+                continue                                     # this SOURCE already has enough for the sample
             context = row.get("context", "") or ""
             if max_context_chars is not None and len(context) > max_context_chars:
                 skipped_size[source] = skipped_size.get(source, 0) + 1   # don't silently vanish sub-sources
@@ -192,8 +200,7 @@ def load_memoryagentbench_text(variant: str = "s", max_examples: Optional[int] =
                     "full_history": context,
                     "sessions": chunks,
                 })
-                comp_counts[competency] = comp_counts.get(competency, 0) + 1
-                if cap is not None and comp_counts[competency] >= cap:
+                if per_source_cap is not None and len(src_bucket) >= per_source_cap:
                     break
 
     if skipped_size:

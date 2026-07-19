@@ -35,9 +35,9 @@ _DEFAULT_CHECKPOINT = "latent-context/0.6b-4b-LCLM-16x"   # highest compression;
 _DEFAULT_REPO_DIR = "~/tier2_repos/LCLM"                  # git clone https://github.com/LeonLixyz/LCLM
 
 
-def _git_commit() -> str:
+def _git_commit(path=REPO) -> str:
     try:
-        return subprocess.check_output(["git", "-C", str(REPO), "rev-parse", "--short", "HEAD"],
+        return subprocess.check_output(["git", "-C", str(path), "rev-parse", "--short", "HEAD"],
                                        text=True, stderr=subprocess.DEVNULL).strip() or "nogit"
     except Exception:  # noqa: BLE001
         return "nogit"
@@ -52,18 +52,47 @@ def _seed_everything(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def _record(it, hyp="", error=None):
+def _record(it, hyp="", error=None, finish_reason=None):
     return {"question_id": it["question_id"], "question": it["question"], "answer": it["answer"],
             "hypothesis": hyp, "question_type": it["question_type"],
-            "finish_reason": "error" if error else "stop", "error": error}
+            "finish_reason": finish_reason or ("error" if error else "stop"), "error": error}
+
+
+def _generate_new_tokens(model, dec_tok, processor, prompt: str, max_new_tokens: int,
+                         device="cuda") -> "tuple[str, str]":
+    """Mirror LCLM inference/hf.generate_text's flow but decode ROBUSTLY. LCLM generates via `inputs_embeds`
+    internally (memory positions become latent embeddings), so HF `generate` returns ONLY the new tokens (no
+    input prefix). We therefore decode the full returned sequence UNLESS it is longer than the input (a
+    prefixed regime), in which case we slice the prefix off. This handles both:
+      - only-new-tokens (the actual LCLM case): decode full → the answer. (An unconditional slice would drop
+        the whole answer → empty output.)
+      - prefix+new (defensive): slice `[input_len:]`.
+    It also avoids generate_text's fragile string-prefix strip, which leaves prompt echo when the decoded
+    prefix != formatted_prompt (memory tokens). Greedy (do_sample=False) for determinism."""
+    import torch
+    formatted = f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
+    proc = processor.process_wrapped_batch(prompts=[formatted], targets=None, padding="longest",
+                                           truncation=True, return_tensors="pt")
+    input_ids = proc["input_ids"].to(device)
+    with torch.inference_mode():
+        out = model.generate(input_ids=input_ids, attention_mask=proc["attention_mask"].to(device),
+                             memory_token_ids=proc["memory_token_ids"], memory_positions=proc["memory_positions"],
+                             latent_counts=proc["latent_counts"], max_new_tokens=max_new_tokens,
+                             do_sample=False, pad_token_id=dec_tok.pad_token_id, eos_token_id=dec_tok.eos_token_id)
+    seq = out[0]
+    gen = seq[input_ids.shape[1]:] if seq.shape[0] > input_ids.shape[1] else seq   # slice ONLY if prefixed
+    text = dec_tok.decode(gen, skip_special_tokens=True).strip()
+    eos = dec_tok.eos_token_id
+    truncated = gen.shape[0] >= max_new_tokens and (eos is None or int(gen[-1]) != eos)
+    return text, ("length" if truncated else "stop")
 
 
 def run_lclm(args, items, checkpoint: str, repo_dir: str, store) -> None:
     """Load LCLM once, then per item: wrap the dated history in memory markers, encode→decode the answer.
-    Exact entry points from the LCLM repo's inference/hf.py (load_model / generate_text)."""
+    Entry points from the LCLM repo's inference/hf.py (load_model) + a new-token-sliced generate."""
     sys.path.insert(0, repo_dir)
     # POD-ONLY: needs the LCLM repo on PYTHONPATH (checkpoints aren't vanilla-transformers loadable).
-    from inference.hf import load_model, generate_text
+    from inference.hf import load_model
 
     model, dec_tok, processor = load_model(checkpoint, device="cuda", dtype="bf16")
 
@@ -78,9 +107,8 @@ def run_lclm(args, items, checkpoint: str, repo_dir: str, store) -> None:
             if it.get("question_date"):
                 q = f"Current Date: {it['question_date']}\n{q}"
             prompt = f"<|memory_start|>{it['full_history']}<|memory_end|> {q}"
-            hyp = generate_text(model, dec_tok, processor, prompt,
-                                max_tokens=args.max_new_tokens, temperature=0.0)
-            store.append(_record(it, hyp=hyp))
+            hyp, fr = _generate_new_tokens(model, dec_tok, processor, prompt, args.max_new_tokens)
+            store.append(_record(it, hyp=hyp, finish_reason=fr))
         except Exception as e:  # noqa: BLE001 — crash-safe: record, continue, resume later
             print(f"[run_lclm] ERROR on {it['question_id']}: {type(e).__name__}: {e}")
             store.append(_record(it, error=f"{type(e).__name__}: {e}"))
@@ -127,7 +155,9 @@ def main():
 
     run_lclm(args, items, args.checkpoint, repo_dir, store)
 
-    records = [r for r in store.all_records() if not r.get("error")]
+    # exclude gen errors AND length-truncated answers from scoring (matches Tier-1 policy).
+    records = [r for r in store.all_records()
+               if not r.get("error") and r.get("finish_reason") != "length"]
     agg = score_longmemeval(records, use_bem=not args.no_bem)
     store.merge_verdicts(agg.get("details", [])); store.compact()
     n_err = sum(1 for r in store.all_records() if r.get("error"))
@@ -138,7 +168,7 @@ def main():
     payload = {
         "dataset": "longmemeval", "method": "lclm", "model": args.checkpoint,
         "meta": {"n": len(records), "n_errors": n_err, "variant": args.variant, "seed": args.seed,
-                 "max_new_tokens": args.max_new_tokens, "commit": commit,
+                 "max_new_tokens": args.max_new_tokens, "commit": commit, "upstream_commit": _git_commit(repo_dir), "scorer": "score_longmemeval (deterministic, negation-guarded)",
                  "coverage": round(len(records) / len(items), 4) if items else None},
         "aggregate": {k: v for k, v in agg.items() if k != "details"},
         "store": str(store.path),

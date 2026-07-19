@@ -61,9 +61,9 @@ _DEFAULT_REPO_DIR = {
 }
 
 
-def _git_commit() -> str:
+def _git_commit(path=REPO) -> str:
     try:
-        return subprocess.check_output(["git", "-C", str(REPO), "rev-parse", "--short", "HEAD"],
+        return subprocess.check_output(["git", "-C", str(path), "rev-parse", "--short", "HEAD"],
                                        text=True, stderr=subprocess.DEVNULL).strip() or "nogit"
     except Exception:  # noqa: BLE001
         return "nogit"
@@ -80,7 +80,9 @@ def _seed_everything(seed: int) -> None:
 
 
 def _valid(r) -> bool:
-    return not r.get("error")
+    # exclude API/gen errors AND length-truncated answers (a cut-off answer isn't a wrong answer — matches
+    # the Tier-1 _valid_for_scoring policy).
+    return not r.get("error") and r.get("finish_reason") != "length"
 
 
 def _record(it, hyp="", error=None, finish_reason=None):
@@ -187,7 +189,9 @@ def run_kvzip(args, items, model_name: str, repo_dir: str, store) -> None:
             query_ids = m.apply_template(q)
             # #17: honor --max-new-tokens. KVzip's canonical call (integration doc) is generate(ids, kv=kv)
             # with no cap kwarg; if this build's signature doesn't accept it, fall back rather than error
-            # every item (a silent 100%-failure run). Verify the real signature on the pod.
+            # every item (a silent 100%-failure run). POD-VERIFY: if generate() accepts **kwargs and SILENTLY
+            # IGNORES max_new_tokens, this pass-through is a no-op — confirm the cap is actually honored (else
+            # patch KVzip's generate to thread it into its decode loop) before trusting the numbers.
             try:
                 hyp = m.generate(query_ids, kv=kv, max_new_tokens=args.max_new_tokens)
             except TypeError:
@@ -263,7 +267,7 @@ def main():
     payload = {
         "dataset": "longmemeval", "method": args.method, "model": model_name,
         "meta": {"n": len(records), "n_errors": n_err, "variant": args.variant, "seed": args.seed,
-                 "max_new_tokens": args.max_new_tokens, "commit": commit,
+                 "max_new_tokens": args.max_new_tokens, "commit": commit, "upstream_commit": _git_commit(repo_dir), "scorer": "score_longmemeval (deterministic, negation-guarded)",
                  "coverage": round(len(records) / len(items), 4) if items else None,
                  "max_capacity_prompt": args.max_capacity_prompt if args.method != "kvzip" else None,
                  "ratio": args.ratio if args.method == "kvzip" else None},

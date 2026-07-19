@@ -65,6 +65,51 @@ The adversarial pass over the fixes themselves caught real defects the fixes int
   attr as "captured" (muted the leak warning); kvzip `max_new_tokens` kwarg now guarded (TypeError fallback);
   tier-2 `finish_reason` now detects length-truncation for the retry path.
 
+## Audit #3 (third external review) — Batches A/B/C fixed + tested (83 tests)
+A No-Go review found production-path scoring/faithfulness defects the earlier audits missed (they covered
+internal-consistency + protocol-fidelity; this one went into containment precision + actual upstream-repo
+behavior). All addressed:
+- **A — Tier-1 scoring (blocked LongMemEval):** **#1** containment negation-guard (`_negated`) — a wrong
+  answer stated as "3, not 2" / "London, not Paris" no longer scores correct (fired before BEM); + drop
+  note-style parenthetical candidates ("(including the last day)"). **#2** preference polarity — exclude
+  "avoid/not/instead-of" concepts from the positive keys + flag preference `low_confidence`. **#3** explicit
+  `scoring_note` disclaiming the non-official metric. *(Real-data: 470/470 oracle golds still self-match.)*
+- **B — MAB coverage:** **#4** per-SOURCE cap (was per-competency → only 1 source/competency in bounded
+  runs) so smoke samples span variants. **#5** faithful `recall_at_k` (verbatim port of the repo's Recsys
+  algorithm — parse→fuzzy-snap→Recall@k, pure-python Levenshtein fallback) as an OPT-IN utility;
+  default remains 4/5 competencies with a `coverage_note` disclosure.
+- **C — Tier-2/2b upstream faithfulness:** **#6** real M+ mutable field names (`ltm_recall_frequencies`,
+  `cached_dropped_*`). **#7** 512-token injection blocks (was whole-session → far harsher compression than
+  M+ was evaluated at). **#8** LCLM new-token slicing (`outputs[input_len:]`) instead of the prompt-echo-
+  prone `generate_text` string-strip. **#9** A-MEM `OPENAI_BASE_URL` env routing (its openai backend drops
+  `api_base`). **#10** KVzip pod-verify note (pass-through is a no-op if upstream accept-and-ignores).
+
+## Audit #4 (fourth external review) — fixed + open items (86 tests)
+Code fixes:
+- **LCLM empty-answer bug (my audit-3 #8 was wrong):** LCLM generates via `inputs_embeds`, so HF `generate`
+  returns ONLY new tokens — the unconditional `[input_len:]` slice removed the whole answer. Now slice ONLY
+  if the sequence is longer than the input (`run_lclm._generate_new_tokens`); + length-cutoff detection.
+- **Dense retrieval re-embedding:** `DenseRetriever` now caches passage embeddings per context (~36 unique
+  MAB contexts were re-encoded per question → ~1.4M encodings; now ~16k).
+- **Tier-2 length-cutoffs now EXCLUDED from scoring** (M+, LCLM, SnapKV/H2O) — matches Tier-1 policy.
+- **MAB source-filter under-fill:** per-source cap is relaxed to `max_examples` when `--sources` narrows the
+  set (was `ceil(max_examples/12)` → a single-source filter returned only 9).
+- **2b fidelity:** A-MEM now passes each session's REAL date (not wall-clock) to `add_note`; MemoryOS state
+  keyed by question_id + cleared per item (no dup-on-retry). Both retrieval-flow/turn-flattening deviations
+  documented in-file.
+- **Provenance:** Tier-2 artifacts now record `upstream_commit` (the cloned baseline-repo HEAD) + `scorer`.
+
+Open items — NOT code-fixable here (setup / pod / user):
+- **KVzip `--max-new-tokens`** may be accept-and-ignored upstream → pass-through is a no-op. POD-VERIFY
+  (patch KVzip's decode loop if it doesn't honor the cap).
+- **`meta-llama/Llama-3.1-8B-Instruct` is gated** (SnapKV/H2O default) → current creds 403. Accept the Meta
+  license on the HF token, or `--model` an ungated Mistral. (README §3.)
+- **Tier-2 env isolation:** KVzip / KVCache-Factory / MemoryLLM / LCLM need mutually incompatible
+  torch/transformers/numpy/python pins → run each in its OWN pod/venv, not one shared env.
+- **Pod bootstrap** currently launches Phase-0 training, not Phase-2 eval (`scripts/pod/bootstrap.sh`) — wire
+  a Phase-2 path before a remote run, and COMMIT+PIN so the pod clones the exact run state (provenance).
+- **Panel-A matched-135M runner + Tier-2-on-MemoryAgentBench matrix** still to build (tasks #212).
+
 ## Verify
 - [x] Regression tests per fix; full suite green (65 pass; +34 new across test_audit2_fixes,
       test_run_api_eval_integration, and the earlier audit-1 files).

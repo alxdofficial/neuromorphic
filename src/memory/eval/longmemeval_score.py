@@ -129,12 +129,32 @@ def _content_tokens(s: str) -> list[str]:
     return [t for t in normalize_answer(s).split() if t not in _STOPWORDS]
 
 
+_AVOID_CUE_RE = re.compile(
+    r"\b(?:avoid|avoiding|without|instead of|rather than|not|no|dislikes?|don'?t (?:want|like)|"
+    r"steer clear of)\b(.*?)(?:[.;,]|$)", re.IGNORECASE)
+
+
+def _avoidance_tokens(rubric: str) -> set:
+    """Content tokens the rubric says to AVOID ('avoid generic advice', 'not X', 'instead of Y'). A response
+    that mentions these PROHIBITED concepts should not earn preference credit, so they are excluded from the
+    positive key set (addresses the polarity-blindness of bag-of-words coverage)."""
+    out: set = set()
+    for m in _AVOID_CUE_RE.finditer(rubric or ""):
+        out |= set(_content_tokens(m.group(1)))
+    return out
+
+
 # trailing "... (is) (also) acceptable/correct/fine" clause on a verbose gold (stripped to expose the answer).
 # Leading \b so it can't bite mid-word (e.g. 'TikTok' -> 'TikT'). Only APPLIED to golds containing
 # "acceptable" (see _gold_candidates), so the generic answer-words below can't clip a normal gold.
 _ACCEPT_TAIL_RE = re.compile(
     r"[\.,;:]?\s*(?:is\s+)?(?:also\s+)?(?:an?\s+)?\b(?:acceptable|correct|fine|valid|okay|ok)\b\.?\s*$",
     re.IGNORECASE)
+# a parenthetical that opens with one of these is an explanatory NOTE, not an acceptable alternate answer
+# — "(including the last day)", "(approx.)", "(not counting X)" — so we must NOT treat it as a gold.
+_NOTE_PREFIX_RE = re.compile(
+    r"^\s*(including|excluding|excl|incl|approx|approximately|about|around|roughly|note|e\.?g\.?|"
+    r"see|per|as|which|that|not|without|assuming|depending|if)\b", re.IGNORECASE)
 
 
 def _gold_candidates(gold: str) -> list[str]:
@@ -147,10 +167,14 @@ def _gold_candidates(gold: str) -> list[str]:
     (split on sentence boundaries + strip the acceptability tail), so a model answering either counts.
     """
     cands: list[str] = [gold]
-    # parenthetical content (strip a leading "or"/"i.e."/"aka")
+    # parenthetical content: keep as an acceptable ALTERNATE only if the paren signals one ("(or 25:50)") or
+    # is a short/atomic value ("(25:50)"); DROP explanatory notes like "(including the last day)" that would
+    # otherwise false-match a wrong answer that merely echoes the note. Strips a leading "or"/"i.e."/"aka"/"=".
     for m in re.findall(r"\(([^)]*)\)", gold):
-        inner = re.sub(r"^\s*(or|i\.?e\.?|aka|=)\s*", "", m.strip(), flags=re.IGNORECASE)
-        if inner:
+        raw = m.strip()
+        alt = re.match(r"^\s*(or|i\.?e\.?|aka|=)\s*", raw, flags=re.IGNORECASE) is not None
+        inner = re.sub(r"^\s*(or|i\.?e\.?|aka|=)\s*", "", raw, flags=re.IGNORECASE).strip()
+        if inner and (alt or (len(inner.split()) <= 3 and not _NOTE_PREFIX_RE.match(inner))):
             cands.append(inner)
     # text with the parentheticals removed
     stripped = re.sub(r"\([^)]*\)", "", gold).strip()
@@ -201,6 +225,29 @@ def _is_list_like(hyp: str) -> bool:
     """True if the hypothesis enumerates items ('... 1. A, 2. B, 3. C') — where a bare-number gold can match
     an incidental list index rather than the actual answer."""
     return len(_LIST_MARKER_RE.findall(hyp or "")) >= 2
+
+
+# negation cues (post-normalize, so contractions are apostrophe-stripped: "isn't"->"isnt")
+_NEGATORS = {"not", "no", "never", "nor", "without", "isnt", "wasnt", "arent", "werent", "dont", "doesnt",
+             "didnt", "cant", "couldnt", "wouldnt", "shouldnt", "aint", "havent", "hasnt", "rather", "instead"}
+
+
+def _negated(gold: str, hyp: str) -> bool:
+    """True if EVERY contiguous occurrence of the gold in the hypothesis sits in a NEGATED context — i.e. the
+    model stated the WRONG answer as a negation of the gold ('the answer is 3, not 2'; 'London, not Paris').
+    Vetoes that containment false-positive (which otherwise fires before BEM). If the gold ALSO appears
+    un-negated anywhere, returns False (a real match)."""
+    g = normalize_answer(gold).split()
+    h = normalize_answer(hyp).split()
+    if not g or len(g) > len(h):
+        return False
+    occ = neg = 0
+    for i in range(len(h) - len(g) + 1):
+        if h[i:i + len(g)] == g:
+            occ += 1
+            if any(w in _NEGATORS for w in h[max(0, i - 3):i]):   # a negator within 3 tokens before the span
+                neg += 1
+    return occ > 0 and neg == occ
 
 
 def _exact_match(gold: str, hyp: str) -> bool:
@@ -340,6 +387,10 @@ class LongMemEvalScorer:
                 return True, "exact_match"
         for cand in _gold_candidates(gold):
             if _containment(cand, hyp):
+                # The gold appears ONLY as a negated (wrong) answer ('3, not 2' / 'London, not Paris') →
+                # don't credit containment; defer to BEM. (Containment short-circuits before BEM otherwise.)
+                if _negated(cand, hyp):
+                    continue
                 # A bare-number gold matched inside an ENUMERATED hypothesis is unreliable ONLY when the digit
                 # appears SOLELY as a list index. Strip the enumeration markers and re-test: if the number
                 # still matches (e.g. gold '3' in 'You led 3 projects: 1. A, 2. B, 3. C' — '3 projects'
@@ -357,10 +408,14 @@ class LongMemEvalScorer:
         return False, "none"
 
     def _score_preference(self, rubric: str, hyp: str) -> tuple[bool, str]:
-        # salient rubric tokens: proper-noun-ish (originally capitalized) + content words
+        # HEURISTIC + LOW-CONFIDENCE (see class docstring): rubric keyword-coverage, not the official judge.
+        # salient rubric tokens: proper-noun-ish (originally capitalized) + content words, MINUS the tokens
+        # the rubric says to AVOID ('avoid generic advice', 'not X') — so a response echoing a PROHIBITED
+        # concept doesn't earn coverage credit.
+        avoid = _avoidance_tokens(rubric)
         proper = {normalize_answer(w) for w in re.findall(r"\b[A-Z][a-zA-Z0-9]+\b", rubric or "")}
-        proper = {p for p in proper if p and p not in _STOPWORDS}
-        content = set(_content_tokens(rubric))
+        proper = {p for p in proper if p and p not in _STOPWORDS and p not in avoid}
+        content = set(_content_tokens(rubric)) - avoid
         keys = (proper | content)
         if not keys:
             return False, "preference_no_keys"
@@ -386,6 +441,11 @@ class LongMemEvalScorer:
         per_type = {t: {"accuracy": a, "n": n} for t, (a, n) in per_type_acc.items()}
         # per_subtask = uniform key the report tool reads across datasets (question types + abstention).
         per_subtask = dict(per_type)
+        # preference is a HEURISTIC keyword-coverage score (polarity-aware but crude) — flag it so the ~30
+        # preference Qs are read as low-confidence and not trusted at the same bar as factual/temporal.
+        for pk in ("single-session-preference", "preference"):
+            if pk in per_subtask:
+                per_subtask[pk] = {**per_subtask[pk], "low_confidence": True}
         if self._abstention:
             per_subtask["abstention"] = {"accuracy": abst, "n": len(self._abstention)}
         return {
@@ -397,6 +457,10 @@ class LongMemEvalScorer:
             "n_nonabstention": len(all_nonabs),
             "n_abstention": len(self._abstention),
             "bem_used": self.use_bem and _BEM.get() is not None,
+            # DISCLOSURE (audit): this is a deterministic substitute, NOT the official LongMemEval judge metric.
+            # overall/task-averaged EXCLUDE abstention (reported separately); preference is low-confidence.
+            "scoring_note": ("deterministic EM+containment(negation-guarded)+BEM; NOT the official GPT-4o-judge "
+                             "metric; overall/task-avg exclude abstention (separate); preference low-confidence"),
         }
 
 

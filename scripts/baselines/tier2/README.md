@@ -32,6 +32,12 @@ Follow `scripts/pod/README.md` / `docs/ops/runpod_workflow.md` for the actual `r
 `drive` / `reap` mechanics (SSH key, tmux, billing-safety wall-clock cap) — this doc only covers what's
 Tier-2-specific: which repos to clone and how to launch each runner once you're on the pod.
 
+> ⚠ **Environment isolation.** KVzip (CUDA 12.1 / py3.10 / flash-attn 2.7.4.post1 + custom kernel),
+> KVCache-Factory, MemoryLLM/M+, and LCLM pin **mutually incompatible** torch / transformers / numpy /
+> python versions. Do **not** install them into one shared env — give each its own venv/conda env (or run
+> them on separate pod sessions). Our harness code is pure-python + lazy-imported, so it rides along in any
+> of them.
+
 ## 2. Clone the method repos (on the pod)
 
 Each runner does `sys.path.insert(0, <repo-dir>)` instead of `pip install`-ing these (none are on PyPI as

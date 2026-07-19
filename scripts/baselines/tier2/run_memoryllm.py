@@ -13,8 +13,9 @@ LongMemEval-S's ~115k-token haystack; M+'s LTM (153,600 tok, co-trained retrieve
 plausibly fits a 24GB card but unverified — authors used an H100-80GB) and pod plan.
 
 No official LongMemEval runner exists for this repo — this file hand-writes the write-then-query loop:
-chunk each item's full_history into its sessions -> `inject_memory` each session (merging any session
-under MemoryLLM's >16-token hard minimum) -> `generate()` for the question. Scores with the SAME
+split each item's full_history into fixed 512-token blocks -> `inject_memory` each block (upstream LongBench
+granularity; a short trailing block is merged to clear the >16-token minimum) -> `generate()` for the
+question. Scores with the SAME
 deterministic scorer as Tier-1 (`src/memory/eval/score_longmemeval`). RESUMABLE + crash-safe: each
 answer is appended to a per-run JSONL store immediately.
 
@@ -50,15 +51,18 @@ _DEFAULT_REPO_DIR = "~/tier2_repos/MemoryLLM"  # `git clone git@github.com:wangy
 # names differ, `_snapshot_memory_state` warns loudly listing what it DID find, prompting a modeling_mplus.py
 # check. Cross-reference the auditor's list: LTM contents, keys, ages, retrieval frequencies, dropped caches.
 _LTM_CANDIDATE_ATTRS = (
+    # CONFIRMED real M+ mutable fields (MemoryLLM repo, mutated by inject_memory — verified against source):
+    "ltm_recall_frequencies", "cached_dropped_memories", "cached_dropped_memory_ages", "cached_dropped_keys",
+    # plus broader candidates in case the checkpoint's field names differ:
     "ltm", "long_term_memory", "ltm_memory", "ltm_keys", "ltm_values", "ltm_ages", "ltm_age",
     "memory_ages", "retrieval_frequencies", "retrieval_freq", "dropped_memory", "dropped_memories",
     "update_step", "ltm_numpy", "ltm_key", "ltm_value",
 )
 
 
-def _git_commit() -> str:
+def _git_commit(path=REPO) -> str:
     try:
-        return subprocess.check_output(["git", "-C", str(REPO), "rev-parse", "--short", "HEAD"],
+        return subprocess.check_output(["git", "-C", str(path), "rev-parse", "--short", "HEAD"],
                                        text=True, stderr=subprocess.DEVNULL).strip() or "nogit"
     except Exception:  # noqa: BLE001
         return "nogit"
@@ -148,23 +152,17 @@ def _restore_memory_state(model, snap) -> None:
             setattr(model, attr, _copy_buf(saved))
 
 
-def _chunk_min_tokens(tok, sessions: list[str], min_tokens: int) -> list[str]:
-    """Merge consecutive rendered sessions so every chunk we hand to `inject_memory` clears
-    MemoryLLM's hard >16-token minimum (injecting fewer "disturbs" the memory, per the model
-    README). Order-preserving forward merge; any short tail is folded into the previous chunk."""
-    chunks: list[str] = []
-    buf = ""
-    for s in sessions:
-        buf = f"{buf}\n{s}" if buf else s
-        if len(tok(buf, add_special_tokens=False)["input_ids"]) >= min_tokens:
-            chunks.append(buf)
-            buf = ""
-    if buf:
-        if chunks and len(tok(buf, add_special_tokens=False)["input_ids"]) < min_tokens:
-            chunks[-1] = f"{chunks[-1]}\n{buf}"
-        else:
-            chunks.append(buf)
-    return chunks
+def _inject_blocks(tok, full_history: str, block_tokens: int, min_tokens: int) -> list[list[int]]:
+    """Split the full history into FIXED `block_tokens`-token id blocks — the granularity M+ was evaluated at
+    upstream (LongBench runner injects 512-token blocks). Whole-session injection is UNFAITHFUL: 93.8% of
+    LongMemEval sessions exceed 512 tok (max ~17k), so it compresses far more per update than the model saw.
+    A short (<min_tokens) tail block is merged into the previous one (sub-16-token injects 'disturb' memory)."""
+    ids = tok(full_history, add_special_tokens=False)["input_ids"]
+    blocks = [ids[i:i + block_tokens] for i in range(0, len(ids), block_tokens)]
+    if len(blocks) >= 2 and len(blocks[-1]) < min_tokens:
+        blocks[-2] = blocks[-2] + blocks[-1]
+        blocks.pop()
+    return blocks
 
 
 def _record(it, hyp="", error=None, finish_reason=None):
@@ -210,10 +208,9 @@ def run_memoryllm(args, items, model_name: str, repo_dir: str, store) -> None:
         try:
             _restore_memory_state(model, snap)          # reset before this item's private haystack
 
-            sessions = it["sessions"] or [it["full_history"]]
-            chunks = _chunk_min_tokens(tok, sessions, min_tokens=args.min_inject_tokens)
-            for chunk_text in chunks:
-                ctx_ids = tok(chunk_text, return_tensors="pt", add_special_tokens=False).input_ids.cuda()
+            for block in _inject_blocks(tok, it["full_history"], args.inject_block_tokens,
+                                        args.min_inject_tokens):
+                ctx_ids = torch.tensor([block], dtype=torch.long).cuda()
                 model.inject_memory(ctx_ids, update_memory=True)
 
             # Pretrained-model prompt template (mplus-8b currently ships pretrained-only, per README "we
@@ -243,8 +240,11 @@ def main():
     ap.add_argument("--variant", default="s", choices=["s", "m", "oracle"])
     ap.add_argument("--max-examples", type=int, default=None)
     ap.add_argument("--max-new-tokens", type=int, default=64)
+    ap.add_argument("--inject-block-tokens", type=int, default=512,
+                    help="inject_memory() block size in tokens — 512 matches the upstream LongBench runner's "
+                         "granularity (whole-session injection is unfaithful; see _inject_blocks)")
     ap.add_argument("--min-inject-tokens", type=int, default=17,
-                    help="merge sessions until each inject_memory() chunk has >= this many tokens "
+                    help="a trailing block shorter than this is merged into the previous one "
                          "(model's hard minimum is 'larger than 16')")
     ap.add_argument("--seed", type=int, default=0, help="seed py/np/torch/cuda (M+ randomly drops memory)")
     ap.add_argument("--no-bem", action="store_true", help="skip BEM paraphrase scoring (EM+containment only)")
@@ -278,7 +278,10 @@ def main():
 
     run_memoryllm(args, items, args.model, repo_dir, store)
 
-    records = [r for r in store.all_records() if not r.get("error")]
+    # exclude API/gen errors AND length-truncated answers (finish_reason=='length') from scoring — a cut-off
+    # answer isn't a wrong answer (matches the Tier-1 _valid_for_scoring policy).
+    records = [r for r in store.all_records()
+               if not r.get("error") and r.get("finish_reason") != "length"]
     agg = score_longmemeval(records, use_bem=not args.no_bem)
     store.merge_verdicts(agg.get("details", [])); store.compact()
     n_err = sum(1 for r in store.all_records() if r.get("error"))
@@ -290,7 +293,7 @@ def main():
         "dataset": "longmemeval", "method": "memoryllm", "model": args.model,
         "meta": {"n": len(records), "n_errors": n_err, "variant": args.variant, "seed": args.seed,
                  "min_inject_tokens": args.min_inject_tokens, "max_new_tokens": args.max_new_tokens,
-                 "commit": commit, "coverage": round(len(records) / len(items), 4) if items else None},
+                 "commit": commit, "upstream_commit": _git_commit(repo_dir), "scorer": "score_longmemeval (deterministic, negation-guarded)", "coverage": round(len(records) / len(items), 4) if items else None},
         "aggregate": {k: v for k, v in agg.items() if k != "details"},
         "store": str(store.path),
     }
