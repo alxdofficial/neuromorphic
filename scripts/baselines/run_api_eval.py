@@ -36,7 +36,10 @@ DATASETS = {
 }
 _BIG_FIELDS = ("full_history", "sessions", "context")   # dropped from scored records (kept only for prompts)
 _CHARS_PER_TOKEN = 3.6          # rough, for dry-run cost estimation only
-_RESERVE_TOKENS = 6000          # headroom (question + system prompt + completion) kept free in the served window
+_RESERVE_TOKENS = 16000         # headroom kept free in the served window: completion (~2k) + system/question/
+#                               # template (~1k) + a safety margin for the provider tokenizer counting ~8%
+#                               # higher than our reference tokenizer on the largest histories (131k-ctx llama
+#                               # still 400'd at 6k/10k reserve; 16k gives budget ~115k, comfortably under 131k).
 
 
 def model_context_lengths(models: list[str]) -> dict[str, int]:
