@@ -230,6 +230,82 @@ class LongMemEvalDataset(IterableDataset):
             }
 
 
+def _text_question_type(ex: dict) -> str:
+    """Question-type bucket for the SCORING path — the paper's raw 6-way taxonomy (single-session-user/
+    -assistant/-preference kept DISTINCT, unlike the torch path's 5-way merge). Keeping `-preference`
+    distinct is what routes it to the preference scorer instead of factual matching; keeping the paper's
+    granularity is what makes per-type numbers comparable to the published table. `_abs` → 'abstention'."""
+    qid = str(ex.get("question_id", ""))
+    if qid.endswith("_abs"):
+        return "abstention"
+    return ex.get("question_type") or "unknown"
+
+
+def _stratified_sample(raw: list, max_examples: Optional[int], key) -> list:
+    """Deterministic round-robin across `key(ex)` groups so a BOUNDED sample spans every question type
+    (a plain prefix `raw[:N]` can be all one type — e.g. the first 20 are all single-session — which makes
+    smoke runs silently skip whole code paths). No RNG (round-robin is deterministic by construction)."""
+    if max_examples is None or max_examples >= len(raw):
+        return raw
+    groups: dict = {}
+    for ex in raw:
+        groups.setdefault(key(ex), []).append(ex)   # first-occurrence group order → reproducible
+    out: list = []
+    depth = 0
+    while len(out) < max_examples:
+        progressed = False
+        for g in groups.values():
+            if depth < len(g):
+                out.append(g[depth]); progressed = True
+                if len(out) >= max_examples:
+                    break
+        if not progressed:
+            break
+        depth += 1
+    return out
+
+
+def load_longmemeval_text(variant: str = "s", max_examples: Optional[int] = None) -> list[dict]:
+    """Raw-TEXT accessor for the API/baseline harness (no tokenizer, no tensors).
+
+    Returns one dict per question with the fields the Phase-2 baseline runners need:
+      {question_id, question, answer, question_date, question_type (paper's 6-way incl. 'abstention'),
+       full_history (all sessions rendered, dated + speaker-tagged),
+       sessions (list[str], one rendered block per haystack session — the retrieval units)}.
+    The torch/tokenizer path (`LongMemEvalDataset`) is for the local matched-decoder runs; this
+    is for the API reference baselines (floor / full-context / RAG)."""
+    raw = _load_raw(variant)
+    raw = _stratified_sample(raw, max_examples, _text_question_type)
+    items = []
+    for ex in raw:
+        qid = str(ex.get("question_id", ""))
+        qtype = _text_question_type(ex)
+        sessions = ex.get("haystack_sessions") or []
+        dates = ex.get("haystack_dates") or []
+        sids = ex.get("haystack_session_ids") or []
+        sess_texts = []
+        for i, turns in enumerate(sessions):
+            sid = sids[i] if i < len(sids) else i
+            date = dates[i] if i < len(dates) else ""
+            lines = [f"[Session {sid} — {date}]"]
+            for t in (turns or []):
+                content = (t.get("content") or "").strip()
+                if content:
+                    speaker = "User" if t.get("role", "user") == "user" else "Assistant"
+                    lines.append(f"{speaker}: {content}")
+            sess_texts.append("\n".join(lines))
+        items.append({
+            "question_id": qid,
+            "question": str(ex.get("question", "")),
+            "answer": str(ex.get("answer", "")),
+            "question_date": str(ex.get("question_date", "")),   # the 'now' anchor for temporal questions
+            "question_type": qtype,
+            "full_history": LongMemEvalDataset._render(ex),
+            "sessions": sess_texts,
+        })
+    return items
+
+
 def make_longmemeval_dataloader(
     tokenizer,
     batch_size: int,

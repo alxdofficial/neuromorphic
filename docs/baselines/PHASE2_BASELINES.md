@@ -1,0 +1,212 @@
+# Phase-2 Baseline Establishment — Plan & Runbook
+
+**Status: APPROVED (2026-07-17), REVISED 2026-07-18, execution DEFERRED (Phase-0 binding unsolved).**
+Establish reference numbers for established SOTA memory/long-context baselines on a fixed benchmark +
+fixed harness *before* our memory layer exists, so our own number later drops into the same table.
+Operationalizes the Phase-2 section of `docs/data/DATA_PHASES_PLAN.md` with concrete baselines, compute,
+scoring.
+
+> **REVISION 2026-07-18** (external cited peer-review, 2 load-bearing claims web-verified). Adopted, see
+> memory `project_phase2_baseline_run` for full rationale:
+> 1. **Whitespace narrower** — EpiCache (VERIFIED, arXiv:2509.17396) + TRIM-KV are already on LongMemEval
+>    as *KV-cache* compression; our true claim = **first SOFT-TOKEN / trainable-encoder compressor on LME**.
+>    Keep LME; cite them.
+> 2. **MemoryAgentBench → judge-free CO-PRIMARY** (VERIFIED deterministic: AR+CR=`substring_exact_match`,
+>    LRU+TTL=`exact_match`, Recsys=`Recall@5`; drop only `longmemeval`+`infbench_sum` judge subsets).
+> 3. **Decoder: 135M for DEV now** (objective wall is scale-independent), **paper = 135M→360M→1B→3B ladder
+>    + one 7–8B** confirmatory (matched-budget controlled study). Don't retrain at 3B until it binds.
+> 4. **Panel B de-scoped** — cite published GPT-4o 60.6 / oracle 87, don't pay ~$144/pass; keep one local
+>    Llama-3.1-8B ceiling. **MemoryLLM → M+ only** (8B can't hold 115k). **KV baselines → KVzip+SnapKV**
+>    (KVCache-Factory ⚠ truncates to 7,500 tok by default). **Avoid LoCoMo.**
+
+> **REVISION 2026-07-18b** (memory-MECHANISM competitor sweep; cited peer-review + **LCLM web-verified from
+> the primary source** — [arXiv:2606.09659](https://arxiv.org/abs/2606.09659) + HF `latent-context`). The
+> mechanism baselines are now split into **2a** (architectural / memory-as-state — our true head-to-heads)
+> and **2b** (agent-memory frameworks — RAG-adjacent, on a big frozen LLM); see **§2.5**. Headline addition:
+> **LCLM** — an encoder→soft-token→adapter→**frozen-init-4B-decoder** compressor AT SCALE **with released
+> weights**, which benchmarks the same SnapKV/KVzip baselines we do → our closest concurrent competitor;
+> engage head-on (novelty note in §2.5). Corrections applied vs the source addendum: **Memory-R1 code is NOT
+> released** (cite-only, not a runnable 2b); **A-MEM repo = `WujiangXu/A-mem`** (not `agiresearch`).
+
+Companion docs: `docs/baselines/FROZEN_COMPETITORS.md` (landscape), `docs/data/DATA_PHASES_PLAN.md`
+(two-phase plan), `docs/RESULTS.md` (Phase-0 results log).
+
+> **Directive (supervisor, 2026-07-17):** move past architecture-only work → take established SOTAs
+> (parametric + nonparametric), pick a real-world established memory/long-context eval, and RUN those
+> baselines first. Later drop our trained memory layer into the same harness.
+
+Grounded by a 2026-07-17 three-agent research sweep (benchmark landscape / runnable baselines / scoring)
+— primary-source-verified; every vendor self-report treated as noise until re-run.
+
+---
+
+## 1. Benchmarks
+
+| role | benchmark | why |
+|---|---|---|
+| **headline** | **LongMemEval-S** (`xiaowu0162/longmemeval-cleaned`, ~115k tok, 500 Qs, 5-way taxonomy) | de-facto standard for multi-session memory (mid-2026); **whitespace: no soft-token-prepend compressor — our exact class — has ever published on it** |
+| **thesis-axis support** | **MemoryAgentBench** (ICLR'26) | its Selective-Forgetting + Test-Time-Learning competencies map onto our streaming-write / forced-forgetting thesis — the axis LongMemEval doesn't test |
+| deferred supports | RULER, BABILong | contamination-proof synthetics where RMT/Titans compete; add in a later pass |
+| **cross-ref only** | LoCoMo | integrity-flagged (Penfield audit: 6.4% of answer key wrong; judge accepts 63% of wrong answers). Never headline. |
+
+**Anchor numbers (primary paper ONLY — vendor numbers span 36–94% for one system):**
+GPT-4o full-ctx **60.6%** / +Chain-of-Note 64.0% / RAG@top-k ~71% / oracle **87.0** (+CoN 92.4).
+Llama-3.1-8B-128k full-ctx **45.4%** (70B *worse* at 33.4% = long-context degradation). Phi-3-med 38.0%.
+
+---
+
+## 2. Two baseline panels
+
+The fairness problem: SOTAs run at native 7–8B / GPT-4o; our decoder is a frozen **SmolLM2-135M**. A raw
+accuracy table isn't apples-to-apples. So we report two panels.
+
+### Panel A — matched-decoder (the fair fight our model slots into)
+Everything reads the **same frozen SmolLM2-135M**; win = accuracy at the smallest memory footprint
+(Cartridges KV-ratio framing). At 135M you **cannot** read 115k tokens — compression IS the point —
+so "full-context" is not a Panel-A entry (only meaningful on the oracle split / native scale).
+
+| baseline | param? | mechanism | compute |
+|---|---|---|---|
+| no-memory floor | — | `vanilla_llama` (question only, no context) | 4090 ✓ (have) |
+| RAG (BM25) | nonparam | BM25 over sessions → top-k → 135M reader | 4090 ✓ |
+| RAG (dense) | nonparam | Stella-V5 / GTE-Qwen2 embed → top-k → 135M reader | 4090 ✓ |
+| KV-eviction | nonparam | H2O (have) + StreamingLLM/SnapKV via `apple/ml-epicache` | 4090 ✓ |
+| **OURS** | parametric | streaming-compress → 96 slots + edges → 135M | 4090 ✓ |
+
+### Panel B — native-scale reference (the "what's the ceiling" numbers)
+
+| baseline | param? | mechanism | compute |
+|---|---|---|---|
+| GPT-4o full-ctx / RAG | nonparam | official harness, OpenAI API | **API — needs `OPENAI_API_KEY`** |
+| Llama-3.1-8B-128k full-ctx | nonparam | 115k-tok single prompt | 40–48GB pod, or 4-bit on 4090 |
+| **MemoryLLM-8B / M+** | parametric | `YuWangX/memoryllm-8b`, `mplus-8b` — online session-by-session write | 4090 ✓ (fits 24GB); **no LongMemEval number exists → we establish it** |
+
+Skipped as headline: Mem0/Zep/Letta (numbers 36–94% for one system; need an API backend; only worth it
+re-run under our fixed harness).
+
+> **Mechanism competitors (LCLM / Cartridges / Larimar / MemoryLLM-M+ / one agent-memory system) are all
+> native-scale too → they slot into THIS panel.** Their mechanism classification (2a vs 2b), priority, and
+> the LCLM novelty note live in §2.5 to keep this scale-table uncluttered.
+
+---
+
+## 2.5 Memory-mechanism competitors — 2a architectural vs 2b agent-memory
+
+Panels A/B are a **scale** cut (matched-135M vs native). Orthogonal to it, the memory MECHANISMS we compete
+against split two ways — keeping them straight avoids fighting the wrong zoo:
+
+- **2a — architectural / "memory-as-state":** a trainable memory read by a (mostly) frozen decoder, or the
+  model itself IS the memory. **Our true head-to-heads** (same family; matched-decoder-able in principle).
+- **2b — agent-memory frameworks:** an external text/graph store + retrieval bolted onto a big frozen LLM
+  (RAG-adjacent). A different paradigm — include **ONE** as the paradigm reference; anchor with
+  full-context + naive-RAG (already our Tier-1). Do **not** chase the tail (LiCoMemory / TiMem / SGMem / …
+  — self-reported, mutually contradictory; the EMem "simple strong baseline" shows raw-text + good
+  embeddings rivals the elaborate pipelines).
+
+Every 2a **ADD** below is 0.6–8B → **Panel B (native)**, not matched-135M (a matched-135M version =
+reimplementation). Rule for ALL of these: **re-run under our fixed harness; never quote a paper's number**
+(Mem0/Zep moved 84→58 under re-evaluation).
+
+### 2a — architectural (priority-ordered)
+| baseline | status | mechanism | scale / GPU | why |
+|---|---|---|---|---|
+| **LCLM** ★ | **ADD (must)** | encoder → soft tokens → adapter → **frozen-init 4B** decoder, e2e continual-pretrain, 4×/8×/16× | Qwen3-Emb-0.6B enc + 4B dec; **released weights**; 1 GPU **inference-only** | our architecture family AT SCALE with weights; benchmarks the same SnapKV/KVzip we do → closest concurrent competitor (novelty note below) |
+| Larimar | optional | Kanerva episodic-memory matrix conditioning a frozen-ish decoder | 1.3B/6B; train-your-own | classic architectural analog / "memory-module baseline" |
+| KV-compression | **have** | KVzip + SnapKV (+ H2O) evict the 115k-tok KV cache | Llama/Qwen 7–8B; 48GB pod | the KV-eviction branch (LCLM itself compares to these) |
+| MemoryLLM / M+ | **have** | parametric in-weights memory, online session write | `mplus-8b`; 24GB | only mechanism-with-released-weights parametric baseline |
+
+**Cite-only** (a related-work STRENGTH: "prior work claims X, ships nothing runnable-for-our-task, so we
+compare against released alternatives"): **Titans / ATLAS / Miras** (Google — code promised, never shipped),
+MELODI, B'MOJO, CAMELoT (no weights); **Cartridges** (`HazyResearch/cartridges`, Apache-2.0 — has code, but
+trains a KV cache **per corpus**: on LongMemEval's 500 private haystacks that's 500 cartridges = infeasible &
+pointless; **dropped as a runnable baseline 2026-07-18b**, keep as the trainable-frozen-soft-KV citation).
+Optional recurrent-state branch: RWKV-7-Goose 2.9B (runnable) — skip unless we add the delta-rule family.
+
+### 2b — agent-memory (add exactly ONE)
+| baseline | status | note |
+|---|---|---|
+| **A-MEM** (NeurIPS'25, `WujiangXu/A-mem`, MIT) | **ADD (default)** | canonical Zettelkasten agentic memory; runs over a frozen LLM (our OpenRouter path) → minimal GPU |
+| MemoryOS (EMNLP'25 Oral, `BAI-LAB/MemoryOS`) | alt | cleanest citable "memory-OS"; swap for A-MEM if preferred |
+| Memory-R1 (ACL'26) | **cite-only** | code "coming soon" (NOT released); already cited in OBJECTIVES.md as a GRPO ref |
+
+### LCLM — novelty note (engage head-on in related work)
+LCLM overlaps our core (soft-token compression of a long context into a decoder's latent input) and ships
+at 4B with weights → it **dents** the "first soft-token compressor at scale" framing and must be **addressed,
+not cited in passing.** What is STILL ours: (1) LCLM **trains the decoder end-to-end** (frozen-init → 350B-tok
+continual pretrain); **we keep the decoder FROZEN** — compose a memory onto an unmodified LM (cheaper, no
+decoder retrain, composable). (2) LCLM is a **static** compressor; our axis is **streaming write/update +
+forced forgetting** (stability–plasticity) — LCLM doesn't test it. (3) our compositional discrete-vocab-over-
+graph angle. One-liner: LCLM = "compression-at-scale by training everything"; ours = "frozen-decoder implicit
+memory cache with streaming update." **Read the paper directly before finalizing the framing.**
+
+---
+
+## 3. Scoring — deterministic, policy-compliant (+ judge cross-check)
+
+LongMemEval ships **only** a GPT-4o judge (`src/evaluation/evaluate_qa.py`), which violates our
+no-LLM-judge policy. We use `src/memory/eval/longmemeval_score.py` (built 2026-07-17, validated):
+
+- **factual** types → normalize (SQuAD-style + number-word canonicalization + parenthetical alternates)
+  → EM | containment | **BEM** paraphrase (`kortukov/answer-equivalence-bem`, threshold 0.5)
+- **preference** → rubric keyword-coverage (proper-noun gate + ≥50% salient-token coverage)
+- **abstention** (`_abs`, ~30/500) → fixed refusal-lexicon detector (recall-biased)
+- report the three official-harness numbers: **overall** (micro, non-abstention) / **task-averaged**
+  (mean of per-type means) / **abstention** accuracy
+
+**+ one-time GPT-4o-judge cross-check on ~100 Qs** to quantify & disclose the offset (our deterministic
+number sits *below* the judge number — the judge credits paraphrase/superset answers). Report ours as
+"deterministic (EM+containment+BEM)", explicitly *not* the official metric.
+
+**Freeze for fairness** (config alone swings published numbers 10–40 pts): cleaned Sept-2025 data
+revision · retrieval top-k + granularity (session vs turn) · reader prompt (`direct` vs Chain-of-Note) ·
+max-gen-tokens · denominator (overall vs task-avg vs abstention).
+
+---
+
+## 4. Infra: have / reuse / build
+
+- **Have:** `src/memory/data/longmemeval.py` (real reader, 500 Qs, taxonomy + abstention); floor/ceiling
+  `vanilla_llama` / `vanilla_full_context`; H2O eval-only; **the deterministic scorer (done).**
+- **Have (built 2026-07-18, 2-audit-hardened, 70 tests):** the **Tier-1 API reference harness** —
+  `scripts/baselines/run_api_eval.py` (floor / full-context / RAG-bm25 / RAG-dense over OpenRouter, token-
+  accurate budgeting, resumable per-question store, coverage/cost accounting) + `src/memory/eval/` scorers
+  for BOTH LongMemEval and MemoryAgentBench (judge-free, per-competency prompts verbatim from the MAB repo)
+  + `scripts/baselines/tier2/` runners (KVzip/SnapKV/H2O, MemoryLLM/M+, **LCLM**) + `run_agentmem.py`
+  (**A-MEM/MemoryOS**, no GPU). Cartridges dropped (cite-only).
+- **Reuse, don't build:** official harness `xiaowu0162/LongMemEval` (MIT) = retrieval + generation +
+  judge with pluggable vLLM readers → Panel-B GPT-4o/8B mostly config.
+- **Build:** Panel-A matched-decoder runner (135M reader + BM25/dense RAG + KV-eviction) · MemoryLLM/M+
+  adapter (online write loop) · our-model adapter (last).
+
+---
+
+## 5. Execution order (cheapest-first)
+
+1. ✅ **Deterministic scorers + Tier-1 API harness** (`src/memory/eval/`, `scripts/baselines/run_api_eval.py`)
+   — built + 2-audit-hardened (70 tests). Shared prerequisite. **DONE.**
+2. **Tier-1 API reference run** — floor / full-context / RAG-bm25 / RAG-dense over the OpenRouter panel on
+   LongMemEval + MemoryAgentBench. **No GPU**, parallel to Phase-0; first real reference numbers.
+3. **Panel-A on 4090** — 135M reader: floor → BM25 RAG → dense RAG → KV-eviction (matched-decoder fight).
+4. **2a mechanism competitors** (native / Panel-B), cheapest-first:
+   a. **LCLM** — inference-only on released weights (1 GPU). **MUST** — closest concurrent competitor.
+   b. **KVzip + SnapKV + MemoryLLM/M+** — already scaffolded in `scripts/baselines/tier2/` (48GB / 24GB pod).
+   c. **Larimar** optional. (Cartridges dropped — per-corpus training doesn't fit private haystacks; cite-only.)
+5. **2b — ONE agent-memory system** (**A-MEM** default) over a frozen LLM via the OpenRouter path (min GPU).
+6. **Panel-B native ceilings** — Llama-3.1-8B on a pod; GPT-4o via API (needs key); + one-time judge cross-check.
+7. **MemoryAgentBench** across the same set (thesis-axis support; harness already built).
+8. **Our trained model** into the same harness → the headline row.
+
+Rule for steps 4–5: **re-run under our harness, never quote paper numbers.** Results land in
+`docs/RESULTS.md` (Phase-2 section) as they complete.
+
+---
+
+## Changelog
+- **2026-07-17** — doc created; decisions approved (both panels, deterministic+judge, LongMemEval +
+  MemoryAgentBench); scorer built + validated.
+- **2026-07-18** — Tier-1 API reference harness built (`scripts/baselines/`, `src/memory/eval/`) + Tier-2
+  GPU scaffolds; two external audits (harness fidelity) fixed + re-verified, 70 tests. See
+  `PHASE2_AUDIT2_FIXES.md`.
+- **2026-07-18b** — memory-MECHANISM competitor sweep adopted: **§2.5** splits mechanism baselines into 2a
+  (architectural) / 2b (agent-memory); **LCLM added (must)** as our closest concurrent competitor
+  (web-verified, novelty note); Cartridges added; A-MEM = the one 2b; Larimar optional; Memory-R1 → cite-only.

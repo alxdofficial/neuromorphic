@@ -1,0 +1,61 @@
+"""Retrievers for the RAG reference baseline: sparse (BM25) and dense (sentence-transformers, CPU).
+
+Both take a list of candidate passages (for LongMemEval: one per haystack session) + a query, and return
+the indices of the top-k, kept in original (chronological) order. Dense retrieval runs on CPU by default so
+it never contends with local Phase-0 GPU work.
+"""
+from __future__ import annotations
+
+import functools
+
+
+def bm25_topk(passages: list[str], query: str, k: int) -> list[int]:
+    """Top-k passage indices by BM25 (Okapi), returned in original (chronological) order."""
+    if len(passages) <= k:
+        return list(range(len(passages)))
+    from rank_bm25 import BM25Okapi
+    tokenized = [p.lower().split() for p in passages]
+    q = query.lower().split()
+    if not any(tokenized) or not q:
+        # all-empty passages ⇒ BM25 avgdl=0 (ZeroDivisionError); empty query ⇒ all scores 0.
+        # Either way there is no retrieval signal → keep the first k (chronological) rather than crash.
+        return list(range(k))
+    scores = BM25Okapi(tokenized).get_scores(q)
+    top = sorted(range(len(passages)), key=lambda i: scores[i], reverse=True)[:k]
+    return sorted(top)
+
+
+class DenseRetriever:
+    """Cosine-similarity retrieval with a small sentence-transformer on CPU (cached MiniLM by default).
+
+    The model is loaded once (lazily) and reused across queries. CPU-pinned to avoid GPU contention.
+    """
+
+    def __init__(self, model_name: str = "sentence-transformers/all-MiniLM-L6-v2", device: str = "cpu"):
+        self.model_name = model_name
+        self.device = device
+
+    @functools.cached_property
+    def _model(self):
+        from sentence_transformers import SentenceTransformer
+        return SentenceTransformer(self.model_name, device=self.device)
+
+    def topk(self, passages: list[str], query: str, k: int) -> list[int]:
+        if len(passages) <= k:
+            return list(range(len(passages)))
+        import numpy as np
+        emb = self._model.encode(passages, normalize_embeddings=True, show_progress_bar=False)
+        q = self._model.encode([query], normalize_embeddings=True, show_progress_bar=False)[0]
+        scores = emb @ q
+        top = sorted(range(len(passages)), key=lambda i: scores[i], reverse=True)[:k]
+        return sorted(top)
+
+
+def retrieve(passages: list[str], query: str, k: int, method: str,
+             dense: DenseRetriever | None = None) -> list[int]:
+    """Dispatch to bm25 or dense. `dense` is a reusable DenseRetriever (create once, pass in)."""
+    if method == "bm25":
+        return bm25_topk(passages, query, k)
+    if method == "dense":
+        return (dense or DenseRetriever()).topk(passages, query, k)
+    raise ValueError(f"unknown retrieval method {method!r}")
