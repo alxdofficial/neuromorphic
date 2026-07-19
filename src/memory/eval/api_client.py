@@ -109,31 +109,46 @@ class OpenRouterClient:
                    temperature: float = 0.0) -> CallResult:
         payload = {"model": model, "messages": messages,
                    "temperature": temperature, "max_tokens": max_tokens}
-        async with self.sem:
-            for attempt in range(self.retries):
+        last = "exhausted retries"
+        for attempt in range(self.retries):
+            retryable = False
+            # hold a concurrency slot ONLY for the POST + parse — NOT during backoff, so a request sleeping
+            # off a 429 doesn't stall the others (keeps effective concurrency up under rate-limiting).
+            async with self.sem:
                 try:
                     r = await self._client.post(OPENROUTER_URL, json=payload, timeout=self.timeout)
+                except Exception as e:  # noqa: BLE001 — pre-response (network/timeout): safe to retry
+                    last = f"{type(e).__name__}: {e}"
+                    retryable = True
+                else:
                     if r.status_code in (429, 500, 502, 503, 504):
-                        await asyncio.sleep(2 ** attempt)
-                        continue
-                    if 400 <= r.status_code < 500:
+                        last = f"HTTP {r.status_code}: {r.text[:120]}"
+                        retryable = True
+                    elif 400 <= r.status_code < 500:
                         # permanent client error (context-length 400, auth 401, not-found 404, 422 …):
                         # retrying can't fix it — surface immediately instead of burning the retry budget.
                         return CallResult("", 0, 0, f"HTTP {r.status_code}: {r.text[:200]}")
-                    r.raise_for_status()
-                    d = r.json()
-                    choice = (d.get("choices") or [{}])[0]
-                    # reasoning models put chain-of-thought in `reasoning`; the ANSWER is in `content`.
-                    # content can be null when the model is cut off at max_tokens (finish_reason="length").
-                    msg = choice.get("message", {}).get("content") or ""
-                    u = d.get("usage", {}) or {}
-                    return CallResult(msg, u.get("prompt_tokens", 0), u.get("completion_tokens", 0),
-                                      None, choice.get("finish_reason"))
-                except Exception as e:  # noqa: BLE001 — retry, surface on final attempt
-                    if attempt == self.retries - 1:
-                        return CallResult("", 0, 0, f"{type(e).__name__}: {e}")
-                    await asyncio.sleep(2 ** attempt)
-        return CallResult("", 0, 0, "exhausted retries")
+                    else:
+                        try:
+                            d = r.json()
+                        except Exception as e:  # noqa: BLE001 — malformed 2xx body; the call ALREADY billed,
+                            return CallResult("", 0, 0, f"bad-json: {type(e).__name__}: {e}")  # so do NOT retry
+                        # OpenRouter can return HTTP 200 with a top-level {"error": ...} and no choices
+                        # (provider/moderation failures). That's an ERROR, not a wrong answer — surface it so
+                        # it's EXCLUDED from scoring, not silently counted as an empty (wrong) response.
+                        if d.get("error") or not d.get("choices"):
+                            return CallResult("", 0, 0, error=str(d.get("error") or "200 with no choices"))
+                        choice = d["choices"][0]
+                        # reasoning models put chain-of-thought in `reasoning`; the ANSWER is in `content`.
+                        # `message` itself can be JSON null (content filter) → guard both levels (a bare
+                        # .get on None would raise AttributeError → retry → REBILL the 200).
+                        msg = ((choice.get("message") or {}).get("content")) or ""
+                        u = d.get("usage") or {}
+                        return CallResult(msg, u.get("prompt_tokens", 0), u.get("completion_tokens", 0),
+                                          None, choice.get("finish_reason"))
+            if retryable and attempt < self.retries - 1:
+                await asyncio.sleep(2 ** attempt)          # backoff OUTSIDE the semaphore (slot released)
+        return CallResult("", 0, 0, last)
 
     async def map(self, model: str, message_lists: list[list[dict]], max_tokens: int = 256):
         """Run many chat calls concurrently (bounded by the semaphore); returns list[CallResult]."""

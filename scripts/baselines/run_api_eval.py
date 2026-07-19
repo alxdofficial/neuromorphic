@@ -111,7 +111,7 @@ def _proj(r) -> dict:
 
 
 async def run_one(client, model, mode, items, token_budget, char_budget, bm25_topk, dense, max_tokens,
-                  store, scorer, use_bem):
+                  store, scorer, use_bem, concurrency=32):
     """RESUMABLE: skip questions already answered in `store`, request only the rest, appending each result
     the moment it returns (crash-safe). Then score ONLY the currently-selected items — NOT the whole store,
     which may hold answers from a larger earlier run (`--max-examples` is a proper scoping knob) — and fold
@@ -138,7 +138,13 @@ async def run_one(client, model, mode, items, token_budget, char_budget, bm25_to
             "correct": None, "score_method": None,
         })
 
-    await asyncio.gather(*[one(it) for it in pending])
+    # Process in bounded BATCHES so only ~batch prompts are materialized at once. `client.chat`'s semaphore
+    # throttles in-flight HTTP, but build_messages (which concatenates the FULL history — up to multi-MB for
+    # MemoryAgentBench full_context) runs before that await, so gathering ALL pending up front would hold
+    # every prompt string in RAM simultaneously → OOM on large-context datasets. The batch caps residency.
+    batch = max(16, concurrency * 4)
+    for i in range(0, len(pending), batch):
+        await asyncio.gather(*[one(it) for it in pending[i:i + batch]])
 
     # score ONLY this run's selection (the cache may carry extra records from a bigger earlier run)
     sel = [r for r in store.all_records() if str(r.get("question_id")) in want]
@@ -168,7 +174,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dataset", choices=list(DATASETS), default="longmemeval")
     ap.add_argument("--models", nargs="+", default=DEFAULT_MODELS)
-    ap.add_argument("--modes", nargs="+", default=list(MODES))
+    ap.add_argument("--modes", nargs="+", default=list(MODES), choices=list(MODES))
     ap.add_argument("--variant", default="s")
     ap.add_argument("--max-examples", type=int, default=None)
     ap.add_argument("--concurrency", type=int, default=32,
@@ -200,6 +206,10 @@ def main():
     print(f"[run_api_eval] {len(items)} items; types={types}")
 
     ctx_len = model_context_lengths(args.models)
+    unpriced = [m for m in args.models if m not in PRICING]
+    if unpriced:
+        print(f"[run_api_eval] WARN: no PRICING entry for {unpriced} → their cost read-out will be $0.00 "
+              "(add them to api_client.PRICING for an accurate cost).")
     dense = DenseRetriever() if "rag_dense" in args.modes else None
     out_dir = REPO / args.out_dir; out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -238,7 +248,7 @@ def main():
                         print(f"[resume] {tag}: {n_done}/{len(items)} already answered — requesting the rest")
                     agg, meta = await run_one(client, model, mode, items, token_budget, char_budget,
                                               args.bm25_topk, dense, args.max_tokens, store, scorer,
-                                              not args.no_bem)
+                                              not args.no_bem, concurrency=args.concurrency)
                     print(f"\n=== {tag} ===")
                     _sec = (f"abstention={agg.get('abstention_accuracy')}" if "abstention_accuracy" in agg
                             else f"n_scored={agg.get('n_scored')} n_skipped={agg.get('n_skipped')}")
