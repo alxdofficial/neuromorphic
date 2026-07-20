@@ -83,7 +83,10 @@ def _is_nonempty(v) -> bool:
 
 def _snapshot_memory_state(model):
     """Deep-snapshot the short-term pool + all LTM buffers found. Returns (snapshot dict, captured names)."""
-    snap = {"model.memory": model.memory.data.clone()}
+    # CPU-resident snapshot: keeping the ~2.7GB STM-pool clone off the GPU frees ~5.4GB (pristine + per-context
+    # post) so multiple M+ instances fit one GPU for packing. Fidelity-neutral (our reset bookkeeping, not M+'s
+    # mechanism); restore copies it back to GPU. PCIe copy is ~0.17s — negligible vs ~178s/context injection.
+    snap = {"model.memory": model.memory.data.detach().to("cpu", copy=True)}
     captured, empty = [], []
     for attr in _LTM_CANDIDATE_ATTRS:
         if hasattr(model, attr):
@@ -231,8 +234,13 @@ def main():
                     help="a trailing block shorter than this is merged into the previous one (hard min > 16)")
     ap.add_argument("--seed", type=int, default=0, help="seed py/np/torch/cuda (M+ randomly drops memory)")
     ap.add_argument("--no-bem", action="store_true", help="skip BEM paraphrase scoring (LongMemEval only)")
+    ap.add_argument("--num-shards", type=int, default=1,
+                    help="data-parallel/instance-packing: partition DISTINCT CONTEXTS across this many shards "
+                         "(sharding by context, NOT question, preserves per-context reuse — critical for MAB).")
+    ap.add_argument("--shard-idx", type=int, default=0, help="which shard (0..num_shards-1) this process runs")
     ap.add_argument("--out-dir", default="outputs/baselines")
     args = ap.parse_args()
+    assert 0 <= args.shard_idx < args.num_shards, "shard_idx must be in [0, num_shards)"
 
     repo_dir = str(Path(args.repo_dir).expanduser())
 
@@ -243,13 +251,24 @@ def main():
     print(f"[run_memoryllm] model={args.model} dataset={args.dataset} repo_dir={repo_dir} "
           f"variant={args.variant} max_examples={args.max_examples} seed={args.seed}")
     items = load_items(args.dataset, variant=args.variant, max_examples=args.max_examples)
+    if args.num_shards > 1:
+        # Partition DISTINCT CONTEXTS round-robin across shards (keep every context whole → per-context reuse
+        # is preserved: an MAB context's ~85 Q all land on one shard, injected once). LongMemEval's unique
+        # contexts just split ~evenly. Deterministic (first-seen context order), so shards are disjoint.
+        from src.memory.eval.tier2_common import group_by_context
+        ctx_order = list(group_by_context(items).keys())
+        keep = {c for i, c in enumerate(ctx_order) if i % args.num_shards == args.shard_idx}
+        items = [it for it in items if (it.get("full_history", "") or "") in keep]
+        print(f"[run_memoryllm] SHARD {args.shard_idx}/{args.num_shards}: "
+              f"{len(keep)}/{len(ctx_order)} contexts, {len(items)} items")
     types = {t: sum(1 for i in items if i["question_type"] == t)
              for t in sorted({i["question_type"] for i in items})}
     print(f"[run_memoryllm] {len(items)} items; types={types}")
 
     commit = git_commit(REPO)
+    knob = f"blk{args.inject_block_tokens}" + (f"_sh{args.shard_idx}of{args.num_shards}" if args.num_shards > 1 else "")
     tag = build_tag(args.dataset, "memoryllm", args.model.split("/")[-1], args.variant, len(items),
-                    f"blk{args.inject_block_tokens}", args.max_new_tokens, args.seed, commit)
+                    knob, args.max_new_tokens, args.seed, commit)
     out_dir = REPO / args.out_dir
     store = ResultStore(out_dir / "cache" / f"{tag}.jsonl")
     n_done = len(store.done_ids())

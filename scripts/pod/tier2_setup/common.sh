@@ -11,11 +11,14 @@ set -uo pipefail
 WORKDIR="${WORKDIR:-/root}"
 REPO="${REPO:-/root/neuromorphic}"
 export HF_HOME="${HF_HOME:-$WORKDIR/hf}"
-export MAMBA_ROOT_PREFIX="$WORKDIR/micromamba"
+# IMPORTANT: /workspace is a NETWORK volume (moosefs) — writing a many-small-file env there is ~3MB/s (glacial).
+# Default env/scratch to WORKDIR, but RESPECT pre-set overrides so a caller can put the env on the pod's LOCAL
+# SSD (MAMBA_ROOT_PREFIX=/root/micromamba TMPDIR=/tmp) — ~10× faster pip installs. Weights stay on WORKDIR (few
+# big files, download-bound, fine). For an ephemeral measurement pod the env need not persist across restarts.
+export MAMBA_ROOT_PREFIX="${MAMBA_ROOT_PREFIX:-$WORKDIR/micromamba}"
 REPOS="$WORKDIR/tier2_repos"
-# Route ALL scratch onto WORKDIR — the container overlay `/` is often ~20GB and a flash-attn build alone blows it.
-export PIP_CACHE_DIR="$WORKDIR/pipcache"
-export TMPDIR="$WORKDIR/tmp"
+export PIP_CACHE_DIR="${PIP_CACHE_DIR:-$WORKDIR/pipcache}"
+export TMPDIR="${TMPDIR:-$WORKDIR/tmp}"
 mkdir -p "$HF_HOME" "$REPOS" "$PIP_CACHE_DIR" "$TMPDIR" /root/logs
 
 step(){ echo -e "\n=== [tier2-setup] $* ==="; }
@@ -59,7 +62,8 @@ prefetch(){  # <env> <repo_id...>  — background-fetch checkpoints so eval does
 import sys
 from huggingface_hub import snapshot_download
 for r in sys.argv[1:]:
-    try: snapshot_download(r); print("fetched", r)
+    ignore = ["original/*"] if r.startswith("meta-llama/") else None
+    try: snapshot_download(r, ignore_patterns=ignore); print("fetched", r)
     except Exception as e: print("SKIP", r, str(e)[:160])
 PY
   ok "prefetch [$ids] pid $! (tail /root/logs/prefetch.log)"
