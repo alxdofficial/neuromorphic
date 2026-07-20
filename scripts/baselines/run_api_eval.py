@@ -164,25 +164,35 @@ async def run_one(client, model, mode, items, token_budget, char_budget, bm25_to
             "correct": None, "score_method": None,
         })
 
-    # Process in bounded BATCHES so only ~batch prompts are materialized at once. `client.chat`'s semaphore
-    # throttles in-flight HTTP, but build_messages (which concatenates the FULL history — up to multi-MB for
-    # MemoryAgentBench full_context) runs before that await, so gathering ALL pending up front would hold
-    # every prompt string in RAM simultaneously → OOM on large-context datasets. The batch caps residency.
-    batch = max(16, concurrency * 4)
+    # WORKER-POOL (producer/consumer), NOT a batch barrier. `concurrency` workers each pull the next pending
+    # item from a shared iterator, process it, and append the moment it returns — so a slow (e.g. reasoning-
+    # heavy) call ties up ONE worker while the others keep draining the queue. The old code gathered a whole
+    # batch and awaited ALL of it before starting the next, so one straggler stalled ~batch finished answers
+    # (bursty writes that looked like a hang). In-flight stays bounded at `concurrency`, so prompt RAM
+    # residency is still capped (the only reason the old code batched). Mirrors a DataLoader's num_workers.
+    # `next(item_iter)` is atomic under the single-threaded event loop (no await between get and use), so no
+    # lock is needed across workers.
+    async def _drain(item_iter):
+        while True:
+            try:
+                it = next(item_iter)
+            except StopIteration:
+                return
+            await one(it)
+
     if warm_by_context:
-        # group pending by distinct context (preserve first-seen order); warm each context with ONE call,
-        # then run the remainder concurrently so ~1 fresh + N cached per context (not `concurrency` fresh).
+        # group pending by distinct context; warm each context with ONE call (populate the prefix cache),
+        # then drain the remainder through the worker pool (~1 fresh + N cached per context).
         groups: dict = {}
         for it in pending:
             groups.setdefault(it.get("full_history", ""), []).append(it)
-        for gi, (_, gitems) in enumerate(groups.items()):
+        for _, gitems in groups.items():
             await one(gitems[0])                                   # warm the prefix cache
-            rest = gitems[1:]
-            for i in range(0, len(rest), batch):
-                await asyncio.gather(*[one(it) for it in rest[i:i + batch]])
+            rest_iter = iter(gitems[1:])
+            await asyncio.gather(*[_drain(rest_iter) for _ in range(concurrency)])
     else:
-        for i in range(0, len(pending), batch):
-            await asyncio.gather(*[one(it) for it in pending[i:i + batch]])
+        pending_iter = iter(pending)
+        await asyncio.gather(*[_drain(pending_iter) for _ in range(concurrency)])
 
     # score ONLY this run's selection (the cache may carry extra records from a bigger earlier run)
     sel = [r for r in store.all_records() if str(r.get("question_id")) in want]
