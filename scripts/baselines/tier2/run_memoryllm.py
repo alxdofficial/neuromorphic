@@ -275,6 +275,11 @@ def main():
     # LPT cost model (balancing only — never affects results). Defaults = measured M+ throughput on one RTX
     # 4090: 0.375 s per 512-token inject, 2.3 s per generated answer. Retune for a different card; only the
     # inject:answer RATIO changes the partition.
+    ap.add_argument("--shard-weights", default=None,
+                    help="comma-separated relative throughput per shard for a HETEROGENEOUS fleet, e.g. "
+                         "'1,1,1,1,0.43,0.43' for 4x RTX 4090 + 2x RTX 3090. 1.0 = the card the --cost-* "
+                         "defaults were measured on. Balances projected COMPLETION TIME, not raw work. "
+                         "Must be identical on every shard (each derives the same partition).")
     ap.add_argument("--dry-run", action="store_true",
                     help="print shard partition + question ids and exit (no model load) — verifies sharding")
     ap.add_argument("--inject-progress-every", type=int, default=10,
@@ -308,19 +313,34 @@ def main():
         # the partitions are provably disjoint with no coordination.
         from src.memory.eval.tier2_common import group_by_context
         groups = group_by_context(items)
-        loads = [0.0] * args.num_shards
+        # Relative throughput per shard, for a HETEROGENEOUS fleet (e.g. 4x RTX 4090 + 2x RTX 3090). Balancing
+        # raw work equally would hand a slow card a fast card's workload; since fleet wall-time is the SLOWEST
+        # shard, that card straggles and everyone waits. So balance PROJECTED COMPLETION TIME (work / speed).
+        # 1.0 = the reference card the --cost-* defaults were measured on (RTX 4090); an RTX 3090 is ~0.43.
+        if args.shard_weights:
+            speeds = [float(x) for x in args.shard_weights.split(",")]
+            if len(speeds) != args.num_shards:
+                sys.exit(f"--shard-weights has {len(speeds)} entries, need {args.num_shards}")
+            if min(speeds) <= 0:
+                sys.exit("--shard-weights must all be > 0")
+        else:
+            speeds = [1.0] * args.num_shards
+        loads = [0.0] * args.num_shards          # accumulated work, in reference-card seconds
         assign: dict[str, int] = {}
         # sort by (-cost, ctx): the ctx tiebreak keeps the order total, so ties resolve identically everywhere
         for ctx, its in sorted(groups.items(), key=lambda kv: (-_cost(kv[0], kv[1]), kv[0])):
-            j = min(range(args.num_shards), key=lambda k: (loads[k], k))
+            c = _cost(ctx, its)
+            j = min(range(args.num_shards), key=lambda k: ((loads[k] + c) / speeds[k], k))
             assign[ctx] = j
-            loads[j] += _cost(ctx, its)
+            loads[j] += c
         keep = {c for c, j in assign.items() if j == args.shard_idx}
         items = [it for it in items if (it.get("full_history", "") or "") in keep]
-        imbalance = (max(loads) - min(loads)) / max(loads) if max(loads) > 0 else 0.0
-        print(f"[run_memoryllm] SHARD {args.shard_idx}/{args.num_shards} (LPT): "
-              f"{len(keep)}/{len(groups)} contexts, {len(items)} items; est {loads[args.shard_idx] / 60:.1f} min "
-              f"(fleet slowest {max(loads) / 60:.1f} min, imbalance {imbalance * 100:.1f}%)")
+        eta = [loads[k] / speeds[k] for k in range(args.num_shards)]     # wall seconds per shard
+        imbalance = (max(eta) - min(eta)) / max(eta) if max(eta) > 0 else 0.0
+        het = "" if args.shard_weights is None else f" speed={speeds[args.shard_idx]:g}"
+        print(f"[run_memoryllm] SHARD {args.shard_idx}/{args.num_shards} (LPT{het}): "
+              f"{len(keep)}/{len(groups)} contexts, {len(items)} items; est {eta[args.shard_idx] / 60:.1f} min "
+              f"(fleet slowest {max(eta) / 60:.1f} min, imbalance {imbalance * 100:.1f}%)")
     types = {t: sum(1 for i in items if i["question_type"] == t)
              for t in sorted({i["question_type"] for i in items})}
     print(f"[run_memoryllm] {len(items)} items; types={types}")
