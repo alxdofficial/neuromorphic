@@ -1,146 +1,198 @@
 #!/usr/bin/env python3
-"""Phase-2 2b baseline: agent-memory frameworks (A-MEM / MemoryOS) over LongMemEval — API-based, NO GPU.
+"""Phase-2 2b baseline: agent-memory frameworks (A-MEM / MemoryOS) over LongMemEval / MemoryAgentBench.
 
-The 2b "agent-memory paradigm" reference (docs/baselines/PHASE2_BASELINES.md §2.5): an external memory store
-+ retrieval bolted onto a FROZEN chat LLM. Both frameworks run over an OpenAI-compatible endpoint → we point
-them at OpenRouter (the same panel as run_api_eval.py), so the reader LLM is shared with Tier-1 and only a
-small local sentence-embedder runs (CPU-fine). Per LongMemEval item (private haystack): spin up a FRESH memory
-system, ingest each session, then answer the question. Scored with the SAME deterministic scorer.
+API-based, **NO GPU** — runs on any box (this one): the agent-memory orchestration + a small local
+sentence-embedder run on CPU, and the reader LLM runs over OpenRouter (the SAME panel as run_api_eval.py, so
+the reader is shared with Tier-1). The 2b "agent-memory paradigm" reference (docs/baselines/PHASE2_BASELINES.md
+§2.5): an external memory store + retrieval bolted onto a frozen chat LLM.
 
   --method a-mem     A-MEM (Xu et al., NeurIPS'25; github.com/WujiangXu/A-mem, MIT). `AgenticMemorySystem`:
-                     add_note(session) to ingest, find_related_memories(q, k) to retrieve; WE generate the
-                     answer from the retrieved context via OpenRouter (its class doesn't do the QA step).
-  --method memoryos  MemoryOS (Kang et al., EMNLP'25; github.com/BAI-LAB/MemoryOS, Apache-2.0; pip
-                     memoryos-pro). `Memoryos`: add_memory(user,assistant) to ingest, get_response(q) which
-                     retrieves AND generates internally (same OpenRouter model).
+                     add_note(text) ingests (LLM-generates keywords/tags + evolves links), find_related_memories
+                     (q, k) -> (context_str, indices) retrieves; WE generate the answer via OpenRouter.
+  --method memoryos  MemoryOS (Kang et al., EMNLP'25; pip memoryos-pro). `Memoryos`: add_memory then
+                     get_response(q) which retrieves AND generates internally. ⚠ UNTESTED here (needs its pip
+                     package); get_response may mutate state, so per-context reuse is a POD-VERIFY for it.
 
-Add exactly ONE for the paper (A-MEM default). `--help` works without the framework installed (lazy import);
-running needs `pip install` of the chosen framework + `OPENROUTER_API_KEY`. RESUMABLE per-item.
+PER-CONTEXT REUSE (docs/baselines/TIER2_HOSTING.md, via src/memory/eval/tier2_common.run_grouped): build the
+memory store ONCE per distinct context and answer every question sharing it — the local prompt-cache analog.
+MAB = 36 ingests for 3,071 Q (retrieval is read-only, safe to reuse); LongMemEval = ingest per question
+(unique histories). Same deterministic scorers + JSON shape as Tier-1.
 
-Example:  OPENROUTER_API_KEY=... python scripts/baselines/run_agentmem.py --method a-mem --max-examples 5
+`--help` works without the framework installed (lazy import). Running needs the cloned A-mem repo
+(`--repo-dir`, default ~/tier2_repos/A-mem) + `OPENROUTER_API_KEY`. RESUMABLE + crash-safe.
+
+Example:  OPENROUTER_API_KEY=... python scripts/baselines/run_agentmem.py --method a-mem --dataset longmemeval --max-examples 5
 """
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import re
 import shutil
-import subprocess
 import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 
-from src.memory.eval.baselines import build_messages          # noqa: E402  (ours, no heavy deps)
-
 _OPENROUTER_BASE = "https://openrouter.ai/api/v1"
 _DEFAULT_LLM = "meta-llama/llama-3.1-8b-instruct"              # reader LLM (share with the Tier-1 panel)
 _DEFAULT_EMBED = "all-MiniLM-L6-v2"
+_DEFAULT_REPO_DIR = "~/tier2_repos/A-mem"                     # git clone github.com/WujiangXu/A-mem
 
 
-def _git_commit() -> str:
-    try:
-        return subprocess.check_output(["git", "-C", str(REPO), "rev-parse", "--short", "HEAD"],
-                                       text=True, stderr=subprocess.DEVNULL).strip() or "nogit"
-    except Exception:  # noqa: BLE001
-        return "nogit"
-
-
-def _openrouter_chat(model: str, messages: list[dict], api_key: str, max_tokens: int) -> tuple[str, str | None]:
-    """Minimal synchronous OpenRouter chat (the answer step for A-MEM). Returns (text, error)."""
+def _openrouter_chat(model: str, messages: list[dict], api_key: str, max_tokens: int):
+    """Synchronous OpenRouter chat (the answer step for A-MEM), with the Tier-1 safeguards (audit #7): retry
+    on 429/5xx with backoff, treat a choice-level error or terminal finish_reason (error/content_filter) as
+    an ERROR not an empty answer, and surface a length cutoff. Returns (text, error, finish_reason)."""
+    import time
     import httpx
-    try:
-        r = httpx.post(f"{_OPENROUTER_BASE}/chat/completions",
-                       headers={"Authorization": f"Bearer {api_key}"},
-                       json={"model": model, "messages": messages, "max_tokens": max_tokens,
-                             "temperature": 0.0}, timeout=120.0)
-        if r.status_code != 200:
-            return "", f"HTTP {r.status_code}: {r.text[:200]}"
-        choice = r.json()["choices"][0]
-        return (choice.get("message", {}).get("content") or ""), None
-    except Exception as e:  # noqa: BLE001
-        return "", f"{type(e).__name__}: {e}"
-
-
-def _record(it, hyp="", error=None):
-    return {"question_id": it["question_id"], "question": it["question"], "answer": it["answer"],
-            "hypothesis": hyp, "question_type": it["question_type"],
-            "finish_reason": "error" if error else "stop", "error": error}
-
-
-def run_a_mem(args, items, api_key, store) -> None:
-    """A-MEM: ingest sessions as Zettelkasten notes, retrieve top-k, then WE generate via OpenRouter."""
-    from memory_layer import AgenticMemorySystem   # POD/env: pip install the A-mem repo (github.com/WujiangXu/A-mem)
-
-    done = store.done_ids()
-    for it in items:
-        if str(it["question_id"]) in done:
-            continue
+    last = "exhausted retries"
+    for attempt in range(5):
         try:
-            mem = AgenticMemorySystem(model_name=args.embed_model, llm_backend="openai",
-                                      llm_model=args.llm_model, api_key=api_key, api_base=_OPENROUTER_BASE)
-            # DEVIATION (documented): this uses A-MEM's add_note (which DOES run its keyword/context/tag
-            # generation + link/evolve) + find_related_memories; the final QA answer is generated by us via
-            # OpenRouter for a shared reader. Pass each session's REAL date ("[Session X — DATE]") as the note
-            # time so temporal reasoning isn't broken by wall-clock defaults.
-            for sess in (it["sessions"] or [it["full_history"]]):
+            r = httpx.post(f"{_OPENROUTER_BASE}/chat/completions",
+                           headers={"Authorization": f"Bearer {api_key}"},
+                           json={"model": model, "messages": messages, "max_tokens": max_tokens,
+                                 "temperature": 0.0}, timeout=120.0)
+        except Exception as e:  # noqa: BLE001 — pre-response: retryable
+            last = f"{type(e).__name__}: {e}"
+        else:
+            if r.status_code in (429, 500, 502, 503, 504):
+                last = f"HTTP {r.status_code}: {r.text[:120]}"
+            elif r.status_code != 200:
+                return "", f"HTTP {r.status_code}: {r.text[:200]}", None   # permanent client error, no retry
+            else:
+                d = r.json()
+                if d.get("error") or not d.get("choices"):
+                    return "", str(d.get("error") or "200 with no choices"), None
+                choice = d["choices"][0]
+                fr = choice.get("finish_reason")
+                if choice.get("error") or fr in ("error", "content_filter"):
+                    return "", str(choice.get("error") or f"terminal finish_reason={fr}"), fr
+                return ((choice.get("message") or {}).get("content") or ""), None, fr
+        if attempt < 4:
+            time.sleep(2 ** attempt)
+    return "", last, None
+
+
+def _quiet(verbose: bool):
+    """Suppress A-MEM's very chatty internal print()s (per-note evolution JSONs) unless --verbose — a 500-item
+    run prints GBs of them otherwise. Our own run_grouped progress lines print OUTSIDE this, so stay visible."""
+    import contextlib
+    import os
+    if verbose:
+        return contextlib.nullcontext()
+    return contextlib.redirect_stdout(open(os.devnull, "w"))
+
+
+def run_a_mem(args, items, api_key, repo_dir, store, dataset, meta_out) -> None:
+    """A-MEM with per-context reuse: ingest a context's sessions ONCE (Zettelkasten notes with link-evolution),
+    then per question retrieve top-k and generate via OpenRouter. Retrieval is read-only → safe to reuse."""
+    sys.path.insert(0, repo_dir)
+    from memory_layer import AgenticMemorySystem
+    from src.memory.eval.tier2_common import format_query, group_by_context, run_grouped
+    from src.memory.eval.baselines import build_messages
+
+    def _ingest_units(ctx, first_item):
+        """What to ingest as A-MEM notes. LongMemEval → its natural dated sessions. MAB → the DOCUMENT context
+        re-aggregated into `--ingest-chunk-chars` notes: A-MEM runs 1-3 LLM calls PER note (keyword/tag + link
+        evolution), and MAB's 2k-char RAG chunks make ~600 notes/context (985k-char AR) → ~10 hr of ingest.
+        A-MEM was designed for dozens of sessions, not hundreds of doc chunks; a coarser granularity is both
+        more faithful to that design and tractable. DEVIATION to disclose in the paper."""
+        if dataset == "longmemeval":
+            return first_item.get("sessions") or [ctx]
+        from src.memory.data.memoryagentbench import _chunk
+        return _chunk(ctx, chunk_chars=args.ingest_chunk_chars)
+
+    def encode_ctx(ctx, first_item):
+        mem = AgenticMemorySystem(model_name=args.embed_model, llm_backend="openai",
+                                  llm_model=args.llm_model, api_key=api_key, api_base=_OPENROUTER_BASE)
+        # Pass each LongMemEval session's REAL date ("[Session X — DATE]") so temporal reasoning isn't broken
+        # by wall-clock defaults; MAB chunks carry no such marker → default time.
+        with _quiet(args.verbose):
+            for sess in _ingest_units(ctx, first_item):
                 mt = re.search(r"—\s*([^\]]+)\]", sess)
                 mem.add_note(sess, time=mt.group(1).strip()) if mt else mem.add_note(sess)
-            ctx, _idx = mem.find_related_memories(it["question"], k=args.retrieve_k)
-            q = it["question"]
-            if it.get("question_date"):
-                q = f"Current Date: {it['question_date']}\n{q}"
-            msgs, _ = build_messages("full_context", question=q, full_history=ctx or "", char_budget=10 ** 9)
-            hyp, err = _openrouter_chat(args.llm_model, msgs, api_key, args.max_new_tokens)
-            store.append(_record(it, hyp=hyp, error=err))
-        except Exception as e:  # noqa: BLE001
-            print(f"[run_agentmem] ERROR on {it['question_id']}: {type(e).__name__}: {e}")
-            store.append(_record(it, error=f"{type(e).__name__}: {e}"))
+        return mem
+
+    def answer(mem, it):
+        # retrieve with the RAW question (semantic embedding match); generate with the possibly-templated query
+        # (MAB competency instruction / LongMemEval date anchor).
+        with _quiet(args.verbose):
+            ctx_str, _idx = mem.find_related_memories(it["question"], k=args.retrieve_k)
+        msgs, _ = build_messages("full_context", question=format_query(it, dataset),
+                                 full_history=ctx_str or "", char_budget=10 ** 9)
+        hyp, err, fr = _openrouter_chat(args.llm_model, msgs, api_key, args.max_new_tokens)
+        if err:
+            raise RuntimeError(err)                 # let run_grouped record it as an error (retryable)
+        return hyp, (fr or "stop")                  # fr='length' → excluded from scoring + retried
+
+    # audit #10: A-MEM runs ~2 LLM calls per note (metadata + link-evolution) — estimate up front so a full
+    # run's cost/time is known (it is the SLOWEST baseline). Resume is PER-CONTEXT: a context whose questions
+    # are all done is skipped (not re-ingested); a mid-context crash re-ingests that one context on rerun.
+    groups = group_by_context(items)
+    n_units = sum(len(_ingest_units(ctx, its[0])) for ctx, its in groups.items())
+    est_calls = n_units * 2 + len(items)
+    meta_out.update({"n_contexts": len(groups), "n_ingest_units": n_units, "est_llm_calls": est_calls})
+    print(f"[run_agentmem] A-MEM estimate: {len(groups)} contexts, ~{n_units} ingest notes → ~{est_calls} LLM "
+          f"calls (~2/note + {len(items)} answers). Slowest baseline; resume is per-context.", flush=True)
+
+    run_grouped(items, encode_ctx, answer, store, "[run_agentmem a-mem]")
 
 
-def run_memoryos(args, items, api_key, store) -> None:
-    """MemoryOS: ingest session turn-pairs, then get_response (retrieves + generates internally)."""
-    from memoryos import Memoryos   # POD/env: pip install memoryos-pro
+def run_memoryos(args, items, api_key, repo_dir, store, dataset, meta_out) -> None:
+    """MemoryOS: ingest, then get_response (retrieves + generates internally). ⚠ UNTESTED here (needs
+    memoryos-pro). audit #1: get_response MUTATES memory with every query+answer, so reusing one instance
+    across a context's questions would let later questions SEE earlier benchmark Q&A → contamination. We
+    therefore build a FRESH instance PER QUESTION (no cross-question reuse), and detect the upstream
+    "Error: Could not get response from LLM." string (which it returns instead of raising) → recorded as an
+    error, NOT frozen as a valid answer."""
+    del meta_out
+    from memoryos import Memoryos   # pip install memoryos-pro
+    from src.memory.eval.tier2_common import format_query, make_record
 
     done = store.done_ids()
-    for it in items:
+    for i, it in enumerate(items):
         if str(it["question_id"]) in done:
             continue
         try:
-            # state dir keyed by question_id (stable) + CLEARED per item, so a resumed/retried run starts from
-            # fresh memory rather than duplicating a prior partial ingest. DEVIATION (documented): each session
-            # is fed as one user turn with an empty assistant turn (LongMemEval sessions are multi-turn; a
-            # faithful port would split into user/assistant pairs — a pod-time refinement).
             state_dir = REPO / "outputs" / "baselines" / "memoryos_state" / str(it["question_id"])
             if state_dir.exists():
                 shutil.rmtree(state_dir, ignore_errors=True)
-            memo = Memoryos(user_id=f"lme_{it['question_id']}", assistant_id="lme_assistant",
+            memo = Memoryos(user_id=f"q_{it['question_id']}", assistant_id="assistant",
                             openai_api_key=api_key, openai_base_url=_OPENROUTER_BASE,
                             llm_model=args.llm_model, embedding_model_name=args.embed_model,
                             data_storage_path=str(state_dir))
-            for sess in (it["sessions"] or [it["full_history"]]):
-                memo.add_memory(user_input=sess, agent_response="")     # session text as the user turn
-            q = it["question"]
-            if it.get("question_date"):
-                q = f"Current Date: {it['question_date']}\n{q}"
-            hyp = memo.get_response(query=q)
-            store.append(_record(it, hyp=hyp))
-        except Exception as e:  # noqa: BLE001
-            print(f"[run_agentmem] ERROR on {it['question_id']}: {type(e).__name__}: {e}")
-            store.append(_record(it, error=f"{type(e).__name__}: {e}"))
+            for sess in (it.get("sessions") or [it["full_history"]]):
+                memo.add_memory(user_input=sess, agent_response="")     # fresh memory, this question only
+            hyp = memo.get_response(query=format_query(it, dataset)) or ""
+            if hyp.strip().startswith("Error: Could not get response"):
+                store.append(make_record(it, error="memoryos: upstream 'Could not get response from LLM'"))
+            else:
+                store.append(make_record(it, hyp=hyp, finish_reason="stop"))
+        except Exception as e:  # noqa: BLE001 — crash-safe per question
+            print(f"[run_agentmem memoryos] ERROR on {it['question_id']}: {type(e).__name__}: {e}")
+            store.append(make_record(it, error=f"{type(e).__name__}: {e}"))
+        if (i + 1) % 25 == 0:
+            print(f"[run_agentmem memoryos] {i + 1}/{len(items)} done", flush=True)
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--method", choices=["a-mem", "memoryos"], required=True)
+    ap.add_argument("--dataset", choices=["longmemeval", "memoryagentbench"], default="longmemeval")
+    ap.add_argument("--repo-dir", default=_DEFAULT_REPO_DIR, help="cloned A-mem repo (on sys.path)")
     ap.add_argument("--llm-model", default=_DEFAULT_LLM, help="reader LLM (OpenRouter id; share with Tier-1)")
     ap.add_argument("--embed-model", default=_DEFAULT_EMBED, help="local sentence-embedder (CPU-fine)")
     ap.add_argument("--variant", default="s", choices=["s", "m", "oracle"])
     ap.add_argument("--max-examples", type=int, default=None)
     ap.add_argument("--max-new-tokens", type=int, default=2048)
     ap.add_argument("--retrieve-k", type=int, default=10, help="(a-mem) top-k memories to retrieve")
+    ap.add_argument("--ingest-chunk-chars", type=int, default=8000,
+                    help="(MAB only) coarser note size for ingest — A-MEM runs 1-3 LLM calls/note, so the 2k "
+                         "RAG chunks (~600 notes/context) are intractable; 8000 → ~120 notes. LongMemEval "
+                         "ignores this (uses its natural sessions).")
+    ap.add_argument("--verbose", action="store_true", help="show A-MEM's internal evolution logging (very noisy)")
     ap.add_argument("--no-bem", action="store_true")
     ap.add_argument("--out-dir", default="outputs/baselines")
     args = ap.parse_args()
@@ -148,53 +200,41 @@ def main():
     api_key = os.environ.get("OPENROUTER_API_KEY", "")
     if not api_key:
         sys.exit("[run_agentmem] set OPENROUTER_API_KEY (the reader LLM runs over OpenRouter).")
-    # A-MEM's `openai` backend does NOT forward api_base to its OpenAI client (upstream, commit 0c8039f), so
-    # route via the openai SDK's OPENAI_BASE_URL env fallback; set OPENAI_API_KEY too. This makes A-MEM's
-    # internal metadata/memory-evolution calls hit OpenRouter, not the default OpenAI endpoint (which would
-    # 401 the OpenRouter key). MemoryOS forwards openai_base_url itself, but the env is harmless there.
+    # A-MEM's `openai` backend (OpenAIController) does NOT accept api_base → route via the openai SDK's
+    # OPENAI_BASE_URL env fallback (set OPENAI_API_KEY too) so its internal metadata/evolution calls hit
+    # OpenRouter, not the default OpenAI endpoint (which would 401 the key). MemoryOS forwards its own base_url.
     os.environ["OPENAI_BASE_URL"] = _OPENROUTER_BASE
     os.environ["OPENAI_API_KEY"] = api_key
 
-    from src.memory.data.longmemeval import load_longmemeval_text
-    from src.memory.eval import score_longmemeval
+    repo_dir = str(Path(args.repo_dir).expanduser())
+    from src.memory.eval.tier2_common import git_commit, load_items, build_tag, finalize
     from src.memory.eval.results import ResultStore
 
-    print(f"[run_agentmem] method={args.method} llm={args.llm_model} variant={args.variant} "
-          f"max_examples={args.max_examples}")
-    items = load_longmemeval_text(variant=args.variant, max_examples=args.max_examples)
+    print(f"[run_agentmem] method={args.method} dataset={args.dataset} llm={args.llm_model} "
+          f"variant={args.variant} max_examples={args.max_examples}")
+    items = load_items(args.dataset, variant=args.variant, max_examples=args.max_examples)
     types = {t: sum(1 for i in items if i["question_type"] == t)
              for t in sorted({i["question_type"] for i in items})}
     print(f"[run_agentmem] {len(items)} items; types={types}")
 
-    commit = _git_commit()
-    tag = (f"longmemeval__{args.method}__{args.llm_model.split('/')[-1]}__{args.variant}"
-           f"__n{len(items)}__{commit}")
+    commit = git_commit(REPO)
+    tag = build_tag(args.dataset, args.method, args.llm_model.split("/")[-1], args.variant, len(items),
+                    f"k{args.retrieve_k}", args.max_new_tokens, 0, commit)
     out_dir = REPO / args.out_dir
-    out_dir.mkdir(parents=True, exist_ok=True)
     store = ResultStore(out_dir / "cache" / f"{tag}.jsonl")
     n_done = len(store.done_ids())
     if n_done:
         print(f"[run_agentmem] resume: {n_done}/{len(items)} already done — answering the rest")
 
-    (run_a_mem if args.method == "a-mem" else run_memoryos)(args, items, api_key, store)
+    meta_out: dict = {}
+    runner = run_a_mem if args.method == "a-mem" else run_memoryos
+    runner(args, items, api_key, repo_dir, store, args.dataset, meta_out)
 
-    records = [r for r in store.all_records() if not r.get("error")]
-    agg = score_longmemeval(records, use_bem=not args.no_bem)
-    store.merge_verdicts(agg.get("details", [])); store.compact()
-    n_err = sum(1 for r in store.all_records() if r.get("error"))
-    print(f"\n[run_agentmem] overall_acc={agg.get('overall_accuracy', float('nan')):.3f}  "
-          f"task_avg={agg.get('task_averaged_accuracy', float('nan')):.3f}  "
-          f"abstention={agg.get('abstention_accuracy')}  n={agg.get('n_nonabstention')}  errors={n_err}")
-
-    payload = {
-        "dataset": "longmemeval", "method": args.method, "model": args.llm_model,
-        "meta": {"n": len(records), "n_errors": n_err, "variant": args.variant, "commit": commit,
-                 "coverage": round(len(records) / len(items), 4) if items else None},
-        "aggregate": {k: v for k, v in agg.items() if k != "details"},
-        "store": str(store.path),
-    }
-    (out_dir / f"{tag}.json").write_text(json.dumps(payload, indent=1))
-    print(f"[run_agentmem] wrote {out_dir / f'{tag}.json'}")
+    finalize(args.dataset, args.method, args.llm_model, items, store, use_bem=not args.no_bem,
+             extra_meta={"variant": args.variant, "retrieve_k": args.retrieve_k,
+                         "max_new_tokens": args.max_new_tokens, "commit": commit,
+                         "upstream_commit": git_commit(repo_dir), **meta_out},
+             out_dir=out_dir, tag=tag, log_prefix="[run_agentmem]")
 
 
 if __name__ == "__main__":

@@ -340,8 +340,12 @@ class LongMemEvalScorer:
     `aggregate()`; or use the module-level `score_longmemeval(records)`.
     """
 
-    def __init__(self, use_bem: bool = True, bem_threshold: float = 0.5,
+    def __init__(self, use_bem: bool = True, bem_threshold: float = 0.85,
                  preference_coverage: float = 0.5):
+        # bem_threshold LOCKED at 0.85 (audit #4): BEM@0.5 ran +0.13 LENIENT vs the GPT-4o judge (deterministic
+        # 0.72 vs judge 0.59; ALL 16 false-positives were BEM crediting clear errors/refusals). At ~0.85-0.9
+        # our scorer reproduces the published Llama-3.1-8B (0.45); 0.5 over-credits. Re-run judge_crosscheck
+        # (now task-specific) to re-confirm the offset if the panel changes.
         self.use_bem = use_bem
         self.bem_threshold = bem_threshold
         self.preference_coverage = preference_coverage

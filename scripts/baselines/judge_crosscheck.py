@@ -23,26 +23,42 @@ REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 from src.memory.eval.api_client import OpenRouterClient  # noqa: E402
 
-# LongMemEval judge prompts (faithful to src/evaluation/evaluate_qa.py in the LongMemEval repo).
-_QA_JUDGE = ("I will give you a question, a correct answer, and a response from a model. Please answer 'yes' "
-             "if the response contains or conveys the correct answer, and 'no' otherwise.\n\n"
-             "Question: {q}\nCorrect answer: {gold}\nModel response: {hyp}\n\n"
-             "Is the model response correct? Answer yes or no only.")
-_ABS_JUDGE = ("I will give you an UNANSWERABLE question and a response from a model. Please answer 'yes' if "
-              "the model correctly identifies the question as unanswerable (says it lacks the information / "
-              "cannot answer), and 'no' if it fabricates an answer.\n\n"
-              "Question: {q}\nModel response: {hyp}\n\n"
-              "Does the model correctly identify the question as unanswerable? Answer yes or no only.")
+# TASK-SPECIFIC LongMemEval judge prompts (audit #4). The official evaluate_qa.py applies DIFFERENT rubrics
+# per question type — a single generic "contains the answer" prompt cannot calibrate temporal /
+# knowledge-update / preference / abstention questions. These mirror the repo's per-type rules.
+_HEAD = "I will give you a question, a correct answer, and a model's response.\n\n"
+_TAIL = "\n\nQuestion: {q}\nCorrect answer: {gold}\nModel response: {hyp}\n\nAnswer yes or no only."
+_QA_JUDGE = (_HEAD + "Answer 'yes' if the response contains or conveys the correct answer, 'no' otherwise."
+             + _TAIL)
+_TEMPORAL_JUDGE = (_HEAD + "This is a TEMPORAL-REASONING question. Answer 'yes' if the response conveys the "
+                   "correct answer with the right time/order; a SMALL date discrepancy (e.g. off by one day) "
+                   "is still 'yes' (matches the official rubric). A clearly wrong date/order is 'no'." + _TAIL)
+_KU_JUDGE = (_HEAD + "This is a KNOWLEDGE-UPDATE question — the correct answer is the MOST RECENT value. "
+             "Answer 'yes' only if the response reflects the updated (latest) value, 'no' if it gives a "
+             "stale/earlier value." + _TAIL)
+_PREF_JUDGE = (_HEAD + "This is a PREFERENCE question — answer 'yes' if the response is CONSISTENT with the "
+               "user's stated preference (the correct answer describes that preference), 'no' if it "
+               "contradicts or ignores it." + _TAIL)
+_ABS_JUDGE = ("I will give you an UNANSWERABLE question and a model's response. Answer 'yes' if the model "
+              "correctly identifies it as unanswerable (says it lacks the information / cannot answer), 'no' "
+              "if it fabricates an answer.\n\nQuestion: {q}\nModel response: {hyp}\n\nAnswer yes or no only.")
 # GPT-4o list price (not in the deterministic PRICING table); $/token in,out.
 _GPT4O_PRICE = (2.50e-6, 10.0e-6)
 
 
 def _judge_prompt(rec: dict) -> str:
-    qt = (rec.get("question_type") or "")
-    is_abs = "abstention" in qt or str(rec.get("question_id", "")).endswith("_abs")
-    if is_abs:
+    qt = (rec.get("question_type") or "").lower()
+    if "abstention" in qt or str(rec.get("question_id", "")).endswith("_abs"):
         return _ABS_JUDGE.format(q=rec.get("question", ""), hyp=rec.get("hypothesis", ""))
-    return _QA_JUDGE.format(q=rec.get("question", ""), gold=rec.get("gold", ""), hyp=rec.get("hypothesis", ""))
+    if "temporal" in qt:
+        tmpl = _TEMPORAL_JUDGE
+    elif "knowledge-update" in qt or "knowledge_update" in qt:
+        tmpl = _KU_JUDGE
+    elif "preference" in qt:
+        tmpl = _PREF_JUDGE
+    else:
+        tmpl = _QA_JUDGE
+    return tmpl.format(q=rec.get("question", ""), gold=rec.get("gold", ""), hyp=rec.get("hypothesis", ""))
 
 
 def _load_scored(pattern: str) -> list[dict]:

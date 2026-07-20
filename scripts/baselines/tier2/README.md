@@ -86,34 +86,52 @@ token that has accepted the Meta license before running. `Qwen/Qwen2.5-7B-Instru
 
 ## 4. Launch
 
+**All three runners take `--dataset {longmemeval,memoryagentbench}`** and share one eval core
+(`src/memory/eval/tier2_common.py`). That core does the **per-context reuse** that makes MAB affordable: it
+groups questions by distinct context and encodes each context ONCE (MAB = 36 encodes for 3,071 Q; LongMemEval
+= one per question, unique histories). This is the local analog of the Tier-1 prompt-cache win — see
+`docs/baselines/TIER2_HOSTING.md`. Same deterministic scorers + JSON shape as Tier-1, so panels line up in
+`report.py`.
+
 ```bash
 cd /path/to/neuromorphic   # repo root — the runners insert it onto sys.path themselves
 
-# smoke test each method on a handful of items first (no BEM download needed for a quick sanity check)
-python scripts/baselines/tier2/run_kvcompress.py --method snapkv --max-examples 5
-python scripts/baselines/tier2/run_kvcompress.py --method h2o    --max-examples 5
-python scripts/baselines/tier2/run_kvcompress.py --method kvzip  --max-examples 5
-python scripts/baselines/tier2/run_memoryllm.py                  --max-examples 5
-python scripts/baselines/tier2/run_lclm.py --checkpoint latent-context/0.6b-4b-LCLM-16x --max-examples 5
+# --- smoke each method (5-20 items) BEFORE the full run ---
+python scripts/baselines/tier2/run_kvcompress.py --method kvzip --dataset longmemeval --max-examples 5
+python scripts/baselines/tier2/run_memoryllm.py               --dataset memoryagentbench --max-examples 20
+python scripts/baselines/tier2/run_lclm.py                    --dataset longmemeval --max-examples 5
 
-# full LongMemEval-S panel (500 questions)
-python scripts/baselines/tier2/run_kvcompress.py --method snapkv --max-capacity-prompt 2048
-python scripts/baselines/tier2/run_kvcompress.py --method h2o    --max-capacity-prompt 2048
-python scripts/baselines/tier2/run_kvcompress.py --method kvzip  --ratio 0.3
-python scripts/baselines/tier2/run_memoryllm.py
-python scripts/baselines/tier2/run_lclm.py    --checkpoint latent-context/0.6b-4b-LCLM-{4x,8x,16x}
+# --- the ~2-hour parallel panel: 3 methods, one per GPU, each in its own env (see §1 note) ---
+DATASET=longmemeval scripts/baselines/tier2/run_pod_panel.sh          # override KVZIP_ENV/KVZIP_GPU/... to taste
+DATASET=memoryagentbench scripts/baselines/tier2/run_pod_panel.sh
 
-# 2b agent-memory (NO GPU — runs from anywhere with a key):
+# --- or run methods individually ---
+python scripts/baselines/tier2/run_kvcompress.py --method kvzip  --dataset memoryagentbench --ratio 0.3
+python scripts/baselines/tier2/run_kvcompress.py --method snapkv --dataset longmemeval --max-capacity-prompt 2048  # LongMemEval only
+python scripts/baselines/tier2/run_memoryllm.py  --dataset longmemeval
+python scripts/baselines/tier2/run_lclm.py       --dataset longmemeval --checkpoint latent-context/0.6b-4b-LCLM-16x
+
+# 2b agent-memory (NO GPU — runs from anywhere with a key; NOT part of the pod panel):
 OPENROUTER_API_KEY=... python scripts/baselines/run_agentmem.py --method a-mem --max-examples 5
 ```
 
-Each run prints `overall_acc` / `task_averaged_accuracy` / `abstention_accuracy` and writes one JSON to
-`outputs/baselines/longmemeval__<method>__<model-slug>.json` (same scorer + shape as Tier-1's
-`outputs/baselines/*.json`, so the two panels line up directly). Pull that directory back over R2 the same
-way `scripts/pod/pull_results.sh` does for training runs.
+Each run writes `outputs/baselines/<dataset>__<method>__…​.json` (+ a resumable per-question JSONL under
+`cache/`). Pull that directory back over R2 the same way `scripts/pod/pull_results.sh` does for training runs.
 
 ## 5. Gotchas (see the integration doc for the full detail)
 
+- **KV method for MAB = kvzip, NOT snapkv/h2o.** KVzip is query-AGNOSTIC → one reusable compressed cache per
+  context (correct for MAB's ~85 Q/context). SnapKV/H2O are query-AWARE → they'd re-prefill per question
+  (slow AND degraded); the runner **refuses `snapkv|h2o` + `--dataset memoryagentbench`**. Use them on
+  LongMemEval only. (docs/baselines/TIER2_HOSTING.md.)
+- **LCLM on MAB — latent-reuse is a POD-VERIFY.** `run_lclm.py` currently encodes+decodes per question
+  (correct, but re-runs the 0.6B encoder ~85×/context). To hit the MAB time budget, wire `_encode_memory`
+  (encode once) + the cached-latent decode against the repo's `inference/hf.py` on the pod. LongMemEval is
+  unaffected (unique histories → nothing to reuse).
+- **Per-context reuse verify (KVzip / MemoryLLM).** KVzip: confirm `generate(kv=...)` treats the pruned cache
+  read-only (query-agnostic by design; if answers degrade after the 1st question in a group, clone the cache
+  per question). MemoryLLM: `_snapshot_memory_state` must find the real M+ LTM buffers (it HARD-WARNS if not)
+  so a context's memory doesn't leak into the next.
 - **KVCache-Factory: Llama + Mistral only** (no Qwen). `--model` must be a Llama/Mistral checkpoint.
 - **KVCache-Factory's 7,500-tok cap** lives only in ITS OWN `run_longbench.py` — `run_kvcompress.py` never
   imports that file, so the runner sees the full ~115k-token history.

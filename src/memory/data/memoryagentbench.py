@@ -59,8 +59,10 @@ def _metric_competency(source: str) -> tuple[Optional[str], Optional[str]]:
         return None, None                                    # LLM-judged → dropped
     if s.startswith("recsys"):
         return None, None                                    # recall@5 not scored here → DROP (no API waste)
-    if s.startswith(("ruler", "eventqa")):
-        return "substring_exact_match", "Accurate_Retrieval"
+    if s.startswith("ruler"):
+        return "substring_exact_match", "Accurate_Retrieval"     # gold ∈ RAW output (upstream)
+    if s.startswith("eventqa"):
+        return "substring_parsed", "Accurate_Retrieval"          # gold ∈ PARSED answer line (audit #5)
     if s.startswith("factconsolidation"):
         return "substring_exact_match", "Conflict_Resolution"
     if s.startswith("icl"):
@@ -124,7 +126,9 @@ def load_memoryagentbench_text(variant: str = "s", max_examples: Optional[int] =
                                sources: Optional[list[str]] = None,
                                max_context_chars: Optional[int] = None,
                                splits: tuple[str, ...] = _SPLITS,
-                               chunk_chars: int = 2000) -> list[dict]:
+                               chunk_chars: int = 2000,
+                               revision: Optional[str] = None,
+                               allow_partial: bool = False) -> list[dict]:
     """Return per-question items: {question_id, question, answer (list[str] golds), question_type (=competency),
     competency, source, metric, system, question_template, context_header, full_history (context),
     sessions (chunked context)}.
@@ -154,7 +158,7 @@ def load_memoryagentbench_text(variant: str = "s", max_examples: Optional[int] =
 
     for split in splits:
         try:
-            ds = load_dataset("ai-hyz/MemoryAgentBench", split=split)
+            ds = load_dataset("ai-hyz/MemoryAgentBench", split=split, revision=revision)
         except Exception as e:  # noqa: BLE001 — record the failure; do NOT silently pretend the split is empty
             failed_splits[split] = f"{type(e).__name__}: {e}"
             print(f"[data mab] WARN: split {split} FAILED to load ({type(e).__name__}: {e})")
@@ -206,9 +210,16 @@ def load_memoryagentbench_text(variant: str = "s", max_examples: Optional[int] =
     if skipped_size:
         print(f"[data mab] skipped {sum(skipped_size.values())} row(s) over max_context_chars="
               f"{max_context_chars} (entire sub-sources may be absent): {skipped_size}")
+    if failed_splits and not allow_partial:
+        # audit #16: a split failure would drop a WHOLE competency → a silently-partial artifact. FAIL LOUD
+        # by default (pass allow_partial=True to intentionally run on a subset).
+        raise RuntimeError(
+            f"[data mab] {len(failed_splits)} split(s) FAILED to load: {failed_splits}. Results would be "
+            "PARTIAL (missing whole competencies). Fix Hub connectivity/revision and retry, or pass "
+            "allow_partial=True to run on the loaded splits deliberately.")
     if failed_splits:
-        print(f"[data mab] WARN: {len(failed_splits)} split(s) FAILED {list(failed_splits)} — any results are "
-              f"PARTIAL (missing whole competencies). Fix connectivity before trusting competency numbers.")
+        print(f"[data mab] ⚠ allow_partial: {len(failed_splits)} split(s) FAILED {list(failed_splits)} — "
+              f"results are PARTIAL (missing whole competencies).")
 
     items = _round_robin_stratified(by_comp_source, max_examples)
 

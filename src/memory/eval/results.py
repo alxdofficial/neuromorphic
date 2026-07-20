@@ -61,7 +61,10 @@ class ResultStore:
         for q, r in self.records.items():
             if r.get("error"):
                 continue
-            if r.get("finish_reason") == "length":     # empty OR partial — both incomplete, both retryable
+            # a TERMINAL finish_reason is incomplete/retryable even when the `error` field is null (audit #6:
+            # old caches predate api_client attaching an error to content_filter/error responses). length =
+            # cut-off; error/content_filter = provider refusal. All three re-request on rerun.
+            if r.get("finish_reason") in ("length", "error", "content_filter"):
                 continue
             out.add(q)
         return out

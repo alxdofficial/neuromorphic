@@ -58,11 +58,18 @@ def test_200_no_choices_is_error():
     assert res.error is not None and posts == 1
 
 
-def test_200_null_message_no_crash_no_rebill():
-    # #2: message == JSON null must not crash (→ retry → rebill the already-billed 200). Graceful empty.
+def test_200_null_message_content_filter_is_error():
+    # audit #2: message == JSON null with a TERMINAL finish_reason (content_filter) → surfaced as ERROR
+    # (excluded from scoring), not a silent empty answer. Must not crash and must NOT rebill (no retry).
     res, posts = _run(payload={"choices": [{"message": None, "finish_reason": "content_filter"}], "usage": {}})
-    assert res.error is None and res.text == ""
+    assert res.error is not None and res.text == "" and res.finish_reason == "content_filter"
     assert posts == 1                                  # NOT retried
+
+
+def test_200_null_message_nonterminal_is_graceful_empty():
+    # message == null with a NORMAL finish_reason must still not crash → graceful empty, error None, no rebill.
+    res, posts = _run(payload={"choices": [{"message": None, "finish_reason": "stop"}], "usage": {}})
+    assert res.error is None and res.text == "" and posts == 1
 
 
 def test_200_null_content_ok():

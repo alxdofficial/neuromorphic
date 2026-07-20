@@ -50,9 +50,25 @@ PRICING = {
 }
 
 
-def cost_usd(model: str, prompt_tokens: int, completion_tokens: int) -> float:
+# cache-READ $/token for a (model, pinned-provider) — cached prompt tokens bill FAR below fresh input.
+# deepseek first-party = 50x discount ($0.0028/M vs $0.14/M fresh); other providers ~5x. Only entries we
+# actually pin for full_context need to be here; anything absent falls back to the fresh prompt price.
+CACHE_READ_PRICING = {
+    ("deepseek/deepseek-v4-flash", "deepseek"): 0.0028e-6,
+    ("deepseek/deepseek-v4-flash", "streamlake"): 0.0193e-6,
+    ("deepseek/deepseek-v4-flash", "gmicloud"): 0.0196e-6,
+}
+
+
+def cost_usd(model: str, prompt_tokens: int, completion_tokens: int,
+            cached_tokens: int = 0, provider: str | None = None) -> float:
+    """Exact bill. `cached_tokens` (a subset of prompt_tokens) is charged at the provider's cache-read rate
+    instead of the fresh input rate — so a 200k-token context re-sent from cache costs ~cents, not dollars."""
     pin, pout = PRICING.get(model, (0.0, 0.0))
-    return prompt_tokens * pin + completion_tokens * pout
+    cached = max(0, min(cached_tokens, prompt_tokens))
+    fresh = prompt_tokens - cached
+    cache_price = CACHE_READ_PRICING.get((model, provider), pin)   # unknown provider ⇒ no discount assumed
+    return fresh * pin + cached * cache_price + completion_tokens * pout
 
 
 @dataclass
@@ -62,6 +78,8 @@ class CallResult:
     completion_tokens: int = 0
     error: str | None = None
     finish_reason: str | None = None      # "stop" | "length" | ... ; "length" ⇒ answer may be cut off
+    cached_tokens: int = 0                 # prompt tokens served from the provider's prefix cache (billed
+    #                                      # at a discount) — nonzero ⇒ a repeated context hit the cache.
 
 
 @dataclass
@@ -106,9 +124,14 @@ class OpenRouterClient:
             await self._client.aclose()
 
     async def chat(self, model: str, messages: list[dict], max_tokens: int = 256,
-                   temperature: float = 0.0) -> CallResult:
+                   temperature: float = 0.0, provider: dict | None = None) -> CallResult:
         payload = {"model": model, "messages": messages,
                    "temperature": temperature, "max_tokens": max_tokens}
+        # OpenRouter provider routing: pin to ONE backend (allow_fallbacks:false) so a repeated context
+        # keeps hitting the same instance's prefix cache — load-balancing across instances otherwise
+        # scatters cache hits (~27% instead of ~90%). See scripts/baselines cache-probe.
+        if provider is not None:
+            payload["provider"] = provider
         last = "exhausted retries"
         for attempt in range(self.retries):
             retryable = False
@@ -142,10 +165,20 @@ class OpenRouterClient:
                         # reasoning models put chain-of-thought in `reasoning`; the ANSWER is in `content`.
                         # `message` itself can be JSON null (content filter) → guard both levels (a bare
                         # .get on None would raise AttributeError → retry → REBILL the 200).
-                        msg = ((choice.get("message") or {}).get("content")) or ""
                         u = d.get("usage") or {}
-                        return CallResult(msg, u.get("prompt_tokens", 0), u.get("completion_tokens", 0),
-                                          None, choice.get("finish_reason"))
+                        cached = int((u.get("prompt_tokens_details") or {}).get("cached_tokens", 0) or 0)
+                        pin, pout = u.get("prompt_tokens", 0), u.get("completion_tokens", 0)
+                        fr = choice.get("finish_reason")
+                        # A choice-level error or a TERMINAL finish_reason (error / content_filter) is a
+                        # FAILURE, not a wrong answer — OpenRouter may return partial/empty content alongside
+                        # it. Surface as error (keeps cost, excluded from scoring + retried) rather than
+                        # freezing a refusal/blank as a scorable answer.
+                        if choice.get("error") or fr in ("error", "content_filter"):
+                            return CallResult("", pin, pout,
+                                              error=str(choice.get("error") or f"terminal finish_reason={fr}"),
+                                              finish_reason=fr, cached_tokens=cached)
+                        msg = ((choice.get("message") or {}).get("content")) or ""
+                        return CallResult(msg, pin, pout, None, fr, cached)
             if retryable and attempt < self.retries - 1:
                 await asyncio.sleep(2 ** attempt)          # backoff OUTSIDE the semaphore (slot released)
         return CallResult("", 0, 0, last)

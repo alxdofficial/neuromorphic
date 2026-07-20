@@ -131,8 +131,10 @@ def build_messages(mode: str, *, question: str, full_history: str = "", sessions
             {"truncated": trunc, "retrieved_idx": retrieved})
 
 
-def char_budget_for(context_length_tokens: int, reserve_tokens: int = 6000,
+def char_budget_for(context_length_tokens: int, reserve_tokens: int = 16000,
                     chars_per_token: float = 3.6) -> int:
     """Conservative history char budget = (ctx window − reserve) × chars/token. FALLBACK sizing only
-    (dry-run estimates, or when the reference tokenizer is unavailable); the live path uses token_budget."""
+    (dry-run estimates, or when the reference tokenizer is unavailable); the live path uses token_budget.
+    reserve_tokens defaults to 16k to MATCH run_api_eval._RESERVE_TOKENS (audit #8: the char fallback
+    previously reserved only 6k, so a fallback prompt could overflow where the token path would not)."""
     return int(max(0, context_length_tokens - reserve_tokens) * chars_per_token)

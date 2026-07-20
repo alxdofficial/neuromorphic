@@ -1,74 +1,45 @@
 #!/usr/bin/env python3
-"""Phase-2 Tier-2 baseline: LCLM — Latent Context Language Models over LongMemEval (POD-ONLY).
+"""Phase-2 Tier-2 baseline: LCLM — Latent Context Language Models over LongMemEval / MemoryAgentBench (POD-ONLY).
 
-LCLM (Li, McLeish et al., "End-to-End Context Compression at Scale", arXiv:2606.09659) is the closest
-concurrent competitor to our architecture family: an encoder (Qwen3-Embedding-0.6B) pools token chunks into
-SOFT TOKENS, an adapter projects them, and a 4B decoder (Qwen3-4B-Instruct-2507) consumes them as latent
-context. Released weights: HF `latent-context/0.6b-4b-LCLM-{4x,8x,16x}` (compression ratio). Unlike our
-FROZEN-decoder design, LCLM trains the decoder end-to-end (frozen-init → continual pretrain → SFT) — the
-axis to engage in related work (see docs/baselines/PHASE2_BASELINES.md §2.5).
+LCLM (Li, McLeish et al., "End-to-End Context Compression at Scale", arXiv:2606.09659) is our closest
+concurrent competitor: an encoder (Qwen3-Embedding-0.6B) pools token chunks into SOFT TOKENS, an adapter
+projects them, and a 4B decoder (Qwen3-4B) consumes them as latent context. Released weights:
+`latent-context/0.6b-4b-LCLM-{4x,8x,16x}`. Unlike our FROZEN-decoder design, LCLM trains the decoder
+end-to-end (see docs/baselines/PHASE2_BASELINES.md §2.5).
 
-⚠ LICENSE: none stated on the repo/HF org as of 2026-07-18 — clearance is the user's call; this file is the
-technical wiring only. ⚠ The published checkpoints are NOT loadable via vanilla transformers/vllm — the LCLM
-repo (github.com/LeonLixyz/LCLM) must be cloned and on PYTHONPATH (`--repo-dir`), and the long context MUST be
-wrapped in `<|memory_start|> ... <|memory_end|>` (the encoder boundary markers).
+⚠ LICENSE: none stated on the repo/HF org as of 2026-07-18 — clearance is the user's call. ⚠ Checkpoints are
+NOT loadable via vanilla transformers/vllm — clone github.com/LeonLixyz/LCLM and put it on PYTHONPATH
+(`--repo-dir`); the context MUST be wrapped in `<|memory_start|> … <|memory_end|>`.
 
-Per-item INFERENCE compression (no per-corpus training) → fits LongMemEval's private-haystack shape directly:
-encode each item's ~115k history to soft tokens, decode the answer. Scores with the SAME deterministic scorer
-as Tier-1. RESUMABLE + crash-safe (per-item ResultStore). `--help` works without torch/the LCLM repo (lazy).
+PER-CONTEXT REUSE (docs/baselines/TIER2_HOSTING.md): LCLM encodes the context to soft tokens BEFORE decoder
+prefill, so in principle we encode a context ONCE and decode every question against the cached latents. This
+runner is STRUCTURED for that (per-context via tier2_common.run_grouped) but currently uses the correct
+per-question path (encode+decode together) — the encode-latents-once/reuse API must be wired against the
+repo's inference/hf.py on the pod. See `_encode_memory` POD-VERIFY. For LongMemEval (unique histories) there
+is nothing to reuse; for MAB, wiring the reuse is what keeps LCLM inside the pod time budget.
 
-VRAM: ~4.6B params ≈ 9–10GB bf16 → fits one 24GB GPU, inference-only. Example (on the pod):
-  python scripts/baselines/tier2/run_lclm.py --checkpoint latent-context/0.6b-4b-LCLM-16x --max-examples 5
+`--help` works without torch/the LCLM repo (lazy imports). VRAM ~9–10GB bf16 → fits a 24GB GPU, inference-only.
+  python scripts/baselines/tier2/run_lclm.py --dataset longmemeval --checkpoint latent-context/0.6b-4b-LCLM-16x
 """
 from __future__ import annotations
 
 import argparse
-import json
-import subprocess
 import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO))
 
-_DEFAULT_CHECKPOINT = "latent-context/0.6b-4b-LCLM-16x"   # highest compression; swap 16x→8x/4x to trade fidelity
-_DEFAULT_REPO_DIR = "~/tier2_repos/LCLM"                  # git clone https://github.com/LeonLixyz/LCLM
-
-
-def _git_commit(path=REPO) -> str:
-    try:
-        return subprocess.check_output(["git", "-C", str(path), "rev-parse", "--short", "HEAD"],
-                                       text=True, stderr=subprocess.DEVNULL).strip() or "nogit"
-    except Exception:  # noqa: BLE001
-        return "nogit"
-
-
-def _seed_everything(seed: int) -> None:
-    import random
-    import numpy as np
-    import torch
-    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-
-def _record(it, hyp="", error=None, finish_reason=None):
-    return {"question_id": it["question_id"], "question": it["question"], "answer": it["answer"],
-            "hypothesis": hyp, "question_type": it["question_type"],
-            "finish_reason": finish_reason or ("error" if error else "stop"), "error": error}
+_DEFAULT_CHECKPOINT = "latent-context/0.6b-4b-LCLM-16x"   # highest compression; 16x→8x/4x trades fidelity
+_DEFAULT_REPO_DIR = "~/tier2_repos/LCLM"
 
 
 def _generate_new_tokens(model, dec_tok, processor, prompt: str, max_new_tokens: int,
-                         device="cuda") -> "tuple[str, str]":
+                         device="cuda"):
     """Mirror LCLM inference/hf.generate_text's flow but decode ROBUSTLY. LCLM generates via `inputs_embeds`
-    internally (memory positions become latent embeddings), so HF `generate` returns ONLY the new tokens (no
-    input prefix). We therefore decode the full returned sequence UNLESS it is longer than the input (a
-    prefixed regime), in which case we slice the prefix off. This handles both:
-      - only-new-tokens (the actual LCLM case): decode full → the answer. (An unconditional slice would drop
-        the whole answer → empty output.)
-      - prefix+new (defensive): slice `[input_len:]`.
-    It also avoids generate_text's fragile string-prefix strip, which leaves prompt echo when the decoded
-    prefix != formatted_prompt (memory tokens). Greedy (do_sample=False) for determinism."""
+    (memory positions become latent embeddings), so HF `generate` returns ONLY the new tokens; we decode the
+    full returned sequence UNLESS it is longer than the input (a prefixed regime), then slice the prefix.
+    Greedy (do_sample=False) for determinism. Returns (text, finish_reason)."""
     import torch
     formatted = f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
     proc = processor.process_wrapped_batch(prompts=[formatted], targets=None, padding="longest",
@@ -87,31 +58,51 @@ def _generate_new_tokens(model, dec_tok, processor, prompt: str, max_new_tokens:
     return text, ("length" if truncated else "stop")
 
 
-def run_lclm(args, items, checkpoint: str, repo_dir: str, store) -> None:
-    """Load LCLM once, then per item: wrap the dated history in memory markers, encode→decode the answer.
-    Entry points from the LCLM repo's inference/hf.py (load_model) + a new-token-sliced generate."""
+def _encode_memory(model, processor, ctx: str):
+    """POD-VERIFY (MAB reuse optimization). Encode a context to reusable soft-token latents ONCE, so the ~85
+    questions sharing it don't each re-run the encoder. Requires an entry point in the LCLM repo's
+    inference/hf.py that (a) runs the 0.6B encoder + adapter on the memory span and (b) lets `generate`
+    consume the cached latents. Until wired on the pod, we return None → the runner falls back to the correct
+    per-question encode+decode path. Wiring this is what brings LCLM-on-MAB inside the time budget."""
+    return None
+
+
+def run_lclm(args, items, checkpoint, repo_dir, store, dataset) -> None:
     sys.path.insert(0, repo_dir)
-    # POD-ONLY: needs the LCLM repo on PYTHONPATH (checkpoints aren't vanilla-transformers loadable).
     from inference.hf import load_model
+    from src.memory.eval.tier2_common import format_query, run_grouped
 
     model, dec_tok, processor = load_model(checkpoint, device="cuda", dtype="bf16")
 
-    done = store.done_ids()
-    for it in items:
-        if str(it["question_id"]) in done:
-            continue
+    def encode_ctx(ctx, first_item):
+        cached = _encode_memory(model, processor, ctx)      # None until reuse is wired on the pod
+        return {"ctx": ctx, "latents": cached}
+
+    def answer(mem, it):
+        q = format_query(it, dataset)
+        if mem["latents"] is not None:
+            # POD-VERIFY: decode against cached latents (reuse path) — wire against the repo's API alongside
+            # _encode_memory. Must produce the same (text, finish_reason) contract as _generate_new_tokens.
+            raise NotImplementedError("LCLM latent-reuse decode not wired — see _encode_memory POD-VERIFY")
+        # correct fallback: encode+decode together (per question). Context wrapped in the encoder markers.
+        prompt = f"<|memory_start|>{mem['ctx']}<|memory_end|> {q}"
+        return _generate_new_tokens(model, dec_tok, processor, prompt, args.max_new_tokens)
+
+    def release():
         try:
-            # context MUST be wrapped in the encoder boundary markers; the question follows outside them.
-            # anchor temporal questions to their date, like the Tier-1 panel.
-            q = it["question"]
-            if it.get("question_date"):
-                q = f"Current Date: {it['question_date']}\n{q}"
-            prompt = f"<|memory_start|>{it['full_history']}<|memory_end|> {q}"
-            hyp, fr = _generate_new_tokens(model, dec_tok, processor, prompt, args.max_new_tokens)
-            store.append(_record(it, hyp=hyp, finish_reason=fr))
-        except Exception as e:  # noqa: BLE001 — crash-safe: record, continue, resume later
-            print(f"[run_lclm] ERROR on {it['question_id']}: {type(e).__name__}: {e}")
-            store.append(_record(it, error=f"{type(e).__name__}: {e}"))
+            import torch
+            torch.cuda.empty_cache()
+        except Exception:  # noqa: BLE001
+            pass
+
+    # audit #8: on MAB, _encode_memory returns None → we re-encode per question (no latent reuse), so the
+    # advertised ~85x MAB speedup is NOT realized until the reuse is wired against the repo on the pod. Warn
+    # loudly so it isn't mistaken for the fast path.
+    if dataset == "memoryagentbench":
+        print("[run_lclm] ⚠ MAB latent-reuse NOT wired (_encode_memory returns None) → the context is "
+              "re-encoded for EVERY question (~85x the encoder work). Wire _encode_memory on the pod for the "
+              "2-hour budget; LongMemEval is unaffected. (docs/baselines/TIER2_HOSTING.md, audit #8.)")
+    run_grouped(items, encode_ctx, answer, store, "[run_lclm]", release=release)
 
 
 def main():
@@ -119,62 +110,43 @@ def main():
     ap.add_argument("--checkpoint", default=_DEFAULT_CHECKPOINT,
                     help=f"HF checkpoint (default {_DEFAULT_CHECKPOINT}); 4x/8x/16x = compression ratio")
     ap.add_argument("--repo-dir", default=_DEFAULT_REPO_DIR, help="path to the cloned LCLM repo (PYTHONPATH)")
+    ap.add_argument("--dataset", choices=["longmemeval", "memoryagentbench"], default="longmemeval")
     ap.add_argument("--variant", default="s", choices=["s", "m", "oracle"])
     ap.add_argument("--max-examples", type=int, default=None)
     ap.add_argument("--max-new-tokens", type=int, default=128)
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--no-bem", action="store_true", help="skip BEM paraphrase scoring (EM+containment only)")
+    ap.add_argument("--no-bem", action="store_true", help="skip BEM paraphrase scoring (LongMemEval only)")
     ap.add_argument("--out-dir", default="outputs/baselines")
     args = ap.parse_args()
 
     repo_dir = str(Path(args.repo_dir).expanduser())
 
-    # --- everything below needs torch/the LCLM repo — lazy on purpose (see docstring: --help works without) ---
-    _seed_everything(args.seed)
-    from src.memory.data.longmemeval import load_longmemeval_text
-    from src.memory.eval import score_longmemeval
+    from src.memory.eval.tier2_common import (seed_everything, git_commit, load_items, build_tag, finalize)
     from src.memory.eval.results import ResultStore
+    seed_everything(args.seed)
 
-    print(f"[run_lclm] checkpoint={args.checkpoint} repo_dir={repo_dir} variant={args.variant} "
-          f"max_examples={args.max_examples} seed={args.seed}")
-    items = load_longmemeval_text(variant=args.variant, max_examples=args.max_examples)
+    print(f"[run_lclm] checkpoint={args.checkpoint} dataset={args.dataset} repo_dir={repo_dir} "
+          f"variant={args.variant} max_examples={args.max_examples} seed={args.seed}")
+    items = load_items(args.dataset, variant=args.variant, max_examples=args.max_examples)
     types = {t: sum(1 for i in items if i["question_type"] == t)
              for t in sorted({i["question_type"] for i in items})}
     print(f"[run_lclm] {len(items)} items; types={types}")
 
-    commit = _git_commit()
-    ckpt_slug = args.checkpoint.split("/")[-1]
-    tag = (f"longmemeval__lclm__{ckpt_slug}__{args.variant}"
-           f"__n{len(items)}__g{args.max_new_tokens}__seed{args.seed}__{commit}")
+    commit = git_commit(REPO)
+    tag = build_tag(args.dataset, "lclm", args.checkpoint.split("/")[-1], args.variant, len(items),
+                    "cmp", args.max_new_tokens, args.seed, commit)
     out_dir = REPO / args.out_dir
-    out_dir.mkdir(parents=True, exist_ok=True)
     store = ResultStore(out_dir / "cache" / f"{tag}.jsonl")
     n_done = len(store.done_ids())
     if n_done:
         print(f"[run_lclm] resume: {n_done}/{len(items)} already done — generating the rest")
 
-    run_lclm(args, items, args.checkpoint, repo_dir, store)
+    run_lclm(args, items, args.checkpoint, repo_dir, store, args.dataset)
 
-    # exclude gen errors AND length-truncated answers from scoring (matches Tier-1 policy).
-    records = [r for r in store.all_records()
-               if not r.get("error") and r.get("finish_reason") != "length"]
-    agg = score_longmemeval(records, use_bem=not args.no_bem)
-    store.merge_verdicts(agg.get("details", [])); store.compact()
-    n_err = sum(1 for r in store.all_records() if r.get("error"))
-    print(f"\n[run_lclm] overall_acc={agg.get('overall_accuracy', float('nan')):.3f}  "
-          f"task_avg={agg.get('task_averaged_accuracy', float('nan')):.3f}  "
-          f"abstention={agg.get('abstention_accuracy')}  n={agg.get('n_nonabstention')}  errors={n_err}")
-
-    payload = {
-        "dataset": "longmemeval", "method": "lclm", "model": args.checkpoint,
-        "meta": {"n": len(records), "n_errors": n_err, "variant": args.variant, "seed": args.seed,
-                 "max_new_tokens": args.max_new_tokens, "commit": commit, "upstream_commit": _git_commit(repo_dir), "scorer": "score_longmemeval (deterministic, negation-guarded)",
-                 "coverage": round(len(records) / len(items), 4) if items else None},
-        "aggregate": {k: v for k, v in agg.items() if k != "details"},
-        "store": str(store.path),
-    }
-    (out_dir / f"{tag}.json").write_text(json.dumps(payload, indent=1))
-    print(f"[run_lclm] wrote {out_dir / f'{tag}.json'}")
+    finalize(args.dataset, "lclm", args.checkpoint, items, store, use_bem=not args.no_bem,
+             extra_meta={"variant": args.variant, "seed": args.seed, "max_new_tokens": args.max_new_tokens,
+                         "commit": commit, "upstream_commit": git_commit(repo_dir)},
+             out_dir=out_dir, tag=tag, log_prefix="[run_lclm]")
 
 
 if __name__ == "__main__":

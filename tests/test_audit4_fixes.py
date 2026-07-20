@@ -44,16 +44,19 @@ def _load(mod_name, rel):
     return mod
 
 
-def test_kvcompress_valid_excludes_length_and_error():
-    mod = _load("run_kvcompress", "scripts/baselines/tier2/run_kvcompress.py")
-    assert mod._valid({"finish_reason": "stop"}) is True
-    assert mod._valid({"finish_reason": "length"}) is False        # truncated ⇒ not scored
-    assert mod._valid({"error": "boom", "finish_reason": "error"}) is False
+def test_tier2_valid_excludes_length_error_and_content_filter():
+    # the Tier-2 runners now share src/memory/eval/tier2_common.valid_for_scoring (audit #2 tightened it to
+    # also drop terminal error/content_filter finish reasons).
+    from src.memory.eval.tier2_common import valid_for_scoring
+    assert valid_for_scoring({"finish_reason": "stop"}) is True
+    assert valid_for_scoring({"finish_reason": "length"}) is False           # truncated ⇒ not scored
+    assert valid_for_scoring({"error": "boom", "finish_reason": "error"}) is False
+    assert valid_for_scoring({"finish_reason": "content_filter"}) is False   # provider refusal ⇒ not scored
 
 
-def test_lclm_finish_reason_length_helper_shape():
-    # _record carries finish_reason through so the scoring filter can drop length-cutoffs
-    mod = _load("run_lclm", "scripts/baselines/tier2/run_lclm.py")
-    rec = mod._record({"question_id": "1", "question": "q", "answer": "a", "question_type": "t"},
+def test_tier2_make_record_carries_finish_reason():
+    # make_record carries finish_reason through so the scoring filter can drop length-cutoffs
+    from src.memory.eval.tier2_common import make_record
+    rec = make_record({"question_id": "1", "question": "q", "answer": "a", "question_type": "t"},
                       hyp="partial", finish_reason="length")
-    assert rec["finish_reason"] == "length"
+    assert rec["finish_reason"] == "length" and rec["question_id"] == "1"

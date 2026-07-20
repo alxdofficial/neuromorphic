@@ -56,6 +56,17 @@ def collect(pattern: str):
         cov = meta.get("coverage")
         if cov is not None:
             cells[(f"{dataset}-COVERAGE", col)] = (cov, meta.get("n"))
+        # audit #15: overall_accuracy is a per-source MICRO-average (MAB is dominated by Accurate_Retrieval's
+        # 1,700 Q). Surface the competency MACRO-average + per-competency + the intent-parsed lenient overall
+        # so architecture comparisons aren't read off the AR-skewed micro number.
+        cma = agg.get("competency_averaged_accuracy")
+        if cma is not None:
+            cells[(f"{dataset}-COMPETENCY_MACRO", col)] = (cma, n_over)
+        lenient = agg.get("overall_accuracy_lenient")
+        if lenient is not None:
+            cells[(f"{dataset}-OVERALL_lenient", col)] = (lenient, n_over)
+        for comp, v in (agg.get("per_competency") or {}).items():
+            cells[(f"{dataset}-comp:{comp}", col)] = (v.get("accuracy"), v.get("n"))
         for sub, v in agg["per_subtask"].items():
             cells[(f"{dataset}-{sub}", col)] = (v.get("accuracy"), v.get("n"))
     return sorted({r for r, _ in cells}, key=_row_sort_key), sorted(cols), cells

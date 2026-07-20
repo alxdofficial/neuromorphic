@@ -1,81 +1,50 @@
 #!/usr/bin/env python3
-"""Phase-2 Tier-2 GPU baseline: MemoryLLM / M+ (parametric memory) over LongMemEval (POD-ONLY).
+"""Phase-2 Tier-2 GPU baseline: MemoryLLM / M+ over LongMemEval / MemoryAgentBench (POD-ONLY).
 
 MemoryLLM (Wang et al., ICML'24) injects context into a fixed-size in-weights memory pool via
-`inject_memory(ids, update_memory=True)`, then answers with a plain `generate()` — the memory is
-already fused into hidden states, no prompt-side context at query time. M+ (Wang et al. 2025) adds a
-CPU-offloaded long-term memory (LTM) store on top.
+`inject_memory(ids, update_memory=True)`, then answers with a plain `generate()` — the memory is already
+fused into hidden states, no prompt-side context at query time. M+ (Wang et al. 2025) adds a CPU-offloaded
+long-term memory (LTM) store. Base model = **M+ (`YuWangX/mplus-8b`)**: MemoryLLM-8B's retention caps ~20k
+tokens, too small for the ~115k haystacks; M+'s LTM (153,600 tok) holds them. See
+`docs/baselines/TIER2_GPU_INTEGRATION.md` #3.
 
-Base model = **M+ (`YuWangX/mplus-8b`), NOT MemoryLLM-8B** — MemoryLLM-8B's useful retention caps at
-~20k tokens (random Ebbinghaus-style eviction of its 12,800 mem-tok/layer pool), which cannot hold
-LongMemEval-S's ~115k-token haystack; M+'s LTM (153,600 tok, co-trained retriever) can. See
-`docs/baselines/TIER2_GPU_INTEGRATION.md` #3 for the full writeup, VRAM (~16GB weights + ~3.3GB pool,
-plausibly fits a 24GB card but unverified — authors used an H100-80GB) and pod plan.
+PER-CONTEXT REUSE (the local prompt-cache analog, docs/baselines/TIER2_HOSTING.md): MemoryLLM's design is
+already "write once, query many" — we exploit it. `encode_ctx` clears memory, injects a context ONCE, and
+snapshots the post-injection state; `answer` restores that snapshot (undoing any per-question LTM mutation)
+and generates. MAB → 36 injections for 3,071 Q; LongMemEval → inject per question (unique histories).
 
-No official LongMemEval runner exists for this repo — this file hand-writes the write-then-query loop:
-split each item's full_history into fixed 512-token blocks -> `inject_memory` each block (upstream LongBench
-granularity; a short trailing block is merged to clear the >16-token minimum) -> `generate()` for the
-question. Scores with the SAME
-deterministic scorer as Tier-1 (`src/memory/eval/score_longmemeval`). RESUMABLE + crash-safe: each
-answer is appended to a per-run JSONL store immediately.
+STATE ISOLATION: each context's memory must NOT leak into the next. Both the short-term pool (`model.memory`)
+AND the M+ LTM store (contents/keys/ages/frequencies/dropped-caches/update_step) mutate under
+`inject_memory`. We snapshot ALL of them once after load (`_snapshot_memory_state`, which PRINTS what it
+captured and HARD-WARNS if the LTM store wasn't found), restore to pristine before each context injection,
+and restore the post-injection snapshot before each question.
 
-STATE RESET: each LongMemEval question has its OWN private haystack, so per-item memory state must NOT
-leak. Both the short-term memory pool (`model.memory`) AND the M+ long-term store (LTM contents/keys/
-ages/frequencies/dropped-caches/update_step) mutate under `inject_memory`. We snapshot ALL of them once
-after load and restore before every item. See `_snapshot_memory_state` — it PRINTS exactly which buffers
-it captured and HARD-WARNS if the LTM store was not found, so state leakage cannot pass silently.
+`--help` works without torch/transformers/the MemoryLLM repo (heavy imports are lazy).
 
-`--help` works without torch/transformers/the MemoryLLM repo installed — every heavy import is lazy,
-inside `main()` (or a helper called from it), so plain argparse always succeeds.
-
-Example (on the pod, after `scripts/baselines/tier2/README.md`'s setup):
-  python scripts/baselines/tier2/run_memoryllm.py --max-examples 5     # smoke test
-  python scripts/baselines/tier2/run_memoryllm.py --max-examples 500
+Example (on the pod, after scripts/baselines/tier2/README.md's setup):
+  python scripts/baselines/tier2/run_memoryllm.py --dataset memoryagentbench --max-examples 20
+  python scripts/baselines/tier2/run_memoryllm.py --dataset longmemeval
 """
 from __future__ import annotations
 
 import argparse
-import json
-import subprocess
 import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO))
 
-_DEFAULT_MODEL = "YuWangX/mplus-8b"          # M+ — the only checkpoint that can hold the full ~115k history
-_DEFAULT_REPO_DIR = "~/tier2_repos/MemoryLLM"  # `git clone git@github.com:wangyu-ustc/MemoryLLM.git`
+_DEFAULT_MODEL = "YuWangX/mplus-8b"
+_DEFAULT_REPO_DIR = "~/tier2_repos/MemoryLLM"
 
-# Candidate attribute names for M+'s long-term-memory state (short-term `model.memory` is handled separately).
-# Bounded/explicit — NOT a dir() scan — so we never accidentally snapshot the 8B weight tensors. If the real
-# names differ, `_snapshot_memory_state` warns loudly listing what it DID find, prompting a modeling_mplus.py
-# check. Cross-reference the auditor's list: LTM contents, keys, ages, retrieval frequencies, dropped caches.
+# Candidate attribute names for M+'s long-term-memory state (short-term `model.memory` handled separately).
+# Bounded/explicit — NOT a dir() scan — so we never accidentally snapshot the 8B weight tensors.
 _LTM_CANDIDATE_ATTRS = (
-    # CONFIRMED real M+ mutable fields (MemoryLLM repo, mutated by inject_memory — verified against source):
     "ltm_recall_frequencies", "cached_dropped_memories", "cached_dropped_memory_ages", "cached_dropped_keys",
-    # plus broader candidates in case the checkpoint's field names differ:
     "ltm", "long_term_memory", "ltm_memory", "ltm_keys", "ltm_values", "ltm_ages", "ltm_age",
     "memory_ages", "retrieval_frequencies", "retrieval_freq", "dropped_memory", "dropped_memories",
     "update_step", "ltm_numpy", "ltm_key", "ltm_value",
 )
-
-
-def _git_commit(path=REPO) -> str:
-    try:
-        return subprocess.check_output(["git", "-C", str(path), "rev-parse", "--short", "HEAD"],
-                                       text=True, stderr=subprocess.DEVNULL).strip() or "nogit"
-    except Exception:  # noqa: BLE001
-        return "nogit"
-
-
-def _seed_everything(seed: int) -> None:
-    """M+ randomly DROPS memory during injection — seed py/np/torch/cuda so a rerun reproduces the same result."""
-    import random
-    import numpy as np
-    import torch
-    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
 
 
 def _copy_buf(v):
@@ -96,9 +65,8 @@ def _copy_buf(v):
 
 
 def _is_nonempty(v) -> bool:
-    """True if v holds real state (not None / not a 0-length tensor/array/container). A candidate attr that
-    is empty at snapshot time (e.g. LTM lazily populated on first inject) preserves NOTHING useful, so it
-    must NOT count as 'captured' — otherwise the leak warning is silenced while state still leaks."""
+    """True if v holds real state (not None / not a 0-length tensor/array/container) — so an attr that is
+    empty at snapshot time doesn't silence the leak warning while state still leaks."""
     if v is None:
         return False
     n = getattr(v, "numel", None)
@@ -110,7 +78,7 @@ def _is_nonempty(v) -> bool:
     try:
         return len(v) > 0
     except TypeError:
-        return True          # scalar-like (e.g. update_step int) → treat as real state
+        return True
 
 
 def _snapshot_memory_state(model):
@@ -128,13 +96,11 @@ def _snapshot_memory_state(model):
     if not captured:
         print("[run_memoryllm] ⚠ HARD WARNING: no NON-EMPTY M+ long-term-memory buffer was found among "
               f"{_LTM_CANDIDATE_ATTRS} (empty-at-load attrs seen: {empty or 'none'}). Only model.memory "
-              "(short-term pool) is guaranteed reset between items — the LTM store may LEAK across "
-              "LongMemEval questions and CORRUPT results (an attr that is empty at load but fills during "
-              "inject_memory would NOT be reset to its filled-then-cleared state). Inspect modeling_mplus.py "
-              "on the pod, add/confirm the real LTM attribute name(s) in _LTM_CANDIDATE_ATTRS, and re-run "
-              "BEFORE trusting any number. (See docs/baselines/TIER2_GPU_INTEGRATION.md #3.)")
+              "(short-term pool) is guaranteed reset between contexts — the LTM store may LEAK and CORRUPT "
+              "results. Inspect modeling_mplus.py on the pod, add the real LTM attr name(s), re-run BEFORE "
+              "trusting any number. (docs/baselines/TIER2_GPU_INTEGRATION.md #3.)")
     else:
-        print(f"[run_memoryllm] per-item reset will restore: model.memory + LTM buffers {captured}"
+        print(f"[run_memoryllm] per-context reset will restore: model.memory + LTM buffers {captured}"
               + (f" (also snapshotting empty-at-load: {empty})" if empty else ""))
     return snap, captured
 
@@ -147,16 +113,15 @@ def _restore_memory_state(model, snap) -> None:
             continue
         cur = getattr(model, attr, None)
         if isinstance(cur, torch.Tensor) and isinstance(saved, torch.Tensor):
-            cur.data.copy_(saved)            # in-place for parameters/buffers
+            cur.data.copy_(saved)
         else:
             setattr(model, attr, _copy_buf(saved))
 
 
 def _inject_blocks(tok, full_history: str, block_tokens: int, min_tokens: int) -> list[list[int]]:
-    """Split the full history into FIXED `block_tokens`-token id blocks — the granularity M+ was evaluated at
-    upstream (LongBench runner injects 512-token blocks). Whole-session injection is UNFAITHFUL: 93.8% of
-    LongMemEval sessions exceed 512 tok (max ~17k), so it compresses far more per update than the model saw.
-    A short (<min_tokens) tail block is merged into the previous one (sub-16-token injects 'disturb' memory)."""
+    """Split the context into FIXED `block_tokens`-token id blocks — the granularity M+ was evaluated at
+    upstream (LongBench injects 512-token blocks). A short (<min_tokens) tail block is merged into the
+    previous one (sub-16-token injects 'disturb' memory)."""
     ids = tok(full_history, add_special_tokens=False)["input_ids"]
     blocks = [ids[i:i + block_tokens] for i in range(0, len(ids), block_tokens)]
     if len(blocks) >= 2 and len(blocks[-1]) < min_tokens:
@@ -165,140 +130,98 @@ def _inject_blocks(tok, full_history: str, block_tokens: int, min_tokens: int) -
     return blocks
 
 
-def _record(it, hyp="", error=None, finish_reason=None):
-    return {"question_id": it["question_id"], "question": it["question"], "answer": it["answer"],
-            "hypothesis": hyp, "question_type": it["question_type"],
-            "finish_reason": finish_reason or ("error" if error else "stop"), "error": error}
-
-
-def _finish_reason(gen_ids, max_new_tokens, eos_id) -> str:
-    """'length' if generation hit the cap without EOS (answer may be truncated → retryable), else 'stop'."""
-    n = gen_ids.shape[0] if hasattr(gen_ids, "shape") else len(gen_ids)
-    if n >= max_new_tokens and (eos_id is None or int(gen_ids[-1]) != eos_id):
-        return "length"
-    return "stop"
-
-
-def run_memoryllm(args, items, model_name: str, repo_dir: str, store) -> None:
-    """Write-then-query loop. Exact call sequence per docs/baselines/TIER2_GPU_INTEGRATION.md #3
-    (cross-checked against the MemoryLLM repo README's "How to use the model" section). Appends per item."""
+def run_memoryllm(args, items, model_name, repo_dir, store, dataset) -> None:
+    """Encode-once/reuse loop over contexts via tier2_common.run_grouped."""
     sys.path.insert(0, repo_dir)
     import torch
-    # POD-ONLY: requires MemoryLLM cloned to `repo_dir` (see README.md) — `modeling_mplus.py` is a repo
-    # file (not a pip package); the class name is `MPlus` (MemoryLLM-8B/-chat would be `MemoryLLM` from
-    # `modeling_memoryllm.py` instead — swap the import + from_pretrained call if benchmarking those).
+    # POD-ONLY: `modeling_mplus.py` is a repo file (not a pip package); class name `MPlus` (MemoryLLM-8B/-chat
+    # would be `MemoryLLM` from `modeling_memoryllm.py` — swap import + from_pretrained if benchmarking those).
     from modeling_mplus import MPlus
     from transformers import AutoTokenizer
+    from src.memory.eval.tier2_common import format_query, finish_reason_of, run_grouped
 
     tok = AutoTokenizer.from_pretrained(model_name)
     model = MPlus.from_pretrained(model_name, attn_implementation="flash_attention_2",
                                   torch_dtype=torch.bfloat16)
-    model = model.to(torch.bfloat16)  # re-cast per README: from_pretrained alone leaves rotary_emb.inv_freq fp32
+    model = model.to(torch.bfloat16)  # re-cast per README: from_pretrained leaves rotary_emb.inv_freq fp32
     model.put_ltm_to_numpy()          # move LTM off-GPU to a numpy store for inference (README-mandated)
     model = model.cuda()
     model.eval()
 
-    # snapshot the pristine post-load state (short-term pool + LTM buffers); restore before EVERY item.
-    snap, _ = _snapshot_memory_state(model)
+    pristine, _ = _snapshot_memory_state(model)   # empty post-load state; restore before each context inject
 
-    done = store.done_ids()
-    for it in items:
-        if str(it["question_id"]) in done:
-            continue
-        try:
-            _restore_memory_state(model, snap)          # reset before this item's private haystack
+    def encode_ctx(ctx, first_item):
+        _restore_memory_state(model, pristine)                      # clear to pristine
+        for block in _inject_blocks(tok, ctx, args.inject_block_tokens, args.min_inject_tokens):
+            model.inject_memory(torch.tensor([block], dtype=torch.long).cuda(), update_memory=True)
+        return _snapshot_memory_state(model)[0]                     # reusable post-injection memory
 
-            for block in _inject_blocks(tok, it["full_history"], args.inject_block_tokens,
-                                        args.min_inject_tokens):
-                ctx_ids = torch.tensor([block], dtype=torch.long).cuda()
-                model.inject_memory(ctx_ids, update_memory=True)
+    def answer(post_snap, it):
+        _restore_memory_state(model, post_snap)                     # undo any prior question's LTM mutation
+        q = format_query(it, dataset)
+        # pretrained mplus-8b (no chat template): LongMemEval → "Question: … Answer:"; MAB template is
+        # self-contained (already carries its own task instruction + answer cue) → feed as-is.
+        prompt = f"Question: {q} Answer:" if dataset == "longmemeval" else q
+        q_ids = tok(prompt, return_tensors="pt", add_special_tokens=False).input_ids.cuda()
+        with torch.no_grad():
+            out = model.generate(input_ids=q_ids, max_new_tokens=args.max_new_tokens)
+        gen = out[0][q_ids.shape[1]:]
+        return (tok.decode(gen, skip_special_tokens=True),
+                finish_reason_of(gen, args.max_new_tokens, tok.eos_token_id))
 
-            # Pretrained-model prompt template (mplus-8b currently ships pretrained-only, per README "we
-            # only have the pretrained version"). Anchor temporal questions to their date, like Tier-1.
-            q = it["question"]
-            if it.get("question_date"):
-                q = f"Current Date: {it['question_date']} {q}"
-            q_ids = tok(f"Question: {q} Answer:", return_tensors="pt",
-                        add_special_tokens=False).input_ids.cuda()
-            with torch.no_grad():
-                out = model.generate(input_ids=q_ids, max_new_tokens=args.max_new_tokens)
-            gen = out[0][q_ids.shape[1]:]
-            hyp = tok.decode(gen, skip_special_tokens=True)
-            store.append(_record(it, hyp=hyp,
-                                  finish_reason=_finish_reason(gen, args.max_new_tokens, tok.eos_token_id)))
-        except Exception as e:  # noqa: BLE001 — crash-safe: record, continue, resume later
-            print(f"[run_memoryllm] ERROR on {it['question_id']}: {type(e).__name__}: {e}")
-            store.append(_record(it, error=f"{type(e).__name__}: {e}"))
+    def release():
+        torch.cuda.empty_cache()   # run_grouped drops the old snapshot's ref FIRST → this reclaims its ~2.5GB
+
+    run_grouped(items, encode_ctx, answer, store, "[run_memoryllm]", release=release)
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--model", default=_DEFAULT_MODEL,
-                    help="HF repo id. Default = M+ (only checkpoint that fits the full ~115k history); "
-                         "MemoryLLM-8B/-chat cap at ~20k tokens (see module docstring).")
+                    help="HF repo id. Default = M+ (only checkpoint that fits ~115k history).")
     ap.add_argument("--repo-dir", default=_DEFAULT_REPO_DIR, help="path to the cloned MemoryLLM repo")
+    ap.add_argument("--dataset", choices=["longmemeval", "memoryagentbench"], default="longmemeval")
     ap.add_argument("--variant", default="s", choices=["s", "m", "oracle"])
     ap.add_argument("--max-examples", type=int, default=None)
     ap.add_argument("--max-new-tokens", type=int, default=64)
     ap.add_argument("--inject-block-tokens", type=int, default=512,
-                    help="inject_memory() block size in tokens — 512 matches the upstream LongBench runner's "
-                         "granularity (whole-session injection is unfaithful; see _inject_blocks)")
+                    help="inject_memory() block size in tokens (512 = upstream LongBench granularity)")
     ap.add_argument("--min-inject-tokens", type=int, default=17,
-                    help="a trailing block shorter than this is merged into the previous one "
-                         "(model's hard minimum is 'larger than 16')")
+                    help="a trailing block shorter than this is merged into the previous one (hard min > 16)")
     ap.add_argument("--seed", type=int, default=0, help="seed py/np/torch/cuda (M+ randomly drops memory)")
-    ap.add_argument("--no-bem", action="store_true", help="skip BEM paraphrase scoring (EM+containment only)")
+    ap.add_argument("--no-bem", action="store_true", help="skip BEM paraphrase scoring (LongMemEval only)")
     ap.add_argument("--out-dir", default="outputs/baselines")
     args = ap.parse_args()
 
     repo_dir = str(Path(args.repo_dir).expanduser())
 
-    # --- everything below needs torch/transformers/the MemoryLLM repo — lazy on purpose, see docstring ---
-    _seed_everything(args.seed)
-    from src.memory.data.longmemeval import load_longmemeval_text
-    from src.memory.eval import score_longmemeval
+    from src.memory.eval.tier2_common import (seed_everything, git_commit, load_items, build_tag, finalize)
     from src.memory.eval.results import ResultStore
+    seed_everything(args.seed)
 
-    print(f"[run_memoryllm] model={args.model} repo_dir={repo_dir} variant={args.variant} "
-          f"max_examples={args.max_examples} seed={args.seed}")
-    items = load_longmemeval_text(variant=args.variant, max_examples=args.max_examples)
+    print(f"[run_memoryllm] model={args.model} dataset={args.dataset} repo_dir={repo_dir} "
+          f"variant={args.variant} max_examples={args.max_examples} seed={args.seed}")
+    items = load_items(args.dataset, variant=args.variant, max_examples=args.max_examples)
     types = {t: sum(1 for i in items if i["question_type"] == t)
              for t in sorted({i["question_type"] for i in items})}
     print(f"[run_memoryllm] {len(items)} items; types={types}")
 
-    commit = _git_commit()
-    tag = (f"longmemeval__memoryllm__{args.model.split('/')[-1]}__{args.variant}"
-           f"__n{len(items)}__g{args.max_new_tokens}__seed{args.seed}__{commit}")
+    commit = git_commit(REPO)
+    tag = build_tag(args.dataset, "memoryllm", args.model.split("/")[-1], args.variant, len(items),
+                    f"blk{args.inject_block_tokens}", args.max_new_tokens, args.seed, commit)
     out_dir = REPO / args.out_dir
-    out_dir.mkdir(parents=True, exist_ok=True)
     store = ResultStore(out_dir / "cache" / f"{tag}.jsonl")
     n_done = len(store.done_ids())
     if n_done:
         print(f"[run_memoryllm] resume: {n_done}/{len(items)} already done — generating the rest")
 
-    run_memoryllm(args, items, args.model, repo_dir, store)
+    run_memoryllm(args, items, args.model, repo_dir, store, args.dataset)
 
-    # exclude API/gen errors AND length-truncated answers (finish_reason=='length') from scoring — a cut-off
-    # answer isn't a wrong answer (matches the Tier-1 _valid_for_scoring policy).
-    records = [r for r in store.all_records()
-               if not r.get("error") and r.get("finish_reason") != "length"]
-    agg = score_longmemeval(records, use_bem=not args.no_bem)
-    store.merge_verdicts(agg.get("details", [])); store.compact()
-    n_err = sum(1 for r in store.all_records() if r.get("error"))
-    print(f"\n[run_memoryllm] overall_acc={agg.get('overall_accuracy', float('nan')):.3f}  "
-          f"task_avg={agg.get('task_averaged_accuracy', float('nan')):.3f}  "
-          f"abstention={agg.get('abstention_accuracy')}  n={agg.get('n_nonabstention')}  errors={n_err}")
-
-    payload = {
-        "dataset": "longmemeval", "method": "memoryllm", "model": args.model,
-        "meta": {"n": len(records), "n_errors": n_err, "variant": args.variant, "seed": args.seed,
-                 "min_inject_tokens": args.min_inject_tokens, "max_new_tokens": args.max_new_tokens,
-                 "commit": commit, "upstream_commit": _git_commit(repo_dir), "scorer": "score_longmemeval (deterministic, negation-guarded)", "coverage": round(len(records) / len(items), 4) if items else None},
-        "aggregate": {k: v for k, v in agg.items() if k != "details"},
-        "store": str(store.path),
-    }
-    (out_dir / f"{tag}.json").write_text(json.dumps(payload, indent=1))
-    print(f"[run_memoryllm] wrote {out_dir / f'{tag}.json'}")
+    finalize(args.dataset, "memoryllm", args.model, items, store, use_bem=not args.no_bem,
+             extra_meta={"variant": args.variant, "seed": args.seed, "max_new_tokens": args.max_new_tokens,
+                         "min_inject_tokens": args.min_inject_tokens, "commit": commit,
+                         "upstream_commit": git_commit(repo_dir)},
+             out_dir=out_dir, tag=tag, log_prefix="[run_memoryllm]")
 
 
 if __name__ == "__main__":

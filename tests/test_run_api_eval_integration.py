@@ -24,7 +24,7 @@ class StubClient:
         self.by_q = by_q
         self.calls = 0
 
-    async def chat(self, model, msgs, max_tokens=0):
+    async def chat(self, model, msgs, max_tokens=0, provider=None):
         self.calls += 1
         content = msgs[-1]["content"]
         for needle, result in self.by_q.items():
