@@ -153,6 +153,13 @@ def run_memoryllm(args, items, model_name, repo_dir, store, dataset) -> dict:
     model = model.cuda()
     model.eval()
 
+    # Log the M+ memory geometry at runtime (audit rec): confirms the LTM retriever is present + capacities
+    # match the paper (STM = num_tokens×num_blocks/layer; retrieve num_tokens×num_ltm_blocks/layer from LTM).
+    cfg = model.config
+    print(f"[run_memoryllm] M+ geometry: num_tokens={cfg.num_tokens} num_blocks={cfg.num_blocks} "
+          f"→ STM {cfg.num_tokens * cfg.num_blocks} tok/layer · num_ltm_blocks={cfg.num_ltm_blocks} "
+          f"→ retrieve {cfg.num_tokens * cfg.num_ltm_blocks} tok/layer · add_selector={getattr(cfg, 'add_selector', None)}")
+
     pristine, _ = _snapshot_memory_state(model)   # empty post-load state; restore before each context inject
 
     # GPU-synced timing (excludes the ~1-2 min model load, which the sweep amortizes separately): inject time
@@ -180,7 +187,11 @@ def run_memoryllm(args, items, model_name, repo_dir, store, dataset) -> dict:
         q_ids = tok(prompt, return_tensors="pt", add_special_tokens=False).input_ids.cuda()
         t0 = time.perf_counter()
         with torch.no_grad():
-            out = model.generate(input_ids=q_ids, max_new_tokens=args.max_new_tokens)
+            # GREEDY — mplus-8b's generation_config.json ships do_sample=True/temp=0.6/top_p=0.9, but every
+            # authors' eval forces greedy (longbench_pred.py: num_beams=1, do_sample=False). Pin it so results
+            # are deterministic + faithful to the paper (our seed only makes SAMPLING reproducible, not greedy).
+            out = model.generate(input_ids=q_ids, max_new_tokens=args.max_new_tokens,
+                                 do_sample=False, num_beams=1)
         torch.cuda.synchronize()
         stats["answer_s"] += time.perf_counter() - t0
         stats["n_answers"] += 1
