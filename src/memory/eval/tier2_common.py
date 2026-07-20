@@ -18,6 +18,7 @@ returns an opaque method-specific memory object reused across the group.
 from __future__ import annotations
 
 import subprocess
+import time
 from collections import OrderedDict
 from pathlib import Path
 from typing import Callable, Optional
@@ -148,7 +149,8 @@ def group_by_context(items: list[dict]) -> "OrderedDict[str, list[dict]]":
 # the reuse driver — the heart of the local caching win
 # --------------------------------------------------------------------------------------------------
 def run_grouped(items: list[dict], encode_ctx: Callable, answer: Callable, store,
-                log_prefix: str, release: Optional[Callable] = None) -> None:
+                log_prefix: str, release: Optional[Callable] = None,
+                cost_fn: Optional[Callable] = None) -> None:
     """Group by context; per context: encode ONCE, then answer every (not-yet-done) question from that one
     memory. RESUMABLE (skips store.done_ids) + crash-safe (each answer appended immediately). An encode
     failure marks the whole group's pending questions errored (not a wrong answer — excluded from scoring,
@@ -166,8 +168,31 @@ def run_grouped(items: list[dict], encode_ctx: Callable, answer: Callable, store
     groups = group_by_context(items)
     n_groups = len(groups)
     mem = None
+
+    # ---- progress accounting -------------------------------------------------------------------
+    # ETA is WORK-weighted, not context-counted: contexts vary ~10x in length, so "3/6 contexts" says
+    # little about remaining time. `cost_fn(ctx, pending) -> seconds` (the caller's LPT model) gives a
+    # meaningful fraction; without one we fall back to equal weight per context.
+    _cost = cost_fn if cost_fn is not None else (lambda c, p: 1.0)
+    todo = {c: [it for it in its if str(it["question_id"]) not in done] for c, its in groups.items()}
+    total_cost = sum(_cost(c, p) for c, p in todo.items() if p) or 1.0
+    total_q = sum(len(p) for p in todo.values())
+    done_cost = 0.0
+    done_q = 0
+    t_start = time.perf_counter()
+
+    def _progress(gi: int, note: str = "") -> None:
+        frac = min(done_cost / total_cost, 1.0)
+        el = time.perf_counter() - t_start
+        eta = (el * (1 - frac) / frac) if frac > 1e-9 else float("nan")
+        width = 24
+        filled = int(round(frac * width))
+        bar = "#" * filled + "-" * (width - filled)
+        print(f"{log_prefix} [{bar}] {frac * 100:5.1f}% · ctx {gi}/{n_groups} · Q {done_q}/{total_q} · "
+              f"elapsed {el / 60:.1f}m · ETA {eta / 60:.1f}m{note}", flush=True)
+
     for gi, (ctx, gitems) in enumerate(groups.items()):
-        pending = [it for it in gitems if str(it["question_id"]) not in done]
+        pending = todo[ctx]
         if not pending:
             continue
         if mem is not None:                       # free the PREVIOUS context's memory before allocating next
@@ -181,19 +206,25 @@ def run_grouped(items: list[dict], encode_ctx: Callable, answer: Callable, store
             mem = encode_ctx(ctx, gitems[0])
         except Exception as e:  # noqa: BLE001 — encode is the expensive step; a failure dooms the whole group
             print(f"{log_prefix} ENCODE ERROR ctx {gi + 1}/{n_groups} ({len(pending)} Q): "
-                  f"{type(e).__name__}: {e}")
+                  f"{type(e).__name__}: {e}", flush=True)
             for it in pending:
                 store.append(make_record(it, error=f"encode: {type(e).__name__}: {e}"))
+            done_cost += _cost(ctx, pending)
+            done_q += len(pending)
+            _progress(gi + 1, note="  <-- ENCODE ERROR")
             continue
+        n_err = 0
         for it in pending:
             try:
                 hyp, fr = answer(mem, it)
                 store.append(make_record(it, hyp=hyp, finish_reason=fr))
             except Exception as e:  # noqa: BLE001 — crash-safe per question
-                print(f"{log_prefix} ERROR on {it['question_id']}: {type(e).__name__}: {e}")
+                n_err += 1
+                print(f"{log_prefix} ERROR on {it['question_id']}: {type(e).__name__}: {e}", flush=True)
                 store.append(make_record(it, error=f"{type(e).__name__}: {e}"))
-        if (gi + 1) % 5 == 0 or gi + 1 == n_groups:
-            print(f"{log_prefix} context {gi + 1}/{n_groups} done ({len(pending)} Q this ctx)", flush=True)
+            done_q += 1
+        done_cost += _cost(ctx, pending)
+        _progress(gi + 1, note=(f"  <-- {n_err} Q ERRORED" if n_err else ""))
     if mem is not None and release is not None:   # free the last context's memory
         mem = None
         try:

@@ -133,6 +133,17 @@ def _inject_blocks(tok, full_history: str, block_tokens: int, min_tokens: int) -
     return blocks
 
 
+def _make_cost_fn(args):
+    """Build `cost_fn(ctx, its) -> estimated seconds`, used BOTH to balance shards (LPT) and to weight the
+    progress/ETA. Injection is per-token, answering is per-question; contexts vary ~10x in length, so a
+    context-count ETA is badly skewed. Only the RATIO matters — defaults are measured M+ throughput on one
+    RTX 4090 (0.375 s/512-token inject, 2.3 s/answer)."""
+    def _cost(ctx: str, its: list) -> float:
+        n_blocks = (len(ctx) / args.chars_per_token) / args.inject_block_tokens
+        return n_blocks * args.cost_inject_s + len(its) * args.cost_answer_s
+    return _cost
+
+
 def run_memoryllm(args, items, model_name, repo_dir, store, dataset) -> dict:
     """Encode-once/reuse loop over contexts via tier2_common.run_grouped. Returns a timing dict (GPU-synced
     inject vs generate seconds + counts) so the block-size sweep can read the cost lever off the artifact."""
@@ -174,8 +185,17 @@ def run_memoryllm(args, items, model_name, repo_dir, store, dataset) -> dict:
         _restore_memory_state(model, pristine)                      # clear to pristine
         blocks = _inject_blocks(tok, ctx, args.inject_block_tokens, args.min_inject_tokens)
         t0 = time.perf_counter()
-        for block in blocks:
+        # Injection is the long pole (a 200k-token context is ~400 sequential injects, several minutes with
+        # NO output). Emit a sub-progress line periodically so a slow context is distinguishable from a hang.
+        every = max(1, len(blocks) // args.inject_progress_every) if args.inject_progress_every else 0
+        for bi, block in enumerate(blocks):
             model.inject_memory(torch.tensor([block], dtype=torch.long).cuda(), update_memory=True)
+            if every and ((bi + 1) % every == 0 or bi + 1 == len(blocks)):
+                torch.cuda.synchronize()
+                el = time.perf_counter() - t0
+                rate = el / (bi + 1)
+                print(f"    inject {bi + 1}/{len(blocks)} ({(bi + 1) / len(blocks) * 100:4.1f}%) "
+                      f"{rate:.3f}s/inject · ETA {(len(blocks) - bi - 1) * rate:.0f}s", flush=True)
         torch.cuda.synchronize()
         stats["encode_s"] += time.perf_counter() - t0
         stats["n_injects"] += len(blocks)
@@ -211,7 +231,8 @@ def run_memoryllm(args, items, model_name, repo_dir, store, dataset) -> dict:
     def release():
         torch.cuda.empty_cache()   # run_grouped drops the old snapshot's ref FIRST → this reclaims its ~2.5GB
 
-    run_grouped(items, encode_ctx, answer, store, "[run_memoryllm]", release=release)
+    run_grouped(items, encode_ctx, answer, store, "[run_memoryllm]", release=release,
+                cost_fn=_make_cost_fn(args))
     return stats
 
 
@@ -238,6 +259,16 @@ def main():
                     help="data-parallel/instance-packing: partition DISTINCT CONTEXTS across this many shards "
                          "(sharding by context, NOT question, preserves per-context reuse — critical for MAB).")
     ap.add_argument("--shard-idx", type=int, default=0, help="which shard (0..num_shards-1) this process runs")
+    # LPT cost model (balancing only — never affects results). Defaults = measured M+ throughput on one RTX
+    # 4090: 0.375 s per 512-token inject, 2.3 s per generated answer. Retune for a different card; only the
+    # inject:answer RATIO changes the partition.
+    ap.add_argument("--dry-run", action="store_true",
+                    help="print shard partition + question ids and exit (no model load) — verifies sharding")
+    ap.add_argument("--inject-progress-every", type=int, default=10,
+                    help="emit N sub-progress lines per context during injection (0 = off)")
+    ap.add_argument("--cost-inject-s", type=float, default=0.375, help="seconds per inject block (LPT weight)")
+    ap.add_argument("--cost-answer-s", type=float, default=2.3, help="seconds per answer (LPT weight)")
+    ap.add_argument("--chars-per-token", type=float, default=4.0, help="chars→tokens estimate (LPT weight)")
     ap.add_argument("--out-dir", default="outputs/baselines")
     args = ap.parse_args()
     assert 0 <= args.shard_idx < args.num_shards, "shard_idx must be in [0, num_shards)"
@@ -251,19 +282,39 @@ def main():
     print(f"[run_memoryllm] model={args.model} dataset={args.dataset} repo_dir={repo_dir} "
           f"variant={args.variant} max_examples={args.max_examples} seed={args.seed}")
     items = load_items(args.dataset, variant=args.variant, max_examples=args.max_examples)
+
+    _cost = _make_cost_fn(args)
     if args.num_shards > 1:
-        # Partition DISTINCT CONTEXTS round-robin across shards (keep every context whole → per-context reuse
-        # is preserved: an MAB context's ~85 Q all land on one shard, injected once). LongMemEval's unique
-        # contexts just split ~evenly. Deterministic (first-seen context order), so shards are disjoint.
+        # Partition DISTINCT CONTEXTS across shards, keeping every context WHOLE so per-context reuse is
+        # preserved (an MAB context's ~85 Q all land on one shard and are injected ONCE — never re-encoded
+        # here or on any other shard). Plain round-robin STRAGGLES on MAB: it has only ~36 contexts of very
+        # uneven length, the fleet's wall-time is set by the slowest shard, and one unlucky shard drawing
+        # several 200k-token contexts stalls everyone. So use LPT (longest-processing-time-first): walk
+        # contexts heaviest→lightest, assigning each to the currently-lightest shard. Deterministic — a pure
+        # function of the item list — so every shard process computes the SAME assignment independently and
+        # the partitions are provably disjoint with no coordination.
         from src.memory.eval.tier2_common import group_by_context
-        ctx_order = list(group_by_context(items).keys())
-        keep = {c for i, c in enumerate(ctx_order) if i % args.num_shards == args.shard_idx}
+        groups = group_by_context(items)
+        loads = [0.0] * args.num_shards
+        assign: dict[str, int] = {}
+        # sort by (-cost, ctx): the ctx tiebreak keeps the order total, so ties resolve identically everywhere
+        for ctx, its in sorted(groups.items(), key=lambda kv: (-_cost(kv[0], kv[1]), kv[0])):
+            j = min(range(args.num_shards), key=lambda k: (loads[k], k))
+            assign[ctx] = j
+            loads[j] += _cost(ctx, its)
+        keep = {c for c, j in assign.items() if j == args.shard_idx}
         items = [it for it in items if (it.get("full_history", "") or "") in keep]
-        print(f"[run_memoryllm] SHARD {args.shard_idx}/{args.num_shards}: "
-              f"{len(keep)}/{len(ctx_order)} contexts, {len(items)} items")
+        imbalance = (max(loads) - min(loads)) / max(loads) if max(loads) > 0 else 0.0
+        print(f"[run_memoryllm] SHARD {args.shard_idx}/{args.num_shards} (LPT): "
+              f"{len(keep)}/{len(groups)} contexts, {len(items)} items; est {loads[args.shard_idx] / 60:.1f} min "
+              f"(fleet slowest {max(loads) / 60:.1f} min, imbalance {imbalance * 100:.1f}%)")
     types = {t: sum(1 for i in items if i["question_type"] == t)
              for t in sorted({i["question_type"] for i in items})}
     print(f"[run_memoryllm] {len(items)} items; types={types}")
+    if args.dry_run:  # verify shard partitioning without paying for a model load
+        print("[run_memoryllm] DRY RUN — question_ids: " +
+              ",".join(sorted(str(i["question_id"]) for i in items)))
+        return
 
     commit = git_commit(REPO)
     knob = f"blk{args.inject_block_tokens}" + (f"_sh{args.shard_idx}of{args.num_shards}" if args.num_shards > 1 else "")
