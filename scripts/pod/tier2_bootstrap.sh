@@ -78,12 +78,20 @@ pipin kvzip "$FA_KVZIP" 2>/dev/null && ok "flash-attn (prebuilt) in kvzip"
 micromamba run -n kvzip python -c 'import torch, tiny_api_cuda' 2>/dev/null && ok "kvzip kernel imports (torch-first)" || echo "  WARN kvzip kernel import — inspect on pod"
 pipin kvzip $HARNESS
 
-# ---- KVCache-Factory (SnapKV/H2O; LongMemEval only; sdpa OK on 80GB) ----
+# ---- KVCache-Factory (SnapKV; LongMemEval only; sdpa OK on 80GB) ----
 step "env: kvcache"
 mkenv kvcache 3.11
 pipin kvcache torch transformers accelerate 2>/dev/null
 pipin kvcache -r "$REPOS/KVCache-Factory/requirements.txt" 2>/dev/null
 pipin kvcache $HARNESS
+
+# ---- H2O (our online Llama-3.1 adapter; reuse image torch, no upstream clone/build) ----
+step "env: h2o"
+H2O_ENV="$WORKDIR/venvs/h2o"
+[ -x "$H2O_ENV/bin/python" ] || python3 -m venv --system-site-packages "$H2O_ENV"
+"$H2O_ENV/bin/pip" install -q -r "$REPO/requirements.txt" 2>/dev/null
+"$H2O_ENV/bin/python" "$REPO/scripts/baselines/tier2/smoke_h2o.py" --device cuda >/root/logs/smoke_h2o.log 2>&1 \
+  && ok "h2o CUDA smoke" || echo "  WARN h2o smoke — inspect /root/logs/smoke_h2o.log"
 
 # ---- MemoryLLM / M+ (flash-attn REQUIRED; the repo pins a from-source flash-attn — strip it, use prebuilt) ----
 step "env: memoryllm"
@@ -107,10 +115,12 @@ step "HF auth + model prefetch (backgrounded; big)"
 micromamba run -n memoryllm python - <<'PY' >/root/logs/prefetch.log 2>&1 &
 from huggingface_hub import snapshot_download
 # kvzip=Qwen2.5-7B, memoryllm=mplus-8b, lclm=0.6b-4b-LCLM-16x, snapkv/h2o=Llama-3.1-8B (GATED: the token
-# above must have accepted the Meta license, else it SKIPs and only SnapKV/H2O is affected — core 3 are fine).
+# above must have accepted the Meta license, else it SKIPs and only SnapKV/H2O are affected — core 3 are fine).
 for r in ["Qwen/Qwen2.5-7B-Instruct-1M", "YuWangX/mplus-8b", "latent-context/0.6b-4b-LCLM-16x",
           "meta-llama/Llama-3.1-8B-Instruct"]:
-    try: snapshot_download(r); print("fetched", r)
+    revision = "0e9e39f249a16976918f6564b8830bc894c89659" if r.startswith("meta-llama/") else None
+    ignore = ["original/*"] if r.startswith("meta-llama/") else None
+    try: snapshot_download(r, revision=revision, ignore_patterns=ignore); print("fetched", r, revision or "main")
     except Exception as e: print("SKIP", r, str(e)[:120])
 PY
 ok "prefetch pid $!"

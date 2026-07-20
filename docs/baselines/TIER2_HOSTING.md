@@ -24,7 +24,7 @@ the 500 questions has its own unique history → nothing to reuse; the levers th
 | **MemoryLLM / M+** | memory-pool snapshot | write context session-by-session → **snapshot memory state** → answer all its questions → restore for next context | `_snapshot_memory_state` already scaffolded in `run_memoryllm.py` |
 | **LCLM** | encoded latents | encoder compresses context → **cache the latent tokens** → decoder consumes cached latents + each question | LCLM compresses *before* decoder prefill → cheap per-question |
 
-## Decisive method choice: KVzip over SnapKV for the multi-query benchmark
+## Multi-query KV baselines: KVzip and infinite H2O
 
 [KVzip (arXiv:2505.23416, ICML/NeurIPS'25)](https://arxiv.org/abs/2505.23416) is **query-agnostic**: it
 compresses a context into a **single reusable KV cache** by scoring KV importance via context-reconstruction,
@@ -33,11 +33,13 @@ independent of any query. Its explicit selling point is the multi-query setting:
 > "query-aware KV eviction methods (SnapKV, H2O) exhibit substantial performance degradation in multi-query
 > settings, as they overfit to the initial queries and require **repetitive cache prefills**."
 
-That is *exactly* MemoryAgentBench (one context, ~85 queries). So:
-- **MAB → KVzip** (compress once per context, reuse across its ~85 questions). Tested on LLaMA-3.1-8B to 170k
+That is *exactly* MemoryAgentBench (one context, ~85 queries). The comparison now includes:
+- **KVzip** (compress once per context, reuse across its ~85 questions). Tested on LLaMA-3.1-8B to 170k
   ctx; 3–4× cache reduction, ~2× decode speedup, negligible QA loss.
-- SnapKV/H2O (query-aware) would re-prefill per question → both slower AND degraded on MAB. Keep them only as
-  a secondary point on **LongMemEval** (single query per context, where query-aware eviction is legitimate).
+- **Infinite H2O** (stream once with position rolling, snapshot raw retained K/V and heavy-hitter scores, fork
+  per question). Its context-only heavy-hitter decisions cannot use later questions to recover evicted tokens,
+  but the cache is reusable and tests enforce equivalence to independent streaming replay.
+- **SnapKV** still has no reusable path and remains LongMemEval-only.
 
 ## Standard tooling vs. our custom models
 

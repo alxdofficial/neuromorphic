@@ -1,11 +1,13 @@
 # Tier-2 GPU baselines — pod bring-up
 
 Runners for the **2a architectural / weight-level** memory baselines the Phase-2 panel compares us against:
-KV-compression (SnapKV/H2O via KVCache-Factory, KVzip), parametric memory (MemoryLLM/M+), and the soft-token
+KV-compression (SnapKV via KVCache-Factory, infinite-streaming H2O via our Llama-3.1 adapter, KVzip), parametric memory
+(MemoryLLM/M+), and the soft-token
 compressor **LCLM** (`run_lclm.py`, our closest concurrent competitor). (Cartridges was considered but
 **dropped** — per-corpus training doesn't fit LongMemEval's private haystacks; cite-only.)
 Unlike Tier-1 (`scripts/baselines/run_api_eval.py`, OpenRouter API), these manipulate KV cache / model
-internals with real weights — they need a rented GPU and **cannot run on this machine or via any API**.
+internals with real weights — they need a GPU and cannot run via an API. H2O-2048 and LCLM target the local
+4090; the full-prompt KVCache-Factory/KVzip paths still need larger rented GPUs.
 
 > The **2b agent-memory** baselines (A-MEM / MemoryOS) are NOT here — they run over a frozen LLM via the
 > OpenRouter path with only a CPU embedder: `scripts/baselines/run_agentmem.py --method {a-mem,memoryos}`
@@ -15,30 +17,38 @@ Spec + provenance + exact entry points: `docs/baselines/TIER2_GPU_INTEGRATION.md
 
 ## 1. Pick the pod
 
-| GPU | VRAM | RunPod $/hr (community) | KVCache-Factory (SnapKV/H2O) | KVzip | MemoryLLM/M+ |
-|---|---|---|---|---|---|
-| RTX 4090 | 24GB | $0.34 | too small (~35-45GB peak) | too small (~33-38GB peak) | fits (est.) |
-| **RTX A6000** | **48GB** | **$0.33** | fits | fits | fits |
-| L40S | 48GB | $0.79 | fits | fits | fits |
-| A100 80GB | 80GB | $1.19 | fits, headroom | fits, headroom | fits |
+| GPU | VRAM | RunPod $/hr (community) | H2O cap=2048 | KVCache-Factory (SnapKV) | KVzip | MemoryLLM/M+ |
+|---|---|---|---|---|---|---|
+| RTX 4090 | 24GB | $0.34 | fits (18.40GB max measured) | too small (~35-45GB peak) | too small (~33-38GB peak) | fits (est.) |
+| **RTX A6000** | **48GB** | **$0.33** | fits | fits | fits | fits |
+| L40S | 48GB | $0.79 | fits | fits | fits | fits |
+| A100 80GB | 80GB | $1.19 | fits, headroom | fits, headroom | fits, headroom | fits |
 
 **Campaign runs ONE tailored pod PER MODEL (not a shared pod), on Secure Cloud** — current per-model GPU/cost
 choices live in [`docs/baselines/PHASE2_HUB.md`](../../../docs/baselines/PHASE2_HUB.md) §2. The VRAM table above
-is reference only. Key points: the KV-compression methods materialize the FULL ~115k-token KV before compressing
-(peak 33-45GB → want ≥48GB); M+ never holds a full KV (fits 24GB but is **overhead-bound → cheapest on an A40**,
+is reference only. Key points: SnapKV/KVzip materialize the FULL ~115k-token KV before compressing
+(peak 33-45GB → want ≥48GB), whereas online H2O stays bounded; M+ never holds a full KV (fits 24GB but is **overhead-bound → cheapest on an A40**,
 not a big GPU); **LCLM runs FULL locally on the 4090** (no rental).
 
 Follow `scripts/pod/README.md` / `docs/ops/runpod_workflow.md` for the actual `runpod.py create` /
 `drive` / `reap` mechanics (SSH key, tmux, billing-safety wall-clock cap) — this doc only covers what's
 Tier-2-specific: which repos to clone and how to launch each runner once you're on the pod.
 
-> ⚠ **Environment isolation.** KVzip (CUDA 12.1 / py3.10 / flash-attn 2.7.4.post1 + custom kernel),
-> KVCache-Factory, MemoryLLM/M+, and LCLM pin **mutually incompatible** torch / transformers / numpy /
+> ⚠ **Environment isolation.** H2O uses our Transformers 5.1 adapter; KVzip (CUDA 12.1 / py3.10 /
+> flash-attn 2.7.4.post1 + custom kernel), KVCache-Factory, MemoryLLM/M+, and LCLM pin **mutually incompatible** torch / transformers / numpy /
 > python versions. Do **not** install them into one shared env — give each its own venv/conda env (or run
 > them on separate pod sessions). Our harness code is pure-python + lazy-imported, so it rides along in any
 > of them.
 
 ## 2. Clone the method repos (on the pod)
+
+**H2O needs no third-party clone or CUDA build.** Its setup reuses the pod image's CUDA PyTorch, installs the
+validated Transformers 5.1 harness, runs a no-download CUDA smoke, and prefetches Llama in the background:
+
+```bash
+WORKDIR=/workspace bash scripts/pod/tier2_setup/setup_h2o.sh
+source /workspace/venvs/h2o/bin/activate
+```
 
 Each runner does `sys.path.insert(0, <repo-dir>)` instead of `pip install`-ing these (none are on PyPI as
 importable packages) — clone them under `~/tier2_repos/` (the runners' `--repo-dir` defaults) or pass
@@ -47,7 +57,7 @@ importable packages) — clone them under `~/tier2_repos/` (the runners' `--repo
 ```bash
 mkdir -p ~/tier2_repos && cd ~/tier2_repos
 
-# --- KVCache-Factory (SnapKV / H2O) ---
+# --- KVCache-Factory (SnapKV only) ---
 git clone https://github.com/Zefan-Cai/KVCache-Factory.git
 cd KVCache-Factory && pip install -r requirements.txt && cd ..
 
@@ -71,17 +81,17 @@ git clone https://github.com/LeonLixyz/LCLM.git
 cd LCLM && pip install -r requirements.txt && cd ..
 ```
 
-Common baseline deps (KVCache-Factory + MemoryLLM; KVzip pins its own versions above):
+Common upstream baseline deps (KVCache-Factory + MemoryLLM; KVzip pins its own versions above):
 ```bash
 pip install torch transformers accelerate flash-attn --no-build-isolation
 ```
 `flash_attention_2` is REQUIRED for **M+** only (its eager/sdpa attention classes return 4 values but the
-decoder unpacks 5 → crash), installed via a prebuilt wheel. **KVCache-Factory (SnapKV/H2O) and KVzip run fine
+decoder unpacks 5 → crash), installed via a prebuilt wheel. **KVCache-Factory (SnapKV) and KVzip run fine
 under `sdpa` on an 80GB card** (verified) — no flash-attn build needed there. See `scripts/pod/TIER2_RESUME.md`.
 
 ## 3. HF auth + gated weights
 
-`meta-llama/Llama-3.1-8B-Instruct` (KVCache-Factory default) is gated — `huggingface-cli login` with a
+`meta-llama/Llama-3.1-8B-Instruct` (H2O/SnapKV default) is gated — `huggingface-cli login` with a
 token that has accepted the Meta license before running. `Qwen/Qwen2.5-7B-Instruct-1M` (KVzip default) and
 `YuWangX/mplus-8b` (MemoryLLM default) are ungated.
 
@@ -99,6 +109,10 @@ cd /path/to/neuromorphic   # repo root — the runners insert it onto sys.path t
 
 # --- smoke each method (5-20 items) BEFORE the full run ---
 python scripts/baselines/tier2/run_kvcompress.py --method kvzip --dataset longmemeval --max-examples 5
+python scripts/baselines/tier2/run_kvcompress.py --method h2o  --dataset longmemeval --max-examples 1 \
+  --max-capacity-prompt 2048 --prefill-chunk-size 512 --h2o-head-mode query_head
+python scripts/baselines/tier2/run_kvcompress.py --method h2o  --dataset memoryagentbench --max-examples 20 \
+  --max-capacity-prompt 2048 --prefill-chunk-size 512 --h2o-head-mode query_head
 python scripts/baselines/tier2/run_memoryllm.py               --dataset memoryagentbench --max-examples 20
 python scripts/baselines/tier2/run_lclm.py                    --dataset longmemeval --max-examples 5
 
@@ -110,6 +124,8 @@ DATASET=memoryagentbench scripts/baselines/tier2/run_pod_panel.sh
 
 # --- or run methods individually ---
 python scripts/baselines/tier2/run_kvcompress.py --method kvzip  --dataset memoryagentbench --ratio 0.3
+python scripts/baselines/tier2/run_kvcompress.py --method h2o   --dataset longmemeval --max-capacity-prompt 2048
+python scripts/baselines/tier2/run_kvcompress.py --method h2o   --dataset memoryagentbench --max-capacity-prompt 2048
 python scripts/baselines/tier2/run_kvcompress.py --method snapkv --dataset longmemeval --max-capacity-prompt 2048  # LongMemEval only
 python scripts/baselines/tier2/run_memoryllm.py  --dataset longmemeval
 python scripts/baselines/tier2/run_lclm.py       --dataset longmemeval --checkpoint latent-context/0.6b-4b-LCLM-16x
@@ -123,10 +139,25 @@ Each run writes `outputs/baselines/<dataset>__<method>__…​.json` (+ a resuma
 
 ## 5. Gotchas (see the integration doc for the full detail)
 
-- **KV method for MAB = kvzip, NOT snapkv/h2o.** KVzip is query-AGNOSTIC → one reusable compressed cache per
-  context (correct for MAB's ~85 Q/context). SnapKV/H2O are query-AWARE → they'd re-prefill per question
-  (slow AND degraded); the runner **refuses `snapkv|h2o` + `--dataset memoryagentbench`**. Use them on
-  LongMemEval only. (docs/baselines/TIER2_HOSTING.md.)
+- **H2O and KVzip both support MAB context reuse; SnapKV does not.** Infinite H2O streams each context once,
+  snapshots raw retained K/V plus heavy-hitter scores, and forks that state per question. The runner derives
+  and verifies an exact token-level common prefix aligned to the chunk boundary. SnapKV remains query-aware
+  and is refused on MAB because it has no equivalent reusable state path.
+- **H2O's primary setting is fixed 2,048 KV entries/layer:** 1,024 cumulative-attention heavy hitters +
+  1,024 recent tokens, selected independently per query head. The official paper commonly used a 20% budget,
+  so 2,048 is a more aggressive fixed-footprint comparison on ~100k-token LongMemEval prompts. The artifact
+  records this distinction. `--h2o-head-mode kv_head` is a 4x-smaller GQA approximation, not the primary row.
+- **H2O prefill is infinite and chunked:** retained keys are stored before RoPE and re-rotated at compact cache
+  positions, matching the official repository's `H2OLlamaAttention_streaming` design. A 512-token chunk raises
+  attention-time KV from 2,048 to 2,560, then post-attention pruning returns it to 2,048. The eager attention
+  matrix is bounded to `chunk × (2048 + chunk)`. Position rolling discards original absolute token distances;
+  retained order, K/V content, and accumulated importance survive. A tail question can reweight survivors but
+  cannot recover context evicted during streaming.
+- **Measured locally on RTX 4090:** a 105,146-token LME-S prompt prefills in 23.29s (4,514 tok/s), 17.62GB peak.
+  The longest MAB prompt (744,639 tokens, versus Llama's 131,072 native window) prefills once in 164.38s;
+  snapshot forks cost about 2.5ms and peak at 18.40GB. Every layer retained exactly 2,048 entries in both checks.
+- **H2O does not use KVCache-Factory.** The official FMInference/H2O cache is the semantic oracle; our modern
+  adapter is `src/memory/eval/h2o_llama.py`. Run `smoke_h2o.py --device cuda` before loading 8B weights.
 - **LCLM on MAB — latent-reuse is a POD-VERIFY.** `run_lclm.py` currently encodes+decodes per question
   (correct, but re-runs the 0.6B encoder ~85×/context). To hit the MAB time budget, wire `_encode_memory`
   (encode once) + the cached-latent decode against the repo's `inference/hf.py` on the pod. LongMemEval is

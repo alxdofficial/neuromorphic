@@ -34,7 +34,7 @@ def git_commit(path) -> str:
                                        text=True, stderr=subprocess.DEVNULL).strip() or "nogit"
         # `git status --porcelain` catches modified, staged, AND UNTRACKED files (audit #1: a plain
         # `git diff` misses untracked new implementations that would otherwise tag as a clean HEAD). Append a
-        # short hash of the actual diff+untracked-list so two DIFFERENT dirty checkouts at the same HEAD get
+        # short hash of the actual diff+untracked contents so two DIFFERENT dirty checkouts at the same HEAD get
         # DISTINCT tags → don't resume each other's cache (audit #4).
         porcelain = subprocess.check_output(["git", "-C", str(path), "status", "--porcelain"],
                                             text=True, stderr=subprocess.DEVNULL).strip()
@@ -43,7 +43,21 @@ def git_commit(path) -> str:
         import hashlib
         diff = subprocess.run(["git", "-C", str(path), "diff", "HEAD"], text=True,
                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL).stdout
-        h = hashlib.md5((porcelain + diff).encode()).hexdigest()[:6]
+        digest = hashlib.md5((porcelain + diff).encode())
+        untracked = subprocess.check_output(
+            ["git", "-C", str(path), "ls-files", "--others", "--exclude-standard", "-z"]
+        ).split(b"\0")
+        root = Path(path)
+        for rel_bytes in sorted(rel for rel in untracked if rel):
+            digest.update(b"\0path\0" + rel_bytes + b"\0content\0")
+            file_path = root / rel_bytes.decode(errors="surrogateescape")
+            if file_path.is_symlink():
+                digest.update(file_path.readlink().as_posix().encode())
+            elif file_path.is_file():
+                with file_path.open("rb") as f:
+                    for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                        digest.update(chunk)
+        h = digest.hexdigest()[:6]
         return f"{head}-dirty{h}"
     except Exception:  # noqa: BLE001
         return "nogit"
@@ -52,9 +66,13 @@ def git_commit(path) -> str:
 def seed_everything(seed: int) -> None:
     """Seed py/np/torch/cuda so eviction / memory-drop / generation are reproducible across reruns."""
     import random
+
     import numpy as np
     import torch
-    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 

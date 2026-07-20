@@ -10,8 +10,8 @@ two restart scenarios + the exact fixes we hit, so we never re-debug them.
 - attach with: `python scripts/pod/tier2_pod.py attach <pod_id>` (then `exec`/`run`/`logs`/`sync`)
 
 ## Restart scenario A — same volume reattached (common)
-Envs (`/workspace/micromamba/envs/{kvzip,kvcache,memoryllm,lclm}`) + weights (`/workspace/hf`) are already
-there. **No bootstrap needed.** Just:
+Envs (`/workspace/micromamba/envs/{kvzip,kvcache,memoryllm,lclm}` plus `/workspace/venvs/h2o`) + weights
+(`/workspace/hf`) are already there. **No bootstrap needed.** Just:
 1. `python scripts/pod/tier2_pod.py attach <new_pod_id>`
 2. `python scripts/pod/tier2_pod.py sync --push`   # re-ship the repo to the fresh overlay `/root/neuromorphic`
 3. launch the panel (below).
@@ -31,7 +31,8 @@ Run with `WORKDIR=/workspace` so nothing lands on the 20GB overlay.
 5. **M+ requirements pin a from-source flash-attn** → strip it (`grep -v flash`) and use the prebuilt wheel.
 6. **M+ is a BASE model** (rambles, never emits EOS) → `run_memoryllm.py` takes the **first line** as the
    answer + reports `stop`, else every item is a "length" cutoff and coverage = 0.
-7. **kvcache + lclm run under sdpa** on 80GB — no flash-attn needed there.
+7. **kvcache + lclm run under sdpa** on 80GB. H2O uses its own bounded eager attention path. None needs
+   flash-attn.
 8. **Datasets HF-auto-download** (`xiaowu0162/longmemeval-cleaned`); LCLM checkpoint prefetched too. The
    `sync --push` exclude is **anchored** (`/data`, not `data`) so `src/memory/data/` (loaders) ships.
 9. **Llama-3.1-8B is GATED** (SnapKV/H2O only) — the HF token must have accepted the Meta license, else it

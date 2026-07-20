@@ -22,8 +22,15 @@ MAXEX="${MAXEX:-}"                          # e.g. "--max-examples 20"
 KV_METHOD="${KV_METHOD:-kvzip}"            # kvzip works on both datasets; snapkv/h2o are LongMemEval-only
 LOGDIR="${LOGDIR:-outputs/baselines/pod_logs}"; mkdir -p "$LOGDIR"
 
-# per-method env activation + GPU. Defaults assume conda envs named per method; override as needed.
-KVZIP_ENV="${KVZIP_ENV:-conda activate kvzip}";       KVZIP_GPU="${KVZIP_GPU:-0}"
+# per-method env activation + GPU. H2O's small venv reuses the pod image's torch;
+# SnapKV/KVzip retain their isolated micromamba/conda environments.
+case "$KV_METHOD" in
+  h2o)    KV_ENV="${H2O_ENV:-source ${WORKDIR:-/workspace}/venvs/h2o/bin/activate}" ;;
+  snapkv) KV_ENV="${KVCACHE_ENV:-conda activate kvcache}" ;;
+  kvzip)  KV_ENV="${KVZIP_ENV:-conda activate kvzip}" ;;
+  *) echo "unsupported KV_METHOD=$KV_METHOD" >&2; exit 2 ;;
+esac
+KV_GPU="${KV_GPU:-0}"
 MEMLLM_ENV="${MEMLLM_ENV:-conda activate memoryllm}"; MEMLLM_GPU="${MEMLLM_GPU:-1}"
 LCLM_ENV="${LCLM_ENV:-conda activate lclm}";          LCLM_GPU="${LCLM_GPU:-2}"
 
@@ -41,7 +48,7 @@ launch() {
 }
 
 declare -A PID
-launch "$KV_METHOD" "$KVZIP_ENV" "$KVZIP_GPU" \
+launch "$KV_METHOD" "$KV_ENV" "$KV_GPU" \
   scripts/baselines/tier2/run_kvcompress.py --method "$KV_METHOD" --dataset "$DATASET" $MAXEX
 PID[kv]=$!
 launch memoryllm "$MEMLLM_ENV" "$MEMLLM_GPU" \

@@ -55,7 +55,7 @@ Only smoke tests have run. The table below fills in as each model completes its 
 | method | LongMemEval | MemoryAgentBench |
 |---|---|---|
 | KVzip | — | — |
-| H2O / SnapKV | — | (H2O N/A — query-aware) |
+| H2O / SnapKV | — | — (H2O only; SnapKV N/A) |
 | M+ / MemoryLLM | — | — |
 | LCLM | — | — |
 
@@ -75,17 +75,22 @@ agent↔pod tooling in `scripts/pod/tier2_pod.py`. Integration notes: [`TIER2_GP
 
 | # | Model | Method (how) | Backbone | Scope | Cheapest GPU | Est. cost / time | Status |
 |---|---|---|---|---|---|---|---|
-| 1 | **H2O / SnapKV** | query-aware KV eviction | Llama-3.1-8B | LME only | — | TBD | 🟢 gate OPEN; **codex** owns |
+| 1 | **H2O / SnapKV** | streaming/query-aware KV eviction | Llama-3.1-8B | LME + MAB (H2O) | local 4090 | TBD | 🟢 adapter ready; **codex** owns |
 | 2 | **KVzip** | query-agnostic KV compression | Qwen2.5-7B | LME + MAB | H100/A40 | ~$5–10 | ⬜ pending |
 | 3 | **M+ / MemoryLLM** | recurrent parametric memory | mplus-8b | LME + MAB | **A40 48GB** | **~$10 / overnight** | 🟡 **prep in progress (me)** |
 | 4 | **LCLM** | soft-token compression | 0.6b+4b | LME + MAB | **local 4090** | **$0** (no rental) | ⬜ blocked on HALO GPU |
 
 **Per-model notes (findings already established — do not re-discover):**
 
-- **#1 H2O/SnapKV** — Llama-3.1-8B gate is **OPEN** (verified 2026-07-20, account `alxd219p1`). Monkeypatch
-  patches all 3 attn classes and `transformers==4.44.2` still has them → **eviction works under `sdpa`, no
-  flash-attn build needed**. LongMemEval only (query-aware → can't reuse across MAB's 85 Q/context). Tune
-  `--max-capacity-prompt` (default 2048).
+- **#1 H2O/SnapKV** — Llama-3.1-8B gate is **OPEN** (verified 2026-07-20, account `alxd219p1`). **H2O now uses
+  the first-party infinite-streaming Transformers-5.1 adapter**, not KVCache-Factory: raw retained keys,
+  position rolling, 2,048-token cache (1,024 heavy + 1,024 recent), 512-token chunks, query-head GQA mode.
+  A real 105,146-token LME-S prefill completed locally in 23.29s (4,514 tok/s) at 17.62GB peak. The maximum
+  744,639-token MAB prompt crossed the native 131k window and prefetched in 164.38s; query snapshot forks took
+  ~2.5ms and peaked at 18.40GB. All 32 layers retained exactly 2,048 entries. Exact LME prompt stats: p50 105,531,
+  p95 107,047, max 107,557 tokens; all fit Llama's 131,072 window with 64 generation tokens. SnapKV remains on
+  KVCache-Factory/Transformers-4.44.2 and still needs ≥48GB because it materializes full prompt KV first.
+  H2O supports exact context snapshot reuse on MAB; SnapKV remains LongMemEval-only.
 - **#2 KVzip** — needs the custom CUDA kernel (`cuda-nvcc` + **`cuda-cccl=12.4.*`** pin) + prebuilt flash-attn
   wheel (baked into bootstrap). Query-agnostic → correct KV baseline for MAB (36 encodes / 3071 Q). Tune
   `--ratio` (KV retained, default 0.3). **TODO:** patch `wrapper.py` to honor `--max-new-tokens` (upstream

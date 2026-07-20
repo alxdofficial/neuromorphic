@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# Build all 4 Tier-2 method envs CONCURRENTLY (the bootstrap does them serially; they're independent).
+# Build all 5 Tier-2 method envs CONCURRENTLY (the bootstrap does them serially; they're independent).
 # Idempotent: micromamba create skips an existing env; pip re-runs are ~no-ops. Each env logs separately.
 export MAMBA_ROOT_PREFIX=/workspace/micromamba HF_HOME=/workspace/hf
 export PIP_CACHE_DIR=/workspace/pipcache TMPDIR=/workspace/tmp
 REPOS=/workspace/tier2_repos
+REPO="${REPO:-/root/neuromorphic}"
 H='numpy datasets huggingface_hub rank-bm25 sentence-transformers bert-score'
 mm(){ micromamba "$@"; }
 
@@ -23,6 +24,12 @@ b_kvcache(){
   mm run -n kvcache pip install -q $H
   echo KVCACHE_DONE; }
 
+b_h2o(){
+  python3 -m venv --system-site-packages /workspace/venvs/h2o
+  /workspace/venvs/h2o/bin/pip install -q -r "$REPO/requirements.txt"
+  /workspace/venvs/h2o/bin/python "$REPO/scripts/baselines/tier2/smoke_h2o.py" --device cuda
+  echo H2O_DONE; }
+
 b_memoryllm(){
   mm create -y -n memoryllm python=3.11 pip
   mm run -n memoryllm pip install -q -r "$REPOS/MemoryLLM/requirements_infer_only.txt"
@@ -37,6 +44,7 @@ b_lclm(){
 
 b_kvzip     > /root/logs/env_kvzip.log 2>&1 &
 b_kvcache   > /root/logs/env_kvcache.log 2>&1 &
+b_h2o       > /root/logs/env_h2o.log 2>&1 &
 b_memoryllm > /root/logs/env_memoryllm.log 2>&1 &
 b_lclm      > /root/logs/env_lclm.log 2>&1 &
 wait

@@ -13,7 +13,30 @@ and the pod plan. Two kinds (mechanism cut, see `PHASE2_BASELINES.md` §2.5):
 status + GPU/cost per model in [`PHASE2_HUB.md`](PHASE2_HUB.md) §2). **The mechanisms report NO LongMemEval
 number → we generate them under our harness (never quote paper numbers).**
 
-## 1. KVCache-Factory — SnapKV / H2O / PyramidKV / StreamingLLM
+## 1. H2O and KVCache-Factory
+
+### H2O — modern infinite-streaming Llama-3.1 adapter
+- **Scientific oracle:** [FMInference/H2O](https://github.com/FMInference/H2O), pinned reference commit
+  `ac75c2a8a9e76832b2a4139b9363373b56336bfb`. We port the policy rather than its obsolete Llama model fork.
+- **Implementation:** `src/memory/eval/h2o_llama.py`; runner `run_kvcompress.py --method h2o`.
+- **Primary setting:** Llama-3.1-8B-Instruct, BF16, batch 1, 2,048 entries/layer split 1,024 heavy + 1,024 recent,
+  independent query-head retention. This expands Llama-3.1 GQA KV by 4x but is closest to original per-head H2O.
+- **Streaming operation:** store retained keys before RoPE, accumulate normalized attention received by each
+  cached token, prune after each chunk/token, and re-rotate retained keys at compact positions. The retained KV
+  is at most 2,048; a default 512-token chunk temporarily raises attention-time length to 2,560. This is the
+  official infinite-streaming position-rolling mechanism, adapted to modern Llama and GQA.
+- **Declared deviation:** the paper commonly uses a 20% cache; fixed 2,048 is ~2% at LongMemEval's median length.
+  Chunked online prefill is required for bounded attention and is not byte-identical to one-pass short-context prefill.
+  Since the question is at the prompt tail, it can influence surviving scores but cannot recover entries evicted
+  by earlier chunks. Position rolling preserves retained order/content but not original absolute distances.
+- **MAB reuse:** prefill one exact, chunk-aligned common token prefix per context; snapshot raw K/V and scores;
+  clone the snapshot per question and process only the suffix. Tests require snapshot replay to equal independent
+  full-prompt replay and verify the shared snapshot is unchanged.
+- **Setup:** `WORKDIR=/workspace bash scripts/pod/tier2_setup/setup_h2o.sh`. No source clone, flash-attn, or CUDA
+  extension is needed. Verified locally on a 24GB RTX 4090: 105,146-token LME-S in 23.29s at 17.62GB peak;
+  the maximum 744,639-token MAB prompt in 164.38s with reusable query forks at 18.40GB peak.
+
+### KVCache-Factory — SnapKV / PyramidKV / StreamingLLM
 - Repo [Zefan-Cai/KVCache-Factory](https://github.com/Zefan-Cai/KVCache-Factory) · **MIT** (note `csrc/` has its own license) · last commit 2026-07-10 (active).
 - **Entry point = monkey-patch (not CLI-locked):** `from pyramidkv.monkeypatch import replace_llama; replace_llama("snapkv")` BEFORE model load, then set per-layer config on each `layer.self_attn.config` (`window_size`, `max_capacity_prompt`, `kernel_size`, `pooling`), then plain `model.generate(...)`.
 - **7,500-tok cap** lives ONLY in `run_longbench.py`'s data path (`model2maxlen`) — bypass by tokenizing/generating yourself; the full 115k flows through.
@@ -74,12 +97,12 @@ Orchestration layers over a **frozen** chat LLM (retrieval + prompting) — NOT 
 - Both report LoCoMo only (A-MEM: no absolute cells in README; MemoryOS: +49.11% F1 *relative*) → **no LongMemEval; we generate it.** Integration effort ≈ a thin adapter that maps LongMemEval sessions → `add_*` calls and the question → the query call, backend = our OpenRouter key.
 
 ## 7. Pod plan
-| GPU | VRAM | RunPod $/hr (community) | KVCache-Factory | KVzip | MemoryLLM/M+ | our 135M |
-|---|---|---|---|---|---|---|
-| RTX 4090 | 24GB | $0.34 | ✗ (~35–45GB) | ✗ (~33–38GB) | ✓ (est.) | ✓ |
-| **RTX A6000** | **48GB** | **$0.33** | ✓ | ✓ | ✓ | ✓ |
-| L40S | 48GB | $0.79 | ✓ | ✓ | ✓ | ✓ |
-| A100 80GB | 80GB | $1.19 | ✓ (headroom) | ✓ (headroom) | ✓ | ✓ |
+| GPU | VRAM | RunPod $/hr (community) | H2O-2048 | KVCache-Factory | KVzip | MemoryLLM/M+ | our 135M |
+|---|---|---|---|---|---|---|---|
+| RTX 4090 | 24GB | $0.34 | ✓ (measured 17.25GB) | ✗ (~35–45GB) | ✗ (~33–38GB) | ✓ (est.) | ✓ |
+| **RTX A6000** | **48GB** | **$0.33** | ✓ | ✓ | ✓ | ✓ | ✓ |
+| L40S | 48GB | $0.79 | ✓ | ✓ | ✓ | ✓ | ✓ |
+| A100 80GB | 80GB | $1.19 | ✓ | ✓ (headroom) | ✓ (headroom) | ✓ | ✓ |
 
 The VRAM table is reference only. **Current campaign uses Secure Cloud, ONE tailored pod PER MODEL** (not a
 shared pod) — see [`PHASE2_HUB.md`](PHASE2_HUB.md) §2 for the actual per-model GPU/cost choices. Key deviations
