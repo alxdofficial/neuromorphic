@@ -9,18 +9,31 @@ from __future__ import annotations
 import functools
 
 
+# Per-context BM25 index cache. MemoryAgentBench has only 36 distinct contexts but 3,071 questions, and the
+# loader reuses ONE `sessions` list object per context across its questions — so keying by id(passages) (with
+# a length guard) memoizes the expensive tokenize+index build and reuses it across the ~85 questions sharing
+# a context, instead of rebuilding it every call (the same reuse win the dense retriever already has).
+_BM25_CACHE: dict = {}
+
+
 def bm25_topk(passages: list[str], query: str, k: int) -> list[int]:
     """Top-k passage indices by BM25 (Okapi), returned in original (chronological) order."""
     if len(passages) <= k:
         return list(range(len(passages)))
-    from rank_bm25 import BM25Okapi
-    tokenized = [p.lower().split() for p in passages]
+    key = id(passages)
+    entry = _BM25_CACHE.get(key)
+    if entry is None or entry[1] != len(passages):
+        from rank_bm25 import BM25Okapi
+        tokenized = [p.lower().split() for p in passages]
+        entry = ((BM25Okapi(tokenized) if any(tokenized) else None), len(passages))
+        _BM25_CACHE[key] = entry
+    bm25 = entry[0]
     q = query.lower().split()
-    if not any(tokenized) or not q:
+    if bm25 is None or not q:
         # all-empty passages ⇒ BM25 avgdl=0 (ZeroDivisionError); empty query ⇒ all scores 0.
         # Either way there is no retrieval signal → keep the first k (chronological) rather than crash.
         return list(range(k))
-    scores = BM25Okapi(tokenized).get_scores(q)
+    scores = bm25.get_scores(q)
     top = sorted(range(len(passages)), key=lambda i: scores[i], reverse=True)[:k]
     return sorted(top)
 
