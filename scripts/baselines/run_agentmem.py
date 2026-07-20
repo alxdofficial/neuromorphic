@@ -38,7 +38,7 @@ sys.path.insert(0, str(REPO))
 _OPENROUTER_BASE = "https://openrouter.ai/api/v1"
 _DEFAULT_LLM = "meta-llama/llama-3.1-8b-instruct"              # reader LLM (share with the Tier-1 panel)
 _DEFAULT_EMBED = "all-MiniLM-L6-v2"
-_DEFAULT_REPO_DIR = "~/tier2_repos/A-mem"                     # git clone github.com/WujiangXu/A-mem
+_DEFAULT_REPO_DIR = str(REPO.parent / "baselines" / "A-mem")  # local master/baselines; git clone github.com/WujiangXu/A-mem
 
 
 def _openrouter_chat(model: str, messages: list[dict], api_key: str, max_tokens: int):

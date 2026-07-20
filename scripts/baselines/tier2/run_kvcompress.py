@@ -42,10 +42,11 @@ _DEFAULT_MODEL = {
     "h2o": "meta-llama/Llama-3.1-8B-Instruct",
     "kvzip": "Qwen/Qwen2.5-7B-Instruct-1M",
 }
+_BASELINES = REPO.parent / "baselines"   # local master/baselines; pod passes --repo-dir explicitly
 _DEFAULT_REPO_DIR = {
-    "snapkv": "~/tier2_repos/KVCache-Factory",
-    "h2o": "~/tier2_repos/KVCache-Factory",
-    "kvzip": "~/tier2_repos/KVzip",
+    "snapkv": str(_BASELINES / "KVCache-Factory"),
+    "h2o": str(_BASELINES / "KVCache-Factory"),
+    "kvzip": str(_BASELINES / "KVzip"),
 }
 
 

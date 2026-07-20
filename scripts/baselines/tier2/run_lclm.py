@@ -31,7 +31,7 @@ REPO = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO))
 
 _DEFAULT_CHECKPOINT = "latent-context/0.6b-4b-LCLM-16x"   # highest compression; 16x→8x/4x trades fidelity
-_DEFAULT_REPO_DIR = "~/tier2_repos/LCLM"
+_DEFAULT_REPO_DIR = str(REPO.parent / "baselines" / "LCLM")  # local master/baselines; pod passes --repo-dir
 
 
 def _generate_new_tokens(model, dec_tok, processor, prompt: str, max_new_tokens: int,
