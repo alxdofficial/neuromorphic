@@ -312,41 +312,44 @@ def run_kvzip(args, items, model_name, repo_dir, store, dataset, meta_out) -> No
     context ONCE (query-agnostic → the pruned cache is reusable); `answer` decodes each question against that
     single cache. This is the whole point of KVzip and the reason it — not SnapKV — is the MAB KV baseline."""
     sys.path.insert(0, repo_dir)
-    import inspect
+    import time
 
+    import torch
     from model import ModelKVzip
 
     from src.memory.eval.tier2_common import format_query, run_grouped
 
     m = ModelKVzip(model_name)
 
-    # audit #3: KVzip's generate() may NOT accept max_new_tokens (→ it silently uses its own hard-coded cap,
-    # e.g. 512). DETECT it up front instead of relying on a per-call TypeError, and RECORD whether our cap is
-    # actually enforced so the artifact doesn't claim g{max_new_tokens} while a different cap ran.
-    try:
-        _cap_ok = "max_new_tokens" in inspect.signature(m.generate).parameters
-    except (ValueError, TypeError):
-        _cap_ok = False
-    meta_out["gen_cap_enforced"] = _cap_ok
+    # Upstream exposes generation controls through this public dictionary rather than generate() kwargs.
+    # Set it directly so the Phase-2-wide cap is genuinely enforced without patching model logic.
+    if not isinstance(getattr(m, "gen_kwargs", None), dict):
+        raise RuntimeError("KVzip ModelKVzip.gen_kwargs is unavailable; cannot enforce generation policy")
+    m.gen_kwargs["max_new_tokens"] = args.max_new_tokens
+    meta_out["gen_cap_enforced"] = True
+    meta_out["gen_cap_actual"] = args.max_new_tokens
     meta_out["gen_finish_reason_available"] = False   # KVzip returns a string, no finish signal → can't detect length
-    if not _cap_ok:
-        # audit #1: upstream generate() ignores max_new_tokens and uses KVzip's hard-coded 512 (model/wrapper.py).
-        # Record the ACTUAL cap so the artifact isn't mislabeled, and — for a FAIR comparison with the
-        # 64-capped API/other baselines (a longer generation has more chances to contain the gold under
-        # substring scoring) — POD-PATCH wrapper.py's `max_new_tokens=512` default to `args.max_new_tokens`
-        # (or set the wrapper attribute) before the real run. Until patched, KVzip runs at 512.
-        meta_out["gen_cap_actual"] = 512
-        meta_out["gen_cap_note"] = ("upstream cap 512 NOT overridden; POD-PATCH KVzip model/wrapper.py to honor "
-                                    f"--max-new-tokens={args.max_new_tokens} for a fair vs-64 comparison")
-        print(f"[run_kvcompress] ⚠ KVzip.generate() ignores max_new_tokens → runs at upstream 512, NOT "
-              f"{args.max_new_tokens}. UNFAIR vs 64-capped baselines under substring scoring. POD-PATCH "
-              "model/wrapper.py before trusting KVzip numbers. (meta records gen_cap_actual=512.)")
+    meta_out["model_revision_loaded"] = getattr(m.model.config, "_commit_hash", None)
+    meta_out["kvzip_prefill_chunk_size"] = args.kvzip_prefill_chunk_size
+    meta_out["kvzip_scoring_chunk_size"] = 2000       # upstream ModelKVzip.self_task default; paper setting
+    meta_out["kvzip_allocation"] = "pair_nonuniform"
+    meta_out["kvzip_precision"] = str(m.dtype)
+    timing = {"contexts": 0, "questions": 0, "compression_seconds": 0.0, "decode_seconds": 0.0}
 
     def encode_ctx(ctx, first_item):
         # prefill() chunks internally (16k blocks) → handles a full ~115k-tok (or longer, truncated to window)
         # context without a separate truncation step. do_score=True scores KV importance during prefill.
-        kv = m.prefill(ctx, load_score=False, do_score=True)
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+        started = time.perf_counter()
+        kv = m.prefill(ctx, prefill_chunk_size=args.kvzip_prefill_chunk_size,
+                       load_score=False, do_score=True)
         kv.prune(ratio=args.ratio)                    # ratio = fraction of KV RETAINED (0.3 → evict 70%)
+        timing["contexts"] += 1
+        timing["compression_seconds"] += time.perf_counter() - started
+        if torch.cuda.is_available():
+            peak = torch.cuda.max_memory_allocated()
+            meta_out["peak_vram_bytes_max"] = max(int(peak), int(meta_out.get("peak_vram_bytes_max", 0)))
         return kv
 
     def answer(kv, it):
@@ -354,11 +357,14 @@ def run_kvzip(args, items, model_name, repo_dir, store, dataset, meta_out) -> No
         # POD-VERIFY: KVzip is query-agnostic and its own multi-query benchmark reuses ONE pruned cache across
         # queries, so generate() must treat `kv` read-only. If answers degrade AFTER the first question in a
         # group (i.e. the cache is mutated by decode), clone the cache per question here instead.
-        hyp = (m.generate(query_ids, kv=kv, max_new_tokens=args.max_new_tokens) if _cap_ok
-               else m.generate(query_ids, kv=kv))
+        started = time.perf_counter()
+        hyp = m.generate(query_ids, kv=kv, update_cache=False)
+        timing["questions"] += 1
+        timing["decode_seconds"] += time.perf_counter() - started
         return hyp, "stop"                            # KVzip gives no finish signal → cannot detect a cutoff
 
     run_grouped(items, encode_ctx, answer, store, "[run_kvcompress kvzip]", release=_cuda_release)
+    meta_out["timing_current_process"] = timing
 
 
 def main():
@@ -387,10 +393,15 @@ def main():
                     help="H2O streaming-prefill chunk (must be <= recent size)")
     ap.add_argument("--ratio", type=float, default=0.3,
                     help="kvzip: fraction of KV cache RETAINED after prune (0.3 == evict 70%%)")
+    ap.add_argument("--kvzip-prefill-chunk-size", type=int, default=16_000,
+                    help="kvzip: upstream prefill chunk size; scoring stays at the paper's fixed 2,000 tokens")
     ap.add_argument("--seed", type=int, default=0, help="seed py/np/torch/cuda for reproducibility")
     ap.add_argument("--no-bem", action="store_true", help="skip BEM paraphrase scoring (LongMemEval only)")
     ap.add_argument("--out-dir", default="outputs/baselines")
     args = ap.parse_args()
+
+    if args.kvzip_prefill_chunk_size <= 0:
+        ap.error("--kvzip-prefill-chunk-size must be positive")
 
     if args.method == "snapkv" and args.dataset == "memoryagentbench":
         sys.exit("[run_kvcompress] snapkv has no reusable per-context cache path across "
@@ -416,7 +427,7 @@ def main():
     print(f"[run_kvcompress] {len(items)} items; types={types}")
 
     if args.method == "kvzip":
-        knob = f"ratio{args.ratio}"
+        knob = f"ratio{args.ratio}-prefill{args.kvzip_prefill_chunk_size}"
     elif args.method == "h2o":
         knob = _h2o_knob(args)
     else:

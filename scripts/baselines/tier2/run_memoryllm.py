@@ -181,6 +181,16 @@ def run_memoryllm(args, items, model_name, repo_dir, store, dataset) -> dict:
     # M+ is overhead-bound so this is what moves. Kept local to this runner (no shared-harness edit).
     stats = {"encode_s": 0.0, "n_injects": 0, "answer_s": 0.0, "n_answers": 0}
 
+    # How many questions share each context. A SINGLETON group (every LongMemEval context) needs NO
+    # post-injection snapshot: the snapshot exists only to undo a PRIOR question's LTM mutation, and with one
+    # question there is no prior. Skipping it removes a 2.7GB GPU->CPU copy AND the matching 2.7GB CPU->GPU
+    # restore per context — ~5.4GB of the ~8GB PCIe traffic per context. That traffic is the measured
+    # bottleneck when several M+ instances share one host (6 GPUs delivered only ~2x one GPU). Fidelity is
+    # unchanged: isolation still comes from restoring `pristine` before each context's injection, and MAB
+    # (~85 Q/context) still takes the snapshot path.
+    from src.memory.eval.tier2_common import group_by_context as _gbc
+    group_sizes = {c: len(v) for c, v in _gbc(items).items()}
+
     def encode_ctx(ctx, first_item):
         _restore_memory_state(model, pristine)                      # clear to pristine
         blocks = _inject_blocks(tok, ctx, args.inject_block_tokens, args.min_inject_tokens)
@@ -199,10 +209,13 @@ def run_memoryllm(args, items, model_name, repo_dir, store, dataset) -> dict:
         torch.cuda.synchronize()
         stats["encode_s"] += time.perf_counter() - t0
         stats["n_injects"] += len(blocks)
+        if group_sizes.get(ctx, 1) <= 1:
+            return None            # singleton: live memory IS the post-injection state (see note above)
         return _snapshot_memory_state(model)[0]                     # reusable post-injection memory
 
     def answer(post_snap, it):
-        _restore_memory_state(model, post_snap)                     # undo any prior question's LTM mutation
+        if post_snap is not None:
+            _restore_memory_state(model, post_snap)                 # undo any prior question's LTM mutation
         q = format_query(it, dataset)
         # pretrained mplus-8b (no chat template): LongMemEval → "Question: … Answer:"; MAB template is
         # self-contained (already carries its own task instruction + answer cue) → feed as-is.

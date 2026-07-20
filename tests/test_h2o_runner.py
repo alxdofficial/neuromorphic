@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import importlib.util
 import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -131,3 +132,57 @@ def test_dirty_signature_includes_untracked_file_contents(tmp_path):
     untracked.write_text("version = 2\n")
     second = git_commit(tmp_path)
     assert first != second
+
+
+def test_kvzip_uses_upstream_controls_and_reuses_cache(monkeypatch, tmp_path):
+    calls = {"prefill": [], "generate": [], "prune": []}
+
+    class FakeKV:
+        def prune(self, ratio):
+            calls["prune"].append(ratio)
+
+    class FakeModelKVzip:
+        def __init__(self, model_name):
+            self.gen_kwargs = {"max_new_tokens": 512}
+            self.model = SimpleNamespace(config=SimpleNamespace(_commit_hash="model-revision"))
+            self.dtype = torch.bfloat16
+
+        def prefill(self, context, **kwargs):
+            calls["prefill"].append((context, kwargs))
+            return FakeKV()
+
+        def apply_template(self, query):
+            return f"templated:{query}"
+
+        def generate(self, query, *, kv, update_cache):
+            calls["generate"].append((query, kv, update_cache, self.gen_kwargs.copy()))
+            return "answer"
+
+    fake_module = SimpleNamespace(ModelKVzip=FakeModelKVzip)
+    monkeypatch.setitem(sys.modules, "model", fake_module)
+
+    def fake_run_grouped(items, encode_ctx, answer, store, prefix, release=None):
+        memory = encode_ctx("shared context", items[0])
+        assert answer(memory, items[0]) == ("answer", "stop")
+        assert answer(memory, items[1]) == ("answer", "stop")
+
+    import src.memory.eval.tier2_common as common
+    monkeypatch.setattr(common, "run_grouped", fake_run_grouped)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+    args = SimpleNamespace(max_new_tokens=64, kvzip_prefill_chunk_size=4096, ratio=0.3)
+    items = [{"question": "one"}, {"question": "two"}]
+    meta = {}
+    RUNNER.run_kvzip(args, items, "fake-model", str(tmp_path), object(), "longmemeval", meta)
+
+    assert calls["prefill"] == [("shared context", {
+        "prefill_chunk_size": 4096, "load_score": False, "do_score": True,
+    })]
+    assert calls["prune"] == [0.3]
+    assert len(calls["generate"]) == 2
+    assert calls["generate"][0][1] is calls["generate"][1][1]
+    assert all(call[2] is False and call[3]["max_new_tokens"] == 64 for call in calls["generate"])
+    assert meta["gen_cap_enforced"] is True
+    assert meta["gen_cap_actual"] == 64
+    assert meta["model_revision_loaded"] == "model-revision"
+    assert meta["kvzip_allocation"] == "pair_nonuniform"

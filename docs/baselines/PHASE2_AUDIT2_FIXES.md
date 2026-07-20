@@ -102,8 +102,9 @@ Code fixes:
 - **Provenance:** Tier-2 artifacts now record `upstream_commit` (the cloned baseline-repo HEAD) + `scorer`.
 
 Open items — NOT code-fixable here (setup / pod / user):
-- **KVzip `--max-new-tokens`** may be accept-and-ignored upstream → pass-through is a no-op. POD-VERIFY
-  (patch KVzip's decode loop if it doesn't honor the cap).
+- ✅ **RESOLVED (2026-07-20) — KVzip generation cap:** upstream exposes generation controls through
+  `ModelKVzip.gen_kwargs`; the runner now sets and records `max_new_tokens` there instead of passing an
+  unsupported `generate()` keyword.
 - ✅ **RESOLVED (2026-07-20) — `meta-llama/Llama-3.1-8B-Instruct` gate** accepted on the HF token (account
   `alxd219p1`, download verified); SnapKV/H2O unblocked. Ungated Mistral remains a fallback.
 - **Tier-2 env isolation:** KVzip / KVCache-Factory / MemoryLLM / LCLM need mutually incompatible

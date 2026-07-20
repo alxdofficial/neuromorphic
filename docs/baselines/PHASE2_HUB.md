@@ -98,8 +98,8 @@ agent↔pod tooling in `scripts/pod/tier2_pod.py`. Integration notes: [`TIER2_GP
   of the average MAB context, substantially below the original paper's main 4–60% budget sweep.
 - **#2 KVzip** — needs the custom CUDA kernel (`cuda-nvcc` + **`cuda-cccl=12.4.*`** pin) + prebuilt flash-attn
   wheel (baked into bootstrap). Query-agnostic → correct KV baseline for MAB (36 encodes / 3071 Q). Tune
-  `--ratio` (KV retained, default 0.3). **TODO:** patch `wrapper.py` to honor `--max-new-tokens` (upstream
-  hard-codes 512; fairness vs the 64-capped panel; currently disclosed in meta).
+  `--ratio` (KV retained, default 0.3). The runner enforces the shared 64-token cap through upstream's
+  `ModelKVzip.gen_kwargs` and records the actual value.
 - **#3 M+ / MemoryLLM** — **batching within one model is impossible** (single shared `[32,10240,4096]` pool,
   batch=1 baked in). It's **overhead-bound, not compute-bound** (~0.4 s/inject wall vs ~15–25 ms compute) →
   the cost lever is **bigger `--inject-block-tokens`** (default 512; test {1024,2048} on a 50-item subsample

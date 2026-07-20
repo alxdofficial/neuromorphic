@@ -71,6 +71,12 @@ micromamba install -y -n kvzip -c nvidia cuda-nvcc "cuda-cccl=12.4.*" cuda-cudar
 pipin kvzip torch --index-url https://download.pytorch.org/whl/cu121 2>/dev/null
 pipin kvzip -r "$REPOS/KVzip/requirements.txt" 2>/dev/null
 pipin kvzip "$FA_KVZIP" 2>/dev/null && ok "flash-attn (prebuilt) in kvzip"
+# Upstream emits only sm_80/sm_90. Add the RTX 4090's sm_89 cubin without changing runtime logic.
+if ! grep -q 'compute_89' "$REPOS/KVzip/csrc/build.py"; then
+  sed -i '/# 2\. Target NVIDIA H100/i\# Target NVIDIA Ada GPUs (RTX 4090)\ncc_flag.append("-gencode")\ncc_flag.append("arch=compute_89,code=sm_89")\n' \
+    "$REPOS/KVzip/csrc/build.py"
+  ok "KVzip CUDA build target sm_89 added"
+fi
 # build the AdaKV-derived kernel; CUDA_HOME must point at the env (nvcc + cccl 12.4 live there). Upstream
 # `make i` = `cd csrc && make` (compiles+installs tiny_api_cuda) then `pip install -e .` — done explicitly:
 ( cd "$REPOS/KVzip/csrc" && CUDA_HOME="$MAMBA_ROOT_PREFIX/envs/kvzip" micromamba run -n kvzip make 2>&1 | tail -3 ) || echo "  WARN kvzip kernel compile"

@@ -19,15 +19,16 @@ Spec + provenance + exact entry points: `docs/baselines/TIER2_GPU_INTEGRATION.md
 
 | GPU | VRAM | RunPod $/hr (community) | H2O cap=2048 | KVCache-Factory (SnapKV) | KVzip | MemoryLLM/M+ |
 |---|---|---|---|---|---|---|
-| RTX 4090 | 24GB | $0.34 | fits (18.40GB max measured) | too small (~35-45GB peak) | too small (~33-38GB peak) | fits (est.) |
+| RTX 4090 | 24GB | $0.34 | fits (18.40GB max measured) | too small (~35-45GB peak) | LME-S borderline; MAB too large | fits (est.) |
 | **RTX A6000** | **48GB** | **$0.33** | fits | fits | fits | fits |
 | L40S | 48GB | $0.79 | fits | fits | fits | fits |
 | A100 80GB | 80GB | $1.19 | fits, headroom | fits, headroom | fits, headroom | fits |
 
 **Campaign runs ONE tailored pod PER MODEL (not a shared pod), on Secure Cloud** — current per-model GPU/cost
 choices live in [`docs/baselines/PHASE2_HUB.md`](../../../docs/baselines/PHASE2_HUB.md) §2. The VRAM table above
-is reference only. Key points: SnapKV/KVzip materialize the FULL ~115k-token KV before compressing
-(peak 33-45GB → want ≥48GB), whereas online H2O stays bounded; M+ never holds a full KV (fits 24GB but is **overhead-bound → cheapest on an A40**,
+is reference only. Key points: SnapKV/KVzip materialize the full KV before compressing. Qwen2.5-7B KVzip
+uses fewer KV heads than Llama, making LME-S borderline on 24GB, but full MAB still needs 80GB. Online H2O
+stays bounded; M+ never holds a full KV (fits 24GB but is **overhead-bound → cheapest on an A40**,
 not a big GPU); **LCLM runs FULL locally on the 4090** (no rental).
 
 Follow `scripts/pod/README.md` / `docs/ops/runpod_workflow.md` for the actual `runpod.py create` /
@@ -172,6 +173,10 @@ Each run writes `outputs/baselines/<dataset>__<method>__…​.json` (+ a resuma
 - **KVzip CWD assumption** — `from model import ModelKVzip` resolves relative imports inside the KVzip repo;
   if you see import errors, `cd` into the cloned `KVzip/` dir before invoking the runner (in addition to
   `--repo-dir`).
+- **KVzip peak is before pruning.** Increasing compression (`--ratio`) does not make an oversized context fit.
+  Qwen2.5-7B uses about 56 KiB of BF16 KV per token: LME-S is 99,837-111,192 tokens (~5.7-6.4GB raw KV),
+  while MAB reaches 745,586 tokens (~42.8GB raw KV). `--kvzip-prefill-chunk-size` can reduce temporary
+  prefill memory without changing reconstruction scoring; the paper/default scoring chunk remains 2,000.
 - **MemoryLLM-8B (not M+) tops out ~20k tokens** — cannot hold LongMemEval-S's ~115k-token haystack.
   `run_memoryllm.py` defaults to M+ for this reason; only override `--model` to MemoryLLM-8B/-chat if you
   want a (roundly unfair, context-truncated) sanity comparison.

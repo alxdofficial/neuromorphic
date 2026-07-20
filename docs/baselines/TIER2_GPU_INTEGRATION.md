@@ -55,7 +55,9 @@ number → we generate them under our harness (never quote paper numbers).**
   ans = m.generate(m.apply_template(question), kv=kv)
   ```
 - **Base models:** Llama-3.1-8B, Qwen2.5-7B/14B-1M, Qwen3 0.6–32B, Gemma3.
-- **VRAM:** ~16GB weights + ~15GB resident KV → **peak ~33–38GB**; ~20GB after prune(0.3).
+- **VRAM:** Qwen2.5-7B has 4 KV heads (~56 KiB/token in BF16): LongMemEval-S's 100-111k contexts use
+  ~5.7-6.4GB raw KV plus ~15.2GB weights and temporary activations, making a 24GB 4090 borderline.
+  MAB reaches 745,586 tokens (~42.8GB raw KV before pruning), so its complete run needs an 80GB-class GPU.
 - **Gotcha:** pinned CUDA 12.1 / py3.10 / `flash-attn==2.7.4.post1` (`--no-build-isolation`) + `make i` custom-kernel build. Import assumes CWD = repo root.
 
 ## 3. MemoryLLM / M+ — parametric memory
@@ -101,7 +103,7 @@ Orchestration layers over a **frozen** chat LLM (retrieval + prompting) — NOT 
 ## 7. Pod plan
 | GPU | VRAM | RunPod $/hr (community) | H2O-2048 | KVCache-Factory | KVzip | MemoryLLM/M+ | our 135M |
 |---|---|---|---|---|---|---|---|
-| RTX 4090 | 24GB | $0.34 | ✓ (measured 17.25GB) | ✗ (~35–45GB) | ✗ (~33–38GB) | ✓ (est.) | ✓ |
+| RTX 4090 | 24GB | $0.34 | ✓ (measured 17.25GB) | ✗ (~35–45GB) | LME-S borderline; MAB ✗ | ✓ (est.) | ✓ |
 | **RTX A6000** | **48GB** | **$0.33** | ✓ | ✓ | ✓ | ✓ | ✓ |
 | L40S | 48GB | $0.79 | ✓ | ✓ | ✓ | ✓ | ✓ |
 | A100 80GB | 80GB | $1.19 | ✓ | ✓ (headroom) | ✓ (headroom) | ✓ | ✓ |
