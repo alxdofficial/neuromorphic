@@ -30,3 +30,4 @@ scripts/pod/state/
 
 # Independent nested Git repository for publication reproductions.
 /literature-reproductions/
+scripts/pod/.mpod_state.json
