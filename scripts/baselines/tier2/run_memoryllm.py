@@ -35,7 +35,7 @@ REPO = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO))
 
 _DEFAULT_MODEL = "YuWangX/mplus-8b"
-_DEFAULT_REPO_DIR = "~/tier2_repos/MemoryLLM"
+_DEFAULT_REPO_DIR = str(REPO.parent / "baselines" / "MemoryLLM")  # local master/baselines; pod passes --repo-dir
 
 # Candidate attribute names for M+'s long-term-memory state (short-term `model.memory` handled separately).
 # Bounded/explicit — NOT a dir() scan — so we never accidentally snapshot the 8B weight tensors.
@@ -130,9 +130,12 @@ def _inject_blocks(tok, full_history: str, block_tokens: int, min_tokens: int) -
     return blocks
 
 
-def run_memoryllm(args, items, model_name, repo_dir, store, dataset) -> None:
-    """Encode-once/reuse loop over contexts via tier2_common.run_grouped."""
+def run_memoryllm(args, items, model_name, repo_dir, store, dataset) -> dict:
+    """Encode-once/reuse loop over contexts via tier2_common.run_grouped. Returns a timing dict (GPU-synced
+    inject vs generate seconds + counts) so the block-size sweep can read the cost lever off the artifact."""
     sys.path.insert(0, repo_dir)
+    import time
+
     import torch
     # POD-ONLY: `modeling_mplus.py` is a repo file (not a pip package); class name `MPlus` (MemoryLLM-8B/-chat
     # would be `MemoryLLM` from `modeling_memoryllm.py` — swap import + from_pretrained if benchmarking those).
@@ -152,10 +155,20 @@ def run_memoryllm(args, items, model_name, repo_dir, store, dataset) -> None:
 
     pristine, _ = _snapshot_memory_state(model)   # empty post-load state; restore before each context inject
 
+    # GPU-synced timing (excludes the ~1-2 min model load, which the sweep amortizes separately): inject time
+    # is THE block-size cost lever (bigger blocks → fewer sequential inject_memory calls → less overhead), and
+    # M+ is overhead-bound so this is what moves. Kept local to this runner (no shared-harness edit).
+    stats = {"encode_s": 0.0, "n_injects": 0, "answer_s": 0.0, "n_answers": 0}
+
     def encode_ctx(ctx, first_item):
         _restore_memory_state(model, pristine)                      # clear to pristine
-        for block in _inject_blocks(tok, ctx, args.inject_block_tokens, args.min_inject_tokens):
+        blocks = _inject_blocks(tok, ctx, args.inject_block_tokens, args.min_inject_tokens)
+        t0 = time.perf_counter()
+        for block in blocks:
             model.inject_memory(torch.tensor([block], dtype=torch.long).cuda(), update_memory=True)
+        torch.cuda.synchronize()
+        stats["encode_s"] += time.perf_counter() - t0
+        stats["n_injects"] += len(blocks)
         return _snapshot_memory_state(model)[0]                     # reusable post-injection memory
 
     def answer(post_snap, it):
@@ -165,8 +178,12 @@ def run_memoryllm(args, items, model_name, repo_dir, store, dataset) -> None:
         # self-contained (already carries its own task instruction + answer cue) → feed as-is.
         prompt = f"Question: {q} Answer:" if dataset == "longmemeval" else q
         q_ids = tok(prompt, return_tensors="pt", add_special_tokens=False).input_ids.cuda()
+        t0 = time.perf_counter()
         with torch.no_grad():
             out = model.generate(input_ids=q_ids, max_new_tokens=args.max_new_tokens)
+        torch.cuda.synchronize()
+        stats["answer_s"] += time.perf_counter() - t0
+        stats["n_answers"] += 1
         gen = out[0][q_ids.shape[1]:]
         text = tok.decode(gen, skip_special_tokens=True)
         # mplus-8b is a BASE model (no chat template / EOS discipline): it emits the answer, then rambles
@@ -181,6 +198,7 @@ def run_memoryllm(args, items, model_name, repo_dir, store, dataset) -> None:
         torch.cuda.empty_cache()   # run_grouped drops the old snapshot's ref FIRST → this reclaims its ~2.5GB
 
     run_grouped(items, encode_ctx, answer, store, "[run_memoryllm]", release=release)
+    return stats
 
 
 def main():
@@ -227,12 +245,18 @@ def main():
     if n_done:
         print(f"[run_memoryllm] resume: {n_done}/{len(items)} already done — generating the rest")
 
-    run_memoryllm(args, items, args.model, repo_dir, store, args.dataset)
+    stats = run_memoryllm(args, items, args.model, repo_dir, store, args.dataset)
+    timing = {**stats, "inject_block_tokens": args.inject_block_tokens,
+              "s_per_inject": round(stats["encode_s"] / max(stats["n_injects"], 1), 4),
+              "s_per_answer": round(stats["answer_s"] / max(stats["n_answers"], 1), 4)}
+    print(f"[run_memoryllm] timing: {stats['n_injects']} injects in {stats['encode_s']:.1f}s "
+          f"({timing['s_per_inject']:.3f}s/inject) · {stats['n_answers']} answers in {stats['answer_s']:.1f}s "
+          f"({timing['s_per_answer']:.3f}s/answer)")
 
     finalize(args.dataset, "memoryllm", args.model, items, store, use_bem=not args.no_bem,
              extra_meta={"variant": args.variant, "seed": args.seed, "max_new_tokens": args.max_new_tokens,
                          "min_inject_tokens": args.min_inject_tokens, "commit": commit,
-                         "upstream_commit": git_commit(repo_dir)},
+                         "upstream_commit": git_commit(repo_dir), "timing": timing},
              out_dir=out_dir, tag=tag, log_prefix="[run_memoryllm]")
 
 

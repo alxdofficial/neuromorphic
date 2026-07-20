@@ -5,6 +5,11 @@ canonical reference (paper title + arXiv/URL) and, where relevant, the exact Hug
 identifier used in code and our in-repo location. arXiv IDs marked **(verify)** are best-effort —
 the HF identifier / title is the authoritative anchor.
 
+> 📄 **The actual publications are vendored locally** at the master level in **`../papers/`** (sibling of this
+> `code/` repo: `~/code/neuromorphic/papers/`) — every arXiv paper below as a `pdf/` (fidelity) + a `txt/`
+> extract (grep-able, for offline agents / no-web pods). Index: `../papers/README.md`. Refresh/fill gaps:
+> `python scripts/data_build/fetch_references.py`.
+
 ---
 
 ## Backbone (frozen decoder)
@@ -37,6 +42,15 @@ the runtime I/O is our harness. *no official repo* = the authors released none.
 | **MemoryLLM** | MemoryLLM: Towards Self-Updatable LLMs (Wang et al., ICML 2024) | [2402.04624](https://arxiv.org/abs/2402.04624) | per-layer KV pool (random-drop) | `models/memoryllm/` | [wangyu-ustc/MemoryLLM](https://github.com/wangyu-ustc/MemoryLLM) (MIT) | **MemoryLLM-adapted** (write mechanism ported faithfully: co-attention compress + random-drop + positional cue; but the pool is a TRAINABLE learned init that RESETS per episode — vs upstream's non-trainable, initially-empty, persistent pool — so ~half the memory is learned init, not injected content. Report as *-adapted*, not *faithful*.) |
 | **Titans** | Titans: Learning to Memorize at Test Time (Behrouz et al., 2024) | [2501.00663](https://arxiv.org/abs/2501.00663) | **static prepend (Titans-inspired, not MAC)**; deep-MLP autograd write | `models/titans/` | **none** (ref: [lucidrains/titans-pytorch](https://github.com/lucidrains/titans-pytorch), MIT, unofficial) | reimpl-from-paper (no official repo; write kernel faithful, but window-averaged update + static read seeds + static-prepend read → **Titans-inspired**, not MAC) |
 | **H2O** | H2O: Heavy-Hitter Oracle for Efficient Generative Inference of LLMs (Zhang et al., NeurIPS 2023) | [2306.14048](https://arxiv.org/abs/2306.14048) | per-layer heavy-hitter KV selection (training-free, offline) | `models/h2o/` (eval ref) | [FMInference/H2O](https://github.com/FMInference/H2O) (MIT) | H2O-**inspired** (per-layer heavy-hitter selection improved via the repo as reference, but query-blind / offline / pre-RoPE-position-free → not a faithful online-eviction port) |
+
+### Phase-2 Tier-2 GPU baselines (run at native scale on a pod, NOT reimplemented — `scripts/baselines/tier2/`)
+Off-the-shelf mechanisms evaluated under our deterministic scorer on LongMemEval + MemoryAgentBench (`docs/baselines/PHASE2_HUB.md`).
+| Baseline | Paper | arXiv | Backbone | Official repo |
+|---|---|---|---|---|
+| **H2O / SnapKV** | (H2O above) via KVCache-Factory | [2306.14048](https://arxiv.org/abs/2306.14048) | Llama-3.1-8B | [Zefan-Cai/KVCache-Factory](https://github.com/Zefan-Cai/KVCache-Factory) (MIT) |
+| **KVzip** | KVzip: Query-Agnostic KV Cache Compression with Context Reconstruction (Kim et al., NeurIPS 2025 Oral) | [2505.23416](https://arxiv.org/abs/2505.23416) | Qwen2.5-7B | [snu-mllab/KVzip](https://github.com/snu-mllab/KVzip) (MIT) |
+| **M+ / MemoryLLM** | (M+ in the competitor table below; MemoryLLM in the baseline table above) | [2502.00592](https://arxiv.org/abs/2502.00592) | mplus-8b | [wangyu-ustc/MemoryLLM](https://github.com/wangyu-ustc/MemoryLLM) (MIT) |
+| **LCLM** ★ | End-to-End Context Compression at Scale (Li et al., 2026) | [2606.09659](https://arxiv.org/abs/2606.09659) | Qwen3 0.6B enc + 4B dec | [LeonLixyz/LCLM](https://github.com/LeonLixyz/LCLM) (license TBD) |
 
 ### Our own arm + its lineage
 | Arm / concept | Reference | arXiv | Our code |
@@ -110,7 +124,7 @@ Loaders in `src/memory/data/sources/` (train) and `src/memory/data/*.py` (eval);
 | pg19 | `emozilla/pg19` (PG-19) | Compressive Transformer / PG-19 (Rae et al., ICLR 2020) | [1911.05507](https://arxiv.org/abs/1911.05507) |
 | ruler_niah | generator | RULER (Hsieh et al., 2024) | [2404.06654](https://arxiv.org/abs/2404.06654) |
 | babilong_train | `RMT-team/babilong-train-5k-samples` | BABILong (Kuratov et al., NeurIPS 2024) | [2406.10149](https://arxiv.org/abs/2406.10149) |
-| wikibigedit | `lukasthede/WikiBigEdit` | WikiBigEdit — lifelong knowledge editing (Thede et al., 2025) | (verify) |
+| wikibigedit | `lukasthede/WikiBigEdit` | WikiBigEdit — Understanding the Limits of Lifelong Knowledge Editing (Thede et al., ICML 2025) | [2503.05683](https://arxiv.org/abs/2503.05683) |
 | swe_trajectories | `nebius/SWE-agent-trajectories` | dataset by Nebius; SWE-agent (Yang et al., NeurIPS 2024) | [2405.15793](https://arxiv.org/abs/2405.15793) |
 | perltqa | PerLTQA | PerLTQA (Du et al., 2024) | [2402.16288](https://arxiv.org/abs/2402.16288) |
 
@@ -118,6 +132,7 @@ Loaders in `src/memory/data/sources/` (train) and `src/memory/data/*.py` (eval);
 | Reader | Benchmark | Paper | arXiv |
 |---|---|---|---|
 | longmemeval | LongMemEval | Wu et al., ICLR 2025 | [2410.10813](https://arxiv.org/abs/2410.10813) |
+| memoryagentbench | MemoryAgentBench (Evaluating Memory in LLM Agents via Incremental Multi-Turn Interactions) | Hu, Wang & McAuley, ICLR 2026 | [2507.05257](https://arxiv.org/abs/2507.05257) |
 | longbench | LongBench (v1 + v2) | Bai et al., ACL 2024 | [2308.14508](https://arxiv.org/abs/2308.14508) |
 | infinitebench | ∞Bench / InfiniteBench | Zhang et al., ACL 2024 | [2402.13718](https://arxiv.org/abs/2402.13718) |
 | niah | Needle-in-a-Haystack | Kamradt, 2023 | github.com/gkamradt/LLMTest_NeedleInAHaystack |

@@ -96,6 +96,10 @@ agent↔pod tooling in `scripts/pod/tier2_pod.py`. Integration notes: [`TIER2_GP
   first — free ~2× if quality holds). Cheapest = **1× A40** (H100 wasted on an overhead-bound job); multi-GPU
   buys wall-clock only, same $. Needs `flash_attention_2`. First-line answer truncation already in (base model,
   no EOS). Details: memory `project_mplus_batching_verdict`.
+  **Prep DONE (local, off-GPU):** `run_memoryllm.py` now records GPU-synced inject/answer timing into
+  `meta.timing`; `scripts/baselines/tier2/sweep_memoryllm_blocksize.py` runs the block-size sweep on a fixed
+  subsample and prints accuracy-vs-inject-time + a recommended block. First pod action = run the sweep, set
+  the block, then the full LME + MAB run.
 - **#4 LCLM** — closest competitor (frozen-decoder + soft-token memory). Small enough to run **FULL locally on
   the 4090** (~9–10 GB; ~45–60 min full LME), **no rental**. Blocked only on HALO releasing the GPU.
 
