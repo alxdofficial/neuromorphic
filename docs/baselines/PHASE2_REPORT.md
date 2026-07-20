@@ -2,49 +2,64 @@
 
 Generated 2026-07-20 by `python scripts/baselines/report.py` from `outputs/baselines/*.json`.
 Deterministic scoring (EM + negation-guarded containment + **BEM@0.85** paraphrase for LongMemEval;
-substring/exact per-competency for MemoryAgentBench). **No LLM-as-judge** for the panel. Cell = `accuracy (n_scored)`.
-Blank cell = not run (e.g. llama full_context on MAB: only 154 of the shorter contexts fit its 131k window).
+substring/exact per-competency for MemoryAgentBench). **No LLM-as-judge** for the panel. Length-capped
+outputs are scored as emitted; `EOS_COMPLETION` preserves the natural-stop diagnostic. Cell =
+`accuracy (n_scored)`. Blank cell = not run.
 CSV companion: `PHASE2_REPORT.csv`. Index + plan: [`PHASE2_HUB.md`](PHASE2_HUB.md). Panel design + rationale:
 [`PHASE2_BASELINES.md`](PHASE2_BASELINES.md). BEM threshold + cost log below.
 
-| dataset-subtask | deepseek-v4-flash · floor | deepseek-v4-flash · full_context | deepseek-v4-flash · rag_bm25_k15 | deepseek-v4-flash · rag_bm25_k5 | llama-3.1-8b-instruct · floor | llama-3.1-8b-instruct · full_context | llama-3.1-8b-instruct · rag_bm25_k15 | llama-3.1-8b-instruct · rag_bm25_k5 |
-|---|---|---|---|---|---|---|---|---|
-| **longmemeval-OVERALL** | **0.006 (470)** | **0.687 (470)** |  | **0.594 (470)** | **0.002 (470)** | **0.462 (444)** |  | **0.404 (470)** |
-| longmemeval-COVERAGE | 1.000 (500) | 1.000 (500) |  | 1.000 (500) | 1.000 (500) | 0.944 (500) |  | 1.000 (500) |
-| longmemeval-abstention | 1.000 (30) | 0.967 (30) |  | 1.000 (30) | 0.967 (30) | 0.500 (28) |  | 0.800 (30) |
-| longmemeval-knowledge-update | 0.000 (72) | 0.819 (72) |  | 0.792 (72) | 0.000 (72) | 0.783 (69) |  | 0.708 (72) |
-| longmemeval-multi-session | 0.000 (121) | 0.612 (121) |  | 0.421 (121) | 0.000 (121) | 0.235 (115) |  | 0.182 (121) |
-| longmemeval-single-session-assistant | 0.036 (56) | 0.911 (56) |  | 0.875 (56) | 0.018 (56) | 0.731 (52) |  | 0.696 (56) |
-| longmemeval-single-session-preference | 0.000 (30) | 0.067 (30) |  | 0.000 (30) | 0.000 (30) | 0.111 (27) |  | 0.000 (30) |
-| longmemeval-single-session-user | 0.000 (64) | 0.875 (64) |  | 0.797 (64) | 0.000 (64) | 0.541 (61) |  | 0.672 (64) |
-| longmemeval-temporal-reasoning | 0.008 (127) | 0.638 (127) |  | 0.559 (127) | 0.000 (127) | 0.417 (120) |  | 0.276 (127) |
-| **memoryagentbench-OVERALL** | **0.337 (3071)** | **0.721 (2986)** | **0.646 (2944)** | **0.613 (2881)** | **0.206 (3071)** | **0.636 (154)** | **0.417 (3030)** | **0.394 (3063)** |
-| memoryagentbench-COMPETENCY_MACRO | 0.156 (3071) | 0.425 (2986) | 0.379 (2944) | 0.351 (2881) | 0.099 (3071) | 0.636 (154) | 0.223 (3030) | 0.211 (3063) |
-| memoryagentbench-COVERAGE | 1.000 (3071) | 0.972 (3071) | 0.959 (3071) | 0.938 (3071) | 1.000 (3071) | 1.000 (154) | 0.987 (3071) | 0.997 (3071) |
-| memoryagentbench-OVERALL_lenient | 0.382 (3071) | 0.882 (2986) | 0.815 (2944) | 0.760 (2881) | 0.249 (3071) | 0.636 (154) | 0.533 (3030) | 0.492 (3063) |
-| memoryagentbench-comp:Accurate_Retrieval | 0.594 (1700) | 0.936 (1682) | 0.857 (1697) | 0.819 (1700) | 0.349 (1700) | 0.636 (154) | 0.624 (1700) | 0.592 (1700) |
-| memoryagentbench-comp:Conflict_Resolution | 0.030 (800) | 0.765 (756) | 0.658 (682) | 0.585 (639) | 0.049 (800) |  | 0.269 (759) | 0.254 (792) |
-| memoryagentbench-comp:Long_Range_Understanding | 0.000 (71) | 0.000 (67) | 0.000 (67) | 0.000 (64) | 0.000 (71) |  | 0.000 (71) | 0.000 (71) |
-| memoryagentbench-comp:Test_Time_Learning | 0.000 (500) | 0.000 (481) | 0.000 (498) | 0.000 (478) | 0.000 (500) |  | 0.000 (500) | 0.000 (500) |
-| memoryagentbench-detective_qa | 0.000 (71) | 0.000 (67) | 0.000 (67) | 0.000 (64) | 0.000 (71) |  | 0.000 (71) | 0.000 (71) |
-| memoryagentbench-eventqa_131072 | 0.650 (500) | 0.961 (491) | 0.894 (500) | 0.850 (500) | 0.370 (500) |  | 0.652 (500) | 0.618 (500) |
-| memoryagentbench-eventqa_65536 | 0.726 (500) | 0.972 (498) | 0.946 (500) | 0.936 (500) | 0.458 (500) | 0.636 (154) | 0.714 (500) | 0.710 (500) |
-| memoryagentbench-eventqa_full | 0.496 (500) | 0.933 (494) | 0.829 (497) | 0.770 (500) | 0.270 (500) |  | 0.526 (500) | 0.476 (500) |
-| memoryagentbench-factconsolidation_mh_262k | 0.000 (100) | 0.235 (85) | 0.062 (64) | 0.091 (66) | 0.010 (100) |  | 0.011 (87) | 0.031 (97) |
-| memoryagentbench-factconsolidation_mh_32k | 0.010 (100) | 0.644 (90) | 0.212 (66) | 0.160 (50) | 0.000 (100) |  | 0.054 (92) | 0.061 (99) |
-| memoryagentbench-factconsolidation_mh_64k | 0.010 (100) | 0.582 (91) | 0.156 (64) | 0.107 (56) | 0.010 (100) |  | 0.063 (95) | 0.050 (100) |
-| memoryagentbench-factconsolidation_mh_6k | 0.010 (100) | 0.796 (93) | 0.767 (90) | 0.319 (69) | 0.000 (100) |  | 0.044 (91) | 0.062 (96) |
-| memoryagentbench-factconsolidation_sh_262k | 0.050 (100) | 0.835 (97) | 0.778 (99) | 0.707 (99) | 0.050 (100) |  | 0.410 (100) | 0.370 (100) |
-| memoryagentbench-factconsolidation_sh_32k | 0.040 (100) | 0.970 (100) | 0.919 (99) | 0.880 (100) | 0.110 (100) |  | 0.495 (97) | 0.460 (100) |
-| memoryagentbench-factconsolidation_sh_64k | 0.050 (100) | 0.950 (100) | 0.870 (100) | 0.848 (99) | 0.140 (100) |  | 0.561 (98) | 0.530 (100) |
-| memoryagentbench-factconsolidation_sh_6k | 0.070 (100) | 1.000 (100) | 0.970 (100) | 0.900 (100) | 0.070 (100) |  | 0.444 (99) | 0.450 (100) |
-| memoryagentbench-icl_banking77_5900shot_balance | 0.000 (100) | 0.000 (100) | 0.000 (100) | 0.000 (100) | 0.000 (100) |  | 0.000 (100) | 0.000 (100) |
-| memoryagentbench-icl_clinic150_7050shot_balance | 0.000 (100) | 0.000 (99) | 0.000 (100) | 0.000 (99) | 0.000 (100) |  | 0.000 (100) | 0.000 (100) |
-| memoryagentbench-icl_nlu_8296shot_balance | 0.000 (100) | 0.000 (96) | 0.000 (100) | 0.000 (96) | 0.000 (100) |  | 0.000 (100) | 0.000 (100) |
-| memoryagentbench-icl_trec_coarse_6600shot_balance | 0.000 (100) | 0.000 (96) | 0.000 (99) | 0.000 (96) | 0.000 (100) |  | 0.000 (100) | 0.000 (100) |
-| memoryagentbench-icl_trec_fine_6400shot_balance | 0.000 (100) | 0.000 (90) | 0.000 (99) | 0.000 (87) | 0.000 (100) |  | 0.000 (100) | 0.000 (100) |
-| memoryagentbench-ruler_qa1_197K | 0.290 (100) | 0.860 (100) | 0.660 (100) | 0.600 (100) | 0.210 (100) |  | 0.640 (100) | 0.590 (100) |
-| memoryagentbench-ruler_qa2_421K | 0.450 (100) | 0.717 (99) | 0.560 (100) | 0.550 (100) | 0.230 (100) |  | 0.510 (100) | 0.450 (100) |
+| dataset-subtask | Llama-3.1-8B-Instruct · h2o | deepseek-v4-flash · floor | deepseek-v4-flash · full_context | deepseek-v4-flash · rag_bm25_k15 | deepseek-v4-flash · rag_bm25_k5 | llama-3.1-8b-instruct · floor | llama-3.1-8b-instruct · full_context | llama-3.1-8b-instruct · rag_bm25_k15 | llama-3.1-8b-instruct · rag_bm25_k5 | mplus-8b · memoryllm |
+|---|---|---|---|---|---|---|---|---|---|---|
+| **longmemeval-OVERALL** | **0.066 (470)** | **0.006 (470)** | **0.687 (470)** |  | **0.594 (470)** | **0.002 (470)** | **0.462 (444)** |  | **0.404 (470)** | **1.000 (1)** |
+| longmemeval-COVERAGE | 1.000 (500) | 1.000 (500) | 1.000 (500) |  | 1.000 (500) | 1.000 (500) | 0.944 (500) |  | 1.000 (500) | 1.000 (1) |
+| longmemeval-EOS_COMPLETION | 0.390 (500) | 1.000 (500) | 1.000 (500) |  | 1.000 (500) | 1.000 (500) | 0.944 (500) |  | 1.000 (500) |  |
+| longmemeval-abstention | 0.333 (30) | 1.000 (30) | 0.967 (30) |  | 1.000 (30) | 0.967 (30) | 0.500 (28) |  | 0.800 (30) |  |
+| longmemeval-knowledge-update | 0.083 (72) | 0.000 (72) | 0.819 (72) |  | 0.792 (72) | 0.000 (72) | 0.783 (69) |  | 0.708 (72) |  |
+| longmemeval-multi-session | 0.017 (121) | 0.000 (121) | 0.612 (121) |  | 0.421 (121) | 0.000 (121) | 0.235 (115) |  | 0.182 (121) |  |
+| longmemeval-single-session-assistant | 0.054 (56) | 0.036 (56) | 0.911 (56) |  | 0.875 (56) | 0.018 (56) | 0.731 (52) |  | 0.696 (56) |  |
+| longmemeval-single-session-preference | 0.000 (30) | 0.000 (30) | 0.067 (30) |  | 0.000 (30) | 0.000 (30) | 0.111 (27) |  | 0.000 (30) |  |
+| longmemeval-single-session-user | 0.047 (64) | 0.000 (64) | 0.875 (64) |  | 0.797 (64) | 0.000 (64) | 0.541 (61) |  | 0.672 (64) | 1.000 (1) |
+| longmemeval-temporal-reasoning | 0.134 (127) | 0.008 (127) | 0.638 (127) |  | 0.559 (127) | 0.000 (127) | 0.417 (120) |  | 0.276 (127) |  |
+| **memoryagentbench-OVERALL** | **0.278 (3071)** | **0.337 (3071)** | **0.701 (3071)** | **0.622 (3061)** | **0.579 (3052)** | **0.206 (3071)** | **0.636 (154)** | **0.414 (3071)** | **0.393 (3071)** |  |
+| memoryagentbench-COMPETENCY_MACRO | 0.138 (3071) | 0.156 (3071) | 0.412 (3071) | 0.356 (3061) | 0.324 (3052) | 0.099 (3071) | 0.636 (154) | 0.222 (3071) | 0.211 (3071) |  |
+| memoryagentbench-COVERAGE | 1.000 (3071) | 1.000 (3071) | 1.000 (3071) | 0.997 (3071) | 0.994 (3071) | 1.000 (3071) | 1.000 (154) | 1.000 (3071) | 1.000 (3071) |  |
+| memoryagentbench-EOS_COMPLETION | 0.892 (3071) | 1.000 (3071) | 0.972 (3071) | 0.959 (3071) | 0.938 (3071) | 1.000 (3071) | 1.000 (154) | 0.987 (3071) | 0.997 (3071) |  |
+| memoryagentbench-OVERALL_lenient | 0.377 (3071) | 0.382 (3071) | 0.885 (3071) | 0.822 (3061) | 0.774 (3052) | 0.249 (3071) | 0.636 (154) | 0.528 (3071) | 0.491 (3071) |  |
+| memoryagentbench-comp:Accurate_Retrieval | 0.456 (1700) | 0.594 (1700) | 0.926 (1700) | 0.855 (1700) | 0.819 (1700) | 0.349 (1700) | 0.636 (154) | 0.624 (1700) | 0.592 (1700) |  |
+| memoryagentbench-comp:Conflict_Resolution | 0.096 (800) | 0.030 (800) | 0.723 (800) | 0.568 (790) | 0.476 (786) | 0.049 (800) |  | 0.263 (800) | 0.253 (800) |  |
+| memoryagentbench-comp:Long_Range_Understanding | 0.000 (71) | 0.000 (71) | 0.000 (71) | 0.000 (71) | 0.000 (69) | 0.000 (71) |  | 0.000 (71) | 0.000 (71) |  |
+| memoryagentbench-comp:Test_Time_Learning | 0.000 (500) | 0.000 (500) | 0.000 (500) | 0.000 (500) | 0.000 (497) | 0.000 (500) |  | 0.000 (500) | 0.000 (500) |  |
+| memoryagentbench-detective_qa | 0.000 (71) | 0.000 (71) | 0.000 (71) | 0.000 (71) | 0.000 (69) | 0.000 (71) |  | 0.000 (71) | 0.000 (71) |  |
+| memoryagentbench-eventqa_131072 | 0.510 (500) | 0.650 (500) | 0.944 (500) | 0.894 (500) | 0.850 (500) | 0.370 (500) |  | 0.652 (500) | 0.618 (500) |  |
+| memoryagentbench-eventqa_65536 | 0.566 (500) | 0.726 (500) | 0.968 (500) | 0.946 (500) | 0.936 (500) | 0.458 (500) | 0.636 (154) | 0.714 (500) | 0.710 (500) |  |
+| memoryagentbench-eventqa_full | 0.412 (500) | 0.496 (500) | 0.922 (500) | 0.824 (500) | 0.770 (500) | 0.270 (500) |  | 0.526 (500) | 0.476 (500) |  |
+| memoryagentbench-factconsolidation_mh_262k | 0.010 (100) | 0.000 (100) | 0.200 (100) | 0.041 (97) | 0.062 (96) | 0.010 (100) |  | 0.020 (100) | 0.030 (100) |  |
+| memoryagentbench-factconsolidation_mh_32k | 0.010 (100) | 0.010 (100) | 0.580 (100) | 0.143 (98) | 0.086 (93) | 0.000 (100) |  | 0.050 (100) | 0.060 (100) |  |
+| memoryagentbench-factconsolidation_mh_64k | 0.020 (100) | 0.010 (100) | 0.530 (100) | 0.105 (95) | 0.061 (99) | 0.010 (100) |  | 0.060 (100) | 0.050 (100) |  |
+| memoryagentbench-factconsolidation_mh_6k | 0.060 (100) | 0.010 (100) | 0.740 (100) | 0.690 (100) | 0.224 (98) | 0.000 (100) |  | 0.040 (100) | 0.070 (100) |  |
+| memoryagentbench-factconsolidation_sh_262k | 0.050 (100) | 0.050 (100) | 0.810 (100) | 0.770 (100) | 0.700 (100) | 0.050 (100) |  | 0.410 (100) | 0.370 (100) |  |
+| memoryagentbench-factconsolidation_sh_32k | 0.120 (100) | 0.040 (100) | 0.970 (100) | 0.910 (100) | 0.880 (100) | 0.110 (100) |  | 0.510 (100) | 0.460 (100) |  |
+| memoryagentbench-factconsolidation_sh_64k | 0.140 (100) | 0.050 (100) | 0.950 (100) | 0.870 (100) | 0.840 (100) | 0.140 (100) |  | 0.560 (100) | 0.530 (100) |  |
+| memoryagentbench-factconsolidation_sh_6k | 0.360 (100) | 0.070 (100) | 1.000 (100) | 0.970 (100) | 0.900 (100) | 0.070 (100) |  | 0.450 (100) | 0.450 (100) |  |
+| memoryagentbench-icl_banking77_5900shot_balance | 0.000 (100) | 0.000 (100) | 0.000 (100) | 0.000 (100) | 0.000 (100) | 0.000 (100) |  | 0.000 (100) | 0.000 (100) |  |
+| memoryagentbench-icl_clinic150_7050shot_balance | 0.000 (100) | 0.000 (100) | 0.000 (100) | 0.000 (100) | 0.000 (100) | 0.000 (100) |  | 0.000 (100) | 0.000 (100) |  |
+| memoryagentbench-icl_nlu_8296shot_balance | 0.000 (100) | 0.000 (100) | 0.000 (100) | 0.000 (100) | 0.000 (98) | 0.000 (100) |  | 0.000 (100) | 0.000 (100) |  |
+| memoryagentbench-icl_trec_coarse_6600shot_balance | 0.000 (100) | 0.000 (100) | 0.000 (100) | 0.000 (100) | 0.000 (100) | 0.000 (100) |  | 0.000 (100) | 0.000 (100) |  |
+| memoryagentbench-icl_trec_fine_6400shot_balance | 0.000 (100) | 0.000 (100) | 0.000 (100) | 0.000 (100) | 0.000 (99) | 0.000 (100) |  | 0.000 (100) | 0.000 (100) |  |
+| memoryagentbench-ruler_qa1_197K | 0.080 (100) | 0.290 (100) | 0.860 (100) | 0.660 (100) | 0.600 (100) | 0.210 (100) |  | 0.640 (100) | 0.590 (100) |  |
+| memoryagentbench-ruler_qa2_421K | 0.240 (100) | 0.450 (100) | 0.710 (100) | 0.560 (100) | 0.550 (100) | 0.230 (100) |  | 0.510 (100) | 0.450 (100) |  |
+
+### H2O publication congruence
+
+The [H2O paper](https://arxiv.org/abs/2306.14048) and
+[official implementation](https://github.com/FMInference/H2O) evaluate OPT/LLaMA/GPT-NeoX on short
+few-shot QA and summarization, not Llama-3.1 on LongMemEval or MemoryAgentBench. Its main quality result uses
+4–60% of prompt length (typically 20%) and reports H2O near full-cache quality. Our fixed 2,048-token cache is
+only ~1.9% of the average LME prompt and ~1.1% of the average MAB context, so the aggregate scores are an
+out-of-distribution stress test, not a paper reproduction. The closest published slice is 10-document QA:
+H2O-256-256 scores approximately 34–48 EM depending on answer location; our MAB Accurate Retrieval slice is
+45.6%. That narrow retrieval result is roughly congruent, while zero Test-Time Learning/Long-Range and 9.6%
+Conflict Resolution show that H2O does not extend to the broader memory capabilities tested here.
 
 ---
 
@@ -103,4 +118,3 @@ all numbers in this report are BEM@0.85. `finalize()` records `bem_threshold` in
 | MemoryAgentBench deepseek full_context (3,071 Q, deepseek-pinned 50× prefix-cache) | ~$2–3 | done; naive re-send would be ~$66 |
 
 Tier-1 total ≈ **$17**. Tier-2 (GPU pod campaign) budget + per-model plan: [`PHASE2_HUB.md`](PHASE2_HUB.md).
-

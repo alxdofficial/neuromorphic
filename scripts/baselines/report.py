@@ -51,11 +51,14 @@ def collect(pattern: str):
         if n_over is None:
             n_over = agg.get("n_nonabstention")
         cells[(f"{dataset}-OVERALL", col)] = (agg.get("overall_accuracy"), n_over)
-        # COVERAGE QC row: fraction of selected items that produced a scorable answer (<1.0 ⇒ errors/cutoffs
-        # were EXCLUDED from accuracy, not counted wrong — the accuracy above is over fewer items).
+        # COVERAGE QC row: fraction that produced a scoreable model output (provider/execution failures are
+        # excluded). Token-cap outputs are scored; EOS_COMPLETION reports their separate completion signal.
         cov = meta.get("coverage")
         if cov is not None:
             cells[(f"{dataset}-COVERAGE", col)] = (cov, meta.get("n"))
+        eos_rate = meta.get("eos_completion_rate")
+        if eos_rate is not None:
+            cells[(f"{dataset}-EOS_COMPLETION", col)] = (eos_rate, meta.get("n"))
         # audit #15: overall_accuracy is a per-source MICRO-average (MAB is dominated by Accurate_Retrieval's
         # 1,700 Q). Surface the competency MACRO-average + per-competency + the intent-parsed lenient overall
         # so architecture comparisons aren't read off the AR-skewed micro number.
@@ -106,7 +109,7 @@ def to_markdown(rows, cols, cells) -> str:
 
 def to_csv(rows, cols, cells, path: Path):
     with open(path, "w", newline="") as f:
-        w = csv.writer(f)
+        w = csv.writer(f, lineterminator="\n")
         w.writerow(["dataset-subtask", *cols])
         for r in rows:
             w.writerow([r, *[(_fmt(cells.get((r, c))) or "") for c in cols]])

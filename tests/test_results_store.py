@@ -25,13 +25,13 @@ def test_errors_are_not_done_and_get_retried(tmp_path):
     assert s.done_ids() == {"a"}                       # errored 'b' is NOT done → will be retried
 
 
-def test_length_cutoff_empty_is_retryable(tmp_path):
+def test_length_cutoff_is_complete_under_fixed_budget(tmp_path):
     p = tmp_path / "s.jsonl"
     s = ResultStore(p)
     s.append({**_rec("a"), "finish_reason": "stop"})                    # good answer → done
-    s.append({**_rec("b", hyp=""), "finish_reason": "length"})         # cut off, empty → NOT done (retry)
+    s.append({**_rec("b", hyp=""), "finish_reason": "length"})         # real output under fixed cap
     s.append({**_rec("c", hyp="Refuse."), "finish_reason": "stop"})    # non-empty → done
-    assert s.done_ids() == {"a", "c"}
+    assert s.done_ids() == {"a", "b", "c"}
 
 
 def test_last_wins_on_retry(tmp_path):

@@ -9,7 +9,8 @@ and the pod plan. Two kinds (mechanism cut, see `PHASE2_BASELINES.md` §2.5):
 - **Cartridges (§5): DROPPED as a runnable baseline** (per-corpus training doesn't fit private haystacks) →
   cite-only.
 
-**Now ACTIVE as a per-model pod campaign** (KVzip → H2O/SnapKV → M+ → LCLM, one tailored pod at a time; live
+**Now ACTIVE as a per-model pod campaign** (H2O/SnapKV → KVzip → M+, one tailored pod at a time; LCLM was
+dropped from the runnable panel on 2026-07-20; live
 status + GPU/cost per model in [`PHASE2_HUB.md`](PHASE2_HUB.md) §2). **The mechanisms report NO LongMemEval
 number → we generate them under our harness (never quote paper numbers).**
 
@@ -64,7 +65,8 @@ number → we generate them under our harness (never quote paper numbers).**
 - **VRAM:** ~16GB weights + ~3.3GB pool → plausibly fits 24GB (unverified; authors used H100-80GB). M+ CPU-offload → not materially more VRAM than 8B.
 - **No LongMemEval runner exists** — hand-write the write-then-query loop (chunk history → inject per session → generate for the question). **MemoryLLM-8B (~20k) cannot hold 115k → use M+ only.**
 
-## 4. LCLM — end-to-end soft-token compressor at scale (★ closest concurrent competitor)
+## 4. LCLM — DROPPED runnable baseline (reference only)
+- **Project status:** dropped 2026-07-20. Keep this integration record for provenance; do not schedule a run.
 - Repo [LeonLixyz/LCLM](https://github.com/LeonLixyz/LCLM) · HF org [latent-context](https://huggingface.co/latent-context) · ⚠ **LICENSE NOT STATED** (no LICENSE file, no model-card license) → **redistribution blocker; clarify before use/citation.**
 - **Checkpoints:** `latent-context/0.6b-4b-LCLM-{4x,8x,16x}` (= 0.6B encoder + 4B decoder, compression 4×/8×/16×). Eval data `latent-context/lclm-eval` (configs ruler/gsm8k/longhealth5/longbench).
 - **Base models:** encoder `Qwen/Qwen3-Embedding-0.6B`, decoder `Qwen/Qwen3-4B-Instruct-2507`.
@@ -107,7 +109,7 @@ Orchestration layers over a **frozen** chat LLM (retrieval + prompting) — NOT 
 The VRAM table is reference only. **Current campaign uses Secure Cloud, ONE tailored pod PER MODEL** (not a
 shared pod) — see [`PHASE2_HUB.md`](PHASE2_HUB.md) §2 for the actual per-model GPU/cost choices. Key deviations
 from the old "single A6000 covers all" plan: **M+ is overhead-bound not compute-bound → cheapest on an A40, not
-a big GPU** (memory `project_mplus_batching_verdict`); **LCLM runs FULL locally on the 4090** (no rental); the
+a big GPU** (memory `project_mplus_batching_verdict`); LCLM is dropped; the
 KV methods (peak 33–45GB before compression) are the >24GB forcing function that wants ≥48GB.
 
 ## Scaffolding plan (`scripts/baselines/tier2/`)

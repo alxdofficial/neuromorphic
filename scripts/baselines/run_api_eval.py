@@ -109,14 +109,14 @@ def build_all(items, mode, budget, bm25_topk, dense):
 
 
 def _valid_for_scoring(r) -> bool:
-    """A record counts toward accuracy only if it carries a real, COMPLETE model answer. EXCLUDE API errors
-    and ANY answer cut off at the token cap (finish_reason='length' — empty OR partial), PLUS provider
-    failures that arrive as a terminal finish_reason (error / content_filter) even when no `error` field was
-    recorded (audit #2: OpenRouter can return content_filter with blank/partial content — a refusal, not a
-    wrong answer). These are harness artifacts; counting them would deflate accuracy. Surfaced as coverage."""
+    """A record is scoreable unless generation failed outside the model's configured output budget.
+
+    A `length` finish is the model's emitted prediction under that budget and stays in the denominator.
+    Provider errors/content filters remain excluded because they are not comparable model answers.
+    """
     if r.get("error"):
         return False
-    if r.get("finish_reason") in ("length", "error", "content_filter"):
+    if r.get("finish_reason") in ("error", "content_filter"):
         return False
     return True
 
@@ -207,13 +207,17 @@ async def run_one(client, model, mode, items, token_budget, char_budget, bm25_to
     # n_gen_cutoff = answers cut off at the token cap (empty/partial content) — QC signal to raise --max-tokens.
     n_cutoff = sum(1 for r in sel if r.get("finish_reason") == "length")
     n_err = sum(1 for r in sel if r.get("error"))
+    n_eos = sum(1 for r in sel if _valid_for_scoring(r) and r.get("finish_reason") != "length")
     meta = {"n": len(sel), "n_pending_this_run": len(pending),
-            # coverage = fraction of selected items that produced a scorable answer. <1.0 ⇒ errors/cutoffs
-            # were EXCLUDED from accuracy (not counted wrong); rerun to fill them before trusting the number.
+            # Coverage excludes only provider/execution failures. Token-cap hits are scored predictions;
+            # eos_completion_rate preserves their separate QC signal.
             "n_scored": n_valid, "coverage": round(n_valid / len(sel), 4) if sel else None,
             "n_errors": n_err,
             "n_input_truncated": sum(1 for r in sel if r.get("truncated")),
             "n_gen_cutoff": n_cutoff,
+            "n_eos_completed": n_eos,
+            "eos_completion_rate": round(n_eos / len(sel), 4) if sel else None,
+            "scoring_policy": "score_length_capped_output",
             "prompt_tokens": pin, "completion_tokens": pout, "cached_tokens": pcached,
             "cache_hit_frac": round(pcached / pin, 4) if pin else None, "provider": provider_slug,
             "cost_usd": round(cost_usd(model, pin, pout, pcached, provider_slug), 4)}
@@ -324,8 +328,12 @@ def main():
                     cov = meta.get("coverage")
                     if cov is not None and cov < 1.0:
                         print(f"  ⚠ COVERAGE {cov:.1%}: {meta['n'] - meta['n_scored']}/{meta['n']} items NOT "
-                              f"scored (errors={meta['n_errors']}, gen_cutoffs={meta['n_gen_cutoff']}) — "
-                              f"EXCLUDED from accuracy, not counted wrong. Rerun to fill before trusting it.")
+                              f"scored (errors={meta['n_errors']}) — provider/execution failures are "
+                              f"excluded from accuracy. Rerun to fill before trusting it.")
+                    if meta.get("n_gen_cutoff"):
+                        print(f"  QC: {meta['n_gen_cutoff']}/{meta['n']} outputs reached the configured token "
+                              f"cap; they ARE scored as emitted (EOS completion "
+                              f"{meta['eos_completion_rate']:.1%}).")
                     # aggregate JSON (per-item records live in the resumable store cache/<tag>.jsonl). `mode`
                     # carries report_mode (audit #7: report.py keys columns by it — else k5/k15 collide).
                     # Record the reserve policy + prompt-code version for traceability (audit #6).

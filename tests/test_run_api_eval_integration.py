@@ -1,7 +1,7 @@
 """Offline integration test of the async runner `run_one` (no network, stub client).
 
 Exercises the parts NOT reachable by the pure-function unit tests: coverage/error/cutoff accounting (#9),
-partial-cutoff exclusion + retryability (#10), selection-scoped scoring so a bigger cached run doesn't
+length-capped output scoring, selection-scoped scoring so a bigger cached run doesn't
 leak in (#11), and competency threading for MemoryAgentBench (#12).
 """
 import asyncio
@@ -49,7 +49,7 @@ def test_run_one_coverage_cutoff_and_scoping(tmp_path):
         "dog's name": CallResult("Cooper", 10, 2, None, "stop"),        # correct
         "move": CallResult("Portland", 10, 2, None, "stop"),            # correct
         "car": CallResult("", 10, 0, "Timeout 500", None),              # transient error → excluded, retry
-        "job": CallResult("bak", 10, 5, None, "length"),                # partial cutoff → excluded, retry
+        "job": CallResult("bak", 10, 5, None, "length"),                # partial cutoff → scored as emitted
     }
     client = StubClient(responses)
     store = ResultStore(tmp_path / "s.jsonl")
@@ -61,19 +61,19 @@ def test_run_one_coverage_cutoff_and_scoping(tmp_path):
         client, "stub/model", "floor", items, None, 440_000, 5, None, 256, store, score_longmemeval, False))
 
     # coverage/accounting (#9/#10)
-    assert meta["n"] == 4 and meta["n_scored"] == 2 and meta["coverage"] == 0.5
+    assert meta["n"] == 4 and meta["n_scored"] == 3 and meta["coverage"] == 0.75
     assert meta["n_errors"] == 1 and meta["n_gen_cutoff"] == 1
-    # only the 2 valid, correct answers count — stray '999' excluded by selection scoping (#11)
-    assert agg["overall_accuracy"] == 1.0 and agg["n_nonabstention"] == 2
-    # error + partial-cutoff are retryable → not "done" (of the 4 SELECTED items, only 1 & 2 are done;
-    # the stray 999 is also 'done' but that's about resumption, not this run's scoring scope).
-    assert store.done_ids() & {"1", "2", "3", "4"} == {"1", "2"}
+    assert meta["n_eos_completed"] == 2 and meta["eos_completion_rate"] == 0.5
+    # Capped "bak" is scored wrong; stray '999' remains excluded by selection scoping (#11).
+    assert agg["overall_accuracy"] == 2 / 3 and agg["n_nonabstention"] == 3
+    # Only the transport error is retried. The capped prediction is final for this fixed-budget store.
+    assert store.done_ids() & {"1", "2", "3", "4"} == {"1", "2", "4"}
 
-    # resume: a second run re-requests ONLY the 2 unfinished (3=error, 4=cutoff), not the 2 done
+    # Resume requests only the errored item, not the deterministic length-capped prediction.
     client.calls = 0
     asyncio.run(run_api_eval.run_one(
         client, "stub/model", "floor", items, None, 440_000, 5, None, 256, store, score_longmemeval, False))
-    assert client.calls == 2
+    assert client.calls == 1
 
 
 def test_run_one_threads_competency_for_mab(tmp_path):

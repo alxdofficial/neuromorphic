@@ -24,8 +24,9 @@ MemoryAgentBench@455306d utils/templates.py) so #1/#7 reproduce the benchmarks e
 - [x] #3  **(J)** Whitespace-guard the `/` gold-alternate split (stop corrupting `1/48`, dates, ratios);
         keep paren + " or "; lean on BEM for verbose golds. `longmemeval_score.py`.
 - [x] #4  **(J)** Bare-number containment false-positive: strict-numeric handling + documented caveat.
-- [x] #10 All `finish_reason=="length"` cutoffs retryable + excluded from scoring (not just empty ones).
-        `results.py` `done_ids` + `run_api_eval.py` `_valid_for_scoring`.
+- [x] #10 `finish_reason=="length"` is retained for completion-rate QC. **Superseded 2026-07-20:**
+        capped text is a model prediction under the fixed output budget and is now scored/cached; only
+        provider/execution failures are excluded and retried. A larger cap has a distinct run signature.
 
 ## Batch C — Tier-1 harness bookkeeping
 - [x] #9  Surface COVERAGE prominently (n_scored/n_total) + report strict-accuracy alongside; distinguish
@@ -91,7 +92,8 @@ Code fixes:
   if the sequence is longer than the input (`run_lclm._generate_new_tokens`); + length-cutoff detection.
 - **Dense retrieval re-embedding:** `DenseRetriever` now caches passage embeddings per context (~36 unique
   MAB contexts were re-encoded per question → ~1.4M encodings; now ~16k).
-- **Tier-2 length-cutoffs now EXCLUDED from scoring** (M+, LCLM, SnapKV/H2O) — matches Tier-1 policy.
+- **Tier-2 length cutoffs are tracked separately from score coverage.** Superseded 2026-07-20: emitted text
+  is scored; `eos_completion_rate` records how often generation terminated naturally.
 - **MAB source-filter under-fill:** per-source cap is relaxed to `max_examples` when `--sources` narrows the
   set (was `ceil(max_examples/12)` → a single-source filter returned only 9).
 - **2b fidelity:** A-MEM now passes each session's REAL date (not wall-clock) to `add_note`; MemoryOS state

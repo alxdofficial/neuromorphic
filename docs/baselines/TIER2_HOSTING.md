@@ -22,7 +22,7 @@ the 500 questions has its own unique history → nothing to reuse; the levers th
 |---|---|---|---|
 | **KV-eviction** | compressed KV cache | prefill context → compress → **cache the compressed KV** → every question decodes from it | **use KVzip, not SnapKV** (see below) |
 | **MemoryLLM / M+** | memory-pool snapshot | write context session-by-session → **snapshot memory state** → answer all its questions → restore for next context | `_snapshot_memory_state` already scaffolded in `run_memoryllm.py` |
-| **LCLM** | encoded latents | encoder compresses context → **cache the latent tokens** → decoder consumes cached latents + each question | LCLM compresses *before* decoder prefill → cheap per-question |
+| **LCLM (dropped; reference only)** | encoded latents | encoder compresses context → cache latent tokens → decoder consumes cached latents + each question | No Phase-2 run planned as of 2026-07-20 |
 
 ## Multi-query KV baselines: KVzip and infinite H2O
 
@@ -63,6 +63,6 @@ With per-context reuse, **MAB local drops from ~30 GPU-hr/method to ~1.5–2 hr/
 encodes + 3,071 cheap question-decodes, vs. 3,071 heavy encodes). So MAB can ride along on the pod, not just
 LongMemEval — *if* we wire the reuse. Caveat unchanged: 8B methods still **truncate MAB contexts > their
 window** (AR up to 881k → 128k), so those competencies are truncation-limited exactly as the API llama was;
-KVzip/MemoryLLM are meaningful on the ≤128k competencies, LCLM (compresses first) can reach further.
+KVzip/MemoryLLM are meaningful on the ≤128k competencies; H2O provides the active infinite-streaming row.
 
 **Net:** wire the reuse before renting. It's the difference between a feasible ~2-hr pod and a multi-day one.

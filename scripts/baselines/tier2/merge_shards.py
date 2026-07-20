@@ -47,8 +47,14 @@ def main():
 
     agg = score_dataset(args.dataset, records, use_bem=not args.no_bem)
     items = load_items(args.dataset, variant=args.variant, max_examples=args.max_examples)
+    n_cutoff = sum(1 for r in by_qid.values() if r.get("finish_reason") == "length")
+    n_eos = sum(1 for r in by_qid.values()
+                if valid_for_scoring(r) and r.get("finish_reason") != "length")
     meta = {"n": len(by_qid), "n_scored": len(records), "n_shards": len(shard_files),
             "coverage": round(len(records) / len(items), 4) if items else None,
+            "n_gen_cutoff": n_cutoff, "n_eos_completed": n_eos,
+            "eos_completion_rate": round(n_eos / len(items), 4) if items else None,
+            "scoring_policy": "score_length_capped_output",
             "bem_threshold": (0.85 if (not args.no_bem and args.dataset == "longmemeval") else None)}
     payload = {"dataset": args.dataset, "method": "memoryllm", "model": "YuWangX/mplus-8b", "mode": "memoryllm",
                "meta": meta, "aggregate": {k: v for k, v in agg.items() if k != "details"}}

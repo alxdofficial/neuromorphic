@@ -222,7 +222,7 @@ def run_memoryllm(args, items, model_name, repo_dir, store, dataset) -> dict:
         text = tok.decode(gen, skip_special_tokens=True)
         # mplus-8b is a BASE model (no chat template / EOS discipline): it emits the answer, then rambles
         # into hallucinated follow-up "Question: … Answer: …" turns, so it reaches the token cap without an
-        # EOS and finish_reason_of() would mark every item "length" → excluded from scoring (coverage 0).
+        # EOS and finish_reason_of() would mark every item "length", obscuring the useful completion-rate QC.
         # Take the FIRST line as the answer (the standard base-model QA convention) and report a clean stop
         # so the answer IS scored. (The raw multi-line text is still in the record for audit.)
         answer_text = text.split("\n")[0].strip() or text.strip()

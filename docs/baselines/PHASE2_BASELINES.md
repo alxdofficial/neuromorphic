@@ -1,7 +1,8 @@
 # Phase-2 Baseline Establishment — Plan & Runbook
 
 **Status (updated 2026-07-20): Panel-B (native-scale) EXECUTING.** Tier-1 (API long-context + RAG) is **DONE**;
-Tier-2 (GPU memory mechanisms) is a **per-model pod campaign** (KVzip → H2O/SnapKV → M+ → LCLM). **Panel-A
+Tier-2 (GPU memory mechanisms) is a **per-model campaign** (H2O complete; KVzip/SnapKV/M+ pending; LCLM
+dropped). **Panel-A
 (matched-135M)** remains **DEFERRED** until our own model exists (it's the fair fight our number slots into).
 This file is the design rationale; **live status + results = [`PHASE2_HUB.md`](PHASE2_HUB.md)**.
 Establish reference numbers for established SOTA memory/long-context baselines on a fixed benchmark +
@@ -30,6 +31,9 @@ scoring.
 > weights**, which benchmarks the same SnapKV/KVzip baselines we do → our closest concurrent competitor;
 > engage head-on (novelty note in §2.5). Corrections applied vs the source addendum: **Memory-R1 code is NOT
 > released** (cite-only, not a runnable 2b); **A-MEM repo = `WujiangXu/A-mem`** (not `agiresearch`).
+
+> **REVISION 2026-07-20c:** **LCLM dropped from the runnable Phase-2 panel by project decision.** Retain its
+> related-work/novelty analysis below, but do not schedule or report an LCLM benchmark row.
 
 Companion docs: `docs/baselines/FROZEN_COMPETITORS.md` (landscape), `docs/data/DATA_PHASES_PLAN.md`
 (two-phase plan), `docs/RESULTS.md` (Phase-0 results log).
@@ -87,9 +91,9 @@ so "full-context" is not a Panel-A entry (only meaningful on the oracle split / 
 Skipped as headline: Mem0/Zep/Letta (numbers 36–94% for one system; need an API backend; only worth it
 re-run under our fixed harness).
 
-> **Mechanism competitors (LCLM / Cartridges / Larimar / MemoryLLM-M+ / one agent-memory system) are all
+> **Mechanism competitors (Cartridges / Larimar / MemoryLLM-M+ / one agent-memory system) are all
 > native-scale too → they slot into THIS panel.** Their mechanism classification (2a vs 2b), priority, and
-> the LCLM novelty note live in §2.5 to keep this scale-table uncluttered.
+> the cite-only LCLM novelty note live in §2.5 to keep this scale-table uncluttered.
 
 ---
 
@@ -113,7 +117,7 @@ reimplementation). Rule for ALL of these: **re-run under our fixed harness; neve
 ### 2a — architectural (priority-ordered)
 | baseline | status | mechanism | scale / GPU | why |
 |---|---|---|---|---|
-| **LCLM** ★ | **ADD (must)** | encoder → soft tokens → adapter → **frozen-init 4B** decoder, e2e continual-pretrain, 4×/8×/16× | Qwen3-Emb-0.6B enc + 4B dec; **released weights**; 1 GPU **inference-only** | our architecture family AT SCALE with weights; benchmarks the same SnapKV/KVzip we do → closest concurrent competitor (novelty note below) |
+| **LCLM** | **DROPPED (cite-only)** | encoder → soft tokens → adapter → **frozen-init 4B** decoder, e2e continual-pretrain, 4×/8×/16× | Qwen3-Emb-0.6B enc + 4B dec; released weights | related-work comparator only; no Phase-2 run planned |
 | Larimar | optional | Kanerva episodic-memory matrix conditioning a frozen-ish decoder | 1.3B/6B; train-your-own | classic architectural analog / "memory-module baseline" |
 | KV-compression | **have** | KVzip + SnapKV (+ H2O) evict the 115k-tok KV cache | Llama/Qwen 7–8B; 48GB pod | the KV-eviction branch (LCLM itself compares to these) |
 | MemoryLLM / M+ | **have** | parametric in-weights memory, online session write | `mplus-8b`; 24GB | only mechanism-with-released-weights parametric baseline |
@@ -132,7 +136,7 @@ Optional recurrent-state branch: RWKV-7-Goose 2.9B (runnable) — skip unless we
 | MemoryOS (EMNLP'25 Oral, `BAI-LAB/MemoryOS`) | alt | cleanest citable "memory-OS"; swap for A-MEM if preferred |
 | Memory-R1 (ACL'26) | **cite-only** | code "coming soon" (NOT released); already cited in OBJECTIVES.md as a GRPO ref |
 
-### LCLM — novelty note (engage head-on in related work)
+### LCLM — cite-only novelty note
 LCLM overlaps our core (soft-token compression of a long context into a decoder's latent input) and ships
 at 4B with weights → it **dents** the "first soft-token compressor at scale" framing and must be **addressed,
 not cited in passing.** What is STILL ours: (1) LCLM **trains the decoder end-to-end** (frozen-init → 350B-tok
@@ -174,7 +178,8 @@ max-gen-tokens · denominator (overall vs task-avg vs abstention).
   `scripts/baselines/run_api_eval.py` (floor / full-context / RAG-bm25 / RAG-dense over OpenRouter, token-
   accurate budgeting, resumable per-question store, coverage/cost accounting) + `src/memory/eval/` scorers
   for BOTH LongMemEval and MemoryAgentBench (judge-free, per-competency prompts verbatim from the MAB repo)
-  + `scripts/baselines/tier2/` runners (KVzip/SnapKV/H2O, MemoryLLM/M+, **LCLM**) + `run_agentmem.py`
+  + `scripts/baselines/tier2/` runners (KVzip/SnapKV/H2O, MemoryLLM/M+; inactive LCLM runner retained)
+  + `run_agentmem.py`
   (**A-MEM/MemoryOS**, no GPU). Cartridges dropped (cite-only).
 - **Reuse, don't build:** official harness `xiaowu0162/LongMemEval` (MIT) = retrieval + generation +
   judge with pluggable vLLM readers → Panel-B GPT-4o/8B mostly config.
@@ -191,9 +196,8 @@ max-gen-tokens · denominator (overall vs task-avg vs abstention).
    LongMemEval + MemoryAgentBench. **No GPU**, parallel to Phase-0; first real reference numbers.
 3. **Panel-A on 4090** — 135M reader: floor → BM25 RAG → dense RAG → KV-eviction (matched-decoder fight).
 4. **2a mechanism competitors** (native / Panel-B), cheapest-first:
-   a. **LCLM** — inference-only on released weights (1 GPU). **MUST** — closest concurrent competitor.
-   b. **KVzip + SnapKV + MemoryLLM/M+** — already scaffolded in `scripts/baselines/tier2/` (48GB / 24GB pod).
-   c. **Larimar** optional. (Cartridges dropped — per-corpus training doesn't fit private haystacks; cite-only.)
+   a. **KVzip + SnapKV + MemoryLLM/M+** — already scaffolded in `scripts/baselines/tier2/` (48GB / 24GB pod).
+   b. **Larimar** optional. (LCLM and Cartridges dropped as runnable baselines; retain as citations.)
 5. **2b — ONE agent-memory system** (**A-MEM** default) over a frozen LLM via the OpenRouter path (min GPU).
 6. **Panel-B native ceilings** — Llama-3.1-8B on a pod; GPT-4o via API (needs key); + one-time judge cross-check.
 7. **MemoryAgentBench** across the same set (thesis-axis support; harness already built).
@@ -213,3 +217,5 @@ Rule for steps 4–5: **re-run under our harness, never quote paper numbers.** R
 - **2026-07-18b** — memory-MECHANISM competitor sweep adopted: **§2.5** splits mechanism baselines into 2a
   (architectural) / 2b (agent-memory); **LCLM added (must)** as our closest concurrent competitor
   (web-verified, novelty note); Cartridges added; A-MEM = the one 2b; Larimar optional; Memory-R1 → cite-only.
+- **2026-07-20c** — LCLM dropped from the runnable panel by project decision; retained as cite-only related
+  work. Active Tier-2 mechanisms are H2O/SnapKV, KVzip, and MemoryLLM/M+, plus A-MEM in the agent category.

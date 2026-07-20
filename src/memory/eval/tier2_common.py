@@ -237,10 +237,12 @@ def run_grouped(items: list[dict], encode_ctx: Callable, answer: Callable, store
 # scoring + finalize (deduped end-of-run)
 # --------------------------------------------------------------------------------------------------
 def valid_for_scoring(r: dict) -> bool:
-    """A record counts toward accuracy only with a real, COMPLETE answer — exclude gen errors AND any
-    TERMINAL/incomplete finish_reason (length cutoff, or a provider error/content_filter). A refusal/blank
-    from a content filter is a harness artifact, not a wrong answer (audit #2)."""
-    return not r.get("error") and r.get("finish_reason") not in ("length", "error", "content_filter")
+    """Return whether a record is a model prediction that belongs in the accuracy denominator.
+
+    `length` is a real output under the configured token budget and remains scoreable. Exclude only execution
+    errors and provider terminal failures, which are harness/provider artifacts rather than model answers.
+    """
+    return not r.get("error") and r.get("finish_reason") not in ("error", "content_filter")
 
 
 def score_dataset(dataset: str, records: list[dict], use_bem: bool):
@@ -276,8 +278,12 @@ def finalize(dataset: str, method: str, model: str, items: list[dict], store, us
     store.compact()
     n_err = sum(1 for r in sel if r.get("error"))
     n_cut = sum(1 for r in sel if r.get("finish_reason") == "length")
+    n_eos = sum(1 for r in sel if valid_for_scoring(r) and r.get("finish_reason") != "length")
     meta = {"n": len(sel), "n_scored": len(records), "n_errors": n_err, "n_gen_cutoff": n_cut,
             "coverage": round(len(records) / len(items), 4) if items else None,
+            "n_eos_completed": n_eos,
+            "eos_completion_rate": round(n_eos / len(items), 4) if items else None,
+            "scoring_policy": "score_length_capped_output",
             # record the scoring policy in-artifact (audit #6): LongMemEval BEM threshold, or None if disabled.
             "bem_threshold": (0.85 if (use_bem and dataset == "longmemeval") else None), **extra_meta}
     # print whatever headline keys the scorer produced (LongMemEval: abstention/task_avg; MAB: n_scored/skip)

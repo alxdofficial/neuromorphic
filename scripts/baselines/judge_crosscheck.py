@@ -70,7 +70,7 @@ def _load_scored(pattern: str) -> list[dict]:
                 continue
             r = json.loads(line)
             # only rows that WE actually scored (a complete answer with a deterministic verdict)
-            if r.get("error") or r.get("finish_reason") == "length" or r.get("correct") is None:
+            if r.get("error") or r.get("finish_reason") in ("error", "content_filter") or r.get("correct") is None:
                 continue
             seen[(r.get("model"), r.get("mode"), r.get("question_id"))] = r   # last-wins dedup
     return list(seen.values())

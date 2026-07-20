@@ -39,8 +39,13 @@ def main():
         scorer = score_longmemeval if dataset == "longmemeval" else score_memoryagentbench
         agg = scorer(valid, use_bem=(dataset == "longmemeval"))
         n_items = len({r.get("question_id") for r in recs})
+        n_cutoff = sum(1 for r in recs if r.get("finish_reason") == "length")
+        n_eos = sum(1 for r in recs if valid_for_scoring(r) and r.get("finish_reason") != "length")
         meta = {"n": len(recs), "n_scored": len(valid),
                 "coverage": round(len(valid) / n_items, 4) if n_items else None,
+                "n_gen_cutoff": n_cutoff, "n_eos_completed": n_eos,
+                "eos_completion_rate": round(n_eos / n_items, 4) if n_items else None,
+                "scoring_policy": "score_length_capped_output",
                 "bem_threshold": (0.85 if dataset == "longmemeval" else None),
                 "config_sig": sig, "rescored": True}
         payload = {"dataset": dataset, "model": model, "mode": report_mode, "meta": meta,
@@ -57,7 +62,9 @@ def main():
             d = json.load(open(f))
         except Exception:  # noqa: BLE001
             continue
-        if "config_sig" not in (d.get("meta") or {}):
+        # Only Tier-1 API aggregates use config_sig. Tier-2/agent artifacts carry `method` and must never be
+        # mistaken for stale Tier-1 files merely because their naming/config scheme is different.
+        if not d.get("method") and "config_sig" not in (d.get("meta") or {}):
             os.remove(f); deln += 1
 
     print(f"[pure_rescore] {len(made)} aggregates; deleted {deln} stale")

@@ -53,18 +53,18 @@ class ResultStore:
                     self.records[str(qid)] = rec      # last-wins
 
     def done_ids(self) -> set[str]:
-        """Questions with a usable, COMPLETE answer → skip on rerun. Retried on rerun: API errors AND ANY
-        answer cut off at the token cap (finish_reason='length'), whether the content is blank OR a
-        partial/truncated answer. A truncated answer may have the real answer clipped off the end, so it is
-        neither trustworthy to score nor safe to freeze — a rerun with a higher --max-tokens re-requests it."""
+        """Questions with a usable model output → skip on rerun.
+
+        A length-capped output is a completed prediction under this store's fixed generation budget, so it
+        is scored and cached even when empty. Raising the cap changes the run signature and uses a different
+        store. Only transport/model errors and provider terminal failures are retried in the same store.
+        """
         out = set()
         for q, r in self.records.items():
             if r.get("error"):
                 continue
-            # a TERMINAL finish_reason is incomplete/retryable even when the `error` field is null (audit #6:
-            # old caches predate api_client attaching an error to content_filter/error responses). length =
-            # cut-off; error/content_filter = provider refusal. All three re-request on rerun.
-            if r.get("finish_reason") in ("length", "error", "content_filter"):
+            # Old caches can predate api_client attaching an error to content_filter/error responses.
+            if r.get("finish_reason") in ("error", "content_filter"):
                 continue
             out.add(q)
         return out

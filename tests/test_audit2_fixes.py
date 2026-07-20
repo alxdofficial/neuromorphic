@@ -124,11 +124,11 @@ def test_build_messages_mab_template_preserves_literal_label():
 
 
 # --- #10 partial (non-empty) length cutoff is retryable ---
-def test_nonempty_length_cutoff_is_retryable(tmp_path):
+def test_nonempty_length_cutoff_is_complete_under_fixed_budget(tmp_path):
     s = ResultStore(tmp_path / "s.jsonl")
     s.append({"question_id": "a", "hypothesis": "partial ans", "finish_reason": "length", "error": None})
     s.append({"question_id": "b", "hypothesis": "done", "finish_reason": "stop", "error": None})
-    assert s.done_ids() == {"b"}             # 'a' was cut off mid-answer → retry, don't freeze/score it
+    assert s.done_ids() == {"a", "b"}        # a larger cap has a distinct run signature/store
 
 
 # --- #12 competency falls back to question_type (never degenerates to a single 'unknown' bucket) ---
