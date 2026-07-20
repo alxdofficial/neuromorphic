@@ -22,11 +22,11 @@ Spec + provenance + exact entry points: `docs/baselines/TIER2_GPU_INTEGRATION.md
 | L40S | 48GB | $0.79 | fits | fits | fits |
 | A100 80GB | 80GB | $1.19 | fits, headroom | fits, headroom | fits |
 
-**Use a single 48GB RTX A6000** (same community price as a 24GB 4090, 2x the VRAM) — it's the only card in
-the cheap tier that covers all three methods. The forcing function is that the KV-compression methods
-materialize the FULL ~115k-token KV cache before compressing it (peak 33-45GB); MemoryLLM/M+ never holds a
-full KV so it would fit a 24GB card on its own, but sharing one A6000 for the whole panel is simpler and
-still only ~$1-2/method (~3-6 hrs compute) — see the integration doc's pod-plan table for the arithmetic.
+**Campaign runs ONE tailored pod PER MODEL (not a shared pod), on Secure Cloud** — current per-model GPU/cost
+choices live in [`docs/baselines/PHASE2_HUB.md`](../../../docs/baselines/PHASE2_HUB.md) §2. The VRAM table above
+is reference only. Key points: the KV-compression methods materialize the FULL ~115k-token KV before compressing
+(peak 33-45GB → want ≥48GB); M+ never holds a full KV (fits 24GB but is **overhead-bound → cheapest on an A40**,
+not a big GPU); **LCLM runs FULL locally on the 4090** (no rental).
 
 Follow `scripts/pod/README.md` / `docs/ops/runpod_workflow.md` for the actual `runpod.py create` /
 `drive` / `reap` mechanics (SSH key, tmux, billing-safety wall-clock cap) — this doc only covers what's
@@ -75,8 +75,9 @@ Common baseline deps (KVCache-Factory + MemoryLLM; KVzip pins its own versions a
 ```bash
 pip install torch transformers accelerate flash-attn --no-build-isolation
 ```
-`flash_attention_2` is REQUIRED (not just faster) for both KVCache-Factory and M+ — eager/sdpa prefill on
-a ~115k-token context multiplies the already-tight VRAM budget further.
+`flash_attention_2` is REQUIRED for **M+** only (its eager/sdpa attention classes return 4 values but the
+decoder unpacks 5 → crash), installed via a prebuilt wheel. **KVCache-Factory (SnapKV/H2O) and KVzip run fine
+under `sdpa` on an 80GB card** (verified) — no flash-attn build needed there. See `scripts/pod/TIER2_RESUME.md`.
 
 ## 3. HF auth + gated weights
 
@@ -101,7 +102,9 @@ python scripts/baselines/tier2/run_kvcompress.py --method kvzip --dataset longme
 python scripts/baselines/tier2/run_memoryllm.py               --dataset memoryagentbench --max-examples 20
 python scripts/baselines/tier2/run_lclm.py                    --dataset longmemeval --max-examples 5
 
-# --- the ~2-hour parallel panel: 3 methods, one per GPU, each in its own env (see §1 note) ---
+# --- OPTIONAL: multi-GPU shared pod (run_pod_panel.sh, one method per GPU). The CURRENT campaign runs ONE
+#     MODEL PER TAILORED POD instead (docs/baselines/PHASE2_HUB.md §2); LCLM runs LOCALLY, not on a pod.
+#     Kept for the case where a multi-GPU pod is rented to overlap methods. ---
 DATASET=longmemeval scripts/baselines/tier2/run_pod_panel.sh          # override KVZIP_ENV/KVZIP_GPU/... to taste
 DATASET=memoryagentbench scripts/baselines/tier2/run_pod_panel.sh
 

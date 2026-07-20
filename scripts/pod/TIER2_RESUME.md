@@ -37,7 +37,10 @@ Run with `WORKDIR=/workspace` so nothing lands on the 20GB overlay.
 9. **Llama-3.1-8B is GATED** (SnapKV/H2O only) — the HF token must have accepted the Meta license, else it
    SKIPs; the 3 core methods (kvzip/memoryllm/lclm) are unaffected.
 
-## Launch the panel (per method, one GPU each; env prefix matters)
+## Launch (current campaign = ONE MODEL PER POD; LCLM runs LOCALLY, not here)
+The commands below launch multiple methods on one multi-GPU pod (GPU 0/1/2) — that's the OLD shared-pod shape,
+kept only for when a multi-GPU pod is rented. The **current** plan (`docs/baselines/PHASE2_HUB.md` §2) rents a
+tailored pod per model in sequence, and **drops LCLM from the pod entirely** (it runs full on the local 4090).
 ```
 C="MAMBA_ROOT_PREFIX=/workspace/micromamba HF_HOME=/workspace/hf"
 tier2_pod.py run kvzip_lme   "$C CUDA_VISIBLE_DEVICES=0 micromamba run -n kvzip     python scripts/baselines/tier2/run_kvcompress.py --method kvzip --dataset longmemeval     --repo-dir /workspace/tier2_repos/KVzip"

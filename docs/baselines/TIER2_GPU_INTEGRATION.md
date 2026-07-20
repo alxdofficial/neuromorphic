@@ -9,14 +9,15 @@ and the pod plan. Two kinds (mechanism cut, see `PHASE2_BASELINES.md` §2.5):
 - **Cartridges (§5): DROPPED as a runnable baseline** (per-corpus training doesn't fit private haystacks) →
   cite-only.
 
-Deferred until we assemble the matched-decoder table (gated on our layer binding). **The newly-added
-mechanisms report NO LongMemEval number → we generate them under our harness (never quote paper numbers).**
+**Now ACTIVE as a per-model pod campaign** (KVzip → H2O/SnapKV → M+ → LCLM, one tailored pod at a time; live
+status + GPU/cost per model in [`PHASE2_HUB.md`](PHASE2_HUB.md) §2). **The mechanisms report NO LongMemEval
+number → we generate them under our harness (never quote paper numbers).**
 
 ## 1. KVCache-Factory — SnapKV / H2O / PyramidKV / StreamingLLM
 - Repo [Zefan-Cai/KVCache-Factory](https://github.com/Zefan-Cai/KVCache-Factory) · **MIT** (note `csrc/` has its own license) · last commit 2026-07-10 (active).
 - **Entry point = monkey-patch (not CLI-locked):** `from pyramidkv.monkeypatch import replace_llama; replace_llama("snapkv")` BEFORE model load, then set per-layer config on each `layer.self_attn.config` (`window_size`, `max_capacity_prompt`, `kernel_size`, `pooling`), then plain `model.generate(...)`.
 - **7,500-tok cap** lives ONLY in `run_longbench.py`'s data path (`model2maxlen`) — bypass by tokenizing/generating yourself; the full 115k flows through.
-- **Base models: Llama + Mistral ONLY** (no Qwen support). Use `attn_implementation="flash_attention_2"` or prefill VRAM balloons.
+- **Base models: Llama + Mistral ONLY** (no Qwen support). Runs fine under **`sdpa` on an 80GB card** (verified; the monkeypatch patches the sdpa attention class too, transformers 4.44.2) → **no flash-attn build needed**.
 - **VRAM:** 8B bf16 (~16GB) + full 115k KV materialized (~15GB) before compression → **peak ~35–45GB** (needs >24GB).
 
 ## 2. KVzip — query-agnostic KV compression (NeurIPS'25)
@@ -80,7 +81,11 @@ Orchestration layers over a **frozen** chat LLM (retrieval + prompting) — NOT 
 | L40S | 48GB | $0.79 | ✓ | ✓ | ✓ | ✓ |
 | A100 80GB | 80GB | $1.19 | ✓ (headroom) | ✓ (headroom) | ✓ | ✓ |
 
-**Recommendation: a single 48GB A6000 ($0.33/hr community — same as a 4090 but 2× VRAM) covers all four.** The KV methods (must materialize the full 115k KV before compressing → peak 33–45GB) are the >24GB forcing function; MemoryLLM never holds a full KV so it's fine on 24GB. Per-pass compute ≈ $1–2 each (~3–6 hrs on A6000); all Tier-2 + our model sequentially < $6, or use A100 80GB to remove OOM risk.
+The VRAM table is reference only. **Current campaign uses Secure Cloud, ONE tailored pod PER MODEL** (not a
+shared pod) — see [`PHASE2_HUB.md`](PHASE2_HUB.md) §2 for the actual per-model GPU/cost choices. Key deviations
+from the old "single A6000 covers all" plan: **M+ is overhead-bound not compute-bound → cheapest on an A40, not
+a big GPU** (memory `project_mplus_batching_verdict`); **LCLM runs FULL locally on the 4090** (no rental); the
+KV methods (peak 33–45GB before compression) are the >24GB forcing function that wants ≥48GB.
 
 ## Scaffolding plan (`scripts/baselines/tier2/`)
 Each runner: load base model on GPU → for each LongMemEval item, ingest the 115k history via the method's

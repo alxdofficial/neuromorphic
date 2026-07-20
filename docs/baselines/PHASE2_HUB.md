@@ -23,9 +23,9 @@ calibration only. Every number below is directly comparable across rows.
 ## 1. RESULTS
 
 ### Tier-1 — DONE ✅
-Full rendered tables (both datasets, every cell, per-competency + per-source): **[`PHASE2_REPORT.md`](PHASE2_REPORT.md)**
-(+ [`PHASE2_REPORT.csv`](PHASE2_REPORT.csv)). Narrative, config, and the scoring-calibration finding:
-**[`PHASE2_RESULTS.md`](PHASE2_RESULTS.md)**.
+Full rendered tables (both datasets, every cell, per-competency + per-source), plus the **BEM-threshold
+calibration finding** and the **Tier-1 cost log**: **[`PHASE2_REPORT.md`](PHASE2_REPORT.md)**
+(+ [`PHASE2_REPORT.csv`](PHASE2_REPORT.csv)). Panel design + rationale: [`PHASE2_BASELINES.md`](PHASE2_BASELINES.md).
 
 **LongMemEval-S (500 Q) — overall accuracy**
 | model | floor | rag_bm25_k5 | full_context |
@@ -111,7 +111,7 @@ agent↔pod tooling in `scripts/pod/tier2_pod.py`. Integration notes: [`TIER2_GP
 ---
 
 ## 4. Doc map
-- **Results:** [`PHASE2_REPORT.md`](PHASE2_REPORT.md) / [`.csv`](PHASE2_REPORT.csv) (tables) · [`PHASE2_RESULTS.md`](PHASE2_RESULTS.md) (narrative + calibration)
+- **Results:** [`PHASE2_REPORT.md`](PHASE2_REPORT.md) / [`.csv`](PHASE2_REPORT.csv) (full tables + BEM calibration + cost log)
 - **Panel design:** [`PHASE2_BASELINES.md`](PHASE2_BASELINES.md) · audit fixes [`PHASE2_AUDIT2_FIXES.md`](PHASE2_AUDIT2_FIXES.md)
 - **Tier-2 setup:** [`TIER2_GPU_INTEGRATION.md`](TIER2_GPU_INTEGRATION.md) · [`TIER2_HOSTING.md`](TIER2_HOSTING.md) · `scripts/pod/TIER2_RESUME.md`
 - **Competitor landscape:** [`FROZEN_COMPETITORS.md`](FROZEN_COMPETITORS.md)

@@ -1,6 +1,9 @@
 # Phase-2 Baseline Establishment — Plan & Runbook
 
-**Status: APPROVED (2026-07-17), REVISED 2026-07-18, execution DEFERRED (Phase-0 binding unsolved).**
+**Status (updated 2026-07-20): Panel-B (native-scale) EXECUTING.** Tier-1 (API long-context + RAG) is **DONE**;
+Tier-2 (GPU memory mechanisms) is a **per-model pod campaign** (KVzip → H2O/SnapKV → M+ → LCLM). **Panel-A
+(matched-135M)** remains **DEFERRED** until our own model exists (it's the fair fight our number slots into).
+This file is the design rationale; **live status + results = [`PHASE2_HUB.md`](PHASE2_HUB.md)**.
 Establish reference numbers for established SOTA memory/long-context baselines on a fixed benchmark +
 fixed harness *before* our memory layer exists, so our own number later drops into the same table.
 Operationalizes the Phase-2 section of `docs/data/DATA_PHASES_PLAN.md` with concrete baselines, compute,

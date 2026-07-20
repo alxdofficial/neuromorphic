@@ -27,6 +27,10 @@ GPU/matched-decoder baselines.
 `deepseek/deepseek-v4-flash` (1M) · `qwen/qwen3.5-flash-02-23` (1M). Two frontier 1M-ctx slots TBD.
 Full-context sweep ≈ $17 (floor/RAG add pennies). Prices live in `PRICING`; override with `--models`.
 
+> **Executed panel (2026-07-20):** the completed Tier-1 results used **two** models — `deepseek-v4-flash`
+> (1M-ctx frontier anchor) and `llama-3.1-8b-instruct` (reproducible published anchor). gemini/qwen were not
+> run. Final numbers: [`PHASE2_REPORT.md`](PHASE2_REPORT.md) · index: [`PHASE2_HUB.md`](PHASE2_HUB.md).
+
 ## Usage
 ```bash
 export OPENROUTER_API_KEY=sk-or-...

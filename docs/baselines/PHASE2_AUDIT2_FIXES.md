@@ -102,12 +102,13 @@ Code fixes:
 Open items — NOT code-fixable here (setup / pod / user):
 - **KVzip `--max-new-tokens`** may be accept-and-ignored upstream → pass-through is a no-op. POD-VERIFY
   (patch KVzip's decode loop if it doesn't honor the cap).
-- **`meta-llama/Llama-3.1-8B-Instruct` is gated** (SnapKV/H2O default) → current creds 403. Accept the Meta
-  license on the HF token, or `--model` an ungated Mistral. (README §3.)
+- ✅ **RESOLVED (2026-07-20) — `meta-llama/Llama-3.1-8B-Instruct` gate** accepted on the HF token (account
+  `alxd219p1`, download verified); SnapKV/H2O unblocked. Ungated Mistral remains a fallback.
 - **Tier-2 env isolation:** KVzip / KVCache-Factory / MemoryLLM / LCLM need mutually incompatible
-  torch/transformers/numpy/python pins → run each in its OWN pod/venv, not one shared env.
-- **Pod bootstrap** currently launches Phase-0 training, not Phase-2 eval (`scripts/pod/bootstrap.sh`) — wire
-  a Phase-2 path before a remote run, and COMMIT+PIN so the pod clones the exact run state (provenance).
+  torch/transformers/numpy/python pins → run each in its OWN env (micromamba per method, baked into
+  `scripts/pod/tier2_bootstrap.sh`).
+- ✅ **RESOLVED (2026-07-20) — Phase-2 pod path** exists: `scripts/pod/tier2_bootstrap.sh` (+ `tier2_pod.py`)
+  provision the eval envs directly and sync/pin the repo per run (the old Phase-0 `bootstrap.sh` is separate).
 - **Panel-A matched-135M runner + Tier-2-on-MemoryAgentBench matrix** still to build (tasks #212).
 
 ## Verify

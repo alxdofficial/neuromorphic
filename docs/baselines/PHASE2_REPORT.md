@@ -1,10 +1,11 @@
 # Phase-2 Baseline Report — rendered table (authoritative, deterministic scoring)
 
 Generated 2026-07-20 by `python scripts/baselines/report.py` from `outputs/baselines/*.json`.
-Deterministic scoring (EM + negation-guarded containment + BEM@0.5 paraphrase for LongMemEval; substring/exact
-per-competency for MemoryAgentBench). **No LLM-as-judge** for the panel. Cell = `accuracy (n_scored)`.
+Deterministic scoring (EM + negation-guarded containment + **BEM@0.85** paraphrase for LongMemEval;
+substring/exact per-competency for MemoryAgentBench). **No LLM-as-judge** for the panel. Cell = `accuracy (n_scored)`.
 Blank cell = not run (e.g. llama full_context on MAB: only 154 of the shorter contexts fit its 131k window).
-CSV companion: `PHASE2_REPORT.csv`. Narrative + config + calibration notes: `PHASE2_RESULTS.md`.
+CSV companion: `PHASE2_REPORT.csv`. Index + plan: [`PHASE2_HUB.md`](PHASE2_HUB.md). Panel design + rationale:
+[`PHASE2_BASELINES.md`](PHASE2_BASELINES.md). BEM threshold + cost log below.
 
 | dataset-subtask | deepseek-v4-flash · floor | deepseek-v4-flash · full_context | deepseek-v4-flash · rag_bm25_k15 | deepseek-v4-flash · rag_bm25_k5 | llama-3.1-8b-instruct · floor | llama-3.1-8b-instruct · full_context | llama-3.1-8b-instruct · rag_bm25_k15 | llama-3.1-8b-instruct · rag_bm25_k5 |
 |---|---|---|---|---|---|---|---|---|
@@ -80,4 +81,26 @@ _Hu et al., MemoryAgentBench, arXiv:2507.05257 — AR/TTL/CR deterministic; LRU 
 | Mem0 | 22.4–37.5 | 3.4 | 0.8 | 18.0 |
 
 _* LRU is LLM-judged (GPT-4o F1) upstream — our detective_qa (LRU) uses deterministic exact_match, so that column is the LEAST comparable. Conflict-Resolution MULTI-hop collapses to ≤6% for all methods upstream (only single-hop shown). AR is a per-subtask range._
+
+---
+
+## Scoring calibration — why BEM threshold = 0.85 (GPT-4o cross-check, 100 full_context items)
+
+A one-time GPT-4o-judge cross-check (calibration only — **not** used to score the panel) showed the deterministic
+scorer at the old default **BEM@0.5 ran +0.13 LENIENT** (0.720 vs judge 0.590) — the opposite of the usual
+"deterministic is stricter" assumption. Agreement 81%; false-negatives (we-wrong/judge-right) 3%; **false-positives
+(we-right/judge-wrong) 16%, ALL from BEM** crediting clear errors ("5" for gold "6", refusals, `Dark Souls 3` for
+`…3 DLC`). A threshold sweep found **BEM@0.9 ≈ the published GPT-4o-judge number for llama** (0.446 vs 0.454) while
+EM+containment-only is too strict. **Decision (locked): BEM threshold raised 0.5 → 0.85** and everything re-scored;
+all numbers in this report are BEM@0.85. `finalize()` records `bem_threshold` in every result JSON.
+
+## Cost log (Tier-1)
+| run | cost | notes |
+|---|---|---|
+| LongMemEval llama+deepseek (floor/full/rag) | ~$14 | full_context ≈90% of it; 74 llama errors first pass (46 transient rate-limit fixed on rerun, 28 too-big remain @94.4% coverage) |
+| judge cross-check (100 items, gpt-4o) | $0.03 | calibration only (above) |
+| MemoryAgentBench floor+rag (both models, 3,071 Q) | ~$1.30 | done |
+| MemoryAgentBench deepseek full_context (3,071 Q, deepseek-pinned 50× prefix-cache) | ~$2–3 | done; naive re-send would be ~$66 |
+
+Tier-1 total ≈ **$17**. Tier-2 (GPU pod campaign) budget + per-model plan: [`PHASE2_HUB.md`](PHASE2_HUB.md).
 
