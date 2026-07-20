@@ -86,7 +86,10 @@ def run_kvcache_factory(args, items, model_name, repo_dir, store, dataset, meta_
     tok = AutoTokenizer.from_pretrained(model_name)
     model = AutoModelForCausalLM.from_pretrained(
         model_name, torch_dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2",  # REQUIRED — eager/sdpa prefill on ~115k tok balloons VRAM
+        # sdpa by default (80GB fits a 115k-tok prefill; avoids the flash-attn build). NOTE: if KVCache-Factory
+        # only monkey-patches the flash-attn attention class, snapkv/h2o eviction won't apply under sdpa —
+        # the smoke test's KV-size check catches that; pass --attn-impl flash_attention_2 (built) if so.
+        attn_implementation=args.attn_impl,
         device_map="cuda")
     model.eval()
 
@@ -182,6 +185,9 @@ def main():
     ap.add_argument("--variant", default="s", choices=["s", "m", "oracle"])
     ap.add_argument("--max-examples", type=int, default=None)
     ap.add_argument("--max-new-tokens", type=int, default=64)
+    ap.add_argument("--attn-impl", default="sdpa", choices=["sdpa", "flash_attention_2", "eager"],
+                    help="attention backend for snapkv/h2o (sdpa fits 80GB; flash_attention_2 if built). "
+                         "kvzip uses its own loader and ignores this.")
     ap.add_argument("--max-capacity-prompt", type=int, default=2048,
                     help="snapkv/h2o: total retained KV tokens per layer (KVCache-Factory arg name)")
     ap.add_argument("--ratio", type=float, default=0.3,

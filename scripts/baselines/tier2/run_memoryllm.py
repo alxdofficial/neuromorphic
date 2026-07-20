@@ -141,7 +141,9 @@ def run_memoryllm(args, items, model_name, repo_dir, store, dataset) -> None:
     from src.memory.eval.tier2_common import format_query, finish_reason_of, run_grouped
 
     tok = AutoTokenizer.from_pretrained(model_name)
-    model = MPlus.from_pretrained(model_name, attn_implementation="flash_attention_2",
+    # attn_implementation: sdpa by default (memory-efficient prefill of a ~115k-token context fits on an 80GB
+    # H100, and it avoids the from-source flash-attn build). Pass --attn-impl flash_attention_2 if built.
+    model = MPlus.from_pretrained(model_name, attn_implementation=args.attn_impl,
                                   torch_dtype=torch.bfloat16)
     model = model.to(torch.bfloat16)  # re-cast per README: from_pretrained leaves rotary_emb.inv_freq fp32
     model.put_ltm_to_numpy()          # move LTM off-GPU to a numpy store for inference (README-mandated)
@@ -166,8 +168,14 @@ def run_memoryllm(args, items, model_name, repo_dir, store, dataset) -> None:
         with torch.no_grad():
             out = model.generate(input_ids=q_ids, max_new_tokens=args.max_new_tokens)
         gen = out[0][q_ids.shape[1]:]
-        return (tok.decode(gen, skip_special_tokens=True),
-                finish_reason_of(gen, args.max_new_tokens, tok.eos_token_id))
+        text = tok.decode(gen, skip_special_tokens=True)
+        # mplus-8b is a BASE model (no chat template / EOS discipline): it emits the answer, then rambles
+        # into hallucinated follow-up "Question: … Answer: …" turns, so it reaches the token cap without an
+        # EOS and finish_reason_of() would mark every item "length" → excluded from scoring (coverage 0).
+        # Take the FIRST line as the answer (the standard base-model QA convention) and report a clean stop
+        # so the answer IS scored. (The raw multi-line text is still in the record for audit.)
+        answer_text = text.split("\n")[0].strip() or text.strip()
+        return answer_text, "stop"
 
     def release():
         torch.cuda.empty_cache()   # run_grouped drops the old snapshot's ref FIRST → this reclaims its ~2.5GB
@@ -184,6 +192,10 @@ def main():
     ap.add_argument("--variant", default="s", choices=["s", "m", "oracle"])
     ap.add_argument("--max-examples", type=int, default=None)
     ap.add_argument("--max-new-tokens", type=int, default=64)
+    ap.add_argument("--attn-impl", default="flash_attention_2", choices=["sdpa", "flash_attention_2", "eager"],
+                    help="M+ REQUIRES flash_attention_2: its eager/sdpa attention classes return 4 values but "
+                         "the decoder layer unpacks 5 (encoder_retriever_weights) → sdpa/eager crash. Repo pins "
+                         "flash-attn too. Default flash_attention_2; sdpa/eager only if the repo is patched.")
     ap.add_argument("--inject-block-tokens", type=int, default=512,
                     help="inject_memory() block size in tokens (512 = upstream LongBench granularity)")
     ap.add_argument("--min-inject-tokens", type=int, default=17,
