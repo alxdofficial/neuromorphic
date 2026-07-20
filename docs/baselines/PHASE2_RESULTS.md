@@ -50,7 +50,7 @@ _Wu et al., LongMemEval-S, arXiv:2410.10813 — gpt-4o-2024-08-06 judge:_
 
 (MemoryAgentBench published table lives in `src/memory/eval/published_baselines.py`, rendered by report.py.)
 
-## MemoryAgentBench (3,071 Q, 4/5 competencies) — ⏳ RUNNING
+## MemoryAgentBench (3,071 Q, 4/5 competencies) — ✅ DONE (deterministic)
 Deterministic string-match (substring/exact per competency; no BEM). Recsys excluded (opt-in Recall@5).
 **No `--max-context-chars` cap** — every question runs (the earlier cap SKIPPED whole competencies; removed).
 
@@ -68,15 +68,29 @@ the OpenRouter provider to **`deepseek` first-party** (`allow_fallbacks:false`) 
 implicit prefix caching at a **50× cache-read discount** ($0.0028/M vs $0.14/M) — and **warm each context
 once** before parallelizing, so repeats bill at the cached rate. Probe: **100% cache hits, answers correct.**
 Requires the OpenRouter account to allow the DeepSeek provider (data-policy toggle; public-benchmark data).
-Cache-aware cost accounting in `run_api_eval.py` (`--pin-provider`, `cached_tokens`). _Table on completion._
+Cache-aware cost accounting in `run_api_eval.py` (`--pin-provider`, `cached_tokens`).
+
+**MemoryAgentBench overall accuracy** (strict / lenient; `n_scored`). Full per-competency + per-source
+breakdown in [`PHASE2_REPORT.md`](PHASE2_REPORT.md) (+ CSV). llama full_context is N/A except the 154
+shorter contexts that fit its 131k window.
+
+| model | floor | rag_bm25_k5 | rag_bm25_k15 | full_context |
+|---|---|---|---|---|
+| **llama-3.1-8b** | 0.206 | 0.394 / 0.492 | 0.417 / 0.533 | 0.636 (154 only) |
+| **deepseek-v4** | 0.337 | 0.613 / 0.760 | 0.646 / 0.815 | **0.721 / 0.882** |
+
+Reads: deepseek full_context tops out at **0.721 strict / 0.882 lenient**; more retrieval helps (k15 > k5);
+deepseek > llama in every condition. Competency split is bimodal — **Accurate-Retrieval** high (deepseek full
+0.936), **Test-Time-Learning + Long-Range** collapse to ~0 under deterministic exact-match (ICL/detective
+subtasks the string scorer can't credit — a scorer-fidelity floor, not purely a model failure; see report note).
 
 ## Cost + coverage log
 | run | cost | notes |
 |---|---|---|
 | LongMemEval llama+deepseek (floor/full/rag) | ~$14 | full_context is ~90% of it; 74 llama errors first pass (46 transient rate-limit fixed on rerun, 28 too-big remain) |
 | judge cross-check (100 items, gpt-4o) | $0.03 | calibration |
-| MemoryAgentBench floor+rag (both models, 3,071 Q) | ~$1.30 | running |
-| MemoryAgentBench deepseek full_context (3,071 Q, deepseek-pinned 50× cache) | ~$2–3 | running; naive re-send would be ~$66 |
+| MemoryAgentBench floor+rag (both models, 3,071 Q) | ~$1.30 | done |
+| MemoryAgentBench deepseek full_context (3,071 Q, deepseek-pinned 50× cache) | ~$2–3 | done; naive re-send would be ~$66 |
 
 ## Open items
 - Lock the BEM threshold + re-score LongMemEval uniformly.
