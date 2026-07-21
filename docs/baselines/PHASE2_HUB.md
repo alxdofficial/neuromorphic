@@ -20,7 +20,7 @@ calibration only. Every number below is directly comparable across rows.
 | Layer | What | Status |
 |---|---|---|
 | **Tier-1** (API: long-context + RAG) | deepseek-v4-flash, llama-3.1-8b · floor/full_context/rag_bm25 | ✅ **DONE** (on `main`) |
-| **Tier-2** (GPU memory *mechanisms*) | M+, H2O@2%, H2O@20%, KVzip, A-MEM (SnapKV/LCLM/`memoryllm-8b` dropped) | 🟡 **in progress** — H2O@2% done (both benchmarks); **KVzip MAB done (0.519)**, KVzip LongMemEval running; **M+ LongMemEval done (0.423)**, M+ MAB running; H2O@20% planned; A-MEM blocked on an API key (see §2) |
+| **Tier-2** (GPU memory *mechanisms*) | M+, H2O@2%, H2O@20%, KVzip, A-MEM (SnapKV/LCLM/`memoryllm-8b` dropped) | 🟡 **in progress** — H2O@2% done (both benchmarks); **KVzip MAB done (0.519)**, KVzip LongMemEval running; **M+ DONE both** (LME 0.423, MAB 0.286); H2O@20% planned; A-MEM blocked on an API key (see §2) |
 | **Our model** | frozen-decoder learned memory | ⏳ later (Phase-2 head-to-heads) |
 
 ---
@@ -68,7 +68,7 @@ authoritative report.
 
 | method | LongMemEval | MemoryAgentBench |
 |---|---|---|
-| **M+** (`mplus-8b`) | **0.423** overall / 0.379 task-avg / **0.000** abstention (500; coverage 1.000, EOS 1.000) | 🔄 **RUNNING — no number yet** |
+| **M+** (`mplus-8b`) | **0.423** overall / 0.379 task-avg / **0.000** abstention (500; coverage 1.000, EOS 1.000) | **0.286** strict micro / 0.331 competency macro / 0.295 lenient (3,071; coverage 1.000, EOS 1.000) |
 | **H2O @2% KV** (`cap2048`) | **0.066** overall / 0.056 task macro / 0.333 abstention (500; EOS 0.390) — see budget caveat | **0.371** strict micro / 0.287 competency macro / 0.377 lenient (3,071; EOS 0.892) |
 | **H2O @20% KV** (`cap≈20k`) | ⏳ PLANNED — the paper's operating point | ⏳ PLANNED |
 | **KVzip** (`Qwen2.5-7B-Instruct-1M`) | 🔄 RUNNING (4-pod shard fleet) | **0.519** strict micro / 0.519 competency macro / 0.526 lenient (3,071; EOS 1.000) |
@@ -100,6 +100,20 @@ the pair is a compression-ratio ablation showing *where* KV eviction breaks, whi
 result. Sizing for the re-run: peak ≈ **23.8GB** (15.0 weights + 2.44 KV + 2.44 snapshot clone + ~2.0
 attention matrix + ~1.95 activations) → **48GB pod (A40/A6000)**; a 24GB 4090 is borderline. Runtime is
 ~unchanged (attention is ~2% of per-chunk FLOPs at this scale).
+
+**M+ RANK REVERSAL across the two benchmarks (2026-07-21) — the most useful Tier-2 finding so far.**
+M+ is the BEST compression method on LongMemEval (0.423, vs H2O@2% 0.066) and the WORST on MemoryAgentBench
+(0.286, vs H2O@2% 0.371 and KVzip 0.519). Same model, same harness, opposite ranking.
+The discriminating variable is context length: LongMemEval-S contexts are ~115k tokens, MAB's reach
+**793k**. M+'s memory pool is FIXED-SIZE, so beyond some length it evicts more than it retains, while
+KV-eviction methods degrade gracefully because their budget scales with the cache.
+Evidence this is capacity and not general weakness: M+ still beats H2O@2% on Long_Range_Understanding
+(**0.437 vs 0.028**) — it does retain distant information, it just cannot retain enough of it at 793k.
+Per-competency: Accurate_Retrieval 0.297 · Test_Time_Learning 0.432 · Long_Range_Understanding 0.437 ·
+Conflict_Resolution 0.158.
+**Why this matters for us:** it is direct evidence that fixed-capacity parametric memory has a
+context-length ceiling — the stability-plasticity axis our own curriculum's T2 tier is designed to probe.
+A memory layer that cannot forget selectively will hit this same wall.
 
 **M+ read (new, 2026-07-21).** Artifact `outputs/baselines/longmemeval__memoryllm__mplus-8b__s__MERGED.json`
 (28 shards merged, n=500). A fixed-size parametric memory lands **within 4 points of llama-3.1-8b
