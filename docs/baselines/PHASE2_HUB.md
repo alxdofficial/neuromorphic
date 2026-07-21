@@ -2,7 +2,12 @@
 
 Single entry point for the Phase-2 baseline evaluation: **established memory / long-context baselines on
 LongMemEval-S + MemoryAgentBench, run BEFORE our own frozen-decoder memory layer.** This file is the index +
-live status; the detailed docs are linked inline. _Last updated: 2026-07-20._
+live status; the detailed docs are linked inline. _Last updated: 2026-07-21._
+
+> **2026-07-21 — all MemoryAgentBench numbers were regenerated** after a scorer fix (`aab14e9`): two
+> competencies (detective_qa / ICL) were structurally unscoreable and read 0.000 for **every** model.
+> Any MAB figure in an older doc or note is stale; read them from [`PHASE2_REPORT.csv`](PHASE2_REPORT.csv).
+> Details + before/after: [`PHASE2_REPORT.md`](PHASE2_REPORT.md) §"MAB scorer fix".
 
 **Scoring policy:** deterministic only (EM + negation-guarded containment + BEM paraphrase for LongMemEval;
 substring/exact per-competency for MAB). **No LLM-as-judge** for the panel; one GPT-4o cross-check was for
@@ -15,7 +20,7 @@ calibration only. Every number below is directly comparable across rows.
 | Layer | What | Status |
 |---|---|---|
 | **Tier-1** (API: long-context + RAG) | deepseek-v4-flash, llama-3.1-8b · floor/full_context/rag_bm25 | ✅ **DONE** (on `main`) |
-| **Tier-2** (GPU memory *mechanisms*) | KVzip, H2O/SnapKV, M+/MemoryLLM; A-MEM agent baseline | 🔜 per-model campaign (LCLM dropped; see §2) |
+| **Tier-2** (GPU memory *mechanisms*) | KVzip, H2O/SnapKV, M+/MemoryLLM; A-MEM agent baseline | 🟡 **in progress** — H2O done (both benchmarks); **M+ LongMemEval done**, M+ MAB running on the pod fleet; KVzip/SnapKV/A-MEM pending (LCLM dropped; see §2) |
 | **Our model** | frozen-decoder learned memory | ⏳ later (Phase-2 head-to-heads) |
 
 ---
@@ -33,54 +38,91 @@ calibration finding** and the **Tier-1 cost log**: **[`PHASE2_REPORT.md`](PHASE2
 | **deepseek-v4-flash** | 0.006 | 0.594 | **0.687** |
 | **llama-3.1-8b-instruct** | 0.002 | 0.404 | 0.462 |
 
-**MemoryAgentBench (3,071 Q) — overall accuracy (strict / lenient)**
+**MemoryAgentBench (3,071 Q) — overall accuracy (strict / lenient)** — post-scorer-fix
 | model | floor | rag_bm25_k5 | rag_bm25_k15 | full_context |
 |---|---|---|---|---|
-| **deepseek-v4-flash** | 0.337 / 0.382 | 0.579 / 0.774 | 0.622 / 0.822 | **0.701 / 0.885** |
-| **llama-3.1-8b-instruct** | 0.206 / 0.249 | 0.393 / 0.491 | 0.414 / 0.528 | 0.636 (154 only)¹ |
+| **deepseek-v4-flash** | 0.356 / 0.382 | 0.712 / 0.773 | 0.778 / 0.822 | **0.854 / 0.885** |
+| **llama-3.1-8b-instruct** | 0.221 / 0.252 | 0.491 / 0.497 | 0.524 / 0.531 | 0.636 (154 only)¹ |
 
 _¹ llama full_context is N/A on MAB except the 154 shorter contexts that fit its 131k window (most are 158k–881k)._
 
 **Reads:** deepseek-v4 > llama-3.1-8b in every condition; more context/retrieval helps monotonically
 (floor → rag → full). deepseek full_context (0.687 LME) tops GPT-4o's published 0.606 — it's a 2026 model.
-On MAB, Accurate-Retrieval is strong (deepseek full 0.936) while Test-Time-Learning + Long-Range collapse to
-~0 under deterministic exact-match (ICL/detective subtasks the string scorer can't credit — a scorer-fidelity
-floor, disclosed in the report).
+On MAB, deepseek full_context is strong across the board post-fix: Accurate-Retrieval 0.926,
+Test-Time-Learning 0.828, Long-Range 0.789, Conflict-Resolution 0.723 (competency macro 0.816). The residual
+hard cell is **multi-hop fact consolidation** — deepseek full_context still only reaches 0.200 at 262k
+(`factconsolidation_mh_262k`) and RAG collapses to 0.041 there.
+_(Pre-2026-07-21 docs claimed Test-Time-Learning and Long-Range "collapse to ~0 under deterministic
+exact-match". That was our own prompt/metric mismatch, not a scorer-fidelity floor — see the fix note above.)_
 
 **Published references (CITED, GPT-4o-judge — NOT our scale):** GPT-4o LME full 0.606 / oracle 0.870;
 Llama-3.1-8B LME full 0.454 / oracle 0.710. Full tables in [`PHASE2_REPORT.md`](PHASE2_REPORT.md) §Published.
 
 ### Tier-2 — IN PROGRESS
-H2O has completed locally on both full benchmark selections. Length-capped generations are scored as emitted;
-natural EOS completion is reported separately in the authoritative report.
+H2O has completed locally on both full benchmark selections. M+ has completed LongMemEval-S on the pod fleet.
+Length-capped generations are scored as emitted; natural EOS completion is reported separately in the
+authoritative report.
 | method | LongMemEval | MemoryAgentBench |
 |---|---|---|
 | KVzip | — | — |
 | H2O | **0.066** overall / 0.056 task macro / 0.333 abstention (500; EOS 0.390) | **0.278** strict micro / 0.138 competency macro / 0.377 lenient (3,071; EOS 0.892) |
 | SnapKV | — | N/A (query-aware; no reusable MAB context state) |
-| M+ / MemoryLLM | — | — |
+| **M+ / MemoryLLM** (`mplus-8b`) | **0.423** overall / 0.379 task-avg / **0.000** abstention (500; coverage 1.000, EOS 1.000) | 🔄 **RUNNING — no number yet** |
+| A-MEM (2b agent-memory) | — | — |
 | LCLM | **DROPPED** | **DROPPED** |
+
+**M+ read (new, 2026-07-21).** Artifact `outputs/baselines/longmemeval__memoryllm__mplus-8b__s__MERGED.json`
+(28 shards merged, n=500). A fixed-size parametric memory lands **within 4 points of llama-3.1-8b
+full-context** (0.423 vs 0.462) without reading the 115k history at query time, and **beats it on
+temporal-reasoning** (0.472 vs 0.417); it crushes H2O (0.066) and stays well behind deepseek full-context
+(0.687). Per-type: knowledge-update 0.694 · temporal 0.472 · single-session-user 0.406 · multi-session 0.364 ·
+single-session-assistant 0.339 · preference 0.000 (low-confidence). **Abstention = 0.000** while every other
+system scores ≥0.333 — M+ never declines to answer, it confabulates. That is a real, reportable failure mode
+of the mechanism. Full per-type table: [`PHASE2_REPORT.md`](PHASE2_REPORT.md) §M+.
 
 ---
 
-## 2. PLAN — Tier-2 per-model campaign
+## 2. PLAN — Tier-2 campaign (SHARDED POD FLEET)
 
-**Workflow discipline (one model at a time):**
+**How it actually runs (revised 2026-07-21; supersedes the earlier "one tailored pod, sequentially" plan).**
+M+ cannot be batched within one model (single shared pool, batch=1 baked in), so throughput comes from
+**horizontal sharding across many cheap pods**, not from a bigger GPU:
+
 1. All code/script/config changes done **locally first** (no pod burning while editing).
-2. Rent a pod **tailored to that model** → tune config until as fast as it'll go.
-3. Get it running **steadily** → derive a clean ETA → know exactly when it's safe to pull artifacts.
-4. **Retrieve → terminate → next model.** Runs are resumable (per-question JSONL cache).
+2. Launch a **fleet** of single-GPU pods, one shard of the question set each, via
+   **`scripts/pod/mpod.py`** (fleet state in `scripts/pod/.mpod_state.json`). The M+ LongMemEval campaign ran
+   **14 shards** on a mixed RTX 4090 / A40 / RTX A6000 fleet at `rate_per_pod` **$0.69/hr**.
+3. Poll actively; pods that die or lag get their shard re-cut. Runs are resumable (per-question JSONL cache).
+4. **Pull → merge → terminate.** `scripts/baselines/tier2/merge_shards.py` merges shard artifacts
+   (recursive cache glob; duplicate `question_id`s across partitionings resolved by newest mtime — the M+
+   LongMemEval merge hit **72** such duplicates).
 
-Setup fixes are baked into `scripts/pod/tier2_bootstrap.sh`; restart checklist in `scripts/pod/TIER2_RESUME.md`;
-agent↔pod tooling in `scripts/pod/tier2_pod.py`. Integration notes: [`TIER2_GPU_INTEGRATION.md`](TIER2_GPU_INTEGRATION.md),
-[`TIER2_HOSTING.md`](TIER2_HOSTING.md). The 4 methods & how they work: [`FROZEN_COMPETITORS.md`](FROZEN_COMPETITORS.md).
+**Measured throughput (pod fleet, M+ LongMemEval):** **0.44–0.64 s/inject** and **4.1–4.5 s/answer**, against
+the runner's built-in defaults of `--cost-inject-s 0.375` / `--cost-answer-s 2.3` (which came from a local
+4090 n=1/n=2 smoke, `outputs/baselines/longmemeval__memoryllm__mplus-8b__s__n{1,2}__*.json`). **The runner's
+own ETAs therefore read ~1.5× optimistic** — retune the flags per card. Also measured: **Ampere (A40 /
+A6000) runs this workload at ~1.24× an isolated 4090, not slower** — the job is snapshot/PCIe-bandwidth-bound,
+not compute-bound, so the cheap 48GB Ampere cards are the right buy.
 
-| # | Model | Method (how) | Backbone | Scope | Cheapest GPU | Est. cost / time | Status |
+**HARD CONSTRAINT — M+ on MemoryAgentBench needs a ≥116GB **RAM** container** (host RAM, not VRAM). MAB's
+post-injection snapshot includes `cached_dropped_*` buffers that grow with inject count; 47GB pods are
+OOM-killed (SIGKILL, rc=137, no traceback). LongMemEval is unaffected — singleton contexts skip the snapshot
+entirely. Filter pods on RAM, not just GPU, when scheduling M+ MAB.
+
+Ops rules for renting/driving pods (disk, cached images, flash-attn wheels, fleet hygiene):
+**[`docs/ops/RUNPOD_RUNBOOK.md`](../ops/RUNPOD_RUNBOOK.md)**. Fleet driver: **`scripts/pod/mpod.py`**.
+Per-model setup fixes are baked into `scripts/pod/tier2_bootstrap.sh`; restart checklist in
+`scripts/pod/TIER2_RESUME.md`; single-pod tooling in `scripts/pod/tier2_pod.py`. Integration notes:
+[`TIER2_GPU_INTEGRATION.md`](TIER2_GPU_INTEGRATION.md), [`TIER2_HOSTING.md`](TIER2_HOSTING.md). The methods &
+how they work: [`FROZEN_COMPETITORS.md`](FROZEN_COMPETITORS.md).
+
+| # | Model | Method (how) | Backbone | Scope | GPU used | Cost / time | Status |
 |---|---|---|---|---|---|---|---|
 | 1 | **H2O / SnapKV** | streaming/query-aware KV eviction | Llama-3.1-8B | LME + MAB (H2O) | local 4090 | $0 / 4h44m | **H2O complete**; SnapKV pending |
-| 2 | **KVzip** | query-agnostic KV compression | Qwen2.5-7B | LME + MAB | H100/A40 | ~$5–10 | ⬜ pending |
-| 3 | **M+ / MemoryLLM** | recurrent parametric memory | mplus-8b | LME + MAB | **A40 48GB** | **~$10 / overnight** | 🟡 **prep in progress (me)** |
-| 4 | **LCLM** | soft-token compression | 0.6b+4b | — | — | — | **DROPPED 2026-07-20** |
+| 2 | **KVzip** | query-agnostic KV compression | Qwen2.5-7B-1M | LME + MAB | **H100/A100 80GB** | ~$5–10 _(estimate)_ | 🟡 local smoke passed; full run pending |
+| 3 | **M+ / MemoryLLM** | recurrent parametric memory | mplus-8b | LME + MAB | 14-pod fleet, mixed 4090/A40/A6000 @ $0.69/pod-hr | see §3 | ✅ **LME DONE (n=500)**; 🔄 MAB running (needs ≥116GB RAM pods) |
+| 4 | **A-MEM** | 2b agent-memory over a frozen LLM | OpenRouter panel | LME (+MAB) | none (API) | **PROJECTION only** — LME-S ~$14–36 expected / $181 strict-WandB, MAB ~$3.8–38.9; see [`A_MEM_FIDELITY_AUDIT.md`](A_MEM_FIDELITY_AUDIT.md) | ⏳ not started — cost table is a projection **blocked on a 401'd key** (needs key refresh to instrument) |
+| 5 | **LCLM** | soft-token compression | 0.6b+4b | — | — | — | **DROPPED 2026-07-20** |
 
 **Per-model notes (findings already established — do not re-discover):**
 
@@ -99,18 +141,30 @@ agent↔pod tooling in `scripts/pod/tier2_pod.py`. Integration notes: [`TIER2_GP
 - **#2 KVzip** — needs the custom CUDA kernel (`cuda-nvcc` + **`cuda-cccl=12.4.*`** pin) + prebuilt flash-attn
   wheel (baked into bootstrap). Query-agnostic → correct KV baseline for MAB (36 encodes / 3071 Q). Tune
   `--ratio` (KV retained, default 0.3). The runner enforces the shared 64-token cap through upstream's
-  `ModelKVzip.gen_kwargs` and records the actual value.
+  `ModelKVzip.gen_kwargs` and records the actual value. Local 4090 validation passed on the longest LME-S
+  context with prefill=2,048 / scoring=1,000 (paper ablation): 22.03GB allocated, 24.73GB reserved, 81.5s.
+  Paper-default scoring=2,000 OOMs there. Full MAB reaches 745,586 tokens (~42.8GB raw KV plus 15.2GB
+  weights), so use 80GB and smoke the maximum context before the complete run.
 - **#3 M+ / MemoryLLM** — **batching within one model is impossible** (single shared `[32,10240,4096]` pool,
   batch=1 baked in). It's **overhead-bound, not compute-bound** (~0.4 s/inject wall vs ~15–25 ms compute) →
   the cost lever is **bigger `--inject-block-tokens`** (default 512; test {1024,2048} on a 50-item subsample
-  first — free ~2× if quality holds). Cheapest = **1× A40** (H100 wasted on an overhead-bound job); multi-GPU
-  buys wall-clock only, same $. Needs `flash_attention_2`. First-line answer truncation already in (base model,
-  no EOS). Details: memory `project_mplus_batching_verdict`.
-  **Prep DONE (local, off-GPU):** `run_memoryllm.py` now records GPU-synced inject/answer timing into
+  first — free ~2× if quality holds). Because it can't batch, throughput comes from **sharding across many
+  cheap pods** (`mpod.py`), not a bigger GPU: an H100 is wasted here, and A40/A6000 measured **~1.24× a
+  4090**. Multi-GPU inside one pod buys wall-clock only, same $. Needs `flash_attention_2`. First-line answer
+  truncation already in (base model, no EOS). Details: memory `project_mplus_batching_verdict`.
+  **Prep DONE (local, off-GPU):** `run_memoryllm.py` records GPU-synced inject/answer timing into
   `meta.timing`; `scripts/baselines/tier2/sweep_memoryllm_blocksize.py` runs the block-size sweep on a fixed
-  subsample and prints accuracy-vs-inject-time + a recommended block. First pod action = run the sweep, set
-  the block, then the full LME + MAB run.
-- **#4 LCLM — DROPPED 2026-07-20 by project decision.** Its runner and local clone remain for provenance,
+  subsample and prints accuracy-vs-inject-time + a recommended block.
+  **LongMemEval-S DONE (2026-07-21):** 14-shard fleet run, merged to n=500 at `blk512`, overall **0.423**.
+  Two operational facts to carry forward: (a) the runner's ETA defaults (0.375 s/inject, 2.3 s/answer) are
+  **~1.5× optimistic** vs the measured 0.44–0.64 / 4.1–4.5; (b) **MAB needs a ≥116GB-RAM container** — the
+  post-injection snapshot's `cached_dropped_*` buffers scale with inject count and 47GB pods get SIGKILLed
+  (rc=137). LongMemEval is immune (singleton contexts skip the snapshot). `run_memoryllm._inject_blocks` now
+  tokenizes in character chunks so peak is O(chunk) rather than O(context) — necessary but not sufficient.
+- **#4 A-MEM** — not started. The cost table in [`A_MEM_FIDELITY_AUDIT.md`](A_MEM_FIDELITY_AUDIT.md) is a
+  **projection from one instrumented sample per dataset**, not an invoice, and re-instrumenting is **blocked
+  on a 401'd key**. No accuracy number exists.
+- **#5 LCLM — DROPPED 2026-07-20 by project decision.** Its runner and local clone remain for provenance,
   but no Phase-2 run is planned. Keep the paper in related work; do not include it in the active baseline list.
 
 ---
@@ -120,7 +174,8 @@ agent↔pod tooling in `scripts/pod/tier2_pod.py`. Integration notes: [`TIER2_GP
 | | Cost | Notes |
 |---|---|---|
 | Tier-1 (done) | **~$17** | LongMemEval ~$14 (full_context ≈90%) + MAB ~$3.30 (deepseek 50× prefix-cache vs ~$66 naive) + judge $0.03 |
-| Tier-2 (remaining est.) | **~$15–20** | KVzip ~$5–10 · M+ ~$10 (A40 overnight) · H2O complete locally · LCLM dropped |
+| Tier-2 M+ LongMemEval (done) | **fleet burn ≈$9.7/hr** | 14 pods × **$0.69/pod-hr** (`rate_per_pod` in `scripts/pod/.mpod_state.json`). Sharding buys wall-clock at roughly constant $/question — the total is set by the measured 0.44–0.64 s/inject × injects, not by the pod count. Exact invoice = RunPod billing, not reconstructible from the artifacts. |
+| Tier-2 (remaining est.) | **~$15–25** _(estimate)_ | KVzip ~$5–10 · M+ MAB (needs ≥116GB-RAM pods, so pricier per pod than the LME fleet) · H2O complete locally · A-MEM API-only, see projection above · LCLM dropped |
 
 ---
 
@@ -128,5 +183,6 @@ agent↔pod tooling in `scripts/pod/tier2_pod.py`. Integration notes: [`TIER2_GP
 - **Results:** [`PHASE2_REPORT.md`](PHASE2_REPORT.md) / [`.csv`](PHASE2_REPORT.csv) (full tables + BEM calibration + cost log)
 - **Panel design:** [`PHASE2_BASELINES.md`](PHASE2_BASELINES.md) · audit fixes [`PHASE2_AUDIT2_FIXES.md`](PHASE2_AUDIT2_FIXES.md)
 - **Tier-2 setup:** [`TIER2_GPU_INTEGRATION.md`](TIER2_GPU_INTEGRATION.md) · [`TIER2_HOSTING.md`](TIER2_HOSTING.md) · `scripts/pod/TIER2_RESUME.md`
+- **Pod ops:** [`docs/ops/RUNPOD_RUNBOOK.md`](../ops/RUNPOD_RUNBOOK.md) (portable rent/drive rules) · fleet driver `scripts/pod/mpod.py` (+ `scripts/pod/.mpod_state.json`) · shard merge `scripts/baselines/tier2/merge_shards.py`
 - **Competitor landscape:** [`FROZEN_COMPETITORS.md`](FROZEN_COMPETITORS.md)
 - **API runbook:** [`API_EVAL_RUNBOOK.md`](API_EVAL_RUNBOOK.md) · **MAB schema:** [`MEMORYAGENTBENCH_SCHEMA.md`](MEMORYAGENTBENCH_SCHEMA.md)

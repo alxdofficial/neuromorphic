@@ -8,8 +8,8 @@ GPU/matched-decoder baselines.
 ## Code layout
 | Piece | Location |
 |---|---|
-| dataset text accessors | `src/memory/data/longmemeval.py::load_longmemeval_text` (MemoryAgentBench: TODO) |
-| deterministic scorers | `src/memory/eval/longmemeval_score.py` (MemoryAgentBench: TODO) |
+| dataset text accessors | `src/memory/data/longmemeval.py::load_longmemeval_text` · `src/memory/data/memoryagentbench.py` |
+| deterministic scorers | `src/memory/eval/longmemeval_score.py` · `src/memory/eval/memoryagentbench_score.py` |
 | async OpenRouter client + price table | `src/memory/eval/api_client.py` |
 | BM25 + dense retrievers | `src/memory/eval/retrieval.py` |
 | prompt builders (the 4 modes) | `src/memory/eval/baselines.py` |
@@ -23,13 +23,20 @@ GPU/matched-decoder baselines.
 - `rag_dense` — dense (MiniLM/CPU) top-k sessions + question
 
 ## Model panel (default, `src/memory/eval/api_client.py::DEFAULT_MODELS`)
-`meta-llama/llama-3.1-8b-instruct` (131k) · `google/gemini-2.5-flash-lite` (1M) ·
-`deepseek/deepseek-v4-flash` (1M) · `qwen/qwen3.5-flash-02-23` (1M). Two frontier 1M-ctx slots TBD.
-Full-context sweep ≈ $17 (floor/RAG add pennies). Prices live in `PRICING`; override with `--models`.
+Five entries, verbatim from the code: `meta-llama/llama-3.1-8b-instruct` · `google/gemini-2.5-flash-lite` ·
+`deepseek/deepseek-v4-flash` · `qwen/qwen3.5-flash-02-23` · `openai/gpt-oss-120b` (all serve ≥128k, so a
+~115k history fits full-context). Full-context sweep ≈ $17 (floor/RAG add pennies). Prices live in `PRICING`;
+override with `--models`.
 
 > **Executed panel (2026-07-20):** the completed Tier-1 results used **two** models — `deepseek-v4-flash`
-> (1M-ctx frontier anchor) and `llama-3.1-8b-instruct` (reproducible published anchor). gemini/qwen were not
-> run. Final numbers: [`PHASE2_REPORT.md`](PHASE2_REPORT.md) · index: [`PHASE2_HUB.md`](PHASE2_HUB.md).
+> (1M-ctx frontier anchor) and `llama-3.1-8b-instruct` (reproducible published anchor). gemini / qwen /
+> gpt-oss-120b were not run. Final numbers: [`PHASE2_REPORT.md`](PHASE2_REPORT.md) · index:
+> [`PHASE2_HUB.md`](PHASE2_HUB.md).
+>
+> **2026-07-21:** all MemoryAgentBench numbers were regenerated after a `parse_output` fix (`aab14e9`) —
+> detective_qa (JSON-wrapped answers) and ICL (`label:` prefix) were structurally unscoreable and read 0.000
+> for every model. Rescored from cached generations; no re-spend. See `PHASE2_REPORT.md` §"MAB scorer fix".
+> **If you add a new MAB prompt, check that its mandated output shape is one `parse_output` can score.**
 
 ## Usage
 ```bash

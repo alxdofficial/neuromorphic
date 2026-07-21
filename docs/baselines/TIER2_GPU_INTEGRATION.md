@@ -9,8 +9,9 @@ and the pod plan. Two kinds (mechanism cut, see `PHASE2_BASELINES.md` §2.5):
 - **Cartridges (§5): DROPPED as a runnable baseline** (per-corpus training doesn't fit private haystacks) →
   cite-only.
 
-**Now ACTIVE as a per-model pod campaign** (H2O/SnapKV → KVzip → M+, one tailored pod at a time; LCLM was
-dropped from the runnable panel on 2026-07-20; live
+**Now ACTIVE as a pod campaign** (H2O/SnapKV → M+ → KVzip). As of 2026-07-21 it runs as a **sharded fleet**
+(`scripts/pod/mpod.py`, 14 single-GPU pods for the M+ LongMemEval run), not one tailored pod at a time —
+M+ can't batch, so throughput is horizontal. LCLM was dropped from the runnable panel on 2026-07-20; live
 status + GPU/cost per model in [`PHASE2_HUB.md`](PHASE2_HUB.md) §2). **The mechanisms report NO LongMemEval
 number → we generate them under our harness (never quote paper numbers).**
 
@@ -64,7 +65,11 @@ number → we generate them under our harness (never quote paper numbers).**
 - Repo [wangyu-ustc/MemoryLLM](https://github.com/wangyu-ustc/MemoryLLM) · code **MIT**, weights `YuWangX/{memoryllm-8b,mplus-8b}` (HF cards say apache-2.0 but Llama-3-derived → check Meta license) · last commit 2025-07-28 (stale-ish).
 - **Write:** per session, `model.inject_memory(ids, update_memory=True)` (each chunk must be >16 tokens). **Query:** plain `model.generate(...)` (memory already fused into hidden states).
 - **Capacities:** MemoryLLM-8B = 12,800 mem-tok/layer, useful retention **~20k tokens** (random Ebbinghaus-style eviction). **M+** adds CPU-offloaded LTM (`put_ltm_to_numpy()`, 153,600 tok) + co-trained retriever → **~160k tokens** at similar VRAM.
-- **VRAM:** ~16GB weights + ~3.3GB pool → plausibly fits 24GB (unverified; authors used H100-80GB). M+ CPU-offload → not materially more VRAM than 8B.
+- **VRAM/RAM (measured 2026-07-21):** ~16GB weights + ~3.3GB pool → **runs on a 24GB card** (confirmed by the
+  LongMemEval fleet run on RTX 4090 / A40 / A6000; the authors used H100-80GB but it is not needed). The real
+  constraint is **host RAM, not VRAM**: **MemoryAgentBench needs a ≥116GB-RAM container**, because the
+  post-injection snapshot carries `cached_dropped_*` buffers that grow with inject count — 47GB pods are
+  OOM-killed (SIGKILL, rc=137, no traceback). LongMemEval is unaffected (singleton contexts skip the snapshot).
 - **No LongMemEval runner exists** — hand-write the write-then-query loop (chunk history → inject per session → generate for the question). **MemoryLLM-8B (~20k) cannot hold 115k → use M+ only.**
 
 ## 4. LCLM — DROPPED runnable baseline (reference only)
@@ -103,16 +108,20 @@ Orchestration layers over a **frozen** chat LLM (retrieval + prompting) — NOT 
 ## 7. Pod plan
 | GPU | VRAM | RunPod $/hr (community) | H2O-2048 | KVCache-Factory | KVzip | MemoryLLM/M+ | our 135M |
 |---|---|---|---|---|---|---|---|
-| RTX 4090 | 24GB | $0.34 | ✓ (measured 17.25GB) | ✗ (~35–45GB) | LME-S borderline; MAB ✗ | ✓ (est.) | ✓ |
-| **RTX A6000** | **48GB** | **$0.33** | ✓ | ✓ | ✓ | ✓ | ✓ |
-| L40S | 48GB | $0.79 | ✓ | ✓ | ✓ | ✓ | ✓ |
+| RTX 4090 | 24GB | $0.34 | ✓ (measured **17.62GB** peak on the 105,146-token LME-S prefill; 18.40GB on the 744,639-token MAB prompt) | ✗ (~35–45GB) | LME-S ✓ at score-1k; MAB ✗ | ✓ (est.) | ✓ |
+| **RTX A6000** | **48GB** | **$0.33** | ✓ | ✓ | LME-S ✓; MAB ✗ | ✓ | ✓ |
+| L40S | 48GB | $0.79 | ✓ | ✓ | LME-S ✓; MAB ✗ | ✓ | ✓ |
 | A100 80GB | 80GB | $1.19 | ✓ | ✓ (headroom) | ✓ (headroom) | ✓ | ✓ |
 
-The VRAM table is reference only. **Current campaign uses Secure Cloud, ONE tailored pod PER MODEL** (not a
-shared pod) — see [`PHASE2_HUB.md`](PHASE2_HUB.md) §2 for the actual per-model GPU/cost choices. Key deviations
-from the old "single A6000 covers all" plan: **M+ is overhead-bound not compute-bound → cheapest on an A40, not
-a big GPU** (memory `project_mplus_batching_verdict`); LCLM is dropped; the
-KV methods (peak 33–45GB before compression) are the >24GB forcing function that wants ≥48GB.
+The VRAM table is reference only. **Current campaign uses a SHARDED FLEET of single-GPU Secure-Cloud pods**
+(14 for M+ LongMemEval, mixed RTX 4090 / A40 / RTX A6000 at $0.69/pod-hr) driven by `scripts/pod/mpod.py`;
+ops rules in [`../ops/RUNPOD_RUNBOOK.md`](../ops/RUNPOD_RUNBOOK.md) — see [`PHASE2_HUB.md`](PHASE2_HUB.md) §2
+for status and cost. Key deviations from the old "single A6000 covers all" plan: **M+ is overhead-bound not
+compute-bound → many cheap Ampere pods, not a big GPU** (A40/A6000 measured ~1.24× a 4090 on this
+snapshot/PCIe-bound workload; memory `project_mplus_batching_verdict`); **M+ on MAB needs ≥116GB RAM**;
+LCLM is dropped; the
+SnapKV/Llama remains a >24GB path. KVzip/Qwen fits LME-S locally with the paper-ablated 1k scoring chunk,
+but complete MAB reaches ~58GB for weights plus raw KV before temporary memory and therefore wants 80GB.
 
 ## Scaffolding plan (`scripts/baselines/tier2/`)
 Each runner: load base model on GPU → for each LongMemEval item, ingest the 115k history via the method's

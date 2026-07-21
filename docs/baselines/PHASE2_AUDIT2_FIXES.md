@@ -4,6 +4,9 @@ Second external audit of the Tier-1/Tier-2 baseline harness. All 20 findings ver
 (+ spot-checked vs cached LongMemEval data). Zero false alarms. **All 20 fixed; 65 tests pass
 (34 new); real-data smoke + offline runner-integration validated.**
 
+> **Test counts in this file (65 / 83 / 86) are HISTORICAL SNAPSHOTS at each audit** — they are not the
+> current suite size. As of 2026-07-21 the suite is **133** (`.venv/bin/python -m pytest tests/ -q`).
+
 Legend: `[x]` done · **(J)** = scoring-policy/fidelity JUDGMENT call (not pure mechanical).
 
 Official prompts pulled VERBATIM at pinned commits (LongMemEval@9e0b455 src/generation/run_generation.py;

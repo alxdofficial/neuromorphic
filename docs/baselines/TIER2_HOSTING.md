@@ -21,7 +21,7 @@ the 500 questions has its own unique history → nothing to reuse; the levers th
 | method | reuse unit | recipe | note |
 |---|---|---|---|
 | **KV-eviction** | compressed KV cache | prefill context → compress → **cache the compressed KV** → every question decodes from it | **use KVzip, not SnapKV** (see below) |
-| **MemoryLLM / M+** | memory-pool snapshot | write context session-by-session → **snapshot memory state** → answer all its questions → restore for next context | `_snapshot_memory_state` already scaffolded in `run_memoryllm.py` |
+| **MemoryLLM / M+** | memory-pool snapshot | write context session-by-session → **snapshot memory state** → answer all its questions → restore for next context | `_snapshot_memory_state` in `run_memoryllm.py`. ⚠ **The snapshot is the RAM wall on MAB**: it carries `cached_dropped_*` buffers that grow with inject count → **needs a ≥116GB-RAM container** (47GB pods die by SIGKILL, rc=137). LongMemEval skips the snapshot (singleton contexts) and is unaffected. |
 | **LCLM (dropped; reference only)** | encoded latents | encoder compresses context → cache latent tokens → decoder consumes cached latents + each question | No Phase-2 run planned as of 2026-07-20 |
 
 ## Multi-query KV baselines: KVzip and infinite H2O
@@ -34,7 +34,7 @@ independent of any query. Its explicit selling point is the multi-query setting:
 > settings, as they overfit to the initial queries and require **repetitive cache prefills**."
 
 That is *exactly* MemoryAgentBench (one context, ~85 queries). The comparison now includes:
-- **KVzip** (compress once per context, reuse across its ~85 questions). Tested on LLaMA-3.1-8B to 170k
+- **KVzip** (compress once per context, reuse across its ~85 questions). Tested with Qwen2.5-7B-1M to 170k
   ctx; 3–4× cache reduction, ~2× decode speedup, negligible QA loss.
 - **Infinite H2O** (stream once with position rolling, snapshot raw retained K/V and heavy-hitter scores, fork
   per question). Its context-only heavy-hitter decisions cannot use later questions to recover evicted tokens,
@@ -53,8 +53,8 @@ That is *exactly* MemoryAgentBench (one context, ~85 queries). The comparison no
 
 ## Fidelity knobs (do NOT trade these for speed)
 
-- **bf16, not 4-bit**, unless VRAM forces it — these are *baselines*; quantization would handicap them and
-  invite "you under-ran the competitor." 48GB fits bf16 for all three, so no need.
+- **bf16, not 4-bit** — these are *baselines*; quantization would handicap them and invite "you under-ran the
+  competitor." Full MAB KVzip needs 80GB because its longest context is 745,586 Qwen tokens.
 - **FlashAttention-2 / SDPA** for the 100k+ prefills — required for both memory and speed.
 
 ## Scope + timing implication

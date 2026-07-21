@@ -1,8 +1,9 @@
 # Phase-2 Baseline Establishment — Plan & Runbook
 
-**Status (updated 2026-07-20): Panel-B (native-scale) EXECUTING.** Tier-1 (API long-context + RAG) is **DONE**;
-Tier-2 (GPU memory mechanisms) is a **per-model campaign** (H2O complete; KVzip/SnapKV/M+ pending; LCLM
-dropped). **Panel-A
+**Status (updated 2026-07-21): Panel-B (native-scale) EXECUTING.** Tier-1 (API long-context + RAG) is **DONE**
+on both benchmarks; Tier-2 (GPU memory mechanisms) runs as a **sharded pod fleet** (`scripts/pod/mpod.py`) —
+H2O complete on both; **M+ complete on LongMemEval-S (n=500)** with its MemoryAgentBench run still going;
+KVzip/SnapKV/A-MEM pending; LCLM dropped. **Panel-A
 (matched-135M)** remains **DEFERRED** until our own model exists (it's the fair fight our number slots into).
 This file is the design rationale; **live status + results = [`PHASE2_HUB.md`](PHASE2_HUB.md)**.
 Establish reference numbers for established SOTA memory/long-context baselines on a fixed benchmark +
@@ -77,16 +78,22 @@ so "full-context" is not a Panel-A entry (only meaningful on the oracle split / 
 | no-memory floor | — | `vanilla_llama` (question only, no context) | 4090 ✓ (have) |
 | RAG (BM25) | nonparam | BM25 over sessions → top-k → 135M reader | 4090 ✓ |
 | RAG (dense) | nonparam | Stella-V5 / GTE-Qwen2 embed → top-k → 135M reader | 4090 ✓ |
-| KV-eviction | nonparam | H2O (have) + StreamingLLM/SnapKV via `apple/ml-epicache` | 4090 ✓ |
+| KV-eviction | nonparam | **H2O = first-party adapter `src/memory/eval/h2o_llama.py`** (ported policy, not a vendored repo); SnapKV/StreamingLLM via `Zefan-Cai/KVCache-Factory` monkey-patch | 4090 ✓ (H2O; SnapKV needs >24GB) |
 | **OURS** | parametric | streaming-compress → 96 slots + edges → 135M | 4090 ✓ |
 
 ### Panel B — native-scale reference (the "what's the ceiling" numbers)
 
-| baseline | param? | mechanism | compute |
-|---|---|---|---|
-| GPT-4o full-ctx / RAG | nonparam | official harness, OpenAI API | **API — needs `OPENAI_API_KEY`** |
-| Llama-3.1-8B-128k full-ctx | nonparam | 115k-tok single prompt | 40–48GB pod, or 4-bit on 4090 |
-| **MemoryLLM-8B / M+** | parametric | `YuWangX/memoryllm-8b`, `mplus-8b` — online session-by-session write | 4090 ✓ (fits 24GB); **no LongMemEval number exists → we establish it** |
+**Reconciliation of REVISION 2026-07-18 §4 ("Panel B de-scoped"):** the de-scoping applies to the **GPT-4o
+row only** — we do not pay ~$144/pass for it, we cite the published 60.6 / oracle 87.0. The rest of Panel B
+**did run**, substituting a cheap 1M-context frontier model (`deepseek-v4-flash`) for the GPT-4o slot; see
+[`PHASE2_HUB.md`](PHASE2_HUB.md) §1.
+
+| baseline | param? | mechanism | compute | status |
+|---|---|---|---|---|
+| ~~GPT-4o full-ctx / RAG~~ | nonparam | official harness, OpenAI API | ~$144/pass | **CITE-ONLY (de-scoped 2026-07-18)** — published 0.606 full-ctx / 0.870 oracle |
+| deepseek-v4-flash full-ctx / RAG (1M ctx) | nonparam | our harness, OpenRouter | API, ~$17 total | ✅ **DONE** — LME 0.687 full-ctx |
+| Llama-3.1-8B-128k full-ctx | nonparam | 115k-tok single prompt | OpenRouter (served 131k) | ✅ **DONE** — LME 0.462 (94.4% coverage) |
+| **MemoryLLM-8B / M+** | parametric | `YuWangX/memoryllm-8b`, `mplus-8b` — online session-by-session write | fits 24GB VRAM; **MAB needs ≥116GB host RAM** | ✅ **LME DONE — 0.423, the first LongMemEval number for M+**; MAB running |
 
 Skipped as headline: Mem0/Zep/Letta (numbers 36–94% for one system; need an API backend; only worth it
 re-run under our fixed harness).
@@ -120,7 +127,7 @@ reimplementation). Rule for ALL of these: **re-run under our fixed harness; neve
 | **LCLM** | **DROPPED (cite-only)** | encoder → soft tokens → adapter → **frozen-init 4B** decoder, e2e continual-pretrain, 4×/8×/16× | Qwen3-Emb-0.6B enc + 4B dec; released weights | related-work comparator only; no Phase-2 run planned |
 | Larimar | optional | Kanerva episodic-memory matrix conditioning a frozen-ish decoder | 1.3B/6B; train-your-own | classic architectural analog / "memory-module baseline" |
 | KV-compression | **have** | KVzip + SnapKV (+ H2O) evict the 115k-tok KV cache | Llama/Qwen 7–8B; 48GB pod | the KV-eviction branch (LCLM itself compares to these) |
-| MemoryLLM / M+ | **have** | parametric in-weights memory, online session write | `mplus-8b`; 24GB | only mechanism-with-released-weights parametric baseline |
+| MemoryLLM / M+ | **have; LME DONE** | parametric in-weights memory, online session write | `mplus-8b`; 24GB VRAM, but **≥116GB host RAM for MAB** | only mechanism-with-released-weights parametric baseline |
 
 **Cite-only** (a related-work STRENGTH: "prior work claims X, ships nothing runnable-for-our-task, so we
 compare against released alternatives"): **Titans / ATLAS / Miras** (Google — code promised, never shipped),
@@ -174,7 +181,8 @@ max-gen-tokens · denominator (overall vs task-avg vs abstention).
 
 - **Have:** `src/memory/data/longmemeval.py` (real reader, 500 Qs, taxonomy + abstention); floor/ceiling
   `vanilla_llama` / `vanilla_full_context`; H2O eval-only; **the deterministic scorer (done).**
-- **Have (built 2026-07-18, 2-audit-hardened, 70 tests):** the **Tier-1 API reference harness** —
+- **Have (built 2026-07-18, audit-hardened; suite now 133 tests, `.venv/bin/python -m pytest tests/ -q`):**
+  the **Tier-1 API reference harness** —
   `scripts/baselines/run_api_eval.py` (floor / full-context / RAG-bm25 / RAG-dense over OpenRouter, token-
   accurate budgeting, resumable per-question store, coverage/cost accounting) + `src/memory/eval/` scorers
   for BOTH LongMemEval and MemoryAgentBench (judge-free, per-competency prompts verbatim from the MAB repo)
@@ -191,16 +199,24 @@ max-gen-tokens · denominator (overall vs task-avg vs abstention).
 ## 5. Execution order (cheapest-first)
 
 1. ✅ **Deterministic scorers + Tier-1 API harness** (`src/memory/eval/`, `scripts/baselines/run_api_eval.py`)
-   — built + 2-audit-hardened (70 tests). Shared prerequisite. **DONE.**
-2. **Tier-1 API reference run** — floor / full-context / RAG-bm25 / RAG-dense over the OpenRouter panel on
-   LongMemEval + MemoryAgentBench. **No GPU**, parallel to Phase-0; first real reference numbers.
+   — built + audit-hardened (suite now 133 tests). Shared prerequisite. **DONE.**
+2. ✅ **Tier-1 API reference run** — floor / full-context / RAG-bm25 (k5 + k15) over the OpenRouter panel on
+   LongMemEval **and** MemoryAgentBench. No GPU. **DONE** (`deepseek-v4-flash` + `llama-3.1-8b-instruct`;
+   RAG-dense not run). Numbers: [`PHASE2_REPORT.md`](PHASE2_REPORT.md).
 3. **Panel-A on 4090** — 135M reader: floor → BM25 RAG → dense RAG → KV-eviction (matched-decoder fight).
-4. **2a mechanism competitors** (native / Panel-B), cheapest-first:
-   a. **KVzip + SnapKV + MemoryLLM/M+** — already scaffolded in `scripts/baselines/tier2/` (48GB / 24GB pod).
+   **DEFERRED** until our own model exists.
+4. **2a mechanism competitors** (native / Panel-B), cheapest-first — **partly DONE**:
+   a. ✅ **H2O** (local 4090, both benchmarks). ✅ **MemoryLLM/M+ on LongMemEval-S** (14-pod sharded fleet).
+      🔄 **M+ on MemoryAgentBench** running (needs ≥116GB-RAM pods). ⏳ **KVzip** (80GB) + **SnapKV** (>24GB)
+      pending; scaffolded in `scripts/baselines/tier2/`.
    b. **Larimar** optional. (LCLM and Cartridges dropped as runnable baselines; retain as citations.)
 5. **2b — ONE agent-memory system** (**A-MEM** default) over a frozen LLM via the OpenRouter path (min GPU).
-6. **Panel-B native ceilings** — Llama-3.1-8B on a pod; GPT-4o via API (needs key); + one-time judge cross-check.
-7. **MemoryAgentBench** across the same set (thesis-axis support; harness already built).
+   ⏳ not started; cost table in `A_MEM_FIDELITY_AUDIT.md` is a projection blocked on a 401'd key.
+6. **Panel-B native ceilings** — ✅ **DONE via the Tier-1 API path** (llama-3.1-8b + deepseek-v4-flash
+   full-context) with the one-time GPT-4o judge cross-check for BEM calibration. **GPT-4o itself is cite-only**
+   (de-scoped 2026-07-18; ~$144/pass) — do not schedule it.
+7. ✅ **MemoryAgentBench** across the same Tier-1 set (thesis-axis support) — **DONE, 3,071 Q**; rescored
+   2026-07-21 after the detective_qa/ICL scorer fix.
 8. **Our trained model** into the same harness → the headline row.
 
 Rule for steps 4–5: **re-run under our harness, never quote paper numbers.** Results land in
@@ -212,10 +228,14 @@ Rule for steps 4–5: **re-run under our harness, never quote paper numbers.** R
 - **2026-07-17** — doc created; decisions approved (both panels, deterministic+judge, LongMemEval +
   MemoryAgentBench); scorer built + validated.
 - **2026-07-18** — Tier-1 API reference harness built (`scripts/baselines/`, `src/memory/eval/`) + Tier-2
-  GPU scaffolds; two external audits (harness fidelity) fixed + re-verified, 70 tests. See
-  `PHASE2_AUDIT2_FIXES.md`.
+  GPU scaffolds; two external audits (harness fidelity) fixed + re-verified. See
+  `PHASE2_AUDIT2_FIXES.md` (test counts there are historical snapshots; the current suite is **133**).
 - **2026-07-18b** — memory-MECHANISM competitor sweep adopted: **§2.5** splits mechanism baselines into 2a
   (architectural) / 2b (agent-memory); **LCLM added (must)** as our closest concurrent competitor
   (web-verified, novelty note); Cartridges added; A-MEM = the one 2b; Larimar optional; Memory-R1 → cite-only.
 - **2026-07-20c** — LCLM dropped from the runnable panel by project decision; retained as cite-only related
   work. Active Tier-2 mechanisms are H2O/SnapKV, KVzip, and MemoryLLM/M+, plus A-MEM in the agent category.
+- **2026-07-21** — §5 execution order reconciled with reality (Tier-1 + MAB marked DONE; H2O + M+/LongMemEval
+  done); Panel-B contradiction resolved (**GPT-4o row cite-only, rest of Panel B ran**); H2O attribution fixed
+  (first-party `src/memory/eval/h2o_llama.py`, not `apple/ml-epicache`); test count synced to 133. All MAB
+  numbers regenerated after the detective_qa/ICL scorer fix (`aab14e9`) — see `PHASE2_REPORT.md`.

@@ -6,8 +6,8 @@ KV-compression (SnapKV via KVCache-Factory, infinite-streaming H2O via our Llama
 compressor **LCLM** (`run_lclm.py`, our closest concurrent competitor). (Cartridges was considered but
 **dropped** — per-corpus training doesn't fit LongMemEval's private haystacks; cite-only.)
 Unlike Tier-1 (`scripts/baselines/run_api_eval.py`, OpenRouter API), these manipulate KV cache / model
-internals with real weights — they need a GPU and cannot run via an API. H2O-2048 and LCLM target the local
-4090; the full-prompt KVCache-Factory/KVzip paths still need larger rented GPUs.
+internals with real weights — they need a GPU and cannot run via an API. H2O-2048 and KVzip on LME-S can run
+on the local 4090; SnapKV and full-MAB KVzip need larger rented GPUs.
 
 > The **2b agent-memory** baselines (A-MEM / MemoryOS) are NOT here — they run over a frozen LLM via the
 > OpenRouter path with only a CPU embedder: `scripts/baselines/run_agentmem.py --method {a-mem,memoryos}`
@@ -19,17 +19,21 @@ Spec + provenance + exact entry points: `docs/baselines/TIER2_GPU_INTEGRATION.md
 
 | GPU | VRAM | RunPod $/hr (community) | H2O cap=2048 | KVCache-Factory (SnapKV) | KVzip | MemoryLLM/M+ |
 |---|---|---|---|---|---|---|
-| RTX 4090 | 24GB | $0.34 | fits (18.40GB max measured) | too small (~35-45GB peak) | LME-S borderline; MAB too large | fits (est.) |
-| **RTX A6000** | **48GB** | **$0.33** | fits | fits | fits | fits |
-| L40S | 48GB | $0.79 | fits | fits | fits | fits |
+| RTX 4090 | 24GB | $0.34 | fits (18.40GB max measured) | too small (~35-45GB peak) | LME-S fits at score-chunk=1k; MAB too large | fits (est.) |
+| **RTX A6000** | **48GB** | **$0.33** | fits | fits | LME-S fits; full MAB too large | fits |
+| L40S | 48GB | $0.79 | fits | fits | LME-S fits; full MAB too large | fits |
 | A100 80GB | 80GB | $1.19 | fits, headroom | fits, headroom | fits, headroom | fits |
 
-**Campaign runs ONE tailored pod PER MODEL (not a shared pod), on Secure Cloud** — current per-model GPU/cost
-choices live in [`docs/baselines/PHASE2_HUB.md`](../../../docs/baselines/PHASE2_HUB.md) §2. The VRAM table above
+**Campaign runs a SHARDED FLEET of single-GPU Secure-Cloud pods** (`scripts/pod/mpod.py`; 14 pods, mixed
+4090/A40/A6000 at $0.69/pod-hr for the M+ LongMemEval run) — status and cost live in
+[`docs/baselines/PHASE2_HUB.md`](../../../docs/baselines/PHASE2_HUB.md) §2, pod ops in
+[`docs/ops/RUNPOD_RUNBOOK.md`](../../../docs/ops/RUNPOD_RUNBOOK.md). The VRAM table above
 is reference only. Key points: SnapKV/KVzip materialize the full KV before compressing. Qwen2.5-7B KVzip
 uses fewer KV heads than Llama, making LME-S borderline on 24GB, but full MAB still needs 80GB. Online H2O
-stays bounded; M+ never holds a full KV (fits 24GB but is **overhead-bound → cheapest on an A40**,
-not a big GPU); **LCLM runs FULL locally on the 4090** (no rental).
+stays bounded; M+ never holds a full KV (fits 24GB but is **overhead-bound → shard across many cheap Ampere
+pods**, not one big GPU; A40/A6000 measure ~1.24× a 4090). **M+ on MemoryAgentBench additionally needs a
+≥116GB-RAM container** — the post-injection snapshot's `cached_dropped_*` buffers grow with inject count and
+47GB pods get SIGKILLed (rc=137). **LCLM is dropped from the panel.**
 
 Follow `scripts/pod/README.md` / `docs/ops/runpod_workflow.md` for the actual `runpod.py create` /
 `drive` / `reap` mechanics (SSH key, tmux, billing-safety wall-clock cap) — this doc only covers what's
@@ -39,7 +43,10 @@ Tier-2-specific: which repos to clone and how to launch each runner once you're 
 > flash-attn 2.7.4.post1 + custom kernel), KVCache-Factory, MemoryLLM/M+, and LCLM pin **mutually incompatible** torch / transformers / numpy /
 > python versions. Do **not** install them into one shared env — give each its own venv/conda env (or run
 > them on separate pod sessions). Our harness code is pure-python + lazy-imported, so it rides along in any
-> of them.
+> of them. KVzip's environment deliberately overrides its upstream `datasets==3.6.0` pin with
+> `datasets==4.5.0` after
+> installation because current MemoryAgentBench metadata uses the 4.x `List` schema feature; this affects
+> benchmark loading only, not model or KV-cache behavior.
 
 ## 2. Clone the method repos (on the pod)
 
@@ -109,7 +116,9 @@ groups questions by distinct context and encodes each context ONCE (MAB = 36 enc
 cd /path/to/neuromorphic   # repo root — the runners insert it onto sys.path themselves
 
 # --- smoke each method (5-20 items) BEFORE the full run ---
-python scripts/baselines/tier2/run_kvcompress.py --method kvzip --dataset longmemeval --max-examples 5
+# 4090 KVzip: validated low-memory setting; score-1k is a documented paper-ablation setting.
+python scripts/baselines/tier2/run_kvcompress.py --method kvzip --dataset longmemeval --max-examples 5 \
+  --kvzip-prefill-chunk-size 2048 --kvzip-scoring-chunk-size 1000
 python scripts/baselines/tier2/run_kvcompress.py --method h2o  --dataset longmemeval --max-examples 1 \
   --max-capacity-prompt 2048 --prefill-chunk-size 512 --h2o-head-mode query_head
 python scripts/baselines/tier2/run_kvcompress.py --method h2o  --dataset memoryagentbench --max-examples 20 \
@@ -123,7 +132,7 @@ python scripts/baselines/tier2/run_lclm.py                    --dataset longmeme
 DATASET=longmemeval scripts/baselines/tier2/run_pod_panel.sh          # override KVZIP_ENV/KVZIP_GPU/... to taste
 DATASET=memoryagentbench scripts/baselines/tier2/run_pod_panel.sh
 
-# --- or run methods individually ---
+# --- or run methods individually (full MAB KVzip requires 80GB) ---
 python scripts/baselines/tier2/run_kvcompress.py --method kvzip  --dataset memoryagentbench --ratio 0.3
 python scripts/baselines/tier2/run_kvcompress.py --method h2o   --dataset longmemeval --max-capacity-prompt 2048
 python scripts/baselines/tier2/run_kvcompress.py --method h2o   --dataset memoryagentbench --max-capacity-prompt 2048
@@ -176,7 +185,13 @@ Each run writes `outputs/baselines/<dataset>__<method>__…​.json` (+ a resuma
 - **KVzip peak is before pruning.** Increasing compression (`--ratio`) does not make an oversized context fit.
   Qwen2.5-7B uses about 56 KiB of BF16 KV per token: LME-S is 99,837-111,192 tokens (~5.7-6.4GB raw KV),
   while MAB reaches 745,586 tokens (~42.8GB raw KV). `--kvzip-prefill-chunk-size` can reduce temporary
-  prefill memory without changing reconstruction scoring; the paper/default scoring chunk remains 2,000.
+  prefill memory. The paper uses a 2,000-token reconstruction chunk; its ablation reports under 2% average
+  relative performance difference at 1,000, which is the principled fallback (`--kvzip-scoring-chunk-size
+  1000`) when the longest LME-S contexts do not fit on 24GB.
+- **Measured KVzip on the local RTX 4090:** the longest 111,192-token LME-S context succeeds with prefill
+  chunk 2,048 and scoring chunk 1,000 at 22.03GB allocated / 24.73GB reserved, taking 81.5s to compress.
+  The paper-default 2,000 scoring chunk OOMs on that item; a 4,096 prefill chunk also leaves too little
+  scoring headroom. Use `--kvzip-prefill-chunk-size 2048 --kvzip-scoring-chunk-size 1000` locally.
 - **MemoryLLM-8B (not M+) tops out ~20k tokens** — cannot hold LongMemEval-S's ~115k-token haystack.
   `run_memoryllm.py` defaults to M+ for this reason; only override `--model` to MemoryLLM-8B/-chat if you
   want a (roundly unfair, context-truncated) sanity comparison.
@@ -186,8 +201,8 @@ Each run writes `outputs/baselines/<dataset>__<method>__…​.json` (+ a resuma
   snapshots `model.memory.data` once after load and restores it before every LongMemEval item (each item
   has its own private haystack). Flagged as a POD-ONLY TODO in `run_memoryllm.py` — verify on the pod that
   this is the complete state to reset (M+'s LTM store in particular).
-- **VRAM headroom** — if a KV-compression run OOMs on the A6000, first try a smaller `--max-capacity-prompt`
-  / larger `--ratio` (evict more), then fall back to the A100 80GB row in the table above.
+- **VRAM headroom** — KVzip's peak precedes pruning, so a smaller retained ratio cannot rescue an oversized
+  context. Full MAB needs an A100/H100 80GB; smoke its 745,586-token maximum before launching all 3,071 Q.
 - **LCLM** — the context MUST be wrapped in `<|memory_start|> … <|memory_end|>` (the runner does this); the
   checkpoints only load with the repo on PYTHONPATH (`--repo-dir`); ~9–10GB bf16 → fits a 24GB card,
   inference-only. ⚠ **license not stated** — clear redistribution before publishing numbers.

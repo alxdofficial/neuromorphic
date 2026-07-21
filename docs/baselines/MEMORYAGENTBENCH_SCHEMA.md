@@ -55,7 +55,11 @@ agents are the other protocols (only needed if reproducing those specific baseli
 - **Contexts far exceed 128k** for `ruler_qa2` (~420k), `recsys` (~1.48M, only 1 test sample), `eventqa_full`
   (multi-M). For API models: cap/truncate to the model's window and LOG it, or restrict to the ≤128k sub-sources.
 - `exact_match` is deliberately brittle (README warns): ICL numeric labels + detectiveQA JSON need a flexible
-  extractor for fidelity-to-intent; strict repro will under-score.
+  extractor for fidelity-to-intent; strict repro will under-score. **This bit us (fixed 2026-07-21, `aab14e9`):**
+  our prompts mandate single-line JSON for detective_qa and `label: {label}` for ICL, neither of which the old
+  `parse_output` could reach — **both competencies read 0.000 for every model**. `parse_output` now extracts
+  the JSON `answer` field and strips a leading `label:` before the first-line fallback. **When adding a MAB
+  prompt, check its mandated output shape is one the parser can score.**
 - `detectiveQA` gold has the letter prefix — must match `"C. ..."` exactly.
 - `recsys` Recall@5 not reproducible without `entity2id.json` (repo root, not in a split; hardcoded path
   `./processed_data/Recsys_Redial/entity2id.json`) + `find_nearest_movie` fuzzy match. Vendor it or mark
