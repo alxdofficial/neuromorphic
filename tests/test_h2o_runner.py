@@ -23,6 +23,40 @@ assert SPEC.loader is not None
 SPEC.loader.exec_module(RUNNER)
 
 
+def test_kvzip_context_shards_are_complete_disjoint_and_deterministic():
+    items = [
+        {"question_id": "a1", "full_history": "a" * 100},
+        {"question_id": "a2", "full_history": "a" * 100},
+        {"question_id": "b", "full_history": "b" * 80},
+        {"question_id": "c", "full_history": "c" * 60},
+        {"question_id": "d", "full_history": "d" * 40},
+    ]
+
+    partitions = [RUNNER._shard_items(items, 3, idx)[0] for idx in range(3)]
+    ids = [{item["question_id"] for item in part} for part in partitions]
+    assert set().union(*ids) == {item["question_id"] for item in items}
+    assert all(ids[left].isdisjoint(ids[right]) for left in range(3) for right in range(left + 1, 3))
+    assert any({"a1", "a2"}.issubset(partition) for partition in ids)
+    assert partitions[1] == RUNNER._shard_items(items, 3, 1)[0]
+
+
+def test_kvzip_lpt_shards_balance_similar_longmemeval_contexts():
+    items = [
+        {"question_id": str(idx), "full_history": str(idx) * (1000 + idx)}
+        for idx in range(40)
+    ]
+    _, loads, context_counts = RUNNER._shard_items(items, 4, 0)
+    assert sum(context_counts) == len(items)
+    assert (max(loads) - min(loads)) / max(loads) < 0.1
+
+
+def test_kvzip_shard_arguments_are_validated():
+    with pytest.raises(ValueError, match="num_shards"):
+        RUNNER._shard_items([], 0, 0)
+    with pytest.raises(ValueError, match="shard_idx"):
+        RUNNER._shard_items([], 2, 2)
+
+
 class _Tokenizer:
     def __init__(self, result):
         self.result = result

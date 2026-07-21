@@ -27,7 +27,7 @@ calibration only. Every number below is directly comparable across rows.
 | Layer | What | Status |
 |---|---|---|
 | **Tier-1** (API: long-context + RAG) | deepseek-v4-flash, llama-3.1-8b · floor/full_context/rag_bm25 | ✅ **DONE** (on `main`) |
-| **Tier-2** (GPU memory *mechanisms*) | M+, H2O@2%, H2O@20%, KVzip, A-MEM (SnapKV/LCLM/`memoryllm-8b` dropped) | 🟡 **in progress** — H2O@2% done (both benchmarks); **KVzip MAB done (0.519)**, KVzip LongMemEval running; **M+ DONE both** (LME 0.423, MAB 0.286); H2O@20% planned; A-MEM blocked on an API key (see §2) |
+| **Tier-2** (GPU memory *mechanisms*) | M+, H2O@2%, H2O@20%, KVzip, A-MEM (SnapKV/LCLM/`memoryllm-8b` dropped) | 🟡 **in progress** — H2O@2% done (both benchmarks); **KVzip DONE both** (LME 0.523, MAB 0.519); **M+ DONE both** (LME 0.423, MAB 0.286); H2O@20% planned; A-MEM blocked on an API key (see §2) |
 | **Our model** | frozen-decoder learned memory | ⏳ later (Phase-2 head-to-heads) |
 
 ---
@@ -66,7 +66,7 @@ exact-match". That was our own prompt/metric mismatch, not a scorer-fidelity flo
 Llama-3.1-8B LME full 0.454 / oracle 0.710. Full tables in [`PHASE2_REPORT.md`](PHASE2_REPORT.md) §Published.
 
 ### Tier-2 — IN PROGRESS
-H2O has completed locally on both full benchmark selections. M+ has completed LongMemEval-S on the pod fleet.
+H2O, M+, and KVzip have completed both full benchmark selections.
 Length-capped generations are scored as emitted; natural EOS completion is reported separately in the
 authoritative report.
 **SCOPE — the five arms of interest (fixed 2026-07-21).** The runnable Tier-2 panel is **M+**, **H2O@2%**,
@@ -78,7 +78,7 @@ authoritative report.
 | **M+** (`mplus-8b`) | **0.423** overall / 0.379 task-avg / **0.000** abstention (500; coverage 1.000, EOS 1.000) | **0.286** strict micro / 0.331 competency macro / 0.295 lenient (3,071; coverage 1.000, EOS 1.000) |
 | **H2O @2% KV** (`cap2048`) | **0.066** overall / 0.056 task macro / 0.333 abstention (500; EOS 0.390) — see budget caveat | **0.371** strict micro / 0.287 competency macro / 0.377 lenient (3,071; EOS 0.892) |
 | **H2O @20% KV** (`cap≈20k`) | ⏳ PLANNED — the paper's operating point | ⏳ PLANNED |
-| **KVzip** (`Qwen2.5-7B-Instruct-1M`) | 🔄 RUNNING (4-pod shard fleet) | **0.519** strict micro / 0.519 competency macro / 0.526 lenient (3,071; EOS 1.000) |
+| **KVzip** (`Qwen2.5-7B-Instruct-1M`) | **0.523** overall / 0.518 task-avg / **0.067** abstention (500; coverage 1.000, EOS 1.000) | **0.519** strict micro / 0.519 competency macro / 0.526 lenient (3,071; EOS 1.000) |
 | **A-MEM** (agent-memory) | — | — (blocked: OpenRouter key) |
 | ~~SnapKV~~ | **DROPPED** | **DROPPED** |
 | ~~LCLM~~ | **DROPPED** | **DROPPED** |
@@ -97,6 +97,11 @@ which is the expected failure mode for recency-biased eviction.
 **KVzip read (2026-07-21).** At 0.519 it is the strongest compression method on MAB, ahead of H2O@2%
 (0.371), and the gap is concentrated exactly where the mechanisms differ: Long_Range_Understanding
 **0.592 vs 0.028**. KVzip is query-agnostic and retains distant evidence; H2O's recency window discards it.
+On LongMemEval it reaches **0.523**, ahead of M+ (0.423), llama full-context (0.462), and H2O@2% (0.066),
+while remaining below deepseek full-context (0.687). Its strongest slices are knowledge-update (0.792),
+single-session-assistant (0.786), and single-session-user (0.766); preference remains 0.000 and abstention
+is only 0.067. The full run used 3x RTX A6000 + 1x A40, 125 disjoint contexts per shard, and took 4h07m
+evaluation wall time after setup. All 500 generations were retrieved and the pods were terminated.
 
 **H2O budget caveat (2026-07-21) — do not quote 0.066 bare.** That run is `rolling-cap2048` against a
 ~105k-token context = a **1.95% KV budget (~51× compression)**; H2O's paper evaluates at ~20%. At 2% it
@@ -170,7 +175,7 @@ how they work: [`FROZEN_COMPETITORS.md`](FROZEN_COMPETITORS.md).
 | # | Model | Method (how) | Backbone | Scope | GPU used | Cost / time | Status |
 |---|---|---|---|---|---|---|---|
 | 1 | **H2O / SnapKV** | streaming/query-aware KV eviction | Llama-3.1-8B | LME + MAB (H2O) | local 4090 | $0 / 4h44m | **H2O complete**; SnapKV pending |
-| 2 | **KVzip** | query-agnostic KV compression | Qwen2.5-7B-1M | LME + MAB | **H100/A100 80GB** | ~$5–10 _(estimate)_ | 🟡 local smoke passed; full run pending |
+| 2 | **KVzip** | query-agnostic KV compression | Qwen2.5-7B-1M | LME + MAB | MAB: RTX PRO 6000; LME: 3x A6000 + 1x A40 | LME 4h07m eval wall; exact invoice in RunPod | ✅ **DONE both** |
 | 3 | **M+ / MemoryLLM** | recurrent parametric memory | mplus-8b | LME + MAB | 14-pod fleet, mixed 4090/A40/A6000 @ $0.69/pod-hr | see §3 | ✅ **LME DONE (n=500)**; 🔄 MAB running (needs ≥116GB RAM pods) |
 | 4 | **A-MEM** | 2b agent-memory over a frozen LLM | OpenRouter panel | LME (+MAB) | none (API) | **PROJECTION only** — LME-S ~$14–36 expected / $181 strict-WandB, MAB ~$3.8–38.9; see [`A_MEM_FIDELITY_AUDIT.md`](A_MEM_FIDELITY_AUDIT.md) | ⏳ not started — cost table is a projection **blocked on a 401'd key** (needs key refresh to instrument) |
 | 5 | **LCLM** | soft-token compression | 0.6b+4b | — | — | — | **DROPPED 2026-07-20** |
@@ -186,7 +191,7 @@ how they work: [`FROZEN_COMPETITORS.md`](FROZEN_COMPETITORS.md).
   p95 107,047, max 107,557 tokens; all fit Llama's 131,072 window with 64 generation tokens. SnapKV remains on
   KVCache-Factory/Transformers-4.44.2 and still needs ≥48GB because it materializes full prompt KV first.
   H2O supports exact context snapshot reuse on MAB; SnapKV remains LongMemEval-only. **Completed results:** LME
-  0.066 overall (500/500 scored; EOS 39.0%); MAB 0.278 strict micro / 0.138 competency macro / 0.377 lenient
+  0.066 overall (500/500 scored; EOS 39.0%); MAB 0.371 strict micro / 0.287 competency macro / 0.377 lenient
   (3,071/3,071 scored; EOS 89.2%). The 2,048-token budget is only ~1.9% of the average LME prompt and ~1.1%
   of the average MAB context, substantially below the original paper's main 4–60% budget sweep.
 - **#2 KVzip** — needs the custom CUDA kernel (`cuda-nvcc` + **`cuda-cccl=12.4.*`** pin) + prebuilt flash-attn
@@ -194,8 +199,10 @@ how they work: [`FROZEN_COMPETITORS.md`](FROZEN_COMPETITORS.md).
   `--ratio` (KV retained, default 0.3). The runner enforces the shared 64-token cap through upstream's
   `ModelKVzip.gen_kwargs` and records the actual value. Local 4090 validation passed on the longest LME-S
   context with prefill=2,048 / scoring=1,000 (paper ablation): 22.03GB allocated, 24.73GB reserved, 81.5s.
-  Paper-default scoring=2,000 OOMs there. Full MAB reaches 745,586 tokens (~42.8GB raw KV plus 15.2GB
-  weights), so use 80GB and smoke the maximum context before the complete run.
+  Paper-default scoring=2,000 OOMs there. The full LongMemEval run used paper-default scoring=2,000 on
+  48GB A6000/A40 cards, peaking around 25GB and completing 500 questions in 4h07m wall across four shards.
+  Full MAB reaches 745,586 tokens (~42.8GB raw KV plus 15.2GB weights), so use an 80GB-or-larger card and
+  smoke the maximum context before the complete run.
 - **#3 M+ / MemoryLLM** — **batching within one model is impossible** (single shared `[32,10240,4096]` pool,
   batch=1 baked in). It's **overhead-bound, not compute-bound** (~0.4 s/inject wall vs ~15–25 ms compute) →
   the cost lever is **bigger `--inject-block-tokens`** (default 512; test {1024,2048} on a 50-item subsample
@@ -226,7 +233,7 @@ how they work: [`FROZEN_COMPETITORS.md`](FROZEN_COMPETITORS.md).
 |---|---|---|
 | Tier-1 (done) | **~$17** | LongMemEval ~$14 (full_context ≈90%) + MAB ~$3.30 (deepseek 50× prefix-cache vs ~$66 naive) + judge $0.03 |
 | Tier-2 M+ LongMemEval (done) | **fleet burn ≈$9.7/hr** | 14 pods × **$0.69/pod-hr** (`rate_per_pod` in `scripts/pod/.mpod_state.json`). Sharding buys wall-clock at roughly constant $/question — the total is set by the measured 0.44–0.64 s/inject × injects, not by the pod count. Exact invoice = RunPod billing, not reconstructible from the artifacts. |
-| Tier-2 (remaining est.) | **~$15–25** _(estimate)_ | KVzip ~$5–10 · M+ MAB (needs ≥116GB-RAM pods, so pricier per pod than the LME fleet) · H2O complete locally · A-MEM API-only, see projection above · LCLM dropped |
+| Tier-2 (remaining est.) | **~$10–20** _(estimate)_ | KVzip complete · H2O@20% + A-MEM remain · H2O@2% complete locally · LCLM dropped |
 
 ---
 

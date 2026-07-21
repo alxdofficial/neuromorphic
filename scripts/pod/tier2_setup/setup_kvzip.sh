@@ -12,7 +12,8 @@ clone_repo https://github.com/snu-mllab/KVzip.git KVzip
 mkenv kvzip 3.10
 # cuda-cccl MUST be pinned to 12.4 to match cuda-nvcc 12.4 — unpinned pulls cccl 13.x whose nv/target header
 # is incompatible → kernel compile dies 'fatal error: nv/target: No such file or directory'.
-micromamba install -y -n kvzip -c nvidia cuda-nvcc "cuda-cccl=12.4.*" cuda-cudart-dev >/dev/null 2>&1 && ok "cuda-nvcc + cccl 12.4"
+micromamba install -y -n kvzip -c nvidia cuda-nvcc "cuda-cccl=12.4.*" cuda-cudart-dev \
+  "cuda-libraries-dev=12.4.*" >/dev/null 2>&1 && ok "CUDA 12.4 compiler + development libraries"
 pipin kvzip torch --index-url https://download.pytorch.org/whl/cu121 2>/dev/null
 pipin kvzip -r "$REPOS/KVzip/requirements.txt" 2>/dev/null
 pipin kvzip "$FA_KVZIP" 2>/dev/null && ok "flash-attn (prebuilt) in kvzip"
@@ -25,10 +26,14 @@ if ! grep -q 'compute_89' "$REPOS/KVzip/csrc/build.py"; then
 fi
 # build the AdaKV kernel; CUDA_HOME must point at the env (nvcc + cccl 12.4 live there). Upstream `make i` =
 # `cd csrc && make` (compiles+installs tiny_api_cuda) then `pip install -e .` — done explicitly:
-( cd "$REPOS/KVzip/csrc" && CUDA_HOME="$MAMBA_ROOT_PREFIX/envs/kvzip" micromamba run -n kvzip make 2>&1 | tail -3 ) || warn "kvzip kernel compile"
+( cd "$REPOS/KVzip/csrc" && rm -rf build && \
+  CUDA_HOME="$MAMBA_ROOT_PREFIX/envs/kvzip" micromamba run -n kvzip make ) || {
+  warn "kvzip kernel compile failed"; exit 1;
+}
 ( cd "$REPOS/KVzip" && micromamba run -n kvzip pip install -e . >/dev/null 2>&1 )
 # import needs torch FIRST (import torch, tiny_api_cuda) else a spurious libc10.so error.
-micromamba run -n kvzip python -c 'import torch, tiny_api_cuda' 2>/dev/null && ok "kvzip kernel imports (torch-first)" || warn "kvzip kernel import — inspect on pod"
+micromamba run -n kvzip python -c 'import torch, tiny_api_cuda' 2>/dev/null \
+  && ok "kvzip kernel imports (torch-first)" || { warn "kvzip kernel import failed"; exit 1; }
 pipin kvzip $HARNESS
 # KVzip pins datasets 3.6 for its own benchmark loaders, but current MemoryAgentBench metadata uses the
 # datasets-4.x `List` feature. Our adapter only uses datasets for benchmark I/O, so this override is isolated

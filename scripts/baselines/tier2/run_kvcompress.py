@@ -53,6 +53,42 @@ _DEFAULT_REPO_DIR = {
 }
 
 
+def _shard_items(items: list[dict], num_shards: int, shard_idx: int) -> tuple[list[dict], list[int], list[int]]:
+    """Deterministically LPT-partition whole contexts across independent workers.
+
+    KVzip's context processing is dominated by attention over the context, so squared character length is a
+    useful model-free cost proxy.  Keeping a context whole is also required for MAB: splitting its questions
+    would repeat the expensive encode and defeat KVzip's query-agnostic cache reuse.
+    """
+    if num_shards < 1:
+        raise ValueError("num_shards must be >= 1")
+    if not 0 <= shard_idx < num_shards:
+        raise ValueError("shard_idx must be in [0, num_shards)")
+
+    groups: dict[str, list[dict]] = {}
+    for item in items:
+        context = item.get("full_history", "") or ""
+        groups.setdefault(context, []).append(item)
+
+    loads = [0] * num_shards
+    context_counts = [0] * num_shards
+    assignment: dict[str, int] = {}
+    for context, _context_items in sorted(
+        groups.items(), key=lambda pair: (-(len(pair[0]) ** 2), pair[0])
+    ):
+        cost = max(1, len(context) ** 2)
+        worker = min(range(num_shards), key=lambda idx: (loads[idx], idx))
+        assignment[context] = worker
+        loads[worker] += cost
+        context_counts[worker] += 1
+
+    selected = [
+        item for item in items
+        if assignment[item.get("full_history", "") or ""] == shard_idx
+    ]
+    return selected, loads, context_counts
+
+
 def _chat_input_ids(tokenizer, messages):
     """Normalize Transformers 4.x tensor and 5.x BatchEncoding return types."""
     encoded = tokenizer.apply_chat_template(
@@ -420,6 +456,12 @@ def main():
                     help="kvzip: reconstruction chunk; paper default 2000, use 1000 for 24GB LME-S")
     ap.add_argument("--seed", type=int, default=0, help="seed py/np/torch/cuda for reproducibility")
     ap.add_argument("--no-bem", action="store_true", help="skip BEM paraphrase scoring (LongMemEval only)")
+    ap.add_argument("--num-shards", type=int, default=1,
+                    help="partition whole contexts across this many independent workers")
+    ap.add_argument("--shard-idx", type=int, default=0,
+                    help="zero-based shard run by this process")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="print the selected question ids and exit before loading a model")
     ap.add_argument("--out-dir", default="outputs/baselines")
     args = ap.parse_args()
 
@@ -427,6 +469,10 @@ def main():
         ap.error("--kvzip-prefill-chunk-size must be positive")
     if args.kvzip_scoring_chunk_size <= 0:
         ap.error("--kvzip-scoring-chunk-size must be positive")
+    if args.num_shards < 1:
+        ap.error("--num-shards must be >= 1")
+    if not 0 <= args.shard_idx < args.num_shards:
+        ap.error("--shard-idx must be in [0, num-shards)")
 
     if args.method == "snapkv" and args.dataset == "memoryagentbench":
         sys.exit("[run_kvcompress] snapkv has no reusable per-context cache path across "
@@ -442,14 +488,26 @@ def main():
     # --- everything below needs torch/transformers/the method repo — lazy on purpose ---
     from src.memory.eval.results import ResultStore
     from src.memory.eval.tier2_common import build_tag, finalize, git_commit, load_items, seed_everything
-    seed_everything(args.seed)
 
     print(f"[run_kvcompress] method={args.method} dataset={args.dataset} model={model_name} "
           f"repo_dir={repo_dir} variant={args.variant} max_examples={args.max_examples} seed={args.seed}")
     items = load_items(args.dataset, variant=args.variant, max_examples=args.max_examples)
+    items, shard_loads, shard_contexts = _shard_items(items, args.num_shards, args.shard_idx)
+    if args.num_shards > 1:
+        max_load = max(shard_loads)
+        imbalance = (max_load - min(shard_loads)) / max_load if max_load else 0.0
+        print(f"[run_kvcompress] SHARD {args.shard_idx}/{args.num_shards}: "
+              f"{shard_contexts[args.shard_idx]} contexts, {len(items)} items; "
+              f"cost loads={shard_loads}, imbalance={imbalance:.1%}")
     types = {t: sum(1 for i in items if i["question_type"] == t)
              for t in sorted({i["question_type"] for i in items})}
     print(f"[run_kvcompress] {len(items)} items; types={types}")
+    if args.dry_run:
+        print("[run_kvcompress] DRY RUN — question_ids: " +
+              ",".join(sorted(str(item["question_id"]) for item in items)))
+        return
+
+    seed_everything(args.seed)
 
     if args.method == "kvzip":
         knob = (f"ratio{args.ratio}-prefill{args.kvzip_prefill_chunk_size}-"
@@ -458,6 +516,8 @@ def main():
         knob = _h2o_knob(args)
     else:
         knob = f"cap{args.max_capacity_prompt}"
+    if args.num_shards > 1:
+        knob += f"_sh{args.shard_idx}of{args.num_shards}"
     commit = git_commit(REPO)
     tag = build_tag(args.dataset, args.method, model_name.split("/")[-1], args.variant, len(items),
                     knob, args.max_new_tokens, args.seed, commit)
@@ -478,6 +538,7 @@ def main():
     finalize(args.dataset, args.method, model_name, items, store, use_bem=not args.no_bem,
              extra_meta={"variant": args.variant, "seed": args.seed, "max_new_tokens": args.max_new_tokens,
                          "commit": commit, "upstream_commit": git_commit(repo_dir) if repo_dir else None,
+                         "num_shards": args.num_shards, "shard_idx": args.shard_idx,
                          "max_capacity_prompt": args.max_capacity_prompt if args.method != "kvzip" else None,
                          "ratio": args.ratio if args.method == "kvzip" else None, **meta_out},
              out_dir=out_dir, tag=tag, log_prefix="[run_kvcompress]")
