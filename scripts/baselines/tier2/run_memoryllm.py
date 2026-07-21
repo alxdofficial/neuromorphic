@@ -169,6 +169,18 @@ def _restore_memory_state(model, snap) -> None:
         cur = getattr(model, attr, None)
         if isinstance(cur, torch.Tensor) and isinstance(saved, torch.Tensor):
             cur.data.copy_(saved)
+        elif (isinstance(cur, (list, torch.nn.ParameterList)) and isinstance(saved, (list, tuple))
+              and len(cur) == len(saved)
+              and all(isinstance(c, torch.Tensor) and isinstance(v, torch.Tensor) and c.shape == v.shape
+                      for c, v in zip(cur, saved))):
+            # In-place, element-wise. `ltm`/`ltm_keys`/... are nn.ParameterList, so they miss the Tensor
+            # branch above and USED to go through _copy_buf -- allocating a fresh ~40GB clone of the LTM
+            # store on EVERY question (MAB's largest context has 200+). That is what still OOM-killed the
+            # giant shards after the by-reference fix: sh7 peaked at exactly its 116GB cgroup ceiling.
+            # Shapes are identical because the snapshot was taken after this context's injection, so an
+            # in-place copy is equivalent and allocates nothing.
+            for c, v in zip(cur, saved):
+                c.data.copy_(v)
         else:
             setattr(model, attr, _copy_buf(saved))
 

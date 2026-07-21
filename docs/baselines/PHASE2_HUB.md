@@ -20,7 +20,7 @@ calibration only. Every number below is directly comparable across rows.
 | Layer | What | Status |
 |---|---|---|
 | **Tier-1** (API: long-context + RAG) | deepseek-v4-flash, llama-3.1-8b · floor/full_context/rag_bm25 | ✅ **DONE** (on `main`) |
-| **Tier-2** (GPU memory *mechanisms*) | KVzip, H2O/SnapKV, M+/MemoryLLM; A-MEM agent baseline | 🟡 **in progress** — H2O done (both benchmarks); **M+ LongMemEval done**, M+ MAB running on the pod fleet; KVzip/SnapKV/A-MEM pending (LCLM dropped; see §2) |
+| **Tier-2** (GPU memory *mechanisms*) | M+, H2O@2%, H2O@20%, KVzip, A-MEM (SnapKV/LCLM/`memoryllm-8b` dropped) | 🟡 **in progress** — H2O@2% done (both benchmarks); **KVzip MAB done (0.519)**, KVzip LongMemEval running; **M+ LongMemEval done (0.423)**, M+ MAB running; H2O@20% planned; A-MEM blocked on an API key (see §2) |
 | **Our model** | frozen-decoder learned memory | ⏳ later (Phase-2 head-to-heads) |
 
 ---
