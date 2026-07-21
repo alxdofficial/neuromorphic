@@ -62,14 +62,30 @@ Llama-3.1-8B LME full 0.454 / oracle 0.710. Full tables in [`PHASE2_REPORT.md`](
 H2O has completed locally on both full benchmark selections. M+ has completed LongMemEval-S on the pod fleet.
 Length-capped generations are scored as emitted; natural EOS completion is reported separately in the
 authoritative report.
+**SCOPE — the five arms of interest (fixed 2026-07-21).** The runnable Tier-2 panel is **M+**, **H2O@2%**,
+**H2O@20%**, **KVzip**, **A-MEM**. Everything else is cite-only: **SnapKV**, **LCLM**, and
+**`memoryllm-8b`** (the non-M+ MemoryLLM) are **DROPPED** — do not schedule or report rows for them.
+
 | method | LongMemEval | MemoryAgentBench |
 |---|---|---|
-| KVzip | — | — |
-| H2O | **0.066** overall / 0.056 task macro / 0.333 abstention (500; EOS 0.390) | **0.278** strict micro / 0.138 competency macro / 0.377 lenient (3,071; EOS 0.892) |
-| SnapKV | — | N/A (query-aware; no reusable MAB context state) |
-| **M+ / MemoryLLM** (`mplus-8b`) | **0.423** overall / 0.379 task-avg / **0.000** abstention (500; coverage 1.000, EOS 1.000) | 🔄 **RUNNING — no number yet** |
-| A-MEM (2b agent-memory) | — | — |
-| LCLM | **DROPPED** | **DROPPED** |
+| **M+** (`mplus-8b`) | **0.423** overall / 0.379 task-avg / **0.000** abstention (500; coverage 1.000, EOS 1.000) | 🔄 **RUNNING — no number yet** |
+| **H2O @2% KV** (`cap2048`) | **0.066** overall / 0.056 task macro / 0.333 abstention (500; EOS 0.390) — see budget caveat | **0.278** strict micro / 0.138 competency macro / 0.377 lenient (3,071; EOS 0.892) |
+| **H2O @20% KV** (`cap≈20k`) | ⏳ PLANNED — the paper's operating point | ⏳ PLANNED |
+| **KVzip** (`Qwen2.5-7B-Instruct-1M`) | — | 🔄 RUNNING (Blackwell pod) |
+| **A-MEM** (agent-memory) | — | — (blocked: OpenRouter key) |
+| ~~SnapKV~~ | **DROPPED** | **DROPPED** |
+| ~~LCLM~~ | **DROPPED** | **DROPPED** |
+| ~~`memoryllm-8b`~~ | **DROPPED** (M+ only) | **DROPPED** |
+
+**H2O budget caveat (2026-07-21) — do not quote 0.066 bare.** That run is `rolling-cap2048` against a
+~105k-token context = a **1.95% KV budget (~51× compression)**; H2O's paper evaluates at ~20%. At 2% it
+refuses **95.8%** of LongMemEval questions, *more* than the no-context floor (93.0%; full-context is 26.8%),
+and 0.066 vs the floor's 0.002 is barely above nothing. So it measures "H2O at 2%", not "H2O". Its best
+category (abstention 0.333) is accidental — refusing is the correct answer there. Hence the **@20% arm**:
+the pair is a compression-ratio ablation showing *where* KV eviction breaks, which is the informative
+result. Sizing for the re-run: peak ≈ **23.8GB** (15.0 weights + 2.44 KV + 2.44 snapshot clone + ~2.0
+attention matrix + ~1.95 activations) → **48GB pod (A40/A6000)**; a 24GB 4090 is borderline. Runtime is
+~unchanged (attention is ~2% of per-chunk FLOPs at this scale).
 
 **M+ read (new, 2026-07-21).** Artifact `outputs/baselines/longmemeval__memoryllm__mplus-8b__s__MERGED.json`
 (28 shards merged, n=500). A fixed-size parametric memory lands **within 4 points of llama-3.1-8b

@@ -2,8 +2,9 @@
 
 **Status (updated 2026-07-21): Panel-B (native-scale) EXECUTING.** Tier-1 (API long-context + RAG) is **DONE**
 on both benchmarks; Tier-2 (GPU memory mechanisms) runs as a **sharded pod fleet** (`scripts/pod/mpod.py`) —
-H2O complete on both; **M+ complete on LongMemEval-S (n=500)** with its MemoryAgentBench run still going;
-KVzip/SnapKV/A-MEM pending; LCLM dropped. **Panel-A
+H2O@2% complete on both; **M+ complete on LongMemEval-S (n=500)** with its MemoryAgentBench run still going;
+KVzip running, H2O@20% planned, A-MEM pending. **SCOPE FIXED 2026-07-21 — the panel is exactly five arms:
+M+, H2O@2%, H2O@20%, KVzip, A-MEM. SnapKV, LCLM and `memoryllm-8b` are DROPPED (cite-only).** **Panel-A
 (matched-135M)** remains **DEFERRED** until our own model exists (it's the fair fight our number slots into).
 This file is the design rationale; **live status + results = [`PHASE2_HUB.md`](PHASE2_HUB.md)**.
 Establish reference numbers for established SOTA memory/long-context baselines on a fixed benchmark +
@@ -78,7 +79,7 @@ so "full-context" is not a Panel-A entry (only meaningful on the oracle split / 
 | no-memory floor | — | `vanilla_llama` (question only, no context) | 4090 ✓ (have) |
 | RAG (BM25) | nonparam | BM25 over sessions → top-k → 135M reader | 4090 ✓ |
 | RAG (dense) | nonparam | Stella-V5 / GTE-Qwen2 embed → top-k → 135M reader | 4090 ✓ |
-| KV-eviction | nonparam | **H2O = first-party adapter `src/memory/eval/h2o_llama.py`** (ported policy, not a vendored repo); SnapKV/StreamingLLM via `Zefan-Cai/KVCache-Factory` monkey-patch | 4090 ✓ (H2O; SnapKV needs >24GB) |
+| KV-eviction | nonparam | **H2O = first-party adapter `src/memory/eval/h2o_llama.py`** (ported policy, not a vendored repo), run at TWO budgets (2% and 20%). ~~SnapKV/StreamingLLM~~ DROPPED 2026-07-21 | 4090 ✓ (H2O@2%); 48GB for H2O@20% |
 | **OURS** | parametric | streaming-compress → 96 slots + edges → 135M | 4090 ✓ |
 
 ### Panel B — native-scale reference (the "what's the ceiling" numbers)
@@ -93,7 +94,7 @@ row only** — we do not pay ~$144/pass for it, we cite the published 60.6 / ora
 | ~~GPT-4o full-ctx / RAG~~ | nonparam | official harness, OpenAI API | ~$144/pass | **CITE-ONLY (de-scoped 2026-07-18)** — published 0.606 full-ctx / 0.870 oracle |
 | deepseek-v4-flash full-ctx / RAG (1M ctx) | nonparam | our harness, OpenRouter | API, ~$17 total | ✅ **DONE** — LME 0.687 full-ctx |
 | Llama-3.1-8B-128k full-ctx | nonparam | 115k-tok single prompt | OpenRouter (served 131k) | ✅ **DONE** — LME 0.462 (94.4% coverage) |
-| **MemoryLLM-8B / M+** | parametric | `YuWangX/memoryllm-8b`, `mplus-8b` — online session-by-session write | fits 24GB VRAM; **MAB needs ≥116GB host RAM** | ✅ **LME DONE — 0.423, the first LongMemEval number for M+**; MAB running |
+| **M+** | parametric | `YuWangX/mplus-8b` — online session-by-session write. ~~`memoryllm-8b`~~ DROPPED 2026-07-21 (M+ only) | fits 24GB VRAM; **MAB needs ≥116GB host RAM** | ✅ **LME DONE — 0.423, the first LongMemEval number for M+**; MAB running |
 
 Skipped as headline: Mem0/Zep/Letta (numbers 36–94% for one system; need an API backend; only worth it
 re-run under our fixed harness).
@@ -126,8 +127,8 @@ reimplementation). Rule for ALL of these: **re-run under our fixed harness; neve
 |---|---|---|---|---|
 | **LCLM** | **DROPPED (cite-only)** | encoder → soft tokens → adapter → **frozen-init 4B** decoder, e2e continual-pretrain, 4×/8×/16× | Qwen3-Emb-0.6B enc + 4B dec; released weights | related-work comparator only; no Phase-2 run planned |
 | Larimar | optional | Kanerva episodic-memory matrix conditioning a frozen-ish decoder | 1.3B/6B; train-your-own | classic architectural analog / "memory-module baseline" |
-| KV-compression | **have** | KVzip + SnapKV (+ H2O) evict the 115k-tok KV cache | Llama/Qwen 7–8B; 48GB pod | the KV-eviction branch (LCLM itself compares to these) |
-| MemoryLLM / M+ | **have; LME DONE** | parametric in-weights memory, online session write | `mplus-8b`; 24GB VRAM, but **≥116GB host RAM for MAB** | only mechanism-with-released-weights parametric baseline |
+| KV-compression | **have** | KVzip + H2O (2% and 20% budgets) evict the 115k-tok KV cache. ~~SnapKV~~ DROPPED | Llama/Qwen 7–8B; 48GB pod | the KV-eviction branch |
+| M+ | **have; LME DONE** | parametric in-weights memory, online session write | `mplus-8b`; 24GB VRAM, but **≥116GB host RAM for MAB** | only mechanism-with-released-weights parametric baseline. ~~`memoryllm-8b`~~ DROPPED — M+ only (an 8B pool can't hold 115k) |
 
 **Cite-only** (a related-work STRENGTH: "prior work claims X, ships nothing runnable-for-our-task, so we
 compare against released alternatives"): **Titans / ATLAS / Miras** (Google — code promised, never shipped),
@@ -186,7 +187,8 @@ max-gen-tokens · denominator (overall vs task-avg vs abstention).
   `scripts/baselines/run_api_eval.py` (floor / full-context / RAG-bm25 / RAG-dense over OpenRouter, token-
   accurate budgeting, resumable per-question store, coverage/cost accounting) + `src/memory/eval/` scorers
   for BOTH LongMemEval and MemoryAgentBench (judge-free, per-competency prompts verbatim from the MAB repo)
-  + `scripts/baselines/tier2/` runners (KVzip/SnapKV/H2O, MemoryLLM/M+; inactive LCLM runner retained)
+  + `scripts/baselines/tier2/` runners (KVzip/H2O + M+; the SnapKV and LCLM code paths are retained but
+    INACTIVE — both dropped from the panel)
   + `run_agentmem.py`
   (**A-MEM/MemoryOS**, no GPU). Cartridges dropped (cite-only).
 - **Reuse, don't build:** official harness `xiaowu0162/LongMemEval` (MIT) = retrieval + generation +
@@ -207,9 +209,11 @@ max-gen-tokens · denominator (overall vs task-avg vs abstention).
    **DEFERRED** until our own model exists.
 4. **2a mechanism competitors** (native / Panel-B), cheapest-first — **partly DONE**:
    a. ✅ **H2O** (local 4090, both benchmarks). ✅ **MemoryLLM/M+ on LongMemEval-S** (14-pod sharded fleet).
-      🔄 **M+ on MemoryAgentBench** running (needs ≥116GB-RAM pods). ⏳ **KVzip** (80GB) + **SnapKV** (>24GB)
-      pending; scaffolded in `scripts/baselines/tier2/`.
-   b. **Larimar** optional. (LCLM and Cartridges dropped as runnable baselines; retain as citations.)
+      🔄 **M+ on MemoryAgentBench** running (needs ≥116GB-RAM pods). 🔄 **KVzip** running on a Blackwell pod.
+      ⏳ **H2O@20%** planned (#224) — the current H2O is a 1.95% KV budget, ~10× more aggressive than the
+      paper, and sits at the no-context floor; the 2%/20% pair is the compression-ratio ablation.
+   b. ~~SnapKV~~, ~~LCLM~~, ~~Cartridges~~, ~~`memoryllm-8b`~~ and Larimar are NOT runnable panel members —
+      cite-only. Scope fixed 2026-07-21: the panel is M+, H2O@2%, H2O@20%, KVzip, A-MEM.
 5. **2b — ONE agent-memory system** (**A-MEM** default) over a frozen LLM via the OpenRouter path (min GPU).
    ⏳ not started; cost table in `A_MEM_FIDELITY_AUDIT.md` is a projection blocked on a 401'd key.
 6. **Panel-B native ceilings** — ✅ **DONE via the Tier-1 API path** (llama-3.1-8b + deepseek-v4-flash
@@ -234,7 +238,10 @@ Rule for steps 4–5: **re-run under our harness, never quote paper numbers.** R
   (architectural) / 2b (agent-memory); **LCLM added (must)** as our closest concurrent competitor
   (web-verified, novelty note); Cartridges added; A-MEM = the one 2b; Larimar optional; Memory-R1 → cite-only.
 - **2026-07-20c** — LCLM dropped from the runnable panel by project decision; retained as cite-only related
-  work. Active Tier-2 mechanisms are H2O/SnapKV, KVzip, and MemoryLLM/M+, plus A-MEM in the agent category.
+  work.
+- **2026-07-21b** — **PANEL SCOPE FIXED at five arms: M+, H2O@2%, H2O@20%, KVzip, A-MEM.** SnapKV and
+  `memoryllm-8b` dropped by project decision (joining LCLM). H2O split into two budgets after the 2% run was
+  found to sit at the no-context refusal floor (95.8% refusals vs 93.0% for no context at all).
 - **2026-07-21** — §5 execution order reconciled with reality (Tier-1 + MAB marked DONE; H2O + M+/LongMemEval
   done); Panel-B contradiction resolved (**GPT-4o row cite-only, rest of Panel B ran**); H2O attribution fixed
   (first-party `src/memory/eval/h2o_llama.py`, not `apple/ml-epicache`); test count synced to 133. All MAB

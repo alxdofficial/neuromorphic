@@ -82,6 +82,11 @@ Avoid Llama-4's "10M" and MiniMax's claims as headline baselines — **marketing
 ## Recommended Phase-2 lineup
 _Original survey menu (2026-07-12):_ headline vs **GPT-4o/Qwen-long-context + RAG + MemoryLLM/M+ + EM-LLM**, on **LongMemEval** (+ BEAM for scale, + WikiBigEdit for stability), with **ARC-Encoder + ICAE + xRAG/PISCO + Cartridges** as compression cousins, bracketed by the **full-context oracle** and **no-memory floor**.
 
-> **UPDATE 2026-07-20 — active lineup** (see [`PHASE2_HUB.md`](PHASE2_HUB.md) for live status): **Tier-1** = deepseek-v4-flash + llama-3.1-8b (long-context + RAG + floor) — DONE. **Tier-2 GPU mechanisms** = **KVzip** (query-agnostic KV compression) · **H2O/SnapKV** (query-aware KV eviction) · **MemoryLLM/M+** (recurrent parametric). **A-MEM** is the separate agent-memory comparison. **LCLM was dropped from the runnable panel** and remains cite-only. EM-LLM/ARC-Encoder/xRAG/PISCO/Cartridges/GPT-4o/Qwen were not run (cite-only or deferred).
+> **UPDATE 2026-07-21 — PANEL SCOPE FIXED at five arms:** **M+** (`mplus-8b`) · **H2O@2%** · **H2O@20%** ·
+> **KVzip** · **A-MEM**. **SnapKV, LCLM and `memoryllm-8b` are DROPPED** (cite-only) — do not schedule or
+> report rows for them. H2O is run at two KV budgets because the 2% run sits at the no-context refusal floor;
+> the pair is the compression-ratio ablation. Live status: [`PHASE2_HUB.md`](PHASE2_HUB.md).
+>
+> **UPDATE 2026-07-20 — active lineup (superseded by the line above)** (see [`PHASE2_HUB.md`](PHASE2_HUB.md) for live status): **Tier-1** = deepseek-v4-flash + llama-3.1-8b (long-context + RAG + floor) — DONE. **Tier-2 GPU mechanisms** = **KVzip** (query-agnostic KV compression) · **H2O/SnapKV** (query-aware KV eviction) · **MemoryLLM/M+** (recurrent parametric). **A-MEM** is the separate agent-memory comparison. **LCLM was dropped from the runnable panel** and remains cite-only. EM-LLM/ARC-Encoder/xRAG/PISCO/Cartridges/GPT-4o/Qwen were not run (cite-only or deferred).
 
 > **UPDATE 2026-07-21 — the M+ LongMemEval whitespace is now filled by us.** MemoryLLM/M+ reported **no** LongMemEval number; we establish it: **`mplus-8b` = 0.423 overall / 0.379 task-averaged / 0.000 abstention** (n=500, deterministic scorer, artifact `outputs/baselines/longmemeval__memoryllm__mplus-8b__s__MERGED.json`). H2O is done on both benchmarks. Full context: [`PHASE2_REPORT.md`](PHASE2_REPORT.md).

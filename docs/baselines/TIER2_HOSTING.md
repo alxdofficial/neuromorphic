@@ -39,7 +39,8 @@ That is *exactly* MemoryAgentBench (one context, ~85 queries). The comparison no
 - **Infinite H2O** (stream once with position rolling, snapshot raw retained K/V and heavy-hitter scores, fork
   per question). Its context-only heavy-hitter decisions cannot use later questions to recover evicted tokens,
   but the cache is reusable and tests enforce equivalence to independent streaming replay.
-- **SnapKV** still has no reusable path and remains LongMemEval-only.
+- **SnapKV** has no reusable path and would be LongMemEval-only — one reason it was **DROPPED from the
+  panel (2026-07-21)**. The KV-eviction branch is covered by KVzip plus H2O at two budgets (2% and 20%).
 
 ## Standard tooling vs. our custom models
 
