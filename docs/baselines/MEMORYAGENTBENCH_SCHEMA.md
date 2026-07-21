@@ -1,5 +1,32 @@
 # MemoryAgentBench — schema & deterministic scoring (build reference)
 
+## ⚠ OUR MAB RUN IS A SUBSET — disclose when comparing to published numbers (added 2026-07-21)
+
+MemoryAgentBench is assembled from prior benchmarks. Its upstream acknowledgement reads: *"We thank the
+open-source code and datasets from RULER, InfBench, HELMET and LongMemEval."* We run **3,071 questions
+across 4 competencies**, which is NOT the whole benchmark. Dropped in
+`src/memory/data/memoryagentbench.py::_metric_competency`:
+
+| dropped subset | why |
+|---|---|
+| `longmemeval_*` | LLM-judged upstream — conflicts with the project's deterministic/no-LLM-as-judge scoring rule |
+| `infbench_sum_*` | LLM-judged upstream (summarisation) |
+| `recsys` | Recall@5, not deterministically scoreable in our harness |
+
+Consequences to state in any writeup:
+1. **Do not compare our MAB totals directly to published MAB numbers** without naming the subsets — the
+   denominators differ.
+2. **MAB and LongMemEval-S overlap only in the part we drop.** What we actually run (EventQA,
+   FactConsolidation, RULER, ICL, detectiveQA) shares no data with LongMemEval-S, so treating the two as
+   independent evidence is valid — but *because of* the exclusion, not because the benchmarks are disjoint
+   by construction. Say so explicitly rather than implying they never overlapped.
+3. The **length-scaling** evidence (FactConsolidation 6k/32k/64k/262k, RULER 197K/421K) is untouched by the
+   exclusion, so the M+ capacity-ceiling finding does not depend on it.
+
+Sources actually loaded (19): detective_qa 71 · eventqa_{65536,131072,full} 1500 ·
+factconsolidation_{sh,mh}_{6k,32k,64k,262k} 800 · icl_{banking77,clinic150,nlu,trec_coarse,trec_fine} 500 ·
+ruler_qa{1,2} 200.
+
 Research-verified 2026-07-18 (sub-agent, against the live repo + HF dataset). Source of truth for
 `src/memory/data/memoryagentbench.py` (reader) + `src/memory/eval/memoryagentbench_score.py` (scorer).
 Repo: [HUST-AI-HYZ/MemoryAgentBench](https://github.com/HUST-AI-HYZ/MemoryAgentBench) · dataset

@@ -9,6 +9,13 @@ live status; the detailed docs are linked inline. _Last updated: 2026-07-21._
 > Any MAB figure in an older doc or note is stale; read them from [`PHASE2_REPORT.csv`](PHASE2_REPORT.csv).
 > Details + before/after: [`PHASE2_REPORT.md`](PHASE2_REPORT.md) §"MAB scorer fix".
 
+> **MAB SUBSET NOTICE (2026-07-21):** our MemoryAgentBench run is **3,071 Q across 4 competencies**, not the
+> full benchmark. The `longmemeval_*` and `infbench_sum_*` subsets (LLM-judged upstream) and `recsys`
+> (recall@5) are dropped by our deterministic-scoring rule. **Do not compare these totals to published MAB
+> numbers without naming the subsets.** Note MAB is itself assembled from prior benchmarks (RULER, InfBench,
+> HELMET, LongMemEval) — so MAB and LongMemEval-S overlap *in the part we exclude*; what we run shares no
+> data with LongMemEval-S. Details: [`MEMORYAGENTBENCH_SCHEMA.md`](MEMORYAGENTBENCH_SCHEMA.md).
+
 **Scoring policy:** deterministic only (EM + negation-guarded containment + BEM paraphrase for LongMemEval;
 substring/exact per-competency for MAB). **No LLM-as-judge** for the panel; one GPT-4o cross-check was for
 calibration only. Every number below is directly comparable across rows.
