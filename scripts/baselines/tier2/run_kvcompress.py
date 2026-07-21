@@ -331,7 +331,7 @@ def run_kvzip(args, items, model_name, repo_dir, store, dataset, meta_out) -> No
     meta_out["gen_finish_reason_available"] = False   # KVzip returns a string, no finish signal → can't detect length
     meta_out["model_revision_loaded"] = getattr(m.model.config, "_commit_hash", None)
     meta_out["kvzip_prefill_chunk_size"] = args.kvzip_prefill_chunk_size
-    meta_out["kvzip_scoring_chunk_size"] = 2000       # upstream ModelKVzip.self_task default; paper setting
+    meta_out["kvzip_scoring_chunk_size"] = args.kvzip_scoring_chunk_size
     meta_out["kvzip_allocation"] = "pair_nonuniform"
     meta_out["kvzip_precision"] = str(m.dtype)
     timing = {"contexts": 0, "questions": 0, "compression_seconds": 0.0, "decode_seconds": 0.0}
@@ -342,14 +342,35 @@ def run_kvzip(args, items, model_name, repo_dir, store, dataset, meta_out) -> No
         if torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
         started = time.perf_counter()
+        # These are the same two upstream operations performed by prefill(..., do_score=True), separated only
+        # to release temporary allocator blocks between the full-cache prefill and 2k reconstruction scoring.
+        # That allocator boundary is required for the longest LME-S examples on a 24GB 4090 and does not alter
+        # tokens, scores, cache contents, precision, or the paper's scoring chunk size.
         kv = m.prefill(ctx, prefill_chunk_size=args.kvzip_prefill_chunk_size,
-                       load_score=False, do_score=True)
+                       load_score=False, do_score=False)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        if args.kvzip_scoring_chunk_size == 2000:
+            m.scoring(kv, kv.ctx_ids, load_score=False)
+        else:
+            # scoring() calls self_task(ctx_ids) without exposing its supported chunk_size argument. Bind the
+            # requested paper-ablation value for this call, then restore the official method immediately.
+            original_self_task = m.self_task
+            m.self_task = lambda ctx_ids: original_self_task(  # noqa: E731
+                ctx_ids, chunk_size=args.kvzip_scoring_chunk_size)
+            try:
+                m.scoring(kv, kv.ctx_ids, load_score=False)
+            finally:
+                m.self_task = original_self_task
         kv.prune(ratio=args.ratio)                    # ratio = fraction of KV RETAINED (0.3 → evict 70%)
         timing["contexts"] += 1
         timing["compression_seconds"] += time.perf_counter() - started
         if torch.cuda.is_available():
             peak = torch.cuda.max_memory_allocated()
+            reserved = torch.cuda.max_memory_reserved()
             meta_out["peak_vram_bytes_max"] = max(int(peak), int(meta_out.get("peak_vram_bytes_max", 0)))
+            meta_out["peak_vram_reserved_bytes_max"] = max(
+                int(reserved), int(meta_out.get("peak_vram_reserved_bytes_max", 0)))
         return kv
 
     def answer(kv, it):
@@ -394,7 +415,9 @@ def main():
     ap.add_argument("--ratio", type=float, default=0.3,
                     help="kvzip: fraction of KV cache RETAINED after prune (0.3 == evict 70%%)")
     ap.add_argument("--kvzip-prefill-chunk-size", type=int, default=16_000,
-                    help="kvzip: upstream prefill chunk size; scoring stays at the paper's fixed 2,000 tokens")
+                    help="kvzip: upstream prefill chunk size")
+    ap.add_argument("--kvzip-scoring-chunk-size", type=int, default=2_000,
+                    help="kvzip: reconstruction chunk; paper default 2000, use 1000 for 24GB LME-S")
     ap.add_argument("--seed", type=int, default=0, help="seed py/np/torch/cuda for reproducibility")
     ap.add_argument("--no-bem", action="store_true", help="skip BEM paraphrase scoring (LongMemEval only)")
     ap.add_argument("--out-dir", default="outputs/baselines")
@@ -402,6 +425,8 @@ def main():
 
     if args.kvzip_prefill_chunk_size <= 0:
         ap.error("--kvzip-prefill-chunk-size must be positive")
+    if args.kvzip_scoring_chunk_size <= 0:
+        ap.error("--kvzip-scoring-chunk-size must be positive")
 
     if args.method == "snapkv" and args.dataset == "memoryagentbench":
         sys.exit("[run_kvcompress] snapkv has no reusable per-context cache path across "
@@ -427,7 +452,8 @@ def main():
     print(f"[run_kvcompress] {len(items)} items; types={types}")
 
     if args.method == "kvzip":
-        knob = f"ratio{args.ratio}-prefill{args.kvzip_prefill_chunk_size}"
+        knob = (f"ratio{args.ratio}-prefill{args.kvzip_prefill_chunk_size}-"
+                f"score{args.kvzip_scoring_chunk_size}")
     elif args.method == "h2o":
         knob = _h2o_knob(args)
     else:

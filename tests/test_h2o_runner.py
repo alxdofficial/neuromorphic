@@ -149,7 +149,12 @@ def test_kvzip_uses_upstream_controls_and_reuses_cache(monkeypatch, tmp_path):
 
         def prefill(self, context, **kwargs):
             calls["prefill"].append((context, kwargs))
-            return FakeKV()
+            kv = FakeKV()
+            kv.ctx_ids = "context tokens"
+            return kv
+
+        def scoring(self, kv, context_tokens, *, load_score):
+            calls["scoring"] = (kv, context_tokens, load_score)
 
         def apply_template(self, query):
             return f"templated:{query}"
@@ -170,14 +175,16 @@ def test_kvzip_uses_upstream_controls_and_reuses_cache(monkeypatch, tmp_path):
     monkeypatch.setattr(common, "run_grouped", fake_run_grouped)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
 
-    args = SimpleNamespace(max_new_tokens=64, kvzip_prefill_chunk_size=4096, ratio=0.3)
+    args = SimpleNamespace(max_new_tokens=64, kvzip_prefill_chunk_size=4096,
+                           kvzip_scoring_chunk_size=2000, ratio=0.3)
     items = [{"question": "one"}, {"question": "two"}]
     meta = {}
     RUNNER.run_kvzip(args, items, "fake-model", str(tmp_path), object(), "longmemeval", meta)
 
     assert calls["prefill"] == [("shared context", {
-        "prefill_chunk_size": 4096, "load_score": False, "do_score": True,
+        "prefill_chunk_size": 4096, "load_score": False, "do_score": False,
     })]
+    assert calls["scoring"][1:] == ("context tokens", False)
     assert calls["prune"] == [0.3]
     assert len(calls["generate"]) == 2
     assert calls["generate"][0][1] is calls["generate"][1][1]

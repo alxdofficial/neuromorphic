@@ -83,6 +83,9 @@ fi
 ( cd "$REPOS/KVzip" && micromamba run -n kvzip pip install -e . >/dev/null 2>&1 )
 micromamba run -n kvzip python -c 'import torch, tiny_api_cuda' 2>/dev/null && ok "kvzip kernel imports (torch-first)" || echo "  WARN kvzip kernel import — inspect on pod"
 pipin kvzip $HARNESS
+# MemoryAgentBench's current schema uses datasets-4.x `List`; KVzip's 3.6 pin is only for its own loaders.
+pipin kvzip "datasets==4.5.0" "huggingface-hub>=0.30,<1.0" "numpy==1.26.4" \
+  "pandas==2.0.3" "packaging==25.0"
 
 # ---- KVCache-Factory (SnapKV; LongMemEval only; sdpa OK on 80GB) ----
 step "env: kvcache"

@@ -30,5 +30,11 @@ fi
 # import needs torch FIRST (import torch, tiny_api_cuda) else a spurious libc10.so error.
 micromamba run -n kvzip python -c 'import torch, tiny_api_cuda' 2>/dev/null && ok "kvzip kernel imports (torch-first)" || warn "kvzip kernel import — inspect on pod"
 pipin kvzip $HARNESS
+# KVzip pins datasets 3.6 for its own benchmark loaders, but current MemoryAgentBench metadata uses the
+# datasets-4.x `List` feature. Our adapter only uses datasets for benchmark I/O, so this override is isolated
+# from model/cache behavior and is required for MAB to load at all.
+pipin kvzip "datasets==4.5.0" "huggingface-hub>=0.30,<1.0" "numpy==1.26.4" \
+  "pandas==2.0.3" "packaging==25.0"
 prefetch kvzip "Qwen/Qwen2.5-7B-Instruct-1M"
-step "kvzip ready — smoke: cd $REPOS/KVzip && micromamba run -n kvzip python $REPO/scripts/baselines/tier2/run_kvcompress.py --method kvzip --dataset longmemeval --max-examples 5"
+step "kvzip ready — 80GB smoke: cd $REPOS/KVzip && micromamba run -n kvzip python $REPO/scripts/baselines/tier2/run_kvcompress.py --method kvzip --dataset longmemeval --max-examples 5"
+echo "  4090 add: --kvzip-prefill-chunk-size 2048 --kvzip-scoring-chunk-size 1000"
