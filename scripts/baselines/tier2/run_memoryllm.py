@@ -44,6 +44,10 @@ _DEFAULT_REPO_DIR = str(REPO.parent / "baselines" / "MemoryLLM")  # local master
 
 # Candidate attribute names for M+'s long-term-memory state (short-term `model.memory` handled separately).
 # Bounded/explicit — NOT a dir() scan — so we never accidentally snapshot the 8B weight tensors.
+# Written ONLY on the injection path (update_memory_with_delta_memory / merge_cached_memory, both reachable
+# only from inject_memory) and therefore constant while answering questions from an encoded context.
+_INJECTION_ONLY_ATTRS = ("cached_dropped_memories", "cached_dropped_memory_ages", "cached_dropped_keys")
+
 _LTM_CANDIDATE_ATTRS = (
     "ltm_recall_frequencies", "cached_dropped_memories", "cached_dropped_memory_ages", "cached_dropped_keys",
     "ltm", "long_term_memory", "ltm_memory", "ltm_keys", "ltm_values", "ltm_ages", "ltm_age",
@@ -86,17 +90,50 @@ def _is_nonempty(v) -> bool:
         return True
 
 
-def _snapshot_memory_state(model):
-    """Deep-snapshot the short-term pool + all LTM buffers found. Returns (snapshot dict, captured names)."""
+def _fingerprint(v):
+    """Cheap identity+mutation fingerprint for a buffer we deliberately did NOT copy."""
+    import numpy as np
+    import torch
+    if isinstance(v, torch.Tensor):
+        return ("t", v.data_ptr(), tuple(v.shape), v._version)
+    if isinstance(v, np.ndarray):
+        return ("n", v.__array_interface__["data"][0], v.shape)
+    if isinstance(v, (list, tuple)):
+        return ("s", tuple(_fingerprint(x) for x in v))
+    return ("o", id(v))
+
+
+def _snapshot_memory_state(model, by_reference: tuple[str, ...] = ()):
+    """Deep-snapshot the short-term pool + all LTM buffers found. Returns (snapshot dict, captured names).
+
+    `by_reference` names buffers that are written ONLY on the injection path and therefore cannot change
+    while answering questions from an already-encoded context. Those are held by reference plus a
+    fingerprint instead of being cloned.
+
+    Why this matters: M+'s `cached_dropped_*` grow linearly with inject count. MemoryAgentBench's largest
+    context is 1454 injects x 256 tokens x 32 layers x 4096 dims, i.e. ~91GB — cloning it doubles the
+    single largest allocation in the process to ~182GB and gets us OOM-killed (rc=137) on any pod we can
+    rent. Verified against modeling_mplus.py: `cached_dropped_*` are written only in
+    `update_memory_with_delta_memory` / `merge_cached_memory`, both reachable only from `inject_memory`;
+    generation touches `ltm_recall_frequencies` and the LTM eviction path, which we still deep-copy.
+    The fingerprint turns a wrong assumption into a loud failure instead of order-dependent answers.
+    """
     # CPU-resident snapshot: keeping the ~2.7GB STM-pool clone off the GPU frees ~5.4GB (pristine + per-context
     # post) so multiple M+ instances fit one GPU for packing. Fidelity-neutral (our reset bookkeeping, not M+'s
     # mechanism); restore copies it back to GPU. PCIe copy is ~0.17s — negligible vs ~178s/context injection.
     snap = {"model.memory": model.memory.data.detach().to("cpu", copy=True)}
-    captured, empty = [], []
+    refs: dict[str, tuple] = {}
+    captured, empty, byref = [], [], []
     for attr in _LTM_CANDIDATE_ATTRS:
         if hasattr(model, attr):
             try:
                 val = getattr(model, attr)
+                if attr in by_reference and _is_nonempty(val):
+                    snap[attr] = val                      # reference, NOT a clone
+                    refs[attr] = _fingerprint(val)
+                    byref.append(attr)
+                    captured.append(attr)
+                    continue
                 snap[attr] = _copy_buf(val)
                 (captured if _is_nonempty(val) else empty).append(attr)
             except Exception as e:  # noqa: BLE001
@@ -109,15 +146,25 @@ def _snapshot_memory_state(model):
               "trusting any number. (docs/baselines/TIER2_GPU_INTEGRATION.md #3.)")
     else:
         print(f"[run_memoryllm] per-context reset will restore: model.memory + LTM buffers {captured}"
-              + (f" (also snapshotting empty-at-load: {empty})" if empty else ""))
+              + (f" (also snapshotting empty-at-load: {empty})" if empty else "")
+              + (f" (held BY REFERENCE, injection-only: {byref})" if byref else ""))
+    snap["__refs__"] = refs
     return snap, captured
 
 
 def _restore_memory_state(model, snap) -> None:
     import torch
     model.memory.data.copy_(snap["model.memory"])
+    refs = snap.get("__refs__") or {}
+    for attr, want in refs.items():
+        got = _fingerprint(getattr(model, attr, None))
+        if got != want:
+            raise RuntimeError(
+                f"model.{attr} was held BY REFERENCE as injection-only but changed during generation "
+                f"({want} -> {got}). Per-question restore is therefore incomplete and answers would be "
+                f"order-dependent. Remove {attr!r} from by_reference and re-run.")
     for attr, saved in snap.items():
-        if attr == "model.memory":
+        if attr in ("model.memory", "__refs__") or attr in refs:
             continue
         cur = getattr(model, attr, None)
         if isinstance(cur, torch.Tensor) and isinstance(saved, torch.Tensor):
@@ -233,7 +280,9 @@ def run_memoryllm(args, items, model_name, repo_dir, store, dataset) -> dict:
         stats["n_injects"] += len(blocks)
         if group_sizes.get(ctx, 1) <= 1:
             return None            # singleton: live memory IS the post-injection state (see note above)
-        return _snapshot_memory_state(model)[0]                     # reusable post-injection memory
+        # cached_dropped_* are injection-only and enormous (~91GB at MAB's largest context); hold them by
+        # reference so the reusable snapshot doesn't double the process's peak RSS. Guarded at restore.
+        return _snapshot_memory_state(model, by_reference=_INJECTION_ONLY_ATTRS)[0]
 
     def answer(post_snap, it):
         if post_snap is not None:
