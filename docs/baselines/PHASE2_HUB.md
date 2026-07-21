@@ -69,13 +69,27 @@ authoritative report.
 | method | LongMemEval | MemoryAgentBench |
 |---|---|---|
 | **M+** (`mplus-8b`) | **0.423** overall / 0.379 task-avg / **0.000** abstention (500; coverage 1.000, EOS 1.000) | 🔄 **RUNNING — no number yet** |
-| **H2O @2% KV** (`cap2048`) | **0.066** overall / 0.056 task macro / 0.333 abstention (500; EOS 0.390) — see budget caveat | **0.278** strict micro / 0.138 competency macro / 0.377 lenient (3,071; EOS 0.892) |
+| **H2O @2% KV** (`cap2048`) | **0.066** overall / 0.056 task macro / 0.333 abstention (500; EOS 0.390) — see budget caveat | **0.371** strict micro / 0.287 competency macro / 0.377 lenient (3,071; EOS 0.892) |
 | **H2O @20% KV** (`cap≈20k`) | ⏳ PLANNED — the paper's operating point | ⏳ PLANNED |
-| **KVzip** (`Qwen2.5-7B-Instruct-1M`) | — | 🔄 RUNNING (Blackwell pod) |
+| **KVzip** (`Qwen2.5-7B-Instruct-1M`) | 🔄 RUNNING (4-pod shard fleet) | **0.519** strict micro / 0.519 competency macro / 0.526 lenient (3,071; EOS 1.000) |
 | **A-MEM** (agent-memory) | — | — (blocked: OpenRouter key) |
 | ~~SnapKV~~ | **DROPPED** | **DROPPED** |
 | ~~LCLM~~ | **DROPPED** | **DROPPED** |
 | ~~`memoryllm-8b`~~ | **DROPPED** (M+ only) | **DROPPED** |
+
+**Tier-2 RESCORE (2026-07-21).** H2O and KVzip artifacts were written by their POD, whose scorer predates
+the `parse_output` fix; `pure_rescore.py` only matches Tier-1's 4-field run tags and `merge_shards.py` only
+matches `_shKofN` caches, so single-process Tier-2 runs fell through both and kept pre-fix `correct` values.
+Rescoring the cached generations (no recompute) moved: **KVzip MAB 0.402 → 0.519** (Test_Time_Learning
+0.000 → 0.634, Long_Range_Understanding 0.000 → 0.592) and **H2O MAB 0.278 → 0.371** (Test_Time_Learning
+0.000 → 0.566). NOTE the earlier claim that H2O's two zeros were a genuine capability result is **retracted
+for Test_Time_Learning** — H2O scores 0.566 there, consistent with its `recent1024` window retaining the
+ICL labels that sit at the end of the context. Only Long_Range_Understanding (0.028) is genuinely bad,
+which is the expected failure mode for recency-biased eviction.
+
+**KVzip read (2026-07-21).** At 0.519 it is the strongest compression method on MAB, ahead of H2O@2%
+(0.371), and the gap is concentrated exactly where the mechanisms differ: Long_Range_Understanding
+**0.592 vs 0.028**. KVzip is query-agnostic and retains distant evidence; H2O's recency window discards it.
 
 **H2O budget caveat (2026-07-21) — do not quote 0.066 bare.** That run is `rolling-cap2048` against a
 ~105k-token context = a **1.95% KV budget (~51× compression)**; H2O's paper evaluates at ~20%. At 2% it
