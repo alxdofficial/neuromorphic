@@ -26,22 +26,48 @@ def main():
     ap.add_argument("--out-dir", default="outputs/baselines")
     ap.add_argument("--no-bem", action="store_true")
     ap.add_argument("--max-examples", type=int, default=None, help="match the run's scoping for coverage pct")
+    ap.add_argument("--shard-glob", default=None,
+                    help="override the shard-cache glob (relative to --out-dir). Use this to merge ONLY one "
+                         "partitioning, e.g. 'cache/rescue_14way/*_sh*of14__*.jsonl'. The default picks up "
+                         "every partitioning present, which is usually NOT what you want — see below.")
     args = ap.parse_args()
 
     from src.memory.eval.tier2_common import score_dataset, valid_for_scoring, load_items
     from src.memory.eval.results import ResultStore
 
     out_dir = REPO / args.out_dir
-    pattern = str(out_dir / "cache" / f"{args.dataset}__memoryllm__*_sh*of*__*.jsonl")
-    shard_files = sorted(glob.glob(pattern))
+    if args.shard_glob:
+        pattern = str(out_dir / args.shard_glob)
+    else:
+        # Recursive: shard caches rescued off pods may sit in a subdirectory, and a non-recursive glob drops
+        # them SILENTLY (no error, just a smaller merge) — that hid 19 unique records once.
+        pattern = str(out_dir / "cache" / "**" / f"{args.dataset}__memoryllm__*_sh*of*__*.jsonl")
+    shard_files = glob.glob(pattern, recursive=True)
     if not shard_files:
         sys.exit(f"[merge] no shard caches matching {pattern}")
-    print(f"[merge] {len(shard_files)} shard caches:\n  " + "\n  ".join(Path(f).name for f in shard_files))
 
-    by_qid = {}
+    # Dedup is NOT belt-and-braces once more than one partitioning is present. Contexts are disjoint WITHIN a
+    # partitioning, but the same question_id appears across partitionings, and M+'s answer differs between
+    # them (different context grouping -> different injection schedule; measured: only 7/20 of the overlapping
+    # ids were byte-identical). So the winner must be chosen deterministically, not by glob order: sort oldest
+    # -> newest by mtime so the most recent run wins, and report what got overridden.
+    shard_files.sort(key=lambda f: (Path(f).stat().st_mtime, f))
+    parts = sorted({p.split("_sh")[-1].split("__")[0] for f in shard_files for p in [Path(f).name]})
+    print(f"[merge] {len(shard_files)} shard caches across partitioning(s) {parts}:\n  "
+          + "\n  ".join(Path(f).name for f in shard_files))
+    if len({p.split("of")[-1] for p in parts}) > 1:
+        print(f"[merge] ⚠ MULTIPLE partitionings present {parts} — newest-mtime wins per question_id. "
+              "Pass --shard-glob to merge only one if that is not what you want.")
+
+    by_qid, overridden = {}, 0
     for f in shard_files:
         for r in ResultStore(Path(f)).all_records():
-            by_qid[str(r.get("question_id"))] = r          # contexts disjoint → dedup is just belt-and-braces
+            qid = str(r.get("question_id"))
+            if qid in by_qid:
+                overridden += 1
+            by_qid[qid] = r
+    if overridden:
+        print(f"[merge] {overridden} duplicate question_id(s) resolved in favour of the newer cache")
     records = [r for r in by_qid.values() if valid_for_scoring(r)]
     print(f"[merge] {len(by_qid)} unique records, {len(records)} scoreable")
 

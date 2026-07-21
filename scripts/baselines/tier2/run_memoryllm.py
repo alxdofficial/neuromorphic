@@ -34,6 +34,11 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO))
 
+# Tokenize the history in chunks of this many characters rather than in one call — see _inject_blocks.
+# ~4 chars/token, so this is ~256k tokens per call: large enough that chunking overhead is negligible,
+# small enough that the fast tokenizer's transient buffers stay well inside a tight container cgroup.
+_TOKENIZE_CHUNK_CHARS = 1_000_000
+
 _DEFAULT_MODEL = "YuWangX/mplus-8b"
 _DEFAULT_REPO_DIR = str(REPO.parent / "baselines" / "MemoryLLM")  # local master/baselines; pod passes --repo-dir
 
@@ -125,8 +130,25 @@ def _inject_blocks(tok, full_history: str, block_tokens: int, min_tokens: int) -
     """Split the context into FIXED `block_tokens`-token id blocks — the granularity M+ was evaluated at
     upstream (LongBench injects 512-token blocks). A short (<min_tokens) tail block is merged into the
     previous one (sub-16-token injects 'disturb' memory)."""
-    ids = tok(full_history, add_special_tokens=False)["input_ids"]
+    # Tokenize in CHARACTER CHUNKS, not one call on the whole history. A single tok(full_history) on MAB's
+    # largest context (604,706 tokens / ~2.4MB) materializes the fast tokenizer's offsets + attention_mask +
+    # ids at once and then a second full copy when sliced into blocks; on a pod with a small cgroup limit
+    # (observed 31GB, on top of ~20GB already held by the 8B weights + memory pool) that is an OOM-kill,
+    # SIGKILL/rc=137, with no Python traceback. LongMemEval never tripped it (~100k-token contexts).
+    # Chunk on whitespace so no token straddles a boundary; peak memory is now O(chunk), not O(context).
+    ids: list[int] = []
+    step = _TOKENIZE_CHUNK_CHARS
+    pos = 0
+    n = len(full_history)
+    while pos < n:
+        end = min(pos + step, n)
+        if end < n:                                  # extend to the next whitespace so we split cleanly
+            nxt = full_history.find(" ", end)
+            end = n if nxt == -1 else nxt
+        ids.extend(tok(full_history[pos:end], add_special_tokens=False)["input_ids"])
+        pos = end
     blocks = [ids[i:i + block_tokens] for i in range(0, len(ids), block_tokens)]
+    del ids
     if len(blocks) >= 2 and len(blocks[-1]) < min_tokens:
         blocks[-2] = blocks[-2] + blocks[-1]
         blocks.pop()

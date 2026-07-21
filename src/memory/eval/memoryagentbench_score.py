@@ -18,6 +18,9 @@ from collections import defaultdict
 
 _ARTICLES = re.compile(r"\b(a|an|the)\b")
 _ANSWER_PREFIX = re.compile(r"answer\s*:\s*(.*)", re.IGNORECASE)   # line-bounded (no DOTALL) — matches the repo
+# {"answer": "..."} — the detective_qa prompt demands single-line JSON, which _ANSWER_PREFIX cannot match
+# because the closing quote of the key sits between `answer` and `:`.
+_JSON_ANSWER = re.compile(r'"answer"\s*:\s*"((?:[^"\\]|\\.)*)"', re.IGNORECASE)
 _PUNCT = str.maketrans("", "", string.punctuation)
 
 
@@ -38,15 +41,30 @@ def exact_match(prediction: str, gold: str) -> bool:
 
 
 def parse_output(text: str) -> str:
-    """Take the (rest of the) 'Answer:' line if present (the repo's behavior), else the first non-empty line."""
+    """Take the (rest of the) 'Answer:' line if present (the repo's behavior), else the first non-empty line.
+
+    Two extractions run BEFORE the first-non-empty-line fallback, because our own prompts mandate output
+    formats that strict exact_match would otherwise reject 100% of the time:
+      - detective_qa is instructed to emit single-line JSON, so the answer arrives as {"answer": "..."}.
+        `_ANSWER_PREFIX` cannot match it (the quote sits between `answer` and `:`), and the fallback then
+        compares the whole blob — including the `reasoning` field — against a short gold. 0/71 for EVERY
+        model, deepseek included, despite character-identical answers.
+      - ICL is instructed 'Only output "label: {label}"' while the gold is a bare number, so every compliant
+        response fails. 0/500 for every model.
+    Both were structurally unsatisfiable, not capability results (deepseek full_context: 0.789 / 0.828
+    once parsed). Handled here rather than by loosening the metric, so exact_match stays exact.
+    """
     text = text or ""
+    m = _JSON_ANSWER.search(text)
+    if m and m.group(1).strip():
+        return m.group(1).strip()
     m = _ANSWER_PREFIX.search(text)
     if m and m.group(1).strip():
         return m.group(1).strip()
     for line in text.splitlines():
         if line.strip():
-            return line.strip()
-    return text.strip()
+            return _LABEL_PREFIX.sub("", line.strip()).strip()
+    return _LABEL_PREFIX.sub("", text.strip()).strip()
 
 
 # substring_exact_match → RULER (gold ∈ RAW output). substring_parsed → EventQA (gold ∈ the PARSED answer

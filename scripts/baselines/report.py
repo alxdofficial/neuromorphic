@@ -23,13 +23,37 @@ REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 OUT = REPO / "outputs" / "baselines"
 
+# Below this many scored questions an artifact is a smoke test, not a result, and must never reach the
+# published table. LongMemEval-S is 500 Q and MAB 3071, so any real run clears this by two orders of
+# magnitude; the smokes we actually produce are n=1/n=2. Deliberately low: a genuinely partial run should
+# still show up (with its n visible) rather than vanish silently.
+_MIN_REPORTABLE_N = 10
+
 
 def collect(pattern: str):
     """-> (rows_sorted, cols_sorted, cell{(row,col): (acc,n)}, overall{col: (acc,n)})."""
     cells, cols = {}, set()
+    # A (dataset, model, mode) can have SEVERAL artifacts on disk — an n=1/n=2 smoke next to the real run.
+    # Without this, the smoke's cells overwrite the real ones per-row (a 1.000 (1) OVERALL sitting above a
+    # 0.364 (121) subtask row, from two different files). Keep only the highest-n artifact per column key,
+    # and drop smokes outright, so a stray smoke JSON can never be published as a result.
+    best: dict[tuple, tuple] = {}
     for fp in sorted(glob.glob(str(OUT / pattern))):
         if fp.endswith(("_api_summary.json", "report.json")):
             continue
+        try:
+            d0 = json.loads(Path(fp).read_text())
+        except Exception:  # noqa: BLE001
+            continue
+        m0 = d0.get("meta") or {}
+        n0 = m0.get("n_scored") if m0.get("n_scored") is not None else m0.get("n") or 0
+        key = (d0.get("dataset"), d0.get("model"), d0.get("mode") or d0.get("method"))
+        if n0 < _MIN_REPORTABLE_N:
+            print(f"[report] skip {Path(fp).name}: n={n0} < {_MIN_REPORTABLE_N} (smoke, not a result)")
+            continue
+        if key not in best or n0 > best[key][0]:
+            best[key] = (n0, fp)
+    for _n, fp in sorted(best.values(), key=lambda t: t[1]):
         try:
             d = json.loads(Path(fp).read_text())
         except Exception:  # noqa: BLE001
