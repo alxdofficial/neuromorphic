@@ -58,3 +58,40 @@ def test_aggregate_groups_and_skips():
     assert agg["overall_accuracy"] == 2 / 3                       # France + 28 correct, detective wrong
     assert agg["per_competency"]["Accurate_Retrieval"]["accuracy"] == 1.0
     assert agg["per_competency"]["Long_Range_Understanding"]["accuracy"] == 0.0
+
+
+# --- regression: two competencies scored 0.000 for EVERY model because our own prompts mandated an output
+# --- format the metric rejected. See commit "fix two structural scoring zeros".
+
+def test_parse_output_extracts_json_answer_field():
+    """detective_qa is prompted for single-line JSON. `_ANSWER_PREFIX` can't match `"answer":` (the key's
+    closing quote sits between `answer` and `:`), so the whole blob — reasoning included — used to be
+    compared against a short gold. 0/71 for deepseek, llama and h2o alike."""
+    from src.memory.eval.memoryagentbench_score import exact_match, parse_output
+    hyp = ('{"answer":"C. The Brandt couple", "reasoning":"The deceased, Quentin Dugastlin, was murdered '
+           'by the couple who had been blackmailed for years."}')
+    assert parse_output(hyp) == "C. The Brandt couple"
+    assert exact_match(parse_output(hyp), "C. The Brandt couple")
+
+
+def test_parse_output_strips_label_prefix():
+    """ICL is prompted 'Only output "label: {label}"' while the gold is a bare number — so every response
+    that OBEYED the instruction scored zero."""
+    from src.memory.eval.memoryagentbench_score import exact_match, parse_output
+    for raw, gold in (("label: 19", "19"), ("label: 0", "0"), ("LABEL:  43", "43")):
+        assert parse_output(raw) == gold
+        assert exact_match(parse_output(raw), gold)
+
+
+def test_parse_output_preserves_existing_behaviour():
+    """The new extractions must not disturb the plain and `Answer:` paths."""
+    from src.memory.eval.memoryagentbench_score import parse_output
+    assert parse_output("Answer: Paris") == "Paris"
+    assert parse_output("Paris") == "Paris"
+    assert parse_output("") == ""
+    assert parse_output("first line\nsecond line") == "first line"
+
+
+def test_parse_output_json_with_escaped_quotes():
+    from src.memory.eval.memoryagentbench_score import parse_output
+    assert parse_output(r'{"answer": "he said \"hi\" then left"}') == r'he said \"hi\" then left'
