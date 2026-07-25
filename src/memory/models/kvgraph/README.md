@@ -15,16 +15,21 @@ surface, and Gumbel routing.
 
 | module | stage | status |
 |---|---|---|
-| `schema.py` | shared types: `Mention`, `Node`, `Edge`, `Graph`, the `Role` inventory | **written** |
-| `edges.py` | dependency arc -> canonical role; the deterministic v0 edge rule | **written** |
+| `schema.py` | shared types: `Mention`, `Node`, `Edge`, `Graph`, the `Relation` inventory | **written** |
+| `edges.py` | dependency arc -> canonical relation; the deterministic v0 edge rule | **written** |
 | `align.py` | char span <-> token index. The pipeline's most dangerous silent failure | planned |
 | `parse.py` | spaCy (deps + noun chunks) + coref -> `[Mention]`, predicates, arcs | planned |
 | `build.py` | mentions + predicates -> `[Node]`; coref clusters collapse here | planned |
 | `ground.py` | pool **pre-RoPE** K/V over each node's token positions | planned |
-| `merge.py` | link a window's nodes into the persistent graph (incremental, bounded) | planned |
-| `mixer.py` | typed-operator message passing over the graph | planned |
-| `inject.py` | node vectors -> KV entries: norm-match, RoPE at **compact rank** | planned |
+| `merge.py` | link a window's nodes into the persistent graph; evict to budget | planned |
+| `mixer.py` | TokenGT over node+edge tokens; relation-indexed operators + bounded edge-vector correction | planned |
+| `inject.py` | **node** vectors -> KV entries: norm-match, RoPE at **compact rank** | planned |
 | `encoder.py` | the `nn.Module` tying it together; the entry in `src/memory/model.py` | planned |
+
+Each edge carries a **discrete relation** (1-of-23, what the operator bank is indexed by) plus a
+**continuous edge vector** (what `theme` throws away when the real relation was "merchandise"). The edge
+vector is bounded — low-rank, zero-init, decay — because an unbounded one makes the relation decorative and
+rebuilds the loss-neutrality wall behind a good reconstruction number. Hence the ablation is two-sided.
 
 ## The three things most likely to be silently wrong
 

@@ -21,20 +21,20 @@ class NodeKind(str, Enum):
     EVENT = "event"     # a particular event or state, REIFIED as a node: the sale, the delivery
 
 
-class Role(str, Enum):
+class Relation(str, Enum):
     """The canonical relation inventory — deliberately small and CLOSED.
 
-    Size is the point: `K = len(Role)` is the free-bits constraint on the edge channel, exactly as the node
+    Size is the point: `K = len(Relation)` is the free-bits constraint on the edge channel, exactly as the node
     budget is on the node channel. A small K forces relations to be REUSED across the corpus, and reuse is
     what makes the topology carry information a flat bank does not have. If every verb were allowed to invent
-    its own label ("payload", "merchandise" — the same role under two names) the vocabulary would grow with
+    its own label ("payload", "merchandise" — the same relation under two names) the vocabulary would grow with
     the corpus, reuse would never happen, and the typed-operator bank could not be shared.
 
-    Polarity, tense and quantity are NOT roles. They are attributes on a node (see `Node.attrs`), because
+    Polarity, tense and quantity are NOT relations. They are attributes on a node (see `Node.attrs`), because
     they modify one node rather than relating two.
     """
 
-    # These names are BORROWED, not invented: they are the standard thematic/semantic roles used by
+    # These names are BORROWED, not invented: they are the standard thematic/semantic relations used by
     # PropBank, FrameNet, VerbNet and AMR. Every one answers a plain question, given in its comment.
 
     # --- WHO IS INVOLVED IN THIS EVENT, AND HOW? (event hub -> entity) --------------------------------
@@ -49,9 +49,9 @@ class Role(str, Enum):
     GOAL = "goal"                  # where it went TO.
     CONTENT = "content"            # WHAT WAS SAID/BELIEVED/RUMOURED — the argument is a whole
     #                                proposition, not a thing.  Rumour --content--> Sale.
-    #                                This single role is what makes "the rumour THAT he sold it"
+    #                                This single relation is what makes "the rumour THAT he sold it"
     #                                representable; without it the graph asserts the sale as
-    #                                world-fact. See THESIS.md §3.3. THE load-bearing role.
+    #                                world-fact. See THESIS.md §3.3. THE load-bearing relation.
 
     # --- UNDER WHAT CIRCUMSTANCES? (event hub -> entity) ----------------------------------------------
     MANNER = "manner"              # HOW.    Only when there is a noun to point at ("sold by auction");
@@ -79,11 +79,13 @@ class Role(str, Enum):
     #                                Written by the merge stage, not by the parser.
 
 
-#: Roles whose endpoints must both be EVENT nodes. Checked by `Graph.validate()`.
-DISCOURSE_ROLES = frozenset({Role.BECAUSE, Role.ALTHOUGH, Role.CONTRAST, Role.THEN, Role.SUPERSEDES})
+#: Relations whose endpoints must both be EVENT nodes. Checked by `Graph.validate()`.
+DISCOURSE_RELATIONS = frozenset({
+    Relation.BECAUSE, Relation.ALTHOUGH, Relation.CONTRAST, Relation.THEN, Relation.SUPERSEDES})
 
-#: Roles that connect two ENTITY nodes directly, with no hub.
-STATIVE_ROLES = frozenset({Role.PART_OF, Role.MEMBER_OF, Role.OWNS, Role.LOCATED_IN, Role.ATTRIBUTE})
+#: Relations that connect two ENTITY nodes directly, with no hub.
+STATIVE_RELATIONS = frozenset({
+    Relation.PART_OF, Relation.MEMBER_OF, Relation.OWNS, Relation.LOCATED_IN, Relation.ATTRIBUTE})
 
 
 @dataclass
@@ -149,13 +151,23 @@ class Node:
 
 @dataclass
 class Edge:
-    """Directed and typed. For role edges the source is ALWAYS the event hub — direction is uniform and
-    semantically empty, and the ROLE carries the argument structure (log2 K bits, versus the 1 bit that
+    """Directed and typed. For relation edges the source is ALWAYS the event hub — direction is uniform and
+    semantically empty, and the RELATION carries the argument structure (log2 K bits, versus the 1 bit that
     edge orientation carries when verbs are edges). See THESIS.md §3.3."""
 
     src: int
     dst: int
-    role: Role
+    #: The discrete grammatical relation. 1-of-K, from the closed inventory. This is what the mixer's
+    #: operator bank is indexed by, and what the edge ablation collapses.
+    relation: Relation
+    #: The continuous EDGE VECTOR: everything the discrete relation throws away. `theme` says the farm was
+    #: acted on; the edge vector is what carries "merchandise-ness". Attention-pooled from the tokens that
+    #: licensed the arc plus the heads of both endpoints, then refined by the mixer's edge-update.
+    #: BOUNDED by construction (low-rank, zero-init, decay) — if it is free to carry everything, the
+    #: relation goes decorative and we have rebuilt the loss-neutrality wall in a new idiom.
+    vec: object | None = None
+    #: The token indices that licensed this arc. Where `vec` is pooled from, and debugging provenance.
+    licensing_tokens: tuple[int, ...] = ()
     provenance: str = ""    # the dependency arc / rule this came from. Debugging only, never a feature.
 
 
@@ -168,13 +180,14 @@ class Graph:
         self.nodes[node.node_id] = node
         return node
 
-    def add_edge(self, src: int, dst: int, role: Role, provenance: str = "") -> Edge:
-        edge = Edge(src, dst, role, provenance)
+    def add_edge(self, src: int, dst: int, relation: Relation, provenance: str = "",
+                 licensing_tokens: tuple[int, ...] = ()) -> Edge:
+        edge = Edge(src, dst, relation, licensing_tokens=licensing_tokens, provenance=provenance)
         self.edges.append(edge)
         return edge
 
     def neighbors(self, node_id: int) -> list[tuple[Edge, Node]]:
-        """Outgoing only. Traversal walks the SYMMETRIZED graph (see mixer/retrieval); direction and role
+        """Outgoing only. Traversal walks the SYMMETRIZED graph (see mixer/retrieval); direction and relation
         are for computation, not for reachability, which is why no inverse edges are ever stored."""
         return [(e, self.nodes[e.dst]) for e in self.edges if e.src == node_id]
 
@@ -187,13 +200,13 @@ class Graph:
         problems = []
         for e in self.edges:
             if e.src not in self.nodes or e.dst not in self.nodes:
-                problems.append(f"edge {e.role.value} references a missing node: {e.src}->{e.dst}")
+                problems.append(f"edge {e.relation.value} references a missing node: {e.src}->{e.dst}")
                 continue
             src, dst = self.nodes[e.src], self.nodes[e.dst]
-            if e.role in DISCOURSE_ROLES and not (src.kind is NodeKind.EVENT and dst.kind is NodeKind.EVENT):
-                problems.append(f"discourse edge {e.role.value} must join two events: {src} -> {dst}")
-            if e.role in STATIVE_ROLES and src.kind is NodeKind.EVENT:
-                problems.append(f"stative edge {e.role.value} should not leave an event hub: {src}")
+            if e.relation in DISCOURSE_RELATIONS and not (src.kind is NodeKind.EVENT and dst.kind is NodeKind.EVENT):
+                problems.append(f"discourse edge {e.relation.value} must join two events: {src} -> {dst}")
+            if e.relation in STATIVE_RELATIONS and src.kind is NodeKind.EVENT:
+                problems.append(f"stative edge {e.relation.value} should not leave an event hub: {src}")
             # NB: CONTENT is deliberately unconstrained in its target kind. Both are legitimate:
             #   rumour --content--> (sell)     an event  ("the rumour THAT he sold it")
             #   letter --content--> rumour     an entity ("a letter ABOUT it")
@@ -214,5 +227,5 @@ class Graph:
             lines.append(f"{marker[0]}{n.label}{marker[1]:<18} #{n.node_id:<3} tok{n.token_positions[:6]}"
                          f"  <- {surface}")
             for edge, dst in self.neighbors(n.node_id):
-                lines.append(f"      --{edge.role.value:<12}-> #{dst.node_id} {dst.label}")
+                lines.append(f"      --{edge.relation.value:<12}-> #{dst.node_id} {dst.label}")
         return "\n".join(lines)

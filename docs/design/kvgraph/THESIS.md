@@ -424,7 +424,7 @@ for.
 
 ## 7. First falsification (the milestone that decides everything)
 
-Do NOT build all four stages. Test the crux in Stage 1+2:
+Do NOT build all four stages. Test the crux in Stage 1 (streaming, budgeted, evicting):
 
 > **At a fixed compression budget, does a graph with recoverable eviction beat a flat bank at the same budget
 > on a task requiring binding/multi-hop — and does ablating the edges (collapsing to flat) measurably hurt?**
@@ -436,9 +436,14 @@ Do NOT build all four stages. Test the crux in Stage 1+2:
   full-context included at 0.200) — then we have the thing the field does not have: an independently
   verifiable real-task win for a compressed memory.
 
-**The specific ablation, given §3:** collapse `R_{r(ij)}` to a single shared untyped operator (i.e. remove the
-role typing while keeping the topology). If multi-hop accuracy under budget does not drop, the typing was
-decorative.
+**The specific ablation is TWO-SIDED**, because each edge now carries a discrete relation *and* a continuous
+edge vector (BUILD.md §3), and either alone could be doing the work:
+- collapse `R_{r(ij)}` to a single shared untyped operator → does the **relation typing** matter?
+- zero the edge vector → does the **continuous refinement** matter?
+
+If only the edge vector matters, the graph typing was decorative and we have learned that cleanly rather than
+being fooled by a good reconstruction number. This is why the edge vector is bounded by construction
+(low-rank, zero-init, decay): an unbounded residual reproduces loss-neutrality in a new idiom.
 
 Anti-Goodhart co-gate (per `project_curriculum.md` discipline): the win must survive a SHUF−REAL control and
 must not be reachable by the flat baseline at matched budget. Reconstruction fidelity is NOT the success
@@ -495,17 +500,24 @@ errorful) over global joint coref — an accepted cost that must be measured, no
 
 ## 9. The four stages (each a distinct, separately-falsifiable thesis)
 
-### Stage 1 — Graph KV compressor (representation only, NOT persistent)
-- Encode a context window's hidden/KV states into a graph per §3: particulars as nodes, events as hubs, roles
-  from the canonical inventory, anchor+residual vectors.
-- Trained on the **existing mixed reconstruction objective** under a compression budget. **No persistence
-  requirement** — this stage's only job is the representation and, ideally, binding.
-- Grounding: KVzip's winning objective with learned graph reuse substituted for flat pruning.
+### Stage 0 — Warmup (plumbing only, NOT a regime)
+- One paragraph (~256–512 tokens), graph built per §3, **all** nodes read, reconstruct.
+- Sole purpose: verify the decoder can read graph-KV at all. Teaches **representation** before the streaming
+  stage teaches **selection**. Proves nothing scientific.
 
-### Stage 2 — Cross-subgraph edges + recoverable eviction
-- One workspace, not disjoint per-window graphs; nodes from different windows connect (and **merge**, §4).
+### Stage 1 — Streaming compression with live eviction (the gate)
+- Multi-window (ctx 2048 = 8 × 256), one persistent graph, nodes from different windows connect and
+  **merge** (§4); node budget **96**, ~3× over-subscribed, so forgetting is real.
+- **Eviction is a PRECONDITION of the objective, not a scaling feature.** The crux (§6) is
+  reconstruction-*after*-eviction; with eviction deferred, this stage is KVzip-with-a-graph and will be
+  loss-neutral exactly as predicted. Read a **retrieved subgraph**, seeded by the preceding window — a
+  non-circular query the streaming setting supplies for free.
 - Pruning = cache eviction scored by PPR mass (§4.1), **not** by leaf-ness or distance-from-root (§4.3).
 - **Eviction ≠ deletion.** Cold subgraphs → beacon + pointer, body to disk, recoverable (§3.6 L3/L4).
+- Grounding: KVzip's winning objective with learned graph reuse substituted for flat pruning.
+
+### Stage 2 — Scale
+- Long documents, disk offload, recall of evicted subgraphs. Engineering, not new science.
 
 ### Stage 3 — Hierarchy via multi-budget pretraining
 - Pretrain under different compression budgets to force the §3.6 ladder to appear (Matryoshka-style nesting
