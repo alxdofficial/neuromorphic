@@ -44,8 +44,10 @@ DEP_TO_ROLE: dict[str, Role] = {
     "acl": Role.CONTENT,
     "relcl": Role.CONTENT,
 
-    "advmod": Role.MANNER,
     "npadvmod": Role.TIME,        # bare temporal NP: "he called YESTERDAY"
+    # NOTE: `advmod` is deliberately absent. A bare adverb ("secretly") is not a particular, so there is
+    # no node for a MANNER edge to point at -- it becomes an ATTRIBUTE on the event instead. MANNER fires
+    # only for prepositional phrases with a nominal object ("sold BY AUCTION"), handled below.
 }
 
 # Entity -> entity, no hub needed: binary, and nothing ever points at them.
@@ -58,10 +60,19 @@ STATIVE_DEP_TO_ROLE: dict[str, Role] = {
 # Arcs that are NOT edges. Recording them explicitly stops them being silently dropped.
 ATTRIBUTE_DEPS: dict[str, str] = {
     "neg": "polarity",            # -> node attr polarity="-", NOT an edge. Ground facts need no scope region.
+    "advmod": "manner",           # bare adverb: "sold SECRETLY". No particular to point at -> attribute.
     "aux": "tense",
     "auxpass": "voice",
     "det": "definiteness",        # "the sale" vs "a sale" -- a coref cue, not a relation
 }
+
+#: Modifier arcs are edges ONLY when their target is independently referable; otherwise they collapse into
+#: a string attribute on the head. Rationale: budget. Making a node for every adjective would blow the node
+#: count on things nothing ever points at -- but a compound like "the FAMILY farm" deserves a node if
+#: "the family" is mentioned on its own elsewhere, because then a later fact can attach to it.
+#: `modifier_is_referable` is decided by the caller (build.py), which is the stage that knows the full
+#: mention list and NER types for the window.
+MODIFIER_DEPS: frozenset[str] = frozenset({"amod", "compound", "nmod"})
 #: Apposition asserts IDENTITY ("Maria, the owner, ..."), so it merges two nodes instead of relating them.
 MERGE_DEPS: frozenset[str] = frozenset({"appos"})
 
@@ -150,8 +161,16 @@ def role_for_argument(dep: str, *, head_lemma: str, head_is_passive: bool,
     return DEP_TO_ROLE.get(dep) or STATIVE_DEP_TO_ROLE.get(dep)
 
 
-def is_attribute(dep: str) -> str | None:
-    """-> the attribute name this arc sets on the head node, or None. Attributes are not edges."""
+def is_attribute(dep: str, *, modifier_is_referable: bool = False) -> str | None:
+    """-> the attribute name this arc sets on the head node, or None if it should be an edge instead.
+
+    `modifier_is_referable` lets build.py promote a modifier to a real edge when its target is a thing the
+    rest of the document can point at (it appears as a standalone mention, or carries an NER type).
+    "the family farm" becomes an ATTRIBUTE edge to a `family` node if "the family" is mentioned elsewhere,
+    and a plain string attribute otherwise.
+    """
+    if dep in MODIFIER_DEPS:
+        return None if modifier_is_referable else "modifier"
     return ATTRIBUTE_DEPS.get(dep)
 
 

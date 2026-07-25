@@ -34,41 +34,48 @@ class Role(str, Enum):
     they modify one node rather than relating two.
     """
 
-    # --- core participants (event hub -> entity) ------------------------------------------------------
-    AGENT = "agent"                # the doer.  Sale --agent--> Brother
-    THEME = "theme"                # the thing acted on.  Sale --theme--> farm
-    RECIPIENT = "recipient"        # who receives.  Delivery --recipient--> Maria
-    EXPERIENCER = "experiencer"    # who undergoes a mental state.  Believe --experiencer--> Maria
-    INSTRUMENT = "instrument"
-    SOURCE = "source"
-    GOAL = "goal"
-    CONTENT = "content"            # event hub -> ANOTHER event: the proposition-as-argument link.
-    #                                Rumour --content--> Sale.  This single role is what makes
-    #                                "the rumour THAT he sold it" representable at all; without it the
-    #                                graph asserts the sale as world-fact. See THESIS.md §3.3.
+    # These names are BORROWED, not invented: they are the standard thematic/semantic roles used by
+    # PropBank, FrameNet, VerbNet and AMR. Every one answers a plain question, given in its comment.
 
-    # --- circumstantial (event hub -> entity/value) ---------------------------------------------------
-    MANNER = "manner"              # Sale --manner--> secretly
-    TIME = "time"
-    LOCATION = "location"
-    PURPOSE = "purpose"
-    BENEFICIARY = "beneficiary"
+    # --- WHO IS INVOLVED IN THIS EVENT, AND HOW? (event hub -> entity) --------------------------------
+    AGENT = "agent"                # who DID it.            Sale --agent--> Brother
+    THEME = "theme"                # what it was done TO.   Sale --theme--> farm
+    RECIPIENT = "recipient"        # who GOT it.            Delivery --recipient--> Maria
+    EXPERIENCER = "experiencer"    # who FELT/THOUGHT it — an agent that isn't doing anything, just
+    #                                undergoing a mental state.  Believe --experiencer--> Maria.
+    #                                A nicety; collapsing it into AGENT would lose little.
+    INSTRUMENT = "instrument"      # what it was done WITH.
+    SOURCE = "source"              # where it came FROM.
+    GOAL = "goal"                  # where it went TO.
+    CONTENT = "content"            # WHAT WAS SAID/BELIEVED/RUMOURED — the argument is a whole
+    #                                proposition, not a thing.  Rumour --content--> Sale.
+    #                                This single role is what makes "the rumour THAT he sold it"
+    #                                representable; without it the graph asserts the sale as
+    #                                world-fact. See THESIS.md §3.3. THE load-bearing role.
 
-    # --- stative (entity -> entity) -------------------------------------------------------------------
-    # These never need a hub: binary, and nothing points at them.
-    PART_OF = "part_of"
-    MEMBER_OF = "member_of"
-    OWNS = "owns"
-    LOCATED_IN = "located_in"
-    ATTRIBUTE = "attribute"
+    # --- UNDER WHAT CIRCUMSTANCES? (event hub -> entity) ----------------------------------------------
+    MANNER = "manner"              # HOW.    Only when there is a noun to point at ("sold by auction");
+    #                                a bare adverb ("secretly") is an attribute, not an edge.
+    TIME = "time"                  # WHEN.
+    LOCATION = "location"          # WHERE.
+    PURPOSE = "purpose"            # WHAT FOR.
+    BENEFICIARY = "beneficiary"    # FOR WHOSE BENEFIT.
 
-    # --- discourse (event hub -> event hub) -----------------------------------------------------------
+    # --- FACTS RELATING TWO THINGS, NO EVENT NEEDED (entity -> entity) --------------------------------
+    # These never need a hub: binary, and nothing ever points at them.
+    PART_OF = "part_of"            # X is part of Y.
+    MEMBER_OF = "member_of"        # X belongs to group Y.
+    OWNS = "owns"                  # X possesses Y.         Maria --owns--> brother ("her brother")
+    LOCATED_IN = "located_in"      # X sits inside Y.
+    ATTRIBUTE = "attribute"        # X has property Y.
+
+    # --- HOW DO TWO EVENTS RELATE? (event hub -> event hub) -------------------------------------------
     # Only expressible because events are nodes. Both endpoints must be EVENTs.
-    BECAUSE = "because"
-    ALTHOUGH = "although"
-    CONTRAST = "contrast"
-    THEN = "then"
-    SUPERSEDES = "supersedes"      # fact-update: the newer assertion retracts the older one.
+    BECAUSE = "because"            # one caused the other.
+    ALTHOUGH = "although"          # one happened despite the other.
+    CONTRAST = "contrast"          # the two are set against each other.
+    THEN = "then"                  # one followed the other.
+    SUPERSEDES = "supersedes"      # fact-update: the newer assertion RETRACTS the older one.
     #                                Written by the merge stage, not by the parser.
 
 
@@ -187,8 +194,11 @@ class Graph:
                 problems.append(f"discourse edge {e.role.value} must join two events: {src} -> {dst}")
             if e.role in STATIVE_ROLES and src.kind is NodeKind.EVENT:
                 problems.append(f"stative edge {e.role.value} should not leave an event hub: {src}")
-            if e.role is Role.CONTENT and dst.kind is not NodeKind.EVENT:
-                problems.append(f"content edge must point at an event (a proposition), got {dst}")
+            # NB: CONTENT is deliberately unconstrained in its target kind. Both are legitimate:
+            #   rumour --content--> (sell)     an event  ("the rumour THAT he sold it")
+            #   letter --content--> rumour     an entity ("a letter ABOUT it")
+            # What makes CONTENT well-formed is that the SOURCE is information-bearing, which is a
+            # lexical property we cannot check structurally — so we do not pretend to.
         for n in self.nodes.values():
             if not n.mentions:
                 problems.append(f"{n} has no mentions — nothing to pool KV from")
