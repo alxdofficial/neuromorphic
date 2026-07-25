@@ -75,8 +75,22 @@ class Relation(str, Enum):
     ALTHOUGH = "although"          # one happened despite the other.
     CONTRAST = "contrast"          # the two are set against each other.
     THEN = "then"                  # one followed the other.
+    # --- SYSTEM RELATIONS: written by our own machinery, never by the parser ---------------------------
     SUPERSEDES = "supersedes"      # fact-update: the newer assertion RETRACTS the older one.
-    #                                Written by the merge stage, not by the parser.
+    #                                Written by the merge stage.
+    GRAVESTONE_POINTER = "gravestone_pointer"
+    #   Written by eviction. When node B is contracted into its surviving neighbour A, A inherits B's edges
+    #   retyped to this, and gains one pointer edge to B's on-disk record. The EDGE VECTOR carries (a) a gist
+    #   of the archived content, which doubles as the recall trigger, and (b) the original relation, so
+    #   `Sale --agent--> Brother` does not degrade to an untyped "something was here".
+    #
+    #   The survivor's own node vector is NEVER touched. That is the property that makes contraction work:
+    #   routing matches the survivor's real key, which never gets crowded however much archives under it.
+    #   Only the gist is a superposition, and a degraded gist costs an unnecessary recall — a budget cost,
+    #   not a wrong answer. See BUILD.md §8.2-8.3, and §8.6 for why supernodes were abandoned.
+    #
+    #   R_gravestone_pointer is trained on bundles, so it must NOT reuse a content relation's operator:
+    #   R_theme was fitted to real theme targets and a bundle is off-distribution for it.
 
 
 #: Relations whose endpoints must both be EVENT nodes. Checked by `Graph.validate()`.

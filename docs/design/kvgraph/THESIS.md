@@ -230,12 +230,16 @@ hierarchy actually is:
 | L0 | raw token KV | what we are replacing |
 | L1 | node = anchor + residual, decodes to its source span | full |
 | L2 | node = anchor only (identity + type; detail dropped) | cheap |
-| L3 | **beacon** = bundle (superposition) of the anchor codes of an evicted subgraph | one node |
-| L4 | on disk, full fidelity, recoverable via the beacon's pointer | free (not resident) |
+| L3 | **contracted** into a surviving neighbour; content on disk, reachable by a `GRAVESTONE_POINTER` edge whose vector carries a gist | zero extra nodes |
+| L4 | deeper along the pointer chain, after the survivor was itself contracted | free (not resident) |
 
-Bundling anchor codes for a beacon is VSA-style superposition: membership is testable by dot product against
-the bundle, degradation is graceful as more is bundled, and **beacons over beacons** give multi-resolution for
-free. The ceiling on abstraction is decodability (§3.5); the floor is the node budget.
+_Revised 2026-07-25._ L3 was previously a **beacon supernode** whose key was a superposition of its members'.
+That is abandoned — see BUILD.md §8.6. With correlated LM embeddings the bundle caps out around **9** members
+(Plate 1994 App. B.2; discriminability decays 1/k not 1/√k once mean pairwise cosine exceeds ~0.018, and
+GPT-2's is ~0.6), the grouping criterion contradicted the mechanism, and nesting decayed as 1/2^depth.
+Contraction has none of these properties: the survivor's own vector is untouched, so **nothing is superposed
+on the routing path**, and pointer chains are exact so depth is free. The ceiling on abstraction is still
+decodability (§3.5); the floor is still the node budget.
 
 ### 3.7 What the graph does NOT claim
 
@@ -526,10 +530,14 @@ errorful) over global joint coref — an accepted cost that must be measured, no
 ### Stage 2 — Scale
 - Long documents, disk offload, recall of evicted subgraphs. Engineering, not new science.
 
-### Stage 3 — Hierarchy via multi-budget pretraining
-- Pretrain under different compression budgets to force the §3.6 ladder to appear (Matryoshka-style nesting
-  adapted to graph topology): coarse anchors always resident, fine detail evictable and recoverable.
-- Grounding: Matryoshka representation learning; Compressive Transformer two-tier; Continuum Memory Systems.
+### Stage 3 — Hierarchy (now EMERGENT, not trained in)
+- _Revised 2026-07-25._ Earlier this stage proposed multi-budget pretraining to *induce* a Matryoshka-style
+  nesting. That is no longer needed: **contraction produces the hierarchy as a property of the eviction rule**
+  (BUILD.md §8.7). Over a long document the graph stratifies on its own — recurring entities stay resident,
+  their facts contract into them as they cool, older facts sit deeper along pointer chains.
+- Crucially this version is **sound**, where the nested-supernode version was not: a pointer chain is exact,
+  so depth is free, whereas bundle-of-bundles reliability decays as 1/2^depth (Clarkson et al. 2301.10352).
+- Multi-budget pretraining survives only as an optional refinement, not as the mechanism.
 
 ### Stage 4 — Latent reasoning in graph space (JEPA-style)
 - Predict **graph-state transitions** rather than decoding to language every step.

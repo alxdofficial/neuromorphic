@@ -21,7 +21,7 @@ tokens (one window)
               [2] build     nodes; coref clusters collapse; node count is DATA-DEPENDENT
               [3] edges     dep arc → canonical relation; events become hubs
               [4] ground    pool PRE-RoPE K/V over each node's token positions
-              [5] merge     link into the persistent graph; evict to budget
+              [5] merge     link into the persistent graph; contract to budget
               [6] mix       TokenGT over node AND edge tokens
               [7] inject    NODES only → norm-match → RoPE at compact rank → KV
                         │
@@ -289,230 +289,170 @@ control.
 
 ## 8. Eviction
 
-Runs only when the graph approaches the storage budget.
+Runs only when the graph approaches the storage budget. **Policy** (§8.1) decides *which* node dies;
+**mechanism** (§8.2) decides what happens to it. They are independent choices and each is ablated separately.
 
-### 8.1 The signal — LRU by default, attention-EMA only as a gated arm
+### 8.1 Policy — LRU + protected sinks + protected recent window
 
-**Revised 2026-07-25 after the literature sweep. The earlier draft made attention-EMA the primary signal;
-the evidence says it should not be.**
+Three parts, three genuinely different failure modes:
 
-Default policy: **LRU + protected attention sinks + protected recent window.**
+| part | protects against |
+|---|---|
+| **protected sinks** | breaking the model's attention mechanism |
+| **protected recent window** | evicting content before it has had a chance to be used |
+| **LRU** | keeping genuinely stale content |
 
-- **Sinks are not optional.** StreamingLLM (2309.17453) is well replicated: models dump large attention mass
-  onto the first few tokens regardless of content, and evicting them destroys generation. Our injected
-  prefix currently has *nothing* playing that role — position 0 is a pooled entity node, and every node is
-  evictable. **Keep the literal first ~4 token KV entries as permanent, unevictable sink nodes** at the head
-  of the prefix. 4 of a 96-node budget. This is exactly the class of bug that produces a confusing null:
-  graph looks fine, reconstruction mysteriously bad, a week lost blaming the mixer.
+**LRU.** Evict the node whose last real use is oldest, where "used" = *was in the retrieved top-B and
+received non-trivial attention*. No scoring function, no decay constant, no tuning.
 
-The attention-EMA rule we had specified is **LRFU** (Lee et al., IEEE TC 50(12) 2001): `CRF = Σ F(x)` with
-`F(x) = (½)^(λx)` collapses to exactly `score ← γ·score + usage` with `γ = 2^(−λ)`, provably subsuming LRU
-and LFU. Zero novelty — and three lines of evidence say it does not earn its complexity:
+**Protected sinks — non-optional, and a silent-failure bug if missed.** Transformers dump a large share of
+attention onto the first few tokens regardless of content: softmax must sum to 1, and initial tokens are the
+only positions visible to every query under causal masking, so they become the default no-op target.
+StreamingLLM (2309.17453) showed that keeping **4** initial tokens plus a rolling window gives stable
+generation over 4M tokens, while a pure rolling window collapses. **Our injected prefix is entirely nodes —
+position 0 is a pooled entity node — so the sink is missing and the frozen decoder was trained expecting it.**
+Keep the literal first ~4 token KV entries, unpooled, unscored, never evicted, at the head of the prefix.
+Four slots of 96.
 
-1. **It has already lost this head-to-head.** Compressive Transformer (1911.05507) ran "most-used, sorted by
-   average attention received" as an ablation arm: **0.980 BPC, beaten by learned conv at 0.973.**
-2. **Policy sophistication buys ~nothing.** SIEVE (NSDI'24) and S3-FIFO (SOSP'23) — near-trivial FIFO
-   variants — match or beat ARC/LIRS/W-TinyLFU across 6,594 real traces; SIEVE's mean gain over ARC is
-   **1.5%**. Twitter's 153-cluster production study: *"the choice of eviction algorithms has a limited impact
-   on the miss ratio."* LRU is already k-competitive (Sleator–Tarjan).
-3. **It is structurally blind to exactly what a memory is for.** A dormant node has cumulative attention
-   `< ε` *before* the query, making it invisible to any attention-based scorer. **Our EMA cannot see the fact
-   nobody has asked about yet** — which is the fact worth retaining. Not a tuning problem.
+**Protected recent window.** New nodes are exempt from eviction for W windows regardless of score. This is
+the fix for the fact that *any* usage-based policy is blind to content nobody has queried yet — a fact
+written thirty seconds ago has zero usage by construction, so unprotected LRU/LFU evicts it before it can
+prove itself. Note our window means *recently-created nodes*, not raw tokens: the current window's tokens are
+already in the decoder's context, so memory only ever covers what has scrolled off.
 
-→ Attention-EMA ships only if it beats **both LRU and random** at 3 seeds with CIs. Budget one week, not one
-quarter. If a better signal is wanted later, the two that reportedly dominate attention mass are **KVzip's
-reconstruction score** (query-agnostic by construction — and it already won our own Phase-2 benchmark) and
-creation-time retention scoring.
+**Why not something cleverer.** The attention-EMA rule earlier drafts specified is **LRFU** (Lee et al., IEEE
+TC 50(12) 2001) — `score ← γ·score + usage` is exactly its CRF recurrence with `γ = 2^(−λ)`. Three lines of
+evidence say it does not earn its complexity: Compressive Transformer (1911.05507) ran "most-used by average
+attention" as an ablation arm and it **lost** (0.980 BPC vs 0.973 for learned conv); SIEVE (NSDI'24) and
+S3-FIFO (SOSP'23) match or beat ARC/LIRS/W-TinyLFU across 6,594 traces with near-trivial FIFO variants
+(SIEVE's mean gain over ARC: **1.5%**); and attention-based scoring is *structurally* blind to the un-queried.
+**Sinks + recent window with no scoring at all is StreamingLLM, and it is a strong baseline** — "keep first 4
++ last N" is one of the baselines a learned importance scorer failed to beat. Attention-EMA ships only if it
+beats **both LRU and random** at 3 seeds with CIs.
 
-**Removed: homeostatic downscaling.** It was cargo-culted from the synaptic-downscaling analogy without
-checking the math. A uniform global rescale *preserves rank order*, and our eviction is rank-based, so it is
-a no-op. TinyLFU/LFU-DA halve counters because theirs are fixed-width integers that overflow; a float EMA of
-a bounded signal is already bounded by `max(usage)/(1−γ)`. The aging is already in `γ`.
+### 8.2 Mechanism — contraction into a surviving neighbour
 
-**Hierarchy is usage-weighted centrality, not tree depth.** A node is "high" if evicting it would damage a
-lot — many retrieval paths run through it. Two things then *emerge* rather than being hard-coded: entities
-float up while individual events sink, and the leaf problem dissolves (we never needed leaves, only cold
-low-conductance regions). Cycles are irrelevant.
-
-An earlier draft claimed ingestion-time eviction is blind for lack of a query. **In the streaming loop that
-is false** — every window predicts the next *from memory*, so the access signal exists throughout ingestion.
-The blind case arises only in a pure "ingest, then ask" deployment.
-
-**Hierarchy is usage-weighted centrality, not tree depth.** A node is "high" if evicting it would damage a
-lot — i.e. many retrieval paths run through it — which is exactly the accumulated score. Two things then
-*emerge* instead of being hard-coded: entities float up (shared across many facts, many paths through them)
-while individual events sink; and the leaf problem dissolves, since we never needed leaves, only cold
-low-conductance regions. Cycles are irrelevant.
-
-Earlier drafts of this doc claimed ingestion-time eviction is blind for lack of a query. **In the streaming
-loop that is false** — every window predicts the next *from memory*, so the decoder attends to injected
-nodes at every step and the access signal exists throughout ingestion. The blind case arises only in a pure
-"ingest, then ask" deployment, where structural centrality/recency/mention-count is the cold start.
-
-### 8.2 Grouping: cluster by CO-RETRIEVAL, not adjacency
-
-The unit is a **group of nodes**, never a single node — evicting one node and adding one gravestone frees
-nothing.
-
-The naive rule (cluster cold nodes that are *adjacent*) fails, and it fails in the **common** case rather
-than a corner one: events connect to each other only through entities, and entities are hot by construction
-(§8.1), so the induced cold subgraph is nearly **edgeless**. `call(agent=maria, theme=brother)` with both
-entities hot is an isolated cold node, and adjacency clustering would produce nothing but singletons.
-
-So group cold nodes by **shared neighbourhood / co-retrieval**, which is what adjacency was only ever a proxy
-for:
+**No supernodes.** The evicted node is contracted into an existing neighbour, which inherits its edges; its
+content goes to disk. This is standard **edge contraction**, the primitive behind multilevel graph coarsening
+(METIS, algebraic multigrid) — more standard than supernode summarization, not less.
 
 ```
-call    --agent-->       maria,  --theme--> brother      not adjacent to each other,
-believe --experiencer--> maria,  --theme--> rumour       but co-retrieved via maria
+contract B into A  (A = B's hottest surviving neighbour):
+  A inherits B's edges to nodes A is not already connected to,
+      typed GRAVESTONE_POINTER, original relation carried in the edge vector
+  B's content joins A's disk record (one record per survivor)
+  B is removed
 ```
 
-Bundling them gives a gravestone that means *"old facts about Maria"* — semantically right, and profitable.
-This is why the co-retrieval edge weighting is not a refinement: **it is what makes grouping work at all.**
-(It is also the safe home for the Hebbian idea — co-retrieval *weights existing edges for clustering* rather
-than *creating* edges, which would densify the graph back into attention.)
-
-**But prefer the free version first.** Co-retrieval clustering is published twice already (co-activation
-clustering with medoid expansion; Count-Min correlation groups), and GraphKV (2509.00388) documents the
-failure mode directly: evicting a node's whole neighbourhood *"unintentionally removes too many important
-tokens."* The zero-cost substitute is **temporal contiguity** — EM-LLM's contiguity buffer, RETRO's
-continuation chunk: group by adjacency **in the stream**, not by learned co-retrieval. Ship contiguity
-first; co-retrieval clustering must beat it to justify itself.
-
-**Size cap — much tighter than the earlier draft assumed.** The `~√n` crosstalk bound holds only for
-*uncorrelated* vectors. Plate (1994, thesis App. B.2) solved the correlated case: for members with mean
-pairwise cosine `ρ`, discriminability decays as **1/k, not 1/√k**, and capacity drops from `Θ(d)` to
-`Θ(√d)` — "required dimensionality proportional to k²". Ethayarajh (1909.00512) measures average cosine
-between *uniformly random* words in GPT-2 at **~0.6** in middle layers, two orders of magnitude past the
-`ρ* ≈ 0.018` crossover.
-
-| d | uncorrelated | ρ=0.3 | ρ=0.5 |
-|---|---|---|---|
-| 1024 | 56 | **9** | 6 |
-| 4096 | 227 | 20 | 13 |
-
-**Single digits.** A gravestone saves ~8 nodes, not 30 — which materially changes what eviction can buy.
-
-**And there is a direct contradiction with §8.2 to resolve.** Plate's explicit advice is *"avoid the
-situation where vectors of high similarity are superimposed"* — bundling *similar* members is the worst
-case, because accept-dissimilar and reject-similar end up with the same mean and no threshold separates
-them. Co-retrieval grouping selects for exactly that. Three fixes, all cheap:
-
-1. **Center before bundling** — subtract the group mean, bundle and probe with residuals. Independently
-   recommended in five literatures (Plate himself; Tsodyks–Feigel'man's covariance rule; Parga–Virasoro
-   ancestor subtraction; Mu & Viswanath "All-but-the-Top", ICLR'18; IVF-ADC residual encoding). Restores
-   near-linear capacity for a few lines of code.
-2. **Hard cap on |S|**, set from *measured* ρ̄, not guessed — and as a **constraint**, not a term in `gain()`.
-   An objective that linearly rewards `|S|` over coherent groups of correlated vectors is *constructing* a
-   degenerate attractor: Parga & Virasoro (1986) named the object (the "ancestor" — the category average) and
-   proved **its basin of attraction grows with category size**; Ramsauer et al. (2008.02217) rediscovered it
-   as metastable states. Unbounded, every query lands on the mega-gravestone.
-3. **Do not nest gravestones.** An earlier draft claimed beacons-over-beacons gives Stage 3's hierarchy for
-   free. Wrong: Clarkson et al. (2301.10352, Lemma 17) show bundle-of-bundles reliability decays as
-   **1/2^depth**. Hierarchy needs a different mechanism.
-
-**Simpler alternative worth a head-to-head:** SPANN (2111.08566) found the **actual member nearest the
-centroid** is a better posting-list proxy than the mean, removing superposition entirely; it also enforces
-hard list caps and replicates boundary members across lists.
-
-**One mitigation specific to us:** a false positive costs a *recall*, not a wrong answer — we page the
-subgraph in and the decoder attends to the real members. Budget cost, not correctness failure, unlike a
-Bloom filter where the false positive *is* the output.
-
-### 8.3 Gain: what makes eviction worth doing
+Three exhaustive cases, applied **coldest-first**:
 
 ```
-gain(S) =  |S| − 1              nodes freed, minus the gravestone added      ← dominant term
-        +  λ · |E_internal|     edges inside S that vanish entirely
-        −  λ · |∂S|             distinct boundary neighbours whose edges persist
+≥1 surviving neighbour   →  contract into the hottest one
+neighbours all evicted    →  append to their record (follow the pointer chain)
+no neighbours             →  delete outright (orphan; free, no pointer needed)
 ```
 
-λ is small (a node costs `L × kv_heads × dim × 2` floats; an edge costs a relation id and a small vector), so
-node count dominates and the boundary terms order the candidates.
+There is no fourth case and no refuse-to-evict rule. The terminal node of a fully-evicted component is
+subject to the same policy: evict it, and its now-unreachable record dies with it. Holding a resident slot as
+a handle for a region **nothing has ever queried** is exactly the cache pollution LRU exists to prevent. This
+is rare — a record follows the contraction chain, so it is orphaned only when an entire connected component
+goes cold, which in our graph means a one-off entity plus its facts, mentioned once and never again.
 
-Two properties worth noting:
+**Edge accounting, honestly.** Contraction grows edge count by `|N(B) \ N(A)| + [A has no record yet]`.
+Bounded by B's boundary, and usually far smaller because A and B are neighbours so most of B's neighbours are
+already A's — triangle overlap does most of the work. Transferring the edges is not optional: without it,
+paths through B break and we are back to severing multi-hop chains as memory fills, which is literally the M+
+failure we measured (0.423 → 0.286 as context grew).
 
-- **A single-node group always scores negative** — `1 − 1 − λ|∂S| < 0`. The arithmetic forbids it; no rule
-  needed. Likewise a cold-but-well-connected group scores near zero and stays resident, which is correct —
-  those nodes are still doing structural work.
-- **Low conductance is rewarded twice**: dense inside (`+λ|E_int|`) and sparse outside (`−λ|∂S|`). The
-  clustering objective and the gain function pull the same way, which is why components-then-gain works
-  without a joint optimisation.
+### 8.3 Gravestone pointer edges
 
-**Absorbing into an existing gravestone skips the `−1`:**
+The `GRAVESTONE_POINTER` edge carries three things, all on the **edge**, none in the survivor's node vector:
+
+1. **A disk offset** to the archived record.
+2. **A gist** in the edge vector — so a query needing only the general shape is answerable without paying for
+   recall, and so the gist doubles as the recall trigger (`query · gist > threshold`).
+3. **The original relation** of the edge it replaced, also in the edge vector, so `Sale --agent--> Brother`
+   does not degrade to an untyped "something was here."
+
+**The survivor's own vector is never touched.** That is the property that makes this work: routing happens by
+matching the survivor's real key, which never gets crowded no matter how much contracts into it. Only the
+*gist* is a bundle, and a degraded gist costs an unnecessary recall — a budget cost, not a wrong answer.
+
+### 8.4 Caps
+
+- **`k` entries per record**, set from *measured* ρ̄ (§8.6), since the gist is a superposition. Overflow
+  creates an additional pointer edge.
+- **`m` pointer edges per survivor**; beyond that, spill the oldest into a deeper record.
+
+**Pointer chains are lossless.** Following three hops of exact references loses nothing, unlike three levels
+of superposition — which is why depth is free here and was not for supernodes.
+
+### 8.5 Recall
 
 ```
-new gravestone:     gain = |S| − 1 − λ·|∂S|
-absorb into ⟨g⟩:    gain = |S| − 0 − λ·Δ|∂|
+survivor in top-B  ∧  query · gist > threshold  →  page in, expand in place, evict to stay in budget
 ```
 
-which makes **single-node eviction profitable after all**, provided a suitable gravestone is nearby. Take the
-better of the two per group. Once a gravestone hits its size cap, pay the `−1` for a new one or nest.
+A cache-line fill. Bound recalls per query or this degenerates into RAG with extra steps.
 
-### 8.4 The algorithm, and its honest guarantee
+### 8.6 Why not supernodes (the abandoned design, and why it was abandoned)
 
-```
-loop:
-  score all nodes (EMA attention mass × recency)
-  cold set C = bottom-p%
-  cluster C by co-retrieval / shared neighbourhood, capped in size
-  for each group: gain = max(new gravestone, absorb into an existing one)
-  evict greedily by gain
-  collect orphans        ← nodes left at degree 0 cost nothing to delete: gain = 1, no gravestone
-until under budget OR no positive-gain candidate remains
+The earlier design evicted a *group* into a new "gravestone" node whose key was the normalised sum of its
+members' keys. Recorded here because the reasoning is expensive to reconstruct:
 
-if still over budget:
-  allow a bounded overrun (hard ceiling) and LOG IT
-```
+- **The `−1` was the whole problem.** Creating a node cost one node, so single-node eviction was never
+  profitable, so groups were needed, so clustering was needed, so a `gain()` function with a `λ` was needed.
+  Contraction removes the `−1` and the entire chain collapses.
+- **Bundled keys cap out at ~9 members, not ~30.** The familiar `~√n` crosstalk bound holds only for
+  *uncorrelated* vectors. Plate (1994, thesis App. B.2) solved the correlated case: with mean pairwise cosine
+  `ρ`, discriminability decays as **1/k not 1/√k**, and capacity drops from `Θ(d)` to `Θ(√d)`. Ethayarajh
+  (1909.00512) measures ~0.6 mean cosine between *uniformly random* words in GPT-2's middle layers — two
+  orders of magnitude past the `ρ* ≈ 0.018` crossover. At `d=1024, ρ=0.3` the limit is **9**.
+- **The grouping criterion contradicted the mechanism.** Plate's explicit advice is *"avoid the situation
+  where vectors of high similarity are superimposed"* — but co-retrieval grouping selects for exactly that.
+- **A size-rewarding objective builds a degenerate attractor.** Parga & Virasoro (1986) named the object (the
+  "ancestor" — a category average) and proved **its basin of attraction grows with category size**; Ramsauer
+  et al. (2008.02217) rediscovered it as metastable states. Unbounded, every query lands on the mega-node.
+- **Nesting does not work.** Bundle-of-bundles reliability decays as **1/2^depth** (Clarkson et al.
+  2301.10352, Lemma 17), so "beacons over beacons gives hierarchy for free" was wrong.
 
-**There is no guarantee we hit budget, and we deliberately do not force-evict.** A high-boundary node is
-precisely the one whose removal severs multi-hop paths — the failure this whole design exists to avoid — and
-evicting it alone frees roughly nothing anyway. A persistent overrun is a real signal (budget too tight for
-the content, or the scoring has degenerated) and must be **loud**: per our own discipline, a silent cap reads
-as "everything fit" when it didn't.
+If supernodes are ever revisited, the fixes are: **center before bundling** (subtract the group mean, probe
+with residuals — independently recommended by Plate, Tsodyks–Feigel'man, Parga–Virasoro, Mu & Viswanath's
+All-but-the-Top, and IVF-ADC), a hard cap as a *constraint* rather than an objective term, and SPANN's
+(2111.08566) finding that the **actual member nearest the centroid** beats the mean as a proxy.
 
-### 8.5 Gravestones
+Grouping machinery also went with them. Co-retrieval clustering is published twice already, GraphKV
+(2509.00388) documents its failure mode (*"evicting all nodes connected to the source node unintentionally
+removes too many important tokens"*), and the free substitute — **temporal contiguity**, as in EM-LLM's
+contiguity buffer — was never beaten by it.
 
-A gravestone carries four things:
+### 8.7 What contraction gives for free
 
-1. **Routing key** — the **bundled (superposed) keys** of its members: `k_g = normalize(Σ_{i∈S} k_i)`. Then
-   `q·k_g = Σ_i q·k_i`, so a query matching *any* member still matches the gravestone, with crosstalk growing
-   as ~√|S|. This is the actual routing mechanism, not a summarisation metaphor — and it is why the size cap
-   exists.
-2. **Pointer** — offset into the on-disk store.
-3. **Boundary edges — what preserves reachability.** Crossing edges are **rewritten, not added**; parallel
-   ones from the same outside node dedup into one, with the original relations bundled into its edge vector.
-   Edges *internal* to the group vanish entirely — that is the compression.
-   ```
-   before:   rumour --content--> (sell) --agent--> brother
-                                    └---theme--> farm
-   after:    rumour --GRAVESTONE--> ⟨g⟩ --GRAVESTONE--> brother
-   ```
-   Without this, eviction silently severs multi-hop chains exactly as memory fills — the M+ failure we
-   measured (0.423 → 0.286 as context grew).
-4. **Gist** — the gravestone's V, so a query needing only the general shape is answerable without recall.
+**One graph, no merge operation.** Each window contributes nodes into the same persistent pool; coreference
+links them where they denote the same particular; budget contracts the cold parts. There is no step that
+combines graph A with graph B, because per-window graphs were never objects — just batches of admissions.
 
-**Why `GRAVESTONE` is its own relation** rather than keeping the original: `R_theme` was trained on real theme
-targets, and a gravestone is a *superposition of many things* — applying a relation-specific operator to a
-bundle is off-distribution and would quietly degrade every path crossing it. A dedicated `R_gravestone` is
-trained on bundles and learns to handle them, and it is an explicit signal that recall may be needed. The
-original relation is not lost; it lives in the edge vector.
+Keep **coref merge** and **contraction** distinct, though — both are "merge" and they mean different things:
 
-**Recall** is a second pass: a gravestone landing in the top-`B` with a high score is paged in from disk,
-expanded in place, and something else is evicted to stay in budget — a cache-line fill. Bound recalls per
-query, or this degenerates into RAG with extra steps. Nesting (gravestone-of-gravestones) is the hierarchy;
-cap its depth, since crosstalk compounds.
+| | coref merge | contraction |
+|---|---|---|
+| why | these are the *same particular* | out of room |
+| content | unified into one node | archived to disk |
+| loss | none — it was always one thing | lossy but recoverable |
+| between | any two nodes, however distant | neighbours only |
 
-**This is the thesis mechanism, not cache management.** Under reconstruction-after-eviction the model must
-reproduce content whose nodes are gone, using only resident nodes plus gravestones — which requires
-traversing **the right edges** to **the right gravestone**. Neither is satisfiable by a graph whose edges are
-generic. That pressure is absent under plain reconstruction, where everything needed is already present and
-the edges may be decorative. It is the reason eviction had to move into Stage 1.
+Contraction must never make identity claims: that is the over-merge failure, which is worse than
+under-merging because it produces wrong answers rather than missing ones.
 
-**The failure mode to design against:** if the gist alone suffices, recall never fires and routing never
-trains. We have been bitten by the equivalent — `condrecon` scored ~90% template tokens and `SHUF−REAL`
-collapsed to ≈0 until CE was masked to fact-value spans only. Same fix: **the reconstruction target must be
-detail-sensitive** (exact spans, specific values) so a gist genuinely cannot substitute for recall.
+**Hierarchy emerges instead of being trained in.** Over a long document the graph stratifies on its own —
+recurring entities stay resident, their facts contract in as they cool, older facts sit deeper along pointer
+chains. That is Stage 3's multi-resolution memory arriving as a *property of the eviction rule*, and unlike
+the nested-supernode version it is sound, because pointer chains are exact.
+
+**Partial repair for under-merged coref.** If `Maria(¶1)` and `Maria(¶5)` fail to link but both connect to
+`Brother`, the colder duplicate eventually contracts into `Brother`, consolidating its facts under a shared
+anchor. Not equivalent to having merged them, but not nothing. There is **no** corresponding repair for
+over-merging.
 
 ---
 
@@ -665,8 +605,8 @@ of the sweep.
 |---|---|
 | attention-EMA scoring | → LRU + sinks + recent window (§8.1) |
 | co-retrieval clustering | → temporal contiguity first (§8.2) |
-| boundary-edge rewriting | → **not in v1.** Cheapest published policy: "compression removes nodes but never alters edges" — dangling edges point at a tombstone, and eviction is forbidden for nodes with live dependents. Full superedge rewiring + correction list is Navlakha SIGMOD'08; real, but later. |
-| gravestone complexity | → one summary vector per evicted block; **measure page-back precision as a first-class metric before building anything graph-shaped on top.** M+'s page-back recall is only ~30%. |
+| boundary-edge rewriting | → subsumed by contraction: the survivor inherits the evicted node's edges, deduped, retyped `GRAVESTONE_POINTER`. Transferring them is **not** optional — without it, paths break and multi-hop severs as memory fills. |
+| supernode gravestones | → **replaced by contraction into a surviving neighbour** (§8.2). No new node, so no clustering and no `gain()`; nothing superposed on the routing path. **Measure page-back precision as a first-class metric.** M+'s page-back recall is only ~30%. |
 
 ### 13.4 The graph is on probation
 

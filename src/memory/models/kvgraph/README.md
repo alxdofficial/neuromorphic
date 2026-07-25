@@ -21,12 +21,12 @@ surface, and Gumbel routing.
 | `parse.py` | spaCy (deps + noun chunks) + coref -> `[Mention]`, predicates, arcs | planned |
 | `build.py` | mentions + predicates -> `[Node]`; coref clusters collapse here | planned |
 | `ground.py` | pool **pre-RoPE** K/V over each node's token positions | planned |
-| `merge.py` | link a window's nodes into the persistent graph; evict to budget | planned |
+| `merge.py` | link a window's nodes into the persistent graph (coref); LRU+sinks policy; contraction into a surviving neighbour | planned |
 | `mixer.py` | TokenGT over node+edge tokens; relation-indexed operators + bounded edge-vector correction | planned |
 | `inject.py` | **node** vectors -> KV entries: norm-match, RoPE at **compact rank** | planned |
 | `encoder.py` | the `nn.Module` tying it together; the entry in `src/memory/model.py` | planned |
 
-Each edge carries a **discrete relation** (1-of-23, what the operator bank is indexed by) plus a
+Each edge carries a **discrete relation** (1-of-24, what the operator bank is indexed by) plus a
 **continuous edge vector** (what `theme` throws away when the real relation was "merchandise"). The edge
 vector is bounded — low-rank, zero-init, decay — because an unbounded one makes the relation decorative and
 rebuilds the loss-neutrality wall behind a good reconstruction number. Hence the ablation is two-sided.
@@ -60,7 +60,11 @@ anti-Goodhart discipline requires.
 
 ## Reading
 
-Stage 1 (compression) reads **all** nodes — that is what makes the comparison to KVzip/H2O matched at
-budget. Stage 2 (memory) retrieves a subset, and the attention mass each node receives is the access
-signal eviction runs on. Train Stage 1 with **random node dropout** anyway, or the mixer learns to smear a
-fact across co-dependent nodes and subset retrieval breaks it.
+Stage 0 (warmup, one paragraph) reads **all** nodes — the matched comparison against KVzip/H2O. Stage 1
+(streaming, 96-node budget) retrieves a subset with live eviction, because the gate is
+reconstruction-*after*-eviction and a read-everything stage cannot fire it. Train with **random node dropout**
+too, or the mixer smears a fact across co-dependent nodes and subset retrieval breaks it.
+
+**Eviction** = LRU + protected attention sinks + protected recent window (policy), then **contraction** into
+the hottest surviving neighbour (mechanism). No supernodes: the survivor's vector is untouched, so nothing is
+superposed on the routing path. See `docs/design/kvgraph/BUILD.md` §8.
