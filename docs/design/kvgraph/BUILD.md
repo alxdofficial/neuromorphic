@@ -244,26 +244,233 @@ prior slotgraph runs *at the same persistent-state size* — the budget at which
 **Train with random node dropout too.** Otherwise the mixer may smear one fact across several co-dependent
 nodes — fine under read-all, catastrophic once a subset is retrieved.
 
-### Reading at Stage 1+
-
-Two-stage: **PPR** seeded at query-similar nodes gives cheap structural recall (top-B candidates); the
-decoder's **attention mass** over the injected candidates gives the fine-grained, differentiable access
-signal — H2O's heavy-hitter criterion applied to graph nodes.
-
-**Eviction during ingestion has no query.** The memory fills while reading, long before a question arrives,
-so ingestion-time eviction can only use structural centrality (unseeded PageRank), recency and mention
-count — precisely H2O's blind-eviction problem, and why recoverability is what makes it survivable.
-Query-access refines the resident set afterwards. Note this policy is hand-written in v0 and *still*
-supplies the discrete input-dependent bits the proof needs, because *which* nodes are central depends on the
-input; it becomes learnable (straight-through) in phase 2, with the hand-written version as its control.
-
 **Benchmark asymmetry:** MAB shares ~85 questions per context, so access genuinely accumulates.
 LongMemEval gives each question its own haystack — one query per memory, no accumulation, frequency
 mechanism degenerate. Design experiments accordingly.
 
 ---
 
-## 7. Costs
+## 7. Retrieval
+
+**Retrieval is the decoder's own attention, not a separate pre-pass.** Following Memorizing Transformers
+(Wu et al. 2022) and Landmark Attention: layers `0..ℓ` run on context alone; **layer ℓ's queries select from
+memory**; layers `ℓ+1..L` attend over `[retrieved ∪ context]`. Single forward pass. One retrieval layer is
+enough — doing it at every layer is expensive and unstable.
+
+Our twist on the Memorizing-Transformer pattern: the retrieved unit is not a flat KV pair but a **node plus
+its neighbourhood** — a small typed subgraph.
+
+- **Put ℓ late.** With many layers of self-attention *before* the retrieval layer, each token's query is
+  already contextualised by every other token's, so the top-k union comes out **naturally diversified**
+  instead of 512 tokens asking the same thing. The trade-off is fewer layers left to use what came back;
+  optimum probably ~⅔ depth. Cheap to sweep.
+- **Storage bonus:** if retrieval happens at layer 16 of 32, node KV is only ever needed for layers 16–32 —
+  a further ~2× storage cut on top of the ~7× node compression.
+- **Per-token top-k → union → cap at read budget `B` → inject.** No per-token masking needed; attention is
+  already a soft selection, so it only needs the right candidate set present.
+
+**Two budgets, and the gap between them is the point:**
+
+| | caps | v0 |
+|---|---|---|
+| **storage budget** | nodes resident in memory | 96 |
+| **read budget `B`** | nodes injected per query | ~32 |
+
+If read = storage, every node is accessed every time, the frequency signal is uniform, and eviction has
+nothing to rank on. The gap is what *creates* the access signal.
+
+**Learned probe queries** — initialise `B` query vectors in the context, self-attend, use them to interrogate
+memory — are a real alternative with a real advantage (trained to ask good questions rather than being
+whatever next-token prediction produced). Deferred to phase 1.5 because learned queries under a
+reconstruction objective can collapse to fetching a fixed generic set, with token-driven retrieval as the
+control.
+
+---
+
+## 8. Eviction
+
+Runs only when the graph approaches the storage budget.
+
+### 8.1 The signal
+
+EMA over each node's **received attention mass**, which is both the retrieval mechanism and the usage record
+— selection and access-log are the same object:
+
+```
+score_n  ←  γ · score_n  +  attention_mass_n(this step)
+```
+
+"Not retrieved for a while" decays out for free. This is literally M+'s `ltm_recall_frequencies` and H2O's
+heavy-hitter criterion — mechanisms we have run and read. Add **homeostatic downscaling** (periodic
+rescaling of the score distribution), or potentiation saturates, everything looks important, and the ranking
+degenerates.
+
+**Hierarchy is usage-weighted centrality, not tree depth.** A node is "high" if evicting it would damage a
+lot — i.e. many retrieval paths run through it — which is exactly the accumulated score. Two things then
+*emerge* instead of being hard-coded: entities float up (shared across many facts, many paths through them)
+while individual events sink; and the leaf problem dissolves, since we never needed leaves, only cold
+low-conductance regions. Cycles are irrelevant.
+
+Earlier drafts of this doc claimed ingestion-time eviction is blind for lack of a query. **In the streaming
+loop that is false** — every window predicts the next *from memory*, so the decoder attends to injected
+nodes at every step and the access signal exists throughout ingestion. The blind case arises only in a pure
+"ingest, then ask" deployment, where structural centrality/recency/mention-count is the cold start.
+
+### 8.2 Grouping: cluster by CO-RETRIEVAL, not adjacency
+
+The unit is a **group of nodes**, never a single node — evicting one node and adding one gravestone frees
+nothing.
+
+The naive rule (cluster cold nodes that are *adjacent*) fails, and it fails in the **common** case rather
+than a corner one: events connect to each other only through entities, and entities are hot by construction
+(§8.1), so the induced cold subgraph is nearly **edgeless**. `call(agent=maria, theme=brother)` with both
+entities hot is an isolated cold node, and adjacency clustering would produce nothing but singletons.
+
+So group cold nodes by **shared neighbourhood / co-retrieval**, which is what adjacency was only ever a proxy
+for:
+
+```
+call    --agent-->       maria,  --theme--> brother      not adjacent to each other,
+believe --experiencer--> maria,  --theme--> rumour       but co-retrieved via maria
+```
+
+Bundling them gives a gravestone that means *"old facts about Maria"* — semantically right, and profitable.
+This is why the co-retrieval edge weighting is not a refinement: **it is what makes grouping work at all.**
+(It is also the safe home for the Hebbian idea — co-retrieval *weights existing edges for clustering* rather
+than *creating* edges, which would densify the graph back into attention.)
+
+**Size cap** on a group, because the gravestone's routing key is a superposition of member keys and crosstalk
+grows as ~√n. A 30-node gravestone matches every query weakly and routes nothing.
+
+### 8.3 Gain: what makes eviction worth doing
+
+```
+gain(S) =  |S| − 1              nodes freed, minus the gravestone added      ← dominant term
+        +  λ · |E_internal|     edges inside S that vanish entirely
+        −  λ · |∂S|             distinct boundary neighbours whose edges persist
+```
+
+λ is small (a node costs `L × kv_heads × dim × 2` floats; an edge costs a relation id and a small vector), so
+node count dominates and the boundary terms order the candidates.
+
+Two properties worth noting:
+
+- **A single-node group always scores negative** — `1 − 1 − λ|∂S| < 0`. The arithmetic forbids it; no rule
+  needed. Likewise a cold-but-well-connected group scores near zero and stays resident, which is correct —
+  those nodes are still doing structural work.
+- **Low conductance is rewarded twice**: dense inside (`+λ|E_int|`) and sparse outside (`−λ|∂S|`). The
+  clustering objective and the gain function pull the same way, which is why components-then-gain works
+  without a joint optimisation.
+
+**Absorbing into an existing gravestone skips the `−1`:**
+
+```
+new gravestone:     gain = |S| − 1 − λ·|∂S|
+absorb into ⟨g⟩:    gain = |S| − 0 − λ·Δ|∂|
+```
+
+which makes **single-node eviction profitable after all**, provided a suitable gravestone is nearby. Take the
+better of the two per group. Once a gravestone hits its size cap, pay the `−1` for a new one or nest.
+
+### 8.4 The algorithm, and its honest guarantee
+
+```
+loop:
+  score all nodes (EMA attention mass × recency)
+  cold set C = bottom-p%
+  cluster C by co-retrieval / shared neighbourhood, capped in size
+  for each group: gain = max(new gravestone, absorb into an existing one)
+  evict greedily by gain
+  collect orphans        ← nodes left at degree 0 cost nothing to delete: gain = 1, no gravestone
+until under budget OR no positive-gain candidate remains
+
+if still over budget:
+  allow a bounded overrun (hard ceiling) and LOG IT
+```
+
+**There is no guarantee we hit budget, and we deliberately do not force-evict.** A high-boundary node is
+precisely the one whose removal severs multi-hop paths — the failure this whole design exists to avoid — and
+evicting it alone frees roughly nothing anyway. A persistent overrun is a real signal (budget too tight for
+the content, or the scoring has degenerated) and must be **loud**: per our own discipline, a silent cap reads
+as "everything fit" when it didn't.
+
+### 8.5 Gravestones
+
+A gravestone carries four things:
+
+1. **Routing key** — the **bundled (superposed) keys** of its members: `k_g = normalize(Σ_{i∈S} k_i)`. Then
+   `q·k_g = Σ_i q·k_i`, so a query matching *any* member still matches the gravestone, with crosstalk growing
+   as ~√|S|. This is the actual routing mechanism, not a summarisation metaphor — and it is why the size cap
+   exists.
+2. **Pointer** — offset into the on-disk store.
+3. **Boundary edges — what preserves reachability.** Crossing edges are **rewritten, not added**; parallel
+   ones from the same outside node dedup into one, with the original relations bundled into its edge vector.
+   Edges *internal* to the group vanish entirely — that is the compression.
+   ```
+   before:   rumour --content--> (sell) --agent--> brother
+                                    └---theme--> farm
+   after:    rumour --GRAVESTONE--> ⟨g⟩ --GRAVESTONE--> brother
+   ```
+   Without this, eviction silently severs multi-hop chains exactly as memory fills — the M+ failure we
+   measured (0.423 → 0.286 as context grew).
+4. **Gist** — the gravestone's V, so a query needing only the general shape is answerable without recall.
+
+**Why `GRAVESTONE` is its own relation** rather than keeping the original: `R_theme` was trained on real theme
+targets, and a gravestone is a *superposition of many things* — applying a relation-specific operator to a
+bundle is off-distribution and would quietly degrade every path crossing it. A dedicated `R_gravestone` is
+trained on bundles and learns to handle them, and it is an explicit signal that recall may be needed. The
+original relation is not lost; it lives in the edge vector.
+
+**Recall** is a second pass: a gravestone landing in the top-`B` with a high score is paged in from disk,
+expanded in place, and something else is evicted to stay in budget — a cache-line fill. Bound recalls per
+query, or this degenerates into RAG with extra steps. Nesting (gravestone-of-gravestones) is the hierarchy;
+cap its depth, since crosstalk compounds.
+
+**This is the thesis mechanism, not cache management.** Under reconstruction-after-eviction the model must
+reproduce content whose nodes are gone, using only resident nodes plus gravestones — which requires
+traversing **the right edges** to **the right gravestone**. Neither is satisfiable by a graph whose edges are
+generic. That pressure is absent under plain reconstruction, where everything needed is already present and
+the edges may be decorative. It is the reason eviction had to move into Stage 1.
+
+**The failure mode to design against:** if the gist alone suffices, recall never fires and routing never
+trains. We have been bitten by the equivalent — `condrecon` scored ~90% template tokens and `SHUF−REAL`
+collapsed to ≈0 until CE was masked to fact-value spans only. Same fix: **the reconstruction target must be
+detail-sensitive** (exact spans, specific values) so a gist genuinely cannot substitute for recall.
+
+---
+
+## 9. Bio-inspired mechanisms: what is already in, what is queued
+
+The mechanisms that are load-bearing are **already in the design, under engineering names**:
+
+| our name | what it is |
+|---|---|
+| EMA of attention mass (§8.1) | a **Hebbian trace** — co-active with a query → potentiate, unused → decay |
+| sg3's delta-rule write | the **Widrow–Hoff / error-corrected Hebbian rule** (what Titans and DeltaNet are) |
+| competitive assignment, sum aggregation | **lateral inhibition** — the cell-assembly anti-collapse principle |
+| homeostatic downscaling (§8.1) | **synaptic downscaling** (SHY) — stops potentiation saturating |
+
+Note sg3's write is the *delta rule*, not STDP: it has no temporal asymmetry, which is STDP's entire content.
+
+**Queued, deliberately not built:** Hebbian **edge creation** between co-retrieved nodes. It would add
+associative links the parser structurally cannot supply (two facts three paragraphs apart are connected only
+through their shared entity). Deferred for two reasons: densification risk (everything co-retrieved →
+everything linked → we have reinvented attention), and — decisively — **it would confound the gate.** A
+mechanism added before the ablation makes a *positive* result uninterpretable, which is worse than making a
+negative one uninterpretable.
+
+**The right home for the ambitious version is the L1→L2 boundary.** Systems consolidation (hippocampus →
+neocortex: replay recent episodic traces into a slower abstract store) is the principled answer to *where do
+evicted memories eventually go* — for content that recurs, eviction from L1 should mean **consolidation into
+L2**, not just disk. That also gives L2 the training signal it currently lacks.
+
+**The bar:** our own biomem cohort found **LIF neurons inert**. Biological plausibility has never been a
+reason for anything in this project to work; bio-inspired mechanisms earn their place by ablation like
+everything else.
+
+---
+
+## 10. Costs
 
 Llama-3.1-8B, 512-token window, bf16:
 
@@ -282,7 +489,7 @@ Iterate against SmolLM2-135M (what the harness already uses); validate at 8B.
 
 ---
 
-## 8. Instability risks, ranked
+## 11. Instability risks, ranked
 
 1. **Injected-KV distribution shift** *(highest, silent)*. Frozen decoder expects particular per-layer
    statistics. Mitigate with norm-matching **and** initialising the mixer near identity so at init the
@@ -304,7 +511,7 @@ design removes most of the ways this could go unstable.
 
 ---
 
-## 9. Milestones — do not conflate them
+## 12. Milestones — do not conflate them
 
 - **M1 (engineering, Stage 0).** The graph forms, injects, and the decoder reconstructs the paragraph
   sanely. Success ≈ reconstruction in the neighbourhood of KVzip at matched compression. Proves nothing
@@ -327,7 +534,7 @@ If the latter, §2's mapping needs to change before any of this is worth writing
 
 ---
 
-## 10. Why parser-first is not just convenience
+## 13. Why parser-first is not just convenience
 
 Stage 1 already carries **discrete input-dependent bits** — the parser's grouping decisions, plus the
 eviction decisions. Different text yields a different node set, topology and resident set, deterministically
