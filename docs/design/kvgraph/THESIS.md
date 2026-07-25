@@ -78,13 +78,20 @@ recurrent-state SSM/linear-attention) converged on findings that shape this desi
    for the bulk, retrieval for the recall-critical tail.
 4. **The fixed-state recall ceiling is proven, not incidental.** "Repeat After Me" (2402.01032):
    information-theoretic proof a bounded state cannot losslessly copy unbounded input. Zoology (2312.04927):
-   **82% of the SSM-vs-attention gap is associative-recall failure.** "Illusion of State" (2404.08819): SSMs
-   bounded by TC⁰. This is why M+ collapsed 0.423→0.286 (LME→MAB, 124k→793k) in our run — it is the ceiling,
-   on real data, exactly as predicted.
+   **82% of the SSM-vs-attention gap is associative-recall failure.** Based (2402.18668) Thm 3.1: any causal
+   model needs **Ω(N) bits of state** for multi-query associative recall. This is why M+ collapsed
+   0.423→0.286 (LME→MAB, 124k→793k) in our run — the ceiling, on real data, exactly as predicted.
+   _Do NOT cite "Illusion of State" (2404.08819) alongside these._ It is an **expressivity / state-tracking**
+   result (SSMs bounded by TC⁰) and says nothing about the Ω(N)-bits **retrieval** bounds. The two get cited
+   interchangeably in the literature and should not be.
 5. **The open gap.** No architecture in any family has a documented, independently verified case of **beating
-   strong long-context attention or RAG on a real (non-synthetic) multi-hop task.** ARMT beats GPT-4+RAG only
-   on synthetic single-fact BABILong (multi-hop → 37%). Cartridges beats full-ICL on LongHealth but is
-   per-document offline training, not streaming memory. **This gap is the target.**
+   strong long-context attention or RAG on a real (non-synthetic) multi-hop task.** Cartridges beats full-ICL
+   on LongHealth but is per-document offline training, not streaming memory. **This gap is the target.**
+   _Downgraded 2026-07-25:_ the ARMT/BABILong result previously cited here is weaker than stated. BABILong is
+   a **filter benchmark, not a memory benchmark** — its authors twice admit in print that distractors come
+   from a different distribution, and IBM (2503.07903) showed that merely renaming the answer vocabulary
+   collapses RMT from ~100% to **44.7 (1-hop) / 0.6 (2-hop)**. Its headline 50M-token number is also a
+   best-of-3-seeds against a mean of 49.6 ± 40.4, self-scored by the benchmark's own authors.
 6. **Bold claims don't reproduce.** Titans and Infini-attention both failed independent reimplementation.
    Discipline: v2 makes modest, falsifiable claims and de-risks the crux first.
 

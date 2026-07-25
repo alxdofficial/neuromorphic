@@ -291,19 +291,52 @@ control.
 
 Runs only when the graph approaches the storage budget.
 
-### 8.1 The signal
+### 8.1 The signal — LRU by default, attention-EMA only as a gated arm
 
-EMA over each node's **received attention mass**, which is both the retrieval mechanism and the usage record
-— selection and access-log are the same object:
+**Revised 2026-07-25 after the literature sweep. The earlier draft made attention-EMA the primary signal;
+the evidence says it should not be.**
 
-```
-score_n  ←  γ · score_n  +  attention_mass_n(this step)
-```
+Default policy: **LRU + protected attention sinks + protected recent window.**
 
-"Not retrieved for a while" decays out for free. This is literally M+'s `ltm_recall_frequencies` and H2O's
-heavy-hitter criterion — mechanisms we have run and read. Add **homeostatic downscaling** (periodic
-rescaling of the score distribution), or potentiation saturates, everything looks important, and the ranking
-degenerates.
+- **Sinks are not optional.** StreamingLLM (2309.17453) is well replicated: models dump large attention mass
+  onto the first few tokens regardless of content, and evicting them destroys generation. Our injected
+  prefix currently has *nothing* playing that role — position 0 is a pooled entity node, and every node is
+  evictable. **Keep the literal first ~4 token KV entries as permanent, unevictable sink nodes** at the head
+  of the prefix. 4 of a 96-node budget. This is exactly the class of bug that produces a confusing null:
+  graph looks fine, reconstruction mysteriously bad, a week lost blaming the mixer.
+
+The attention-EMA rule we had specified is **LRFU** (Lee et al., IEEE TC 50(12) 2001): `CRF = Σ F(x)` with
+`F(x) = (½)^(λx)` collapses to exactly `score ← γ·score + usage` with `γ = 2^(−λ)`, provably subsuming LRU
+and LFU. Zero novelty — and three lines of evidence say it does not earn its complexity:
+
+1. **It has already lost this head-to-head.** Compressive Transformer (1911.05507) ran "most-used, sorted by
+   average attention received" as an ablation arm: **0.980 BPC, beaten by learned conv at 0.973.**
+2. **Policy sophistication buys ~nothing.** SIEVE (NSDI'24) and S3-FIFO (SOSP'23) — near-trivial FIFO
+   variants — match or beat ARC/LIRS/W-TinyLFU across 6,594 real traces; SIEVE's mean gain over ARC is
+   **1.5%**. Twitter's 153-cluster production study: *"the choice of eviction algorithms has a limited impact
+   on the miss ratio."* LRU is already k-competitive (Sleator–Tarjan).
+3. **It is structurally blind to exactly what a memory is for.** A dormant node has cumulative attention
+   `< ε` *before* the query, making it invisible to any attention-based scorer. **Our EMA cannot see the fact
+   nobody has asked about yet** — which is the fact worth retaining. Not a tuning problem.
+
+→ Attention-EMA ships only if it beats **both LRU and random** at 3 seeds with CIs. Budget one week, not one
+quarter. If a better signal is wanted later, the two that reportedly dominate attention mass are **KVzip's
+reconstruction score** (query-agnostic by construction — and it already won our own Phase-2 benchmark) and
+creation-time retention scoring.
+
+**Removed: homeostatic downscaling.** It was cargo-culted from the synaptic-downscaling analogy without
+checking the math. A uniform global rescale *preserves rank order*, and our eviction is rank-based, so it is
+a no-op. TinyLFU/LFU-DA halve counters because theirs are fixed-width integers that overflow; a float EMA of
+a bounded signal is already bounded by `max(usage)/(1−γ)`. The aging is already in `γ`.
+
+**Hierarchy is usage-weighted centrality, not tree depth.** A node is "high" if evicting it would damage a
+lot — many retrieval paths run through it. Two things then *emerge* rather than being hard-coded: entities
+float up while individual events sink, and the leaf problem dissolves (we never needed leaves, only cold
+low-conductance regions). Cycles are irrelevant.
+
+An earlier draft claimed ingestion-time eviction is blind for lack of a query. **In the streaming loop that
+is false** — every window predicts the next *from memory*, so the access signal exists throughout ingestion.
+The blind case arises only in a pure "ingest, then ask" deployment.
 
 **Hierarchy is usage-weighted centrality, not tree depth.** A node is "high" if evicting it would damage a
 lot — i.e. many retrieval paths run through it — which is exactly the accumulated score. Two things then
@@ -339,8 +372,52 @@ This is why the co-retrieval edge weighting is not a refinement: **it is what ma
 (It is also the safe home for the Hebbian idea — co-retrieval *weights existing edges for clustering* rather
 than *creating* edges, which would densify the graph back into attention.)
 
-**Size cap** on a group, because the gravestone's routing key is a superposition of member keys and crosstalk
-grows as ~√n. A 30-node gravestone matches every query weakly and routes nothing.
+**But prefer the free version first.** Co-retrieval clustering is published twice already (co-activation
+clustering with medoid expansion; Count-Min correlation groups), and GraphKV (2509.00388) documents the
+failure mode directly: evicting a node's whole neighbourhood *"unintentionally removes too many important
+tokens."* The zero-cost substitute is **temporal contiguity** — EM-LLM's contiguity buffer, RETRO's
+continuation chunk: group by adjacency **in the stream**, not by learned co-retrieval. Ship contiguity
+first; co-retrieval clustering must beat it to justify itself.
+
+**Size cap — much tighter than the earlier draft assumed.** The `~√n` crosstalk bound holds only for
+*uncorrelated* vectors. Plate (1994, thesis App. B.2) solved the correlated case: for members with mean
+pairwise cosine `ρ`, discriminability decays as **1/k, not 1/√k**, and capacity drops from `Θ(d)` to
+`Θ(√d)` — "required dimensionality proportional to k²". Ethayarajh (1909.00512) measures average cosine
+between *uniformly random* words in GPT-2 at **~0.6** in middle layers, two orders of magnitude past the
+`ρ* ≈ 0.018` crossover.
+
+| d | uncorrelated | ρ=0.3 | ρ=0.5 |
+|---|---|---|---|
+| 1024 | 56 | **9** | 6 |
+| 4096 | 227 | 20 | 13 |
+
+**Single digits.** A gravestone saves ~8 nodes, not 30 — which materially changes what eviction can buy.
+
+**And there is a direct contradiction with §8.2 to resolve.** Plate's explicit advice is *"avoid the
+situation where vectors of high similarity are superimposed"* — bundling *similar* members is the worst
+case, because accept-dissimilar and reject-similar end up with the same mean and no threshold separates
+them. Co-retrieval grouping selects for exactly that. Three fixes, all cheap:
+
+1. **Center before bundling** — subtract the group mean, bundle and probe with residuals. Independently
+   recommended in five literatures (Plate himself; Tsodyks–Feigel'man's covariance rule; Parga–Virasoro
+   ancestor subtraction; Mu & Viswanath "All-but-the-Top", ICLR'18; IVF-ADC residual encoding). Restores
+   near-linear capacity for a few lines of code.
+2. **Hard cap on |S|**, set from *measured* ρ̄, not guessed — and as a **constraint**, not a term in `gain()`.
+   An objective that linearly rewards `|S|` over coherent groups of correlated vectors is *constructing* a
+   degenerate attractor: Parga & Virasoro (1986) named the object (the "ancestor" — the category average) and
+   proved **its basin of attraction grows with category size**; Ramsauer et al. (2008.02217) rediscovered it
+   as metastable states. Unbounded, every query lands on the mega-gravestone.
+3. **Do not nest gravestones.** An earlier draft claimed beacons-over-beacons gives Stage 3's hierarchy for
+   free. Wrong: Clarkson et al. (2301.10352, Lemma 17) show bundle-of-bundles reliability decays as
+   **1/2^depth**. Hierarchy needs a different mechanism.
+
+**Simpler alternative worth a head-to-head:** SPANN (2111.08566) found the **actual member nearest the
+centroid** is a better posting-list proxy than the mean, removing superposition entirely; it also enforces
+hard list caps and replicates boundary members across lists.
+
+**One mitigation specific to us:** a false positive costs a *recall*, not a wrong answer — we page the
+subgraph in and the decoder attends to the real members. Budget cost, not correctness failure, unlike a
+Bloom filter where the false positive *is* the output.
 
 ### 8.3 Gain: what makes eviction worth doing
 
@@ -485,6 +562,12 @@ Llama-3.1-8B, 512-token window, bf16:
 The graph machinery is free; the parser is the only real cost, and it is the part phase 2 deletes. ~7×
 compression is also the regime KVzip wins in, so Stage 1 starts at a sane operating point.
 
+**Honest accounting: the 7× is on the PERSISTENT footprint, not peak.** We build the full window KV before
+pooling it into nodes, so peak memory during ingestion is the full cache. "Cache Me If You Can"
+(2506.17121) makes exactly this criticism of post-fill eviction methods (H2O/SnapKV/PyramidKV), whose "%
+reduction" headlines misstate real peak footprint. For a memory layer the persistent figure is the one that
+matters across a long document — but it must be stated, not left to read as a peak-memory claim.
+
 Iterate against SmolLM2-135M (what the harness already uses); validate at 8B.
 
 ---
@@ -534,7 +617,109 @@ If the latter, §2's mapping needs to change before any of this is worth writing
 
 ---
 
-## 13. Why parser-first is not just convenience
+## 13. Literature verdict (2026-07-25) — the minimal design
+
+Four parallel literature sweeps. Of six components, **two are load-bearing and well-evidenced, four have
+simpler published equivalents, and the graph — our most distinctive piece — is the least evidenced of all.**
+
+### 13.1 The finding that changes the training setup
+
+**Compressive Transformer (1911.05507) already ran our loss-neutrality experiment, and the coupled objective
+lost.** Their Table 5, enwik8, lower is better:
+
+| compressor | loss | BPC |
+|---|---|---|
+| conv | **BPTT through the main LM loss** | **0.996** ← worst of seven |
+| most-used (attention mass) | — | 0.980 |
+| conv | **separate local attention-reconstruction loss** | **0.973** ← best |
+
+The winner is a **separate, local, lossy objective** — `‖attn(h, old_mem) − attn(h, new_mem)‖₂` — with
+gradients **explicitly stopped** from entering the main network. Training the compressor through the main
+loss was the *worst* of seven configurations.
+
+Two independent corroborations: HuggingFace's failed Infini-attention reproduction diagnosed *"the
+compressive memory is not learnable"* — no signal for which information deserves high-fidelity storage; and
+**Titans Revisited (2510.09551)** found *"memory updates alone proved insufficient for meaningful test-time
+learning when the backbone is frozen"*, hypothesised as a mismatch between the frozen backbone's input
+projections into KV space and how memory evolves. **We have a frozen backbone. That is a direct warning
+about our exact setup.**
+
+→ **Train the mixer with a local attention-reconstruction objective, gradients stopped at the LM boundary —
+not by backprop through the LM loss.** This was not in the plan and it is the single most actionable finding
+of the sweep.
+
+### 13.2 Keep
+
+- **In-forward retrieval at a middle layer.** Memorizing Transformers (2203.08913) ablated layers 3/6/9/12 →
+  ppl 2.40 / **2.36** / **2.37** / 2.43; multiple kNN layers gave "no further benefits". Memory Layers at
+  Scale independently ships the middle FFN. One middle site.
+- **Recall-from-disk.** Our strongest component and the best-evidenced idea in the area. ArkVale's motivating
+  sentence is verbatim ours (*"tokens initially evicted might regain importance"*); M+ proves it in latent
+  space. The central criticism of the entire eviction literature is that it is irreversible, and
+  *"nobody has demonstrated bounded capacity + importance-driven eviction + reversible recall in one
+  system."* **Frame the paper around this, not around the graph.**
+
+### 13.3 Cut or demote
+
+| component | verdict |
+|---|---|
+| attention-EMA scoring | → LRU + sinks + recent window (§8.1) |
+| co-retrieval clustering | → temporal contiguity first (§8.2) |
+| boundary-edge rewriting | → **not in v1.** Cheapest published policy: "compression removes nodes but never alters edges" — dangling edges point at a tombstone, and eviction is forbidden for nodes with live dependents. Full superedge rewiring + correction list is Navlakha SIGMOD'08; real, but later. |
+| gravestone complexity | → one summary vector per evicted block; **measure page-back precision as a first-class metric before building anything graph-shaped on top.** M+'s page-back recall is only ~30%. |
+
+### 13.4 The graph is on probation
+
+This is our least-evidenced component. Three controlled studies find write-time structure is where the money
+*is not*: a 3×3 write × retrieval study where retrieval spans 20 points and write strategy only 3–8,
+concluding *"raw chunked storage, which requires zero LLM calls, matches or outperforms expensive lossy
+alternatives"*; swapping only the embedding model flipping Mem0-beats-RAG into RAG-beats-Mem0; GraphRAG
+13.4% *worse* than vanilla RAG on NQ at 2.3× latency.
+
+Our parse differs (no LLM extraction, latent KV-pooled nodes), so the extraction-noise failure mode does not
+transfer — **but the burden of proof does.**
+
+### 13.5 Benchmarks and baselines
+
+- **LoCoMo is unusable**: ~6.4% of its answer key is wrong (ceiling ~93.6%) and the standard gpt-4o-mini
+  judge accepts **62.8% of deliberately wrong on-topic answers**. Several published scores exceed the honest
+  ceiling. We never used it; do not start.
+- **BABILong is a filter benchmark, not a memory benchmark** — its own authors admit the distributional tell
+  twice in print, and IBM (2503.07903) showed renaming the answer vocabulary collapses RMT from ~100% to
+  **44.7 (1-hop) / 0.6 (2-hop)**. Downgrade every BABILong citation in THESIS.md accordingly.
+- **BEAM is the cliff**: Mem0 reports LoCoMo 91.6 → **BEAM-10M 48.6**, temporal reasoning 16.3.
+- **The real baseline is LRU + verbatim-chunk RAG at matched budget.** On MemoryAgentBench simple retrieval
+  beats the memory systems: BM25 61.0, embedding-RAG 65.0, HippoRAG-2 71.0 vs MemGPT 30.6, Mem0 ~25. No
+  vendor charts this comparison.
+- **The white space is where we already aimed:** every system scores **≤7% on multi-hop conflict
+  resolution** — which MemoryAgentBench v1 called *"Selective Forgetting"*. That is `factconsolidation_mh`.
+
+### 13.6 The minimal design, and the experiment order
+
+```
+parse → node KV → inject at a middle layer
+      → LRU + sinks + recent window
+      → tombstone (no edge rewriting)
+      → recall from disk                    ← the novelty
+mixer trained by a LOCAL attention-reconstruction loss, gradients stopped at the LM boundary
+```
+
+**Experiments, in this order — the first two can kill the design cheaply:**
+
+1. **Measure ρ̄** (mean pairwise cosine) inside real candidate groups. Substitutes for `d` in every capacity
+   theorem in §8.5. Falsifiable prediction: at ρ̄ ≈ 0.3 with |S| = 32, membership becomes statistically
+   indistinguishable from topical similarity.
+2. **Graph off vs graph on**, flat KV blocks at matched budget. Per §13.4 this is now the *first* ablation,
+   not the last.
+3. **Noise-ablation of the retrieved memory** — replace retrieved node KV with padding/zeros/noise. M+'s
+   ICML reviewer asked for exactly this and it was never run; the paper was marked down for it. Cheap,
+   essential, and the only way to show the memory does anything at all.
+4. **Page-back precision.**
+5. Only then: the relation-typing and edge-vector ablations (§3, THESIS §5).
+
+---
+
+## 14. Why parser-first is not just convenience
 
 Stage 1 already carries **discrete input-dependent bits** — the parser's grouping decisions, plus the
 eviction decisions. Different text yields a different node set, topology and resident set, deterministically
