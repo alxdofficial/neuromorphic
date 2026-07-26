@@ -482,6 +482,7 @@ def args_to_config(args, ap):
                    # slotgraph is aux-loss-free (prepend arm) → valid under behavioral_kl.
                    "gisting_baseline", "memoryllm_baseline", "titans_baseline",
                    "slotgraph_kv_baseline",   # v1 per-layer-KV read variant of slotgraph (aux-loss-free)
+                   "kvgraph_baseline",        # entity/event graph over the KV cache (aux-loss-free)
                    "slotgraph_liveread_baseline"}   # Option B faithful live read (prepend + live edge attn)
         # eval-only arms (vanilla floor/ceiling, h2o) don't train, so the training objective doesn't apply
         # to them — exempt them from the whitelist (they're skipped in train.py's mixed_variants loop).
@@ -503,6 +504,7 @@ def args_to_config(args, ap):
             # KV arms carry it in aux['past_kv']; slotgraph live-read carries edge_R/edge_C attached.
             _KV_ARMS = {"gisting_baseline", "memoryllm_baseline",
                         "slotgraph_kv_baseline",        # differentiable memory in aux['past_kv']
+                        "kvgraph_baseline",             # differentiable memory in aux['past_kv']
                         "slotgraph_liveread_baseline"}  # attached edge_R/edge_C in aux (live injection)
             _bad_kv = _KV_ARMS.intersection(args.variants)
             if _bad_kv:
@@ -521,6 +523,13 @@ def args_to_config(args, ap):
     cfg.ctx_len = int(args.compress_len)
     cfg.seed = args.seed             # record the actual seed in ckpt metadata
     cfg.anomaly_from = args.anomaly_from   # debug: backward anomaly detection from this step (-1 = off)
+
+    if "kvgraph_baseline" in args.variants and args.batch_size != 1:
+        raise SystemExit(
+            f"kvgraph_baseline requires --batch-size 1 (got {args.batch_size}). The graph is a PER-SEQUENCE "
+            f"object whose node count is data-dependent, so a batch is ragged; silently building one "
+            f"sequence's memory for the whole batch would be far worse than refusing. Use gradient "
+            f"accumulation for an effective batch.")
 
     print(f"config: chunk={args.chunk_size}, window={args.window_size}")
     print(f"Steps: {args.steps}, batch={cfg.batch_size}")

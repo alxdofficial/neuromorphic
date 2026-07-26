@@ -22,6 +22,8 @@ import torch.nn as nn
 from ...config import ReprConfig
 from .align import assert_alignment, token_char_offsets
 from .build import build_graph
+from .diagnostics import (graph_stats, injection_stats, mean_pairwise_cos,
+                          operator_divergence, participation_ratio, relation_stats)
 from .ground import KVCapture, pool_hidden, pool_nodes
 from .inject import Injector
 from .merge import PersistentGraph
@@ -178,6 +180,7 @@ class KVGraphEncoder(nn.Module):
         pg.contract_to_budget(self._budgets()[0])
         state["n_windows"] += 1
         state["k_rms"], state["v_rms"] = cap["k_rms"], cap["v_rms"]
+        state["n_tokens"] = state.get("n_tokens", 0) + len(ids)
         state["last_hidden"] = cap["hidden"][self.summary_layer][0, -1]     # retrieval seed for next window
         return state, {}
 
@@ -234,11 +237,33 @@ class KVGraphEncoder(nn.Module):
 
         mm = torch.ones(1, len(chosen), device=dev)
         empty = torch.zeros(1, 0, self.d, device=dev)
-        return empty, {"past_kv": (Ks, Vs), "memory_mask": mm, "read_mode": "per_layer_kv",
-                       "kvgraph_stats": {"n_nodes": len(pg.g.nodes), "n_edges": len(pg.g.edges),
-                                         "n_read": len(chosen), "n_evicted": pg.n_evicted,
-                                         "n_recalled": pg.n_recalled,
-                                         "n_records": sum(len(c) for c in pg.records.values())}}
+        aux = {"past_kv": (Ks, Vs), "memory_mask": mm, "read_mode": "per_layer_kv"}
+        aux.update(self._diagnostics(pg, chosen, node_vec, mixed, rel, Kp, Vp, Ks, Vs, state))
+        return empty, aux
+
+    @torch.no_grad()
+    def _diagnostics(self, pg, chosen, node_vec, mixed, rel, Kp, Vp, Ks, Vs, state) -> dict:
+        """Health canaries, emitted EVERY step as `kvgraph_*`. See diagnostics.py for what each one
+        watches; the short version is that several of them decide whether a null result means the
+        hypothesis is wrong or the implementation is."""
+        from .mixer import N_RELATIONS
+        d = {}
+        d.update(graph_stats(pg, len(chosen), state.get("n_tokens", 0)))
+        d.update(relation_stats(rel, N_RELATIONS))
+        d.update(operator_divergence(self.mixer.mp))
+        d.update(injection_stats(Kp, Vp, Ks, Vs, state.get("k_rms"), state.get("v_rms")))
+        # Collapse, measured BOTH before and after the mixer so a flat result is attributable: pooled
+        # healthy + mixed flat => the mixer is over-smoothing; both flat => it is upstream in pooling/parse.
+        d["kvgraph_pooled_effrank"] = participation_ratio(Kp.reshape(Kp.shape[0], -1))
+        d["kvgraph_node_effrank"] = participation_ratio(node_vec)
+        d["kvgraph_mixed_effrank"] = participation_ratio(mixed)
+        d["kvgraph_mixed_cos"] = mean_pairwise_cos(mixed)
+        # Share of each message coming from the continuous per-edge correction rather than the discrete
+        # relation. Toward 1 => the relation has gone decorative and loss-neutrality is back.
+        fr = [m.last_lowrank_frac for m in self.mixer.mp]
+        d["kvgraph_lowrank_frac"] = sum(fr) / max(len(fr), 1)
+        d["kvgraph_pressure"] = self.pressure
+        return d
 
     def forward(self, token_embeds, attention_mask=None, mask_positions=None, context_ids=None):
         del mask_positions

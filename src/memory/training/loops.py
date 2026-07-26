@@ -219,7 +219,16 @@ def train_mixed_variant(
               flush=True)
     rotation = []   # diagnostic: the realized task sequence (capped for the smoke print)
     step = start_step - 1                          # bound even if the loop never runs (resume past end)
+    # Budget-pressure anneal (kvgraph): the curriculum that replaced the deleted read-all warmup STAGE.
+    # p=0 is unbounded storage and full reads — what Stage 0 used to be — except node dropout is already
+    # on, so the fact-smearing habit a read-all warmup would install is never learned. ONE knob drives both
+    # budgets: annealing them separately gives an early regime where storage is loose but reads are tight,
+    # i.e. the model reads a slice of a graph it was never taught to index. No-op for every other arm.
+    _set_pressure = getattr(getattr(model, "encoder", None), "set_pressure", None)
+    _p_frac = float(getattr(cfg, "kvg_pressure_warmup_frac", 0.3))
     for step in range(start_step, n_steps):
+        if _set_pressure is not None:
+            _set_pressure(min(1.0, (step - start_step) / max(1.0, _p_frac * (n_steps - start_step))))
         task = mixed_tasks[step % len(mixed_tasks)]   # equal round-robin
         if len(rotation) < 24:
             rotation.append(task)
@@ -333,7 +342,7 @@ def train_mixed_variant(
         }
         # arm collapse/health canaries at train frequency (biomem edge/decay/beta/sat/mem_effrank/…, etc.)
         for _k, _v in out.items():
-            if _v is None or not _k.startswith(("graph_", "biomem_", "slotgraph_", "vqicae_")):
+            if _v is None or not _k.startswith(("graph_", "biomem_", "slotgraph_", "vqicae_", "kvgraph_")):
                 continue    # "graph_" added for parity with eval.py/val-row forwarding (graph_baseline canaries)
             if isinstance(_v, (int, float)):
                 train_row[_k] = float(_v)
@@ -345,7 +354,7 @@ def train_mixed_variant(
             train_row[_k] = float(_v)
         jsonl_fp.write(json.dumps(train_row) + "\n")
 
-        if step % log_every == 0:
+        if log_every > 0 and step % log_every == 0:
             now = time.time()
             sps = (step - last_print_step) / max(now - last_print_time, 1e-9)
             last_print_step, last_print_time = step, now
@@ -355,7 +364,9 @@ def train_mixed_variant(
                   f"M={out['memory_shape'][1]}  gnorm={float(gn):6.2f}  "
                   f"lr={lr:.2e}  ({sps:.1f} step/s)", flush=True)
 
-        if step > 0 and step % val_every == 0:
+        # val_every <= 0 means "never validate" (smoke runs pass --val-every 0); the bare modulo
+        # divided by zero.
+        if val_every > 0 and step > 0 and step % val_every == 0:
             per_task = run_mixed_val(model, mixed_tasks, val_sets, device,
                                      val_batches, window_size,
                                      gate_batches=int(getattr(cfg, "mixed_gate_batches", 0)))
@@ -425,7 +436,7 @@ def train_mixed_variant(
                       f"{_no_improve} val-evals since step {agg_best['step']}; stopping.", flush=True)
                 break
 
-        if step > 0 and step % save_every == 0:
+        if save_every > 0 and step > 0 and step % save_every == 0:   # 0 = never checkpoint
             save_checkpoint(model, opt, step, ckpt_path,
                             mixed_best=best, mixed_agg_best=agg_best)
             # RETAINED milestone (never overwritten) so EVERY save_every window is preserved on disk —

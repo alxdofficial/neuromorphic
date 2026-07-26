@@ -84,6 +84,10 @@ class RelationMP(nn.Module):
         self.rel_V = nn.Parameter(torch.randn(N_RELATIONS, d, rank) / d ** 0.5)   # 1/sqrt(fan_in)
         self.gate = nn.Linear(d, rank)
         self.norm = nn.LayerNorm(d)
+        #: Last forward's |low-rank term| / |diag term|. Not a buffer (never checkpointed) — it is the live
+        #: readout of the two-sided ablation: climbing toward 1 means the continuous edge vector is carrying
+        #: everything and the discrete relation has gone decorative.
+        self.last_lowrank_frac: float = 0.0
 
     def forward(self, h: torch.Tensor, src: torch.Tensor, dst: torch.Tensor,
                 rel: torch.Tensor, edge_vec: torch.Tensor | None,
@@ -100,11 +104,17 @@ class RelationMP(nn.Module):
             diag, U, V = self.rel_diag[rel], self.rel_U[rel], self.rel_V[rel]
 
         hs = h[src]                                                              # [E, d]
-        msg = diag * hs                                                          # typed, multiplicative
+        base = diag * hs                                                         # typed, multiplicative
+        msg = base
         if edge_vec is not None and not ablate_edge_vec:
             g = self.gate(edge_vec)                                              # [E, rank]
             proj = torch.einsum("ed,edr->er", hs, V) * g                         # bounded low-rank drift
-            msg = msg + torch.einsum("edr,er->ed", U, proj)
+            drift = torch.einsum("edr,er->ed", U, proj)
+            msg = msg + drift
+            with torch.no_grad():
+                self.last_lowrank_frac = float(drift.norm() / base.norm().clamp_min(1e-6))
+        else:
+            self.last_lowrank_frac = 0.0
         agg = torch.zeros_like(h).index_add_(0, dst, msg)                        # SUM aggregation
         return h + self.norm(agg)                                                # residual: signal survives
 

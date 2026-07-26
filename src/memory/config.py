@@ -308,6 +308,11 @@ class ReprConfig:
                                      # per-layer-KV arms (unrotated == position 0) for apples-to-apples.
     kvg_norm_match: bool = True      # rescale injected KV to the layer's real-token RMS. Mean-pooling shrinks
                                      # by ~1/sqrt(m), so the most-mentioned nodes would be the quietest.
+    kvg_pressure_warmup_frac: float = 0.3   # fraction of training over which budget pressure anneals
+                                     # 0 -> 1. There is no separate warmup STAGE: a mixer trained on
+                                     # read-all smears one fact across co-dependent nodes, which is fine
+                                     # when everything is present and fatal under subset retrieval, so a
+                                     # warmup would install exactly the habit node-dropout prevents.
     kvg_spacy_model: str = "en_core_web_sm"
     kvg_use_coref: bool = True
     kvg_require_coref: bool = False  # True ⇒ a missing fastcoref is an ERROR, not a silent downgrade to
