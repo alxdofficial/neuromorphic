@@ -303,6 +303,11 @@ class ReprConfig:
     kvg_adapter_rank: int = 24       # per-layer low-rank adapter in the injector. Pure FiLM was too weak: a
                                      # single shared d_mix→kv_dim map plus a scalar per layer gives all 30
                                      # layers the SAME correction direction.
+    kvg_center_inputs: bool = True   # subtract the mean node/edge vector across the read before the mixer.
+                                     # LM hidden states are strongly anisotropic; the first smoke run
+                                     # measured raw node summaries at effective rank ~1.0, i.e. the mixer
+                                     # was handed almost no signal to route. "All-but-the-Top"
+                                     # (Mu & Viswanath ICLR'18); False is the ablation control.
     kvg_d_id: int = 64               # TokenGT node-identifier width (random orthonormal, resampled/forward).
     kvg_rope_mode: str = "compact"   # compact | none | original. `none` reproduces the rest of the harness's
                                      # per-layer-KV arms (unrotated == position 0) for apples-to-apples.

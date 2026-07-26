@@ -128,9 +128,9 @@ class GraphMixer(nn.Module):
     """
 
     def __init__(self, d_llama: int, d_mix: int = 384, n_layers: int = 4, n_heads: int = 6,
-                 rank: int = 8, d_id: int = 64, ffn_mult: int = 2):
+                 rank: int = 8, d_id: int = 64, ffn_mult: int = 2, center_inputs: bool = True):
         super().__init__()
-        self.d_mix, self.d_id = d_mix, d_id
+        self.d_mix, self.d_id, self.center_inputs = d_mix, d_id, center_inputs
         self.node_in = nn.Linear(d_llama, d_mix)
         self.edge_in = nn.Linear(d_llama, d_mix)
         self.id_proj = nn.Linear(2 * d_id, d_mix, bias=False)
@@ -161,6 +161,17 @@ class GraphMixer(nn.Module):
         not the last.
         """
         n = node_vec.shape[0]
+        if self.center_inputs and n > 1:
+            # Subtract the mean across the read. LM hidden states are strongly ANISOTROPIC — a large shared
+            # component dominates every vector (Ethayarajh 1909.00512 measures ~0.6 mean cosine between
+            # uniformly random mid-layer tokens) — and the smoke run confirmed it here: raw node summaries
+            # came out at effective rank ~1.0, i.e. the mixer was being handed almost no signal to route.
+            # This is "All-but-the-Top" (Mu & Viswanath, ICLR'18), and it is the SAME centring fix the
+            # bundling analysis independently arrived at. Per-vector LayerNorm would NOT do this: it
+            # rescales each vector but leaves the shared direction intact.
+            node_vec = node_vec - node_vec.mean(0, keepdim=True)
+            if edge_vec is not None and edge_vec.shape[0] > 1:
+                edge_vec = edge_vec - edge_vec.mean(0, keepdim=True)
         h = self.node_in(node_vec)
         if ablate_graph or src.numel() == 0:
             src = dst = torch.zeros(0, dtype=torch.long, device=h.device)

@@ -63,9 +63,14 @@ def operator_divergence(mp_layers) -> dict[str, float]:
     """
     diag_div, lr_div = [], []
     for mp in mp_layers:
-        diag_div.append(1.0 - mean_pairwise_cos(mp.rel_diag.detach()))
+        # CENTRED before comparing. rel_diag starts at all-ones, and the cosine between (1+e1) and (1+e2)
+        # is ~1 for any perturbation because the shared component dominates — the uncentred measure read a
+        # flat 0 for 40 steps and would have reported "the relations never differentiated" forever.
+        D = mp.rel_diag.detach()
+        diag_div.append(1.0 - mean_pairwise_cos(D - D.mean(0, keepdim=True)))
         R = mp.rel_U.shape[0]
         U = mp.rel_U.detach().reshape(R, -1)
+        U = U - U.mean(0, keepdim=True)
         # An all-zero U (the init) has UNDEFINED pairwise cosine, and normalize() turning 0/0 into 0 would
         # report it as "maximally diverged" — the exact opposite of the truth. Report 0 until it moves.
         lr_div.append(0.0 if float(U.abs().sum()) == 0.0 else 1.0 - mean_pairwise_cos(U))

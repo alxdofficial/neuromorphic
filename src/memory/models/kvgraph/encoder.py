@@ -70,7 +70,8 @@ class KVGraphEncoder(nn.Module):
                                 n_layers=int(g("kvg_mixer_layers", 4)),
                                 n_heads=int(g("kvg_mixer_heads", 6)),
                                 rank=int(g("kvg_operator_rank", 8)),
-                                d_id=int(g("kvg_d_id", 64)))
+                                d_id=int(g("kvg_d_id", 64)),
+                                center_inputs=bool(g("kvg_center_inputs", True)))
         self.injector = Injector(self.mixer.d_mix, self.L, self.n_kv, self.head_dim,
                                  rope_mode=str(g("kvg_rope_mode", "compact")),
                                  norm_match=bool(g("kvg_norm_match", True)),
