@@ -220,13 +220,38 @@ def test_sinks_are_never_evicted():
 # ----------------------------------------------------------------------------- mixer
 
 
-def test_mixer_is_identity_at_init_up_to_norm():
-    """Zero-initialised edge gate => the operator is exactly its relation's diagonal at step 0, so an
-    untrained mixer is a no-op rather than noise."""
+def test_relation_operator_is_its_diagonal_at_init():
+    """At step 0 the per-edge low-rank correction must be exactly zero, so the operator IS its relation's
+    diagonal and an untrained mixer is a no-op rather than noise.
+
+    Asserted behaviourally, not by inspecting which tensor is zero-initialised: the zero must sit on `rel_U`
+    (the OUTPUT factor), because zero-initialising the gate instead looks equivalent, produces the same
+    step-0 behaviour, and permanently kills the gradient to rel_U/rel_V so the branch never wakes up.
+    """
     torch.manual_seed(0)
     m = GraphMixer(d_llama=16, d_mix=8, n_layers=1, n_heads=2, rank=4, d_id=8)
-    g = m.mp[0].gate(torch.randn(3, 8))
-    assert torch.allclose(g, torch.zeros_like(g)), "edge gate is not zero-initialised"
+    mp = m.mp[0]
+    h = torch.randn(4, 8)
+    src, dst = torch.tensor([0, 1]), torch.tensor([1, 2])
+    rel = torch.tensor([0, 5])
+    ev = torch.randn(2, 8)
+    with_edge = mp(h, src, dst, rel, ev)
+    without = mp(h, src, dst, rel, None)
+    assert torch.allclose(with_edge, without, atol=1e-6), \
+        "the edge-vector correction is non-zero at init — step 0 is no longer the pure relation operator"
+
+    # ...and the gradient must still reach the low-rank factors, or they are dead weight forever.
+    # NB: the probe loss must NOT be `.sum()`. The message passes through a LayerNorm, and the gradient of
+    # sum(LayerNorm(x)) w.r.t. x is exactly zero (LN output is shift-invariant, so its sum is constant) —
+    # a `.sum()` probe reports every upstream parameter as dead regardless of whether it is.
+    torch.manual_seed(1)
+    mp.zero_grad()
+    probe = torch.randn(4, 8)
+    (mp(h, src, dst, rel, ev) * probe).sum().backward()
+    assert mp.rel_U.grad is not None and mp.rel_U.grad.abs().sum() > 0, \
+        "rel_U has no gradient: the low-rank branch can never wake up"
+    assert mp.rel_V.grad is not None and mp.rel_V.grad.abs().sum() == 0, \
+        "rel_V should have zero gradient at init (dL/dV flows through U, which is zero) — it wakes at step 1"
 
 
 def test_ablations_change_the_output():

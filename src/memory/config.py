@@ -286,15 +286,23 @@ class ReprConfig:
                                     # farm"). 1.0 = plain mean = the control.
     kvg_summary_layer: int = 0       # mid-stack layer read for node summaries / edge vectors; 0 ⇒ 2L/3.
                                      # Entity+coref information peaks mid-stack, not at the output.
-    kvg_d_mix: int = 256             # mixer width. Deliberately NARROWER than the backbone: the mixer routes
-                                     # relations, it does not re-represent semantics, and both the quadratic
-                                     # attention and the per-relation operator bank scale with this.
+    kvg_d_mix: int = 384             # mixer width. Deliberately NARROWER than the backbone (576): the mixer
+                                     # routes relations, it does not re-represent semantics. Both the
+                                     # quadratic token attention and the per-relation operator bank scale
+                                     # with this, so it is the single highest-leverage sizing choice.
     kvg_mixer_layers: int = 4        # ≥ graph diameter for the hops we need (2–3 for factconsolidation),
-                                     # shallow enough to avoid over-smoothing.
-    kvg_mixer_heads: int = 4
-    kvg_operator_rank: int = 32      # rank of the per-edge correction to the relation operator. The LIMIT in
-                                     # "properly initialised with limited learnability" — unbounded, the edge
-                                     # vector carries everything and the relation goes decorative.
+                                     # shallow enough to avoid over-smoothing. NOT raised to buy parameters:
+                                     # depth is the axis that trades directly against representation collapse.
+    kvg_mixer_heads: int = 6         # d_mix/heads = 64 = the backbone's own head_dim.
+    kvg_operator_rank: int = 8       # rank of each relation's OWN low-rank component (per-relation, not a
+                                     # shared basis). With a shared basis the only thing distinguishing two
+                                     # relations is a diagonal, which can rescale dimensions but cannot mix
+                                     # them — `agent` and `theme` could never route along different
+                                     # subspaces, and the edge-typing ablation would read flat for a reason
+                                     # about the implementation rather than the hypothesis.
+    kvg_adapter_rank: int = 24       # per-layer low-rank adapter in the injector. Pure FiLM was too weak: a
+                                     # single shared d_mix→kv_dim map plus a scalar per layer gives all 30
+                                     # layers the SAME correction direction.
     kvg_d_id: int = 64               # TokenGT node-identifier width (random orthonormal, resampled/forward).
     kvg_rope_mode: str = "compact"   # compact | none | original. `none` reproduces the rest of the harness's
                                      # per-layer-KV arms (unrotated == position 0) for apples-to-apples.

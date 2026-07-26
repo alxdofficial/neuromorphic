@@ -18,16 +18,23 @@ appearing in one node token and three edge tokens *is* the statement that those 
 Each layer is a Graph-Networks block: an edge update (the attention, which sees both endpoints) followed by
 a node update whose message is a **relation-indexed operator**
 
-    m_{j->i} = R_{rel(ij)} h_j ,   R_r = diag(d_r) + U diag(g(e_ij)) V^T
+    m_{j->i} = R_{rel(ij)} h_j ,   R_r = diag(d_r) + U_r diag(g(e_ij)) V_r^T
 
-with `U, V` SHARED low-rank bases and `g` a zero-initialised per-edge gate. At init the operator is exactly
-its relation's diagonal — pure discrete relation, nothing else — and the rank caps how far any edge can
-drift. That is "properly initialised with limited learnability" made concrete, and it is not cosmetic: an
-unbounded edge vector would carry everything, the relation would go decorative, and loss-neutrality would
-return hidden behind a good reconstruction number.
+`U_r, V_r` are **per-relation**, not shared. This matters more than it looks: with a shared basis the only
+thing distinguishing two relations is a DIAGONAL, which can rescale dimensions but cannot mix them — so
+`agent` and `theme` could never route information along different subspaces, and the edge-typing ablation
+would come back flat for a reason about this file rather than about the hypothesis.
 
-Hence the ablation is TWO-SIDED and both switches live here: `ablate_relations` collapses the operator bank
-to one shared operator; `ablate_edge_vec` zeroes the low-rank correction.
+`g` is a per-edge gate bounding how far an individual edge deviates from its relation's generic behaviour.
+Zero-initialised `U_r` makes the correction exactly zero at step 0 — the operator *is* its relation's
+diagonal — while still admitting gradient (`dL/dU_r` depends on `V_r` and `g`, both non-zero). Initialising
+the GATE to zero instead would look equivalent and is not: it kills the gradient to `U_r` and `V_r` too, and
+the low-rank branch never wakes up.
+
+The ablation is TWO-SIDED and both switches live here. `ablate_relations` **averages the per-relation
+tensors across relations** rather than dropping them, so every parameter stays in the graph and stays
+trained — the control is capacity-matched, and a win cannot be explained by "the full arm simply had more
+parameters". `ablate_edge_vec` zeroes the low-rank correction.
 """
 from __future__ import annotations
 
@@ -65,16 +72,17 @@ class RelationMP(nn.Module):
     produced twice.
     """
 
-    def __init__(self, d: int, rank: int = 32):
+    def __init__(self, d: int, rank: int = 8):
         super().__init__()
         self.rank = rank
-        # Diagonal per relation, initialised to IDENTITY so an untrained mixer is a no-op rather than noise.
+        # Diagonal per relation, initialised to IDENTITY so an untrained mixer is a no-op, not noise.
         self.rel_diag = nn.Parameter(torch.ones(N_RELATIONS, d))
-        self.U = nn.Parameter(torch.randn(d, rank) / d ** 0.5)
-        self.V = nn.Parameter(torch.randn(d, rank) / d ** 0.5)
+        # Per-relation low-rank bases. U zero-init => the correction is exactly 0 at step 0 while dL/dU is
+        # still non-zero (it depends on V and the gate), so the branch bootstraps in one step. See module
+        # docstring for why zero-initialising the gate instead would be a permanent kill.
+        self.rel_U = nn.Parameter(torch.zeros(N_RELATIONS, d, rank))
+        self.rel_V = nn.Parameter(torch.randn(N_RELATIONS, d, rank) / d ** 0.5)   # 1/sqrt(fan_in)
         self.gate = nn.Linear(d, rank)
-        nn.init.zeros_(self.gate.weight)                    # zero-init => R == diag(d_r) exactly at step 0
-        nn.init.zeros_(self.gate.bias)
         self.norm = nn.LayerNorm(d)
 
     def forward(self, h: torch.Tensor, src: torch.Tensor, dst: torch.Tensor,
@@ -82,26 +90,35 @@ class RelationMP(nn.Module):
                 *, ablate_relations: bool = False, ablate_edge_vec: bool = False) -> torch.Tensor:
         if src.numel() == 0:
             return h
-        diag = self.rel_diag.mean(0, keepdim=True).expand(rel.shape[0], -1) if ablate_relations \
-            else self.rel_diag[rel]                                              # [E, d]
-        msg = diag * h[src]                                                      # typed, multiplicative
+        if ablate_relations:
+            # Capacity-matched control: average over the relation axis so every parameter is still present
+            # and still trained, but the operator is forced to be relation-INVARIANT.
+            diag = self.rel_diag.mean(0, keepdim=True).expand(rel.shape[0], -1)
+            U = self.rel_U.mean(0, keepdim=True).expand(rel.shape[0], -1, -1)
+            V = self.rel_V.mean(0, keepdim=True).expand(rel.shape[0], -1, -1)
+        else:
+            diag, U, V = self.rel_diag[rel], self.rel_U[rel], self.rel_V[rel]
+
+        hs = h[src]                                                              # [E, d]
+        msg = diag * hs                                                          # typed, multiplicative
         if edge_vec is not None and not ablate_edge_vec:
             g = self.gate(edge_vec)                                              # [E, rank]
-            msg = msg + (g * (h[src] @ self.V)) @ self.U.t()                     # bounded low-rank drift
+            proj = torch.einsum("ed,edr->er", hs, V) * g                         # bounded low-rank drift
+            msg = msg + torch.einsum("edr,er->ed", U, proj)
         agg = torch.zeros_like(h).index_add_(0, dst, msg)                        # SUM aggregation
         return h + self.norm(agg)                                                # residual: signal survives
 
 
 class GraphMixer(nn.Module):
-    """The only substantial trainable module. Frozen LM in, mixed node vectors out.
+    """The main trainable module. Frozen LM in, mixed node vectors out.
 
-    Works in a NARROWER space than the backbone (`d_mix < d_llama`). The mixer's job is relational routing,
-    not re-representing the LM's semantics, and the quadratic attention cost plus the per-relation operator
-    bank both scale with this width — so it is the single highest-leverage parameter choice in the module.
+    Works in a NARROWER space than the backbone (`d_mix < d_llama`). The mixer routes relations; it does not
+    re-represent the LM's semantics. Both the quadratic token attention and the per-relation operator bank
+    scale with this width, so it is the single highest-leverage sizing choice in the module.
     """
 
-    def __init__(self, d_llama: int, d_mix: int = 256, n_layers: int = 4, n_heads: int = 4,
-                 rank: int = 32, d_id: int = 64, ffn_mult: int = 2):
+    def __init__(self, d_llama: int, d_mix: int = 384, n_layers: int = 4, n_heads: int = 6,
+                 rank: int = 8, d_id: int = 64, ffn_mult: int = 2):
         super().__init__()
         self.d_mix, self.d_id = d_mix, d_id
         self.node_in = nn.Linear(d_llama, d_mix)
@@ -116,9 +133,9 @@ class GraphMixer(nn.Module):
     def _identifiers(self, n: int, device, dtype) -> torch.Tensor:
         """Random near-orthonormal node identifiers, resampled per forward.
 
-        In `d_id` dimensions, independent normalised Gaussians are near-orthogonal for n << exp(d_id), which
-        holds comfortably at d_id=64 and a ~100-node budget. Cheaper than a QR and just as usable, since all
-        that matters is that attention can match a node token against the edge tokens sharing its identifier.
+        In `d_id` dimensions independent normalised Gaussians are near-orthogonal for n << exp(d_id), which
+        holds comfortably at d_id=64 and a ~100-node budget. Cheaper than a QR and just as usable: all that
+        matters is that attention can match a node token against the edge tokens sharing its identifier.
         """
         p = torch.randn(n, self.d_id, device=device, dtype=dtype)
         return F.normalize(p, dim=-1)

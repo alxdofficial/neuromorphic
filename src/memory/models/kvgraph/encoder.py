@@ -64,14 +64,15 @@ class KVGraphEncoder(nn.Module):
         self.ablate_edge_vec = bool(g("kvg_ablate_edge_vec", False))
         self.pressure = 1.0                                   # 0 = no budget pressure, 1 = terminal budgets
 
-        self.mixer = GraphMixer(self.d, d_mix=int(g("kvg_d_mix", 256)),
+        self.mixer = GraphMixer(self.d, d_mix=int(g("kvg_d_mix", 384)),
                                 n_layers=int(g("kvg_mixer_layers", 4)),
-                                n_heads=int(g("kvg_mixer_heads", 4)),
-                                rank=int(g("kvg_operator_rank", 32)),
+                                n_heads=int(g("kvg_mixer_heads", 6)),
+                                rank=int(g("kvg_operator_rank", 8)),
                                 d_id=int(g("kvg_d_id", 64)))
         self.injector = Injector(self.mixer.d_mix, self.L, self.n_kv, self.head_dim,
                                  rope_mode=str(g("kvg_rope_mode", "compact")),
-                                 norm_match=bool(g("kvg_norm_match", True)))
+                                 norm_match=bool(g("kvg_norm_match", True)),
+                                 adapter_rank=int(g("kvg_adapter_rank", 24)))
         self.capture = KVCapture(base)
         self._parser = None                                   # lazy: spaCy load is slow and not always needed
 

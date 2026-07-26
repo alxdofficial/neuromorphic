@@ -17,10 +17,11 @@ zero and the mixer trains normally. This is exactly LoRA's bootstrap and is veri
 `tests/test_kvgraph.py::test_zero_init_bootstraps_mixer_gradient`. Do NOT "fix" it by zero-initialising the
 per-layer FiLM scale instead: that kills the gradient to `to_k` as well and the branch never wakes up.
 
-The per-layer adaptation is FiLM (one shared projection + per-layer scale/shift) rather than L independent
-projections. A correction to something already good does not need L x d x d_kv parameters, and at 30 layers
-the independent version would cost ~50x more than the entire relational operator bank — parameters spent in
-the wrong place.
+Per-layer adaptation is a shared projection + a **per-layer low-rank adapter** + FiLM scale/shift. Pure
+FiLM was too weak: one shared `d_mix -> kv_dim` map plus a scalar per layer asks a single 384-d vector to
+steer 30 layers x 192 dims through nothing but a rescale, so every layer receives the *same* correction
+direction. The rank-r adapter gives each layer its own direction for ~4% of what L independent full
+projections would cost.
 
 **RoPE.** Three modes, because this is an open empirical question and the harness's existing per-layer-KV
 arms (h2o / gisting / memoryllm) all use `none`:
@@ -42,7 +43,7 @@ import torch.nn as nn
 
 class Injector(nn.Module):
     def __init__(self, d_mix: int, n_layers: int, n_kv: int, head_dim: int, *,
-                 rope_mode: str = "compact", norm_match: bool = True):
+                 rope_mode: str = "compact", norm_match: bool = True, adapter_rank: int = 24):
         super().__init__()
         if rope_mode not in ("compact", "none", "original"):
             raise ValueError(f"rope_mode must be compact|none|original, got {rope_mode!r}")
@@ -54,6 +55,13 @@ class Injector(nn.Module):
         for lin in (self.to_k, self.to_v):                  # zero-init => injection == pooled KV at step 0
             nn.init.zeros_(lin.weight)
             nn.init.zeros_(lin.bias)
+        # Per-layer low-rank adapters. `A` zero-init keeps step-0 injection exactly the pooled KV while
+        # leaving dL/dA non-zero (it depends on B), so these bootstrap in one step — same pattern as the
+        # relation operators. `B` at 1/sqrt(fan_in).
+        self.adapt_A_k = nn.Parameter(torch.zeros(n_layers, d_mix, adapter_rank))
+        self.adapt_B_k = nn.Parameter(torch.randn(n_layers, adapter_rank, kv_dim) / adapter_rank ** 0.5)
+        self.adapt_A_v = nn.Parameter(torch.zeros(n_layers, d_mix, adapter_rank))
+        self.adapt_B_v = nn.Parameter(torch.randn(n_layers, adapter_rank, kv_dim) / adapter_rank ** 0.5)
         self.k_scale = nn.Parameter(torch.ones(n_layers, kv_dim))
         self.v_scale = nn.Parameter(torch.ones(n_layers, kv_dim))
         self.k_shift = nn.Parameter(torch.zeros(n_layers, kv_dim))
@@ -109,8 +117,12 @@ class Injector(nn.Module):
 
         Ks, Vs = [], []
         for li in range(L):
-            k = K_pooled[:, li].reshape(n, -1) + dk * self.k_scale[li] + self.k_shift[li]
-            v = V_pooled[:, li].reshape(n, -1) + dv * self.v_scale[li] + self.v_shift[li]
+            k = (K_pooled[:, li].reshape(n, -1)
+                 + (dk + (mixed @ self.adapt_A_k[li]) @ self.adapt_B_k[li]) * self.k_scale[li]
+                 + self.k_shift[li])
+            v = (V_pooled[:, li].reshape(n, -1)
+                 + (dv + (mixed @ self.adapt_A_v[li]) @ self.adapt_B_v[li]) * self.v_scale[li]
+                 + self.v_shift[li])
             if self.norm_match:
                 # Mean-pooling shrinks vectors by ~1/sqrt(m), so the most-mentioned nodes would otherwise be
                 # the quietest in attention. Rescale to the layer's real-token RMS.

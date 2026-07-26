@@ -165,8 +165,9 @@ class PersistentGraph:
         tgt.mentions.extend(node.mentions)
         for k, v in node.attrs.items():
             tgt.attrs.setdefault(k, v)
-        if summary is not None and target in self.summary:
-            self.summary[target] = 0.9 * self.summary[target] + 0.1 * summary
+        # The summary is deliberately NOT updated. A node is an identity KEY, and blending each new mention
+        # in would drift it toward a centroid matching no context — the pool-then-address trap. (An earlier
+        # version did a 0.9/0.1 EMA with no principled basis for either constant.)
         self.last_used[target] = self._step
 
     # ------------------------------------------------------------------ retrieval
@@ -192,13 +193,17 @@ class PersistentGraph:
                 A[i, j] = A[j, i] = 1.0
         return A / A.sum(1, keepdim=True).clamp(min=1.0)
 
-    def retrieve(self, query: torch.Tensor, read_budget: int, *, alpha: float = 0.15,
-                 iters: int = 8) -> list[int]:
+    def retrieve(self, query: torch.Tensor, read_budget: int, *, alpha: float = 0.15) -> list[int]:
         """Personalised PageRank from query-similar seeds -> top-B node ids (sinks always included).
 
         `alpha` is the restart probability and the ONLY knob for "how far to traverse": high stays local,
-        low diffuses. It replaces a discrete hop limit, handles cycles natively (it is a Markov chain), and
-        the same machinery scores nodes for the read that the LRU clock scores for eviction.
+        low diffuses. 0.15 is Brin & Page's original damping, not a guess. It replaces a discrete hop limit
+        and handles cycles natively, being a Markov chain.
+
+        Solved EXACTLY as `r = alpha (I - (1-alpha) P^T)^-1 s` rather than by power iteration. An earlier
+        version ran 8 iterations, which at alpha=0.15 leaves 0.85^8 = 27% residual error — the ranking was
+        being read off an unconverged vector. At a <=few-hundred-node budget the dense solve is microseconds,
+        and it removes an iteration count that had no principled value.
         """
         ids = [n for n in self.g.nodes if n not in self.sink_ids]
         if not ids:
@@ -214,9 +219,13 @@ class PersistentGraph:
         seed = seed / seed.sum()
 
         A = self._adjacency(ids)
-        r = seed.clone()
-        for _ in range(iters):
-            r = alpha * seed + (1 - alpha) * (A.t() @ r)
+        M = torch.eye(len(ids)) - (1 - alpha) * A.t()
+        try:
+            r = alpha * torch.linalg.solve(M, seed)
+        except Exception:                                    # noqa: BLE001 - singular only if A is degenerate
+            r = seed.clone()
+            for _ in range(64):                              # fallback: iterate to ~1e-5 at alpha=0.15
+                r = alpha * seed + (1 - alpha) * (A.t() @ r)
 
         keep = max(0, read_budget - len(self.sink_ids))
         top = torch.topk(r, min(keep, len(ids))).indices.tolist()
