@@ -32,11 +32,26 @@ from .schema import Edge, Graph, Node, NodeKind, Relation
 
 
 @dataclass
+class ArchivedEntry:
+    """One contracted node, complete enough to be reinstated.
+
+    The KV and summary travel WITH the node. Archiving structure alone was a real bug: recall would restore
+    the topology, `finalize_memory` would skip every restored node for want of a cache entry, and the
+    recovery would silently succeed-but-do-nothing.
+    """
+
+    node: Node
+    edges: list[Edge]
+    kv: tuple[torch.Tensor, torch.Tensor] | None = None
+    summary: torch.Tensor | None = None
+
+
+@dataclass
 class ArchivedRecord:
     """What a `GRAVESTONE_POINTER` edge points at. In-memory here; a disk backend is a drop-in replacement
     (the only requirement is that `entries` round-trips)."""
 
-    entries: list[tuple[Node, list[Edge]]] = field(default_factory=list)
+    entries: list[ArchivedEntry] = field(default_factory=list)
 
     def __len__(self) -> int:
         return len(self.entries)
@@ -267,7 +282,9 @@ class PersistentGraph:
         """Case 1/2/3 of the contraction rule. -> False if nothing could be done (caller stops)."""
         nbrs = self._neighbours(victim) & set(self.g.nodes)
         node = self.g.nodes[victim]
-        packed = (node, [e for e in self.g.edges if e.src == victim or e.dst == victim])
+        packed = ArchivedEntry(node=node,
+                               edges=[e for e in self.g.edges if e.src == victim or e.dst == victim],
+                               kv=self.kv.get(victim), summary=self.summary.get(victim))
 
         if not nbrs:                                     # case 3: orphan. Free, no pointer needed.
             self._forget(victim)
@@ -326,6 +343,35 @@ class PersistentGraph:
 
     # ------------------------------------------------------------------ recall
 
+    def recall_candidates(self, resident: list[int], query: torch.Tensor,
+                          threshold: float) -> list[tuple[int, float]]:
+        """Which resident survivors are holding an archive whose GIST matches the query?
+
+        The gist lives on the `GRAVESTONE_POINTER` edge vector, so this is the recall trigger described in
+        BUILD.md 8.5: `survivor in top-B AND query . gist > threshold`. Returned hottest-match first so a
+        bounded recall budget spends itself on the best candidates.
+        """
+        out = []
+        q = query.float().flatten()
+        for nid in resident:
+            if nid not in self.records:
+                continue
+            best = -1.0
+            for e in self.g.edges:
+                if e.src != nid or e.relation is not Relation.GRAVESTONE_POINTER or e.vec is None:
+                    continue
+                v = e.vec.float().flatten()
+                if v.numel() != q.numel():
+                    continue
+                best = max(best, float(torch.nn.functional.cosine_similarity(q, v, dim=0)))
+            # No gist (an archive whose pointer edge carried no vector) still deserves a chance: fall back
+            # to "recall if anything is archived here", which is the correct-but-expensive default rather
+            # than silently never recovering.
+            score = best if best > -1.0 else threshold
+            if score >= threshold:
+                out.append((nid, score))
+        return sorted(out, key=lambda x: -x[1])
+
     def recall(self, host: int, budget: int | None = None) -> int:
         """Page a survivor's archived subgraph back in. -> number of nodes restored.
 
@@ -337,11 +383,18 @@ class PersistentGraph:
             return 0
         rec = chain.pop()
         restored = 0
-        for node, edges in rec.entries:
+        for entry in rec.entries:
+            node = entry.node
             self.g.add_node(node)
+            if entry.kv is not None:
+                self.kv[node.node_id] = entry.kv
+            if entry.summary is not None:
+                self.summary[node.node_id] = entry.summary
+            # Recalled nodes are marked fresh, so the LRU clock does not immediately evict what a query
+            # just asked for. That is the thrash guard.
             self.last_used[node.node_id] = self._step
             self.created_window[node.node_id] = self._window
-            for e in edges:
+            for e in entry.edges:
                 if e.src in self.g.nodes and e.dst in self.g.nodes:
                     self.g.edges.append(e)
             restored += 1

@@ -56,6 +56,8 @@ class KVGraphEncoder(nn.Module):
         self.recent_windows = int(g("kvg_recent_windows", 2))
         self.node_dropout = float(g("kvg_node_dropout", 0.15))
         self.ppr_alpha = float(g("kvg_ppr_alpha", 0.15))
+        self.recall_threshold = float(g("kvg_recall_threshold", 0.25))
+        self.max_recalls = int(g("kvg_max_recalls", 2))
         self.head_weight = float(g("kvg_head_weight", 2.0))
         # Mid-stack read: entity/coreference information peaks in the middle of the stack, and the
         # in-forward retrieval literature independently lands on ~2/3 depth.
@@ -198,7 +200,23 @@ class KVGraphEncoder(nn.Module):
         q = state.get("question_embeds")
         seed = q[0].mean(0) if q is not None else state.get(
             "last_hidden", torch.zeros(self.d, device=dev))
-        chosen = pg.retrieve(seed, self._budgets()[1], alpha=self.ppr_alpha)
+        storage_budget, read_budget = self._budgets()
+        chosen = pg.retrieve(seed, read_budget, alpha=self.ppr_alpha)
+
+        # ── RECALL: page archived subgraphs back in when the query matches their gist ────────────────
+        # This is the half of "recoverable eviction" that makes it recoverable, and it is the component the
+        # literature sweep identified as our strongest and most novel. It has to actually run: an eviction
+        # that can never be undone is just H2O with a graph in front of it.
+        if self.max_recalls > 0 and pg.records:
+            n_done = 0
+            for host, _score in pg.recall_candidates(chosen, seed, self.recall_threshold):
+                if n_done >= self.max_recalls:
+                    break
+                # Page in, then contract straight back to budget — a cache-line fill, not a free extension.
+                if pg.recall(host, budget=storage_budget):
+                    n_done += 1
+            if n_done:
+                chosen = pg.retrieve(seed, read_budget, alpha=self.ppr_alpha)   # restored nodes now eligible
         pg.touch(chosen)
 
         if self.training and self.node_dropout > 0:

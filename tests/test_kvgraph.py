@@ -347,3 +347,36 @@ def test_end_to_end_stream_read_and_train():
         f"mixer destroyed most of the rank it was given: "
         f"node={aux['kvgraph_node_effrank']:.2f} -> mixed={aux['kvgraph_mixed_effrank']:.2f} "
         f"(over-smoothing is the graph-native form of the collapse this project has produced twice)")
+
+
+def test_recall_restores_content_not_just_structure():
+    """Archived nodes must come back WITH their KV.
+
+    An earlier version archived `(node, edges)` only. Recall then restored the topology, `finalize_memory`
+    skipped every restored node for want of a cache entry, and the recovery silently succeeded while doing
+    nothing — the worst kind of bug, because `n_recalled` went up.
+    """
+    pg = _toy_graph()
+    pg.contract_to_budget(4)
+    assert pg.records, "nothing archived"
+    host = next(iter(pg.records))
+    before = set(pg.g.nodes)
+    assert pg.recall(host) > 0
+    restored = set(pg.g.nodes) - before
+    assert restored, "recall returned >0 but added no nodes"
+    for nid in restored:
+        assert nid in pg.kv, f"restored node {nid} has no KV — it will be silently dropped at read time"
+
+
+def test_recall_is_actually_triggered_by_a_query():
+    """The recall PATH must run, not merely exist. Recoverable eviction that never recovers is H2O with a
+    graph in front of it, and `n_recalled` staying at 0 across a whole run is how that hides."""
+    pg = _toy_graph()
+    pg.contract_to_budget(4)
+    resident = [n for n in pg.g.nodes]
+    q = torch.randn(8)
+    # threshold -1 accepts anything: this asserts the candidate SCAN finds the archive-holding survivors,
+    # independently of how well any particular gist happens to match.
+    cands = pg.recall_candidates(resident, q, threshold=-1.0)
+    assert cands, "no survivor was offered as a recall candidate despite holding an archive"
+    assert cands[0][0] in pg.records

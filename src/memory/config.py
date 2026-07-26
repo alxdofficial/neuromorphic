@@ -282,6 +282,13 @@ class ReprConfig:
                                     # fact across co-dependent nodes (fine under read-all, fatal under subset).
     kvg_ppr_alpha: float = 0.15      # personalised-PageRank restart prob = the ONLY "how far to traverse"
                                     # knob. High = local, low = diffuse. Replaces a discrete hop limit.
+    kvg_recall_threshold: float = 0.25  # cosine(query, gravestone gist) above which an archived subgraph is
+                                     # paged back in. This is the trigger for the RECOVERABLE half of
+                                     # recoverable eviction — the component the literature sweep found to be
+                                     # our strongest and most novel. Set it too high and eviction is
+                                     # irreversible, i.e. H2O with a graph in front of it.
+    kvg_max_recalls: int = 2         # recalls per read. Unbounded, this degenerates into RAG with extra
+                                     # steps; 0 disables recall entirely (the irreversible-eviction control).
     kvg_head_weight: float = 2.0     # extra pooling mass on a span's syntactic head ("farm" in "the family
                                     # farm"). 1.0 = plain mean = the control.
     kvg_summary_layer: int = 0       # mid-stack layer read for node summaries / edge vectors; 0 ⇒ 2L/3.
