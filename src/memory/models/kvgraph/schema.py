@@ -118,7 +118,14 @@ class Mention:
     head_lemma: str                       # syntactic head of the span: "farm" in "the family farm"
     token_start: int = -1                 # inclusive; -1 until align.py runs
     token_end: int = -1                   # exclusive
-    head_token: int = -1                  # the head's own token index — carries most of the phrase meaning
+    head_token: int = -1                  # the head's own LM-token index — carries most of the phrase meaning
+    #: The PARSER's token index of this span's head. Distinct from `head_token` and NOT interchangeable
+    #: with it: spaCy and the LM tokenize differently, so dependency arcs (which are stated in parser
+    #: indices) must be resolved through this field. Conflating the two silently drops every edge.
+    parser_token: int = -1
+    #: Char span of the head word alone, so pooling can weight it without guessing that English NPs are
+    #: head-final (they usually are, but "the farm of the family" is not).
+    head_char: tuple[int, int] | None = None
     ner_type: str | None = None
     sent_idx: int = -1
     cluster_id: int | None = None         # coref cluster; mentions sharing one become a single Node
@@ -156,8 +163,12 @@ class Node:
     @property
     def first_token(self) -> int:
         """First-mention token index. The SORT KEY for RoPE position assignment — note the injected
-        position is the node's RANK in this order, never this index itself (see inject.py)."""
-        return min(m.token_start for m in self.mentions)
+        position is the node's RANK in this order, never this index itself (see inject.py).
+
+        Sink nodes have NO mentions (they are literal token KV entries, not pooled spans) and sort first,
+        which is also where they belong in the prefix: the decoder expects its attention sink at the front.
+        """
+        return min((m.token_start for m in self.mentions), default=-1)
 
     def __repr__(self) -> str:  # keep tensors out of reprs so graphs stay printable in tests
         return f"Node({self.node_id}, {self.kind.value}, {self.label!r}, {len(self.mentions)} mentions)"
@@ -227,7 +238,7 @@ class Graph:
             # What makes CONTENT well-formed is that the SOURCE is information-bearing, which is a
             # lexical property we cannot check structurally — so we do not pretend to.
         for n in self.nodes.values():
-            if not n.mentions:
+            if not n.mentions and not n.attrs.get("sink"):
                 problems.append(f"{n} has no mentions — nothing to pool KV from")
         return problems
 
@@ -237,7 +248,7 @@ class Graph:
         lines = []
         for n in sorted(self.nodes.values(), key=lambda x: x.first_token):
             marker = "()" if n.kind is NodeKind.EVENT else "[]"
-            surface = " | ".join(m.text for m in n.mentions)
+            surface = " | ".join(m.text for m in n.mentions) or "(no mentions — sink)"
             lines.append(f"{marker[0]}{n.label}{marker[1]:<18} #{n.node_id:<3} tok{n.token_positions[:6]}"
                          f"  <- {surface}")
             for edge, dst in self.neighbors(n.node_id):

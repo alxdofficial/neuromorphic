@@ -20,6 +20,7 @@ from .chat_template import ChatTemplate, build_chat_template
 from .config import ReprConfig
 from .models.autocompressor import AutoCompressorBaselineEncoder
 from .models.icae import ICAEBaselineEncoder
+from .models.kvgraph.encoder import KVGraphEncoder
 from .models.slotgraph import SlotGraphEncoder
 from .models.memoryllm import MemoryLLMBaselineEncoder
 from .models.gisting import GistingBaselineEncoder
@@ -56,6 +57,11 @@ class ReprLearningModel(nn.Module):
     """
 
     VARIANTS = {
+        # kvgraph — an entity/event graph over the KV cache. Nodes are PARTICULARS parsed from each window
+        # (entities + reified events) whose content is pooled from the frozen LM's pre-RoPE KV, so a node is
+        # a drop-in cache entry. Typed relation edges; LRU+sinks eviction by CONTRACTION into a surviving
+        # neighbour; per-layer-KV read. docs/design/kvgraph/. Requires batch_size=1 (ragged graphs).
+        "kvgraph_baseline": KVGraphEncoder,
         "icae_baseline": ICAEBaselineEncoder,  # ICAE (ICLR'24) compressor
         "autocompressor_baseline": AutoCompressorBaselineEncoder,  # AutoCompressors/RMT recurrent summary
         # THE slotgraph — 96 node slots, NO edge tokens; separate frozen write/read LM copies + LoRAs;
@@ -401,7 +407,8 @@ class ReprLearningModel(nn.Module):
             # floor/ceiling band), so it measures storage capacity, not streaming write. The streaming-
             # write path is exercised by the other 4 tasks. Stream MAE too only if you want a windowed
             # fidelity variant.
-            state, _ = self.encoder.streaming_write(state, enc_in, batch.context_mask, surprise=surprise)
+            state, _ = self.encoder.streaming_write(state, enc_in, batch.context_mask, surprise=surprise,
+                                                    context_ids=getattr(batch, 'context_ids', None))
             memory, mem_aux = self.encoder.finalize_memory(state)      # [B, M, d]
         memory = memory.to(ctx_embeds.dtype)
 
@@ -904,15 +911,20 @@ class ReprLearningModel(nn.Module):
                 win_emb = enc_input[:, s:e, :]
                 win_mask = batch.context_mask[:, s:e]
                 win_sur = surprise_full[:, s:e] if surprise_full is not None else None
+                # kvgraph parses the window's TEXT, so it needs ids as well as embeddings; every other
+                # encoder absorbs this through **extra.
+                win_ids = (batch.context_ids[:, s:e]
+                           if getattr(batch, "context_ids", None) is not None else None)
                 if ckpt_stream:
-                    def _write(st, em, mk, su=win_sur, off=s):
-                        new_st, _ = self.encoder.streaming_write(st, em, mk, chunk_offset=off, surprise=su)
+                    def _write(st, em, mk, su=win_sur, off=s, wi=win_ids):
+                        new_st, _ = self.encoder.streaming_write(st, em, mk, chunk_offset=off, surprise=su,
+                                                                 context_ids=wi)
                         return new_st
                     state = torch.utils.checkpoint.checkpoint(
                         _write, state, win_emb, win_mask, use_reentrant=False)
                 else:
                     state, _ = self.encoder.streaming_write(
-                        state, win_emb, win_mask, chunk_offset=s, surprise=win_sur)
+                        state, win_emb, win_mask, chunk_offset=s, surprise=win_sur, context_ids=win_ids)
                 if e in keep:                                 # snapshot memory at this boundary
                     snap = dict(state) if isinstance(state, dict) else state
                     if isinstance(snap, dict):                # question is constant across horizons
@@ -1065,15 +1077,20 @@ class ReprLearningModel(nn.Module):
                 win_emb = enc_input[:, s:e, :]
                 win_mask = batch.context_mask[:, s:e]
                 win_sur = surprise_full[:, s:e] if surprise_full is not None else None
+                # kvgraph parses the window's TEXT, so it needs ids as well as embeddings; every other
+                # encoder absorbs this through **extra.
+                win_ids = (batch.context_ids[:, s:e]
+                           if getattr(batch, "context_ids", None) is not None else None)
                 if ckpt_stream:
-                    def _write(st, em, mk, su=win_sur, off=s):
-                        new_st, _ = self.encoder.streaming_write(st, em, mk, chunk_offset=off, surprise=su)
+                    def _write(st, em, mk, su=win_sur, off=s, wi=win_ids):
+                        new_st, _ = self.encoder.streaming_write(st, em, mk, chunk_offset=off, surprise=su,
+                                                                 context_ids=wi)
                         return new_st
                     state = torch.utils.checkpoint.checkpoint(
                         _write, state, win_emb, win_mask, use_reentrant=False)
                 else:
                     state, _ = self.encoder.streaming_write(
-                        state, win_emb, win_mask, chunk_offset=s, surprise=win_sur)
+                        state, win_emb, win_mask, chunk_offset=s, surprise=win_sur, context_ids=win_ids)
             # Hand the question to the encoder (dict-state variants may read it;
             # NullEncoder (Tensor state) and Mamba (list state) are non-dict — guard).
             if isinstance(state, dict):

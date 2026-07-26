@@ -263,5 +263,51 @@ class ReprConfig:
     h2o_n_budget: int = 0              # M KV slots to keep; 0 ⇒ n_flat_codes
     h2o_recent_ratio: float = 0.1      # fraction of M reserved for most-recent tokens (H2O local window)
 
+    # ── kvgraph (entity/event graph over the KV cache; models/kvgraph/) ───────
+    # docs/design/kvgraph/{THESIS,BUILD}.md. Nodes are PARTICULARS (entities + reified events) parsed from
+    # the window and pooled from the frozen LM's pre-RoPE KV; edges are typed relations; eviction is
+    # LRU+sinks (policy) plus contraction into a surviving neighbour (mechanism).
+    kvg_storage_budget: int = 96    # terminal resident-node cap. 96 matches the sweep regime's M=96, so this
+                                    # is comparable to the prior slotgraph runs at the SAME persistent-state
+                                    # size — the budget at which the flat bank tied.
+    kvg_read_budget: int = 32       # terminal nodes injected per read. MUST be < storage: if read==storage
+                                    # every node is used every step, the LRU clock is uniform, and eviction
+                                    # has nothing to rank on. The GAP is what creates the access signal.
+    kvg_n_sinks: int = 4            # literal first-token KV entries kept permanently at the head of the
+                                    # prefix. Non-optional (StreamingLLM): without a sink the frozen decoder
+                                    # has nowhere to park unplaceable attention mass and degrades silently.
+    kvg_recent_windows: int = 2      # windows for which a new node is eviction-exempt. Any usage-based policy
+                                    # is blind to content nobody has queried yet; this is the fix.
+    kvg_node_dropout: float = 0.15   # train-time node dropout, ON FROM STEP 0. Stops the mixer smearing one
+                                    # fact across co-dependent nodes (fine under read-all, fatal under subset).
+    kvg_ppr_alpha: float = 0.15      # personalised-PageRank restart prob = the ONLY "how far to traverse"
+                                    # knob. High = local, low = diffuse. Replaces a discrete hop limit.
+    kvg_head_weight: float = 2.0     # extra pooling mass on a span's syntactic head ("farm" in "the family
+                                    # farm"). 1.0 = plain mean = the control.
+    kvg_summary_layer: int = 0       # mid-stack layer read for node summaries / edge vectors; 0 ⇒ 2L/3.
+                                     # Entity+coref information peaks mid-stack, not at the output.
+    kvg_d_mix: int = 256             # mixer width. Deliberately NARROWER than the backbone: the mixer routes
+                                     # relations, it does not re-represent semantics, and both the quadratic
+                                     # attention and the per-relation operator bank scale with this.
+    kvg_mixer_layers: int = 4        # ≥ graph diameter for the hops we need (2–3 for factconsolidation),
+                                     # shallow enough to avoid over-smoothing.
+    kvg_mixer_heads: int = 4
+    kvg_operator_rank: int = 32      # rank of the per-edge correction to the relation operator. The LIMIT in
+                                     # "properly initialised with limited learnability" — unbounded, the edge
+                                     # vector carries everything and the relation goes decorative.
+    kvg_d_id: int = 64               # TokenGT node-identifier width (random orthonormal, resampled/forward).
+    kvg_rope_mode: str = "compact"   # compact | none | original. `none` reproduces the rest of the harness's
+                                     # per-layer-KV arms (unrotated == position 0) for apples-to-apples.
+    kvg_norm_match: bool = True      # rescale injected KV to the layer's real-token RMS. Mean-pooling shrinks
+                                     # by ~1/sqrt(m), so the most-mentioned nodes would be the quietest.
+    kvg_spacy_model: str = "en_core_web_sm"
+    kvg_use_coref: bool = True
+    kvg_require_coref: bool = False  # True ⇒ a missing fastcoref is an ERROR, not a silent downgrade to
+                                     # string matching. Set it for any run whose result gets reported.
+    # Ablations — the two-sided edge test plus the graph-off control (BUILD.md §13.6 experiment order).
+    kvg_ablate_graph: bool = False       # drop all edges: "does structure help at all?" Run this FIRST.
+    kvg_ablate_relations: bool = False   # collapse the operator bank to one shared untyped operator.
+    kvg_ablate_edge_vec: bool = False    # zero the continuous per-edge correction.
+
     # ── Misc ───────────────────────────────────────────────────────────────
     seed: int = 42                  # wired in the trainer (torch/np/random) for reproducibility
