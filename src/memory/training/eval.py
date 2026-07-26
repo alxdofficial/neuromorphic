@@ -94,6 +94,7 @@ def run_val(model, val_set, device, n_batches: int, window_size: int,
     last_graph_eval: dict[str, float] = {}  # graph read+write collapse canaries
     last_biomem_eval: dict[str, float] = {}  # biomem edge/state saturation + leak/eta canaries
     last_slotgraph_eval: dict[str, float] = {}  # slotgraph edge-frac / src-dst entropy / mem-rank canaries
+    last_kvgraph_eval: dict[str, float] = {}    # kvgraph collapse / injection / archive / relation canaries
     last_vqicae_eval: dict[str, float] = {}  # vqicae codebook perplexity / active-code / batch-used canaries
     # Deterministic-eval seed: the soft_pointer_graph chunk-fresh init samples
     # fresh noise per call → seeding torch RNG per batch makes eval reproducible.
@@ -137,7 +138,8 @@ def run_val(model, val_set, device, n_batches: int, window_size: int,
             sink = last_graph_eval if k.startswith("graph_") else (
                 last_biomem_eval if k.startswith("biomem_") else (
                 last_slotgraph_eval if k.startswith("slotgraph_") else (
-                last_vqicae_eval if k.startswith("vqicae_") else None)))
+                last_vqicae_eval if k.startswith("vqicae_") else (
+                last_kvgraph_eval if k.startswith("kvgraph_") else None))))
             if sink is None:
                 continue
             if isinstance(v, (int, float)):
@@ -195,5 +197,7 @@ def run_val(model, val_set, device, n_batches: int, window_size: int,
     for k, v in last_slotgraph_eval.items():
         result[f"val_{k}"] = v
     for k, v in last_vqicae_eval.items():
+        result[f"val_{k}"] = v
+    for k, v in last_kvgraph_eval.items():
         result[f"val_{k}"] = v
     return result

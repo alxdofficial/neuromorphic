@@ -23,7 +23,18 @@ from .schema import Mention, NodeKind
 #: Nominalisations that denote events ("the sale", "her refusal"). A noun in this set becomes an EVENT node,
 #: which is what lets `Rumour --content--> Sale` attach to a noun. Deliberately small and lexical: a learned
 #: eventiveness classifier is a phase-2 upgrade, and getting it wrong costs a node, not a wrong answer.
-_EVENTIVE_NOUN_SUFFIXES = ("tion", "sion", "ment", "ance", "ence", "al", "ure", "age", "ing")
+#: Deliberately NARROW. An earlier version accepted "al", "ing", "ure", "age" and friends, which made
+#: `animal`, `building`, `terminal`, `organization` and `hospital` all EVENT nodes — changing node kinds,
+#: role topology, pooling and retrieval, and invisible to Graph.validate(). Over-classifying an entity as
+#: an event is far worse than missing a nominalisation: it inverts the hub/participant direction.
+_EVENTIVE_NOUN_SUFFIXES = ("ction", "ption", "ssion", "ment", "ance", "ence")
+#: Nouns matching a suffix above that are NOT events. Cheap, and it removes the commonest false positives.
+_EVENTIVE_BLOCKLIST = {"moment", "document", "government", "instrument", "element", "segment", "monument",
+                       "apartment", "department", "compartment", "fragment", "garment", "ornament",
+                       "parliament", "sentiment", "tournament", "experiment", "equipment", "distance",
+                       "substance", "instance", "appliance", "science", "audience", "residence",
+                       "difference", "conference", "reference", "sequence", "sentence", "fiction",
+                       "function", "junction", "section", "faction", "friction"}
 #: Relativizers: spaCy attaches them as an extra object of the relative clause's verb.
 _RELATIVIZERS = {"that", "which", "who", "whom", "whose"}
 _EVENTIVE_NOUNS = {"sale", "purchase", "delivery", "meeting", "call", "visit", "death", "birth",
@@ -52,6 +63,10 @@ class ParseResult:
     #: EVENT nodes and the two are built differently in build.py.
     predicates: list[Mention] = field(default_factory=list)
     arcs: list[Arc] = field(default_factory=list)
+    #: parser token index -> surface text, for every token. Attribute values ("secretly", "not", "the")
+    #: are usually bare modifiers that are not mentions, so without this `_child_text` fell through to the
+    #: dependency LABEL and stored manner="advmod", polarity="neg", tense="aux".
+    token_text: dict[int, str] = field(default_factory=dict)
     #: token index -> index into `mentions` or `predicates`, for resolving arcs to nodes.
     head_token_to_mention: dict[int, int] = field(default_factory=dict)
     head_token_to_predicate: dict[int, int] = field(default_factory=dict)
@@ -59,7 +74,12 @@ class ParseResult:
 
 
 def _is_eventive_noun(lemma: str) -> bool:
-    return lemma in _EVENTIVE_NOUNS or any(lemma.endswith(s) for s in _EVENTIVE_NOUN_SUFFIXES)
+    if lemma in _EVENTIVE_NOUNS:
+        return True
+    if lemma in _EVENTIVE_BLOCKLIST:
+        return False
+    # Length guard: short words hit these suffixes by accident far more often than they nominalise.
+    return len(lemma) > 6 and any(lemma.endswith(s) for s in _EVENTIVE_NOUN_SUFFIXES)
 
 
 class Parser:
@@ -127,6 +147,7 @@ class Parser:
         doc = self.nlp(text)
         clusters = self._coref_clusters(text, doc)
         res = ParseResult(text=text, coref_backend=self.coref_backend)
+        res.token_text = {tok.i: tok.text for tok in doc}
 
         # ── entity mentions: noun chunks (covers "the family farm") + bare pronouns ────────────────
         covered: set[int] = set()

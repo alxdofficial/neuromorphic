@@ -57,11 +57,20 @@ class ArchivedRecord:
         return len(self.entries)
 
 
+def _to_device(x, device):
+    if x is None:
+        return None
+    if torch.is_tensor(x):
+        return x.detach().to(device, non_blocking=True)
+    return tuple(_to_device(i, device) for i in x)
+
+
 class PersistentGraph:
     """The bounded memory. Holds nodes with their pooled KV, their edges, and the LRU bookkeeping."""
 
     def __init__(self, *, storage_budget: int = 96, n_sinks: int = 4, recent_windows: int = 2,
-                 record_cap: int = 8, pointers_per_survivor: int = 4, link_threshold: float = 0.92):
+                 record_cap: int = 8, pointers_per_survivor: int = 4, link_threshold: float = 0.92,
+                 archive_cap: int = 512, archive_device: str = "cpu"):
         self.g = Graph()
         self.storage_budget = storage_budget
         self.n_sinks = n_sinks
@@ -69,6 +78,13 @@ class PersistentGraph:
         self.record_cap = record_cap
         self.pointers_per_survivor = pointers_per_survivor
         self.link_threshold = link_threshold
+        # The archive is the "disk" in recoverable-eviction. Keeping it as live GPU tensors made total KV
+        # storage grow with every eviction, so the 96-node resident cap bounded nothing: a probe measured
+        # the archive at 5.1x resident after eight short windows. It now moves to CPU and is itself capped,
+        # oldest-first, so the memory claim is true rather than aspirational.
+        self.archive_cap = archive_cap
+        self.archive_device = archive_device
+        self.n_archive_dropped = 0
 
         self._next_id = 0
         self._step = 0
@@ -206,7 +222,16 @@ class PersistentGraph:
             i, j = pos.get(e.src), pos.get(e.dst)
             if i is not None and j is not None:
                 A[i, j] = A[j, i] = 1.0
-        return A / A.sum(1, keepdim=True).clamp(min=1.0)
+        deg = A.sum(1, keepdim=True)
+        # Dangling (isolated) nodes have an all-zero row, which DESTROYS probability mass instead of
+        # conserving it — structurally down-ranking isolated but query-relevant facts. Standard PageRank
+        # redistributes their mass; here a self-loop keeps the row stochastic and the node reachable.
+        isolated = (deg.squeeze(-1) == 0)
+        if isolated.any():
+            A = A.clone()
+            A[isolated, isolated.nonzero(as_tuple=True)[0]] = 1.0
+            deg = A.sum(1, keepdim=True)
+        return A / deg.clamp(min=1e-12)
 
     def retrieve(self, query: torch.Tensor, read_budget: int, *, alpha: float = 0.15) -> list[int]:
         """Personalised PageRank from query-similar seeds -> top-B node ids (sinks always included).
@@ -284,22 +309,24 @@ class PersistentGraph:
         node = self.g.nodes[victim]
         packed = ArchivedEntry(node=node,
                                edges=[e for e in self.g.edges if e.src == victim or e.dst == victim],
-                               kv=self.kv.get(victim), summary=self.summary.get(victim))
-
-        if not nbrs:                                     # case 3: orphan. Free, no pointer needed.
-            self._forget(victim)
-            return True
+                               kv=_to_device(self.kv.get(victim), self.archive_device),
+                               summary=_to_device(self.summary.get(victim), self.archive_device))
 
         survivors = [n for n in nbrs if n in self.g.nodes]
         if survivors:                                    # case 1: contract into the hottest survivor
             host = max(survivors, key=lambda n: self.last_used.get(n, 0))
             self._transfer_edges(victim, host)
             self._archive(host, packed)
+            self._inherit_records(victim, host)
             self._forget(victim)
             return True
 
-        # case 2 is unreachable here because `survivors` == `nbrs` by construction; kept explicit so the
-        # invariant is visible rather than implied.
+        # case 3: no surviving neighbour, so nothing can ever point at this node's archive either. Its
+        # records must be DROPPED, not orphaned — leaving them keyed to a removed node is memory holding
+        # content that is unreachable by construction, which is the stranding bug in a second disguise.
+        dropped = self.records.pop(victim, None)
+        if dropped:
+            self.n_archive_dropped += sum(len(r) for r in dropped)
         self._forget(victim)
         return True
 
@@ -320,6 +347,10 @@ class PersistentGraph:
             new = self.g.add_edge(host, other, Relation.GRAVESTONE_POINTER,
                                   provenance=f"contracted:{e.relation.value}")
             new.vec = e.vec
+            # The original relation as DATA, not just a provenance string. The docstring promised it was
+            # carried in the edge vector; it was only ever in a debug field nothing reads, so
+            # `Sale --agent--> Brother` really did degrade to an untyped "something was here".
+            new.original_relation = e.relation
             existing.add(other)
 
     def _archive(self, host: int, packed) -> None:
@@ -332,8 +363,55 @@ class PersistentGraph:
                 chain.pop(0)
             chain.append(ArchivedRecord())
         chain[-1].entries.append(packed)
+        self._enforce_archive_cap()
+
+    def _inherit_records(self, victim: int, host: int) -> None:
+        """Move the victim's own archive chain to its survivor.
+
+        Without this, contracting a node that ALREADY hosts archives leaves `records[victim]` keyed to a
+        node that no longer exists: the archive is unreachable but still resident in memory. A probe found
+        44 of 49 archive hosts stranded this way. It also breaks the "pointer chains are exact, so depth is
+        free" argument that the emergent-hierarchy claim rests on — a chain that drops its tail is not exact.
+        """
+        chain = self.records.pop(victim, None)
+        if not chain:
+            return
+        dest = self.records.setdefault(host, [])
+        for rec in chain:
+            if dest and len(dest[-1]) < self.record_cap:
+                dest[-1].entries.extend(rec.entries)
+            else:
+                dest.append(rec)
+        self._enforce_archive_cap()
+
+    def _enforce_archive_cap(self) -> None:
+        """Drop the OLDEST archived entries once the total exceeds `archive_cap`, and say how many.
+
+        A cap that silently truncates reads as "everything fit" when it did not, so the count is surfaced
+        as a canary rather than swallowed.
+        """
+        total = sum(len(r) for c in self.records.values() for r in c)
+        if total <= self.archive_cap:
+            return
+        for host in list(self.records):
+            for rec in list(self.records[host]):
+                while rec.entries and total > self.archive_cap:
+                    rec.entries.pop(0)
+                    total -= 1
+                    self.n_archive_dropped += 1
+                if not rec.entries:
+                    self.records[host].remove(rec)
+            if not self.records[host]:
+                self.records.pop(host, None)
+            if total <= self.archive_cap:
+                return
 
     def _forget(self, nid: int) -> None:
+        # Defensive: no path may leave `records` keyed to a node that is gone. Callers are expected to have
+        # already inherited or dropped them; this makes stranding impossible rather than merely unlikely.
+        leaked = self.records.pop(nid, None)
+        if leaked:
+            self.n_archive_dropped += sum(len(r) for r in leaked)
         self.g.edges = [e for e in self.g.edges if e.src != nid and e.dst != nid]
         self.g.nodes.pop(nid, None)
         self.kv.pop(nid, None)

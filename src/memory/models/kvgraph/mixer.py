@@ -82,41 +82,73 @@ class RelationMP(nn.Module):
         # docstring for why zero-initialising the gate instead would be a permanent kill.
         self.rel_U = nn.Parameter(torch.zeros(N_RELATIONS, d, rank))
         self.rel_V = nn.Parameter(torch.randn(N_RELATIONS, d, rank) / d ** 0.5)   # 1/sqrt(fan_in)
+        # REVERSE bank: participant -> hub. Edges are uniformly hub->participant, so a forward-only pass
+        # can never route entity -> event -> entity, which is exactly the 2-hop traversal
+        # factconsolidation_mh requires. Without this the typed operators cannot be the mechanism carrying
+        # multi-hop, the global attention would be doing it instead, and the edge ablation would be
+        # measuring the wrong thing. A SEPARATE bank, not a transpose: "who did this" and "what did they do"
+        # are different functions.
+        self.rev_diag = nn.Parameter(torch.ones(N_RELATIONS, d))
+        self.rev_U = nn.Parameter(torch.zeros(N_RELATIONS, d, rank))
+        self.rev_V = nn.Parameter(torch.randn(N_RELATIONS, d, rank) / d ** 0.5)
         self.gate = nn.Linear(d, rank)
-        self.norm = nn.LayerNorm(d)
+        # Learnable gain instead of a LayerNorm on the aggregate. LayerNorm removes SCALE, which destroys
+        # exactly the property sum-aggregation is chosen for: LN(sum of 1 message) and LN(sum of 2 identical
+        # messages) differ by ~1e-5, so the "injective (GIN)" claim was false as implemented. A plain scalar
+        # keeps degree information in the magnitude; the next TokenGT layer's pre-norm handles stability.
+        self.gain = nn.Parameter(torch.full((), 0.1))
         #: Last forward's |low-rank term| / |diag term|. Not a buffer (never checkpointed) — it is the live
         #: readout of the two-sided ablation: climbing toward 1 means the continuous edge vector is carrying
         #: everything and the discrete relation has gone decorative.
         self.last_lowrank_frac: float = 0.0
 
+    def _messages(self, h, idx_from, rel, edge_vec, diag_p, U_p, V_p, ablate_relations, ablate_edge_vec):
+        if ablate_relations:
+            # Capacity-matched control: average over the relation axis so every parameter is still present
+            # and still trained, but the operator is forced to be relation-INVARIANT.
+            diag = diag_p.mean(0, keepdim=True).expand(rel.shape[0], -1)
+            U = U_p.mean(0, keepdim=True).expand(rel.shape[0], -1, -1)
+            V = V_p.mean(0, keepdim=True).expand(rel.shape[0], -1, -1)
+        else:
+            diag, U, V = diag_p[rel], U_p[rel], V_p[rel]
+        hs = h[idx_from]
+        base = diag * hs
+        drift = None
+        if edge_vec is not None and not ablate_edge_vec:
+            # tanh BOUNDS the gate in MAGNITUDE. Low rank bounds dimensionality only, so the previous
+            # unconstrained linear could let the continuous correction swamp the typed diagonal — which is
+            # precisely the "relation goes decorative" failure the bound exists to prevent.
+            g = torch.tanh(self.gate(edge_vec))
+            proj = torch.einsum("ed,edr->er", hs, V) * g
+            drift = torch.einsum("edr,er->ed", U, proj)
+        return base, drift
+
     def forward(self, h: torch.Tensor, src: torch.Tensor, dst: torch.Tensor,
                 rel: torch.Tensor, edge_vec: torch.Tensor | None,
                 *, ablate_relations: bool = False, ablate_edge_vec: bool = False) -> torch.Tensor:
         if src.numel() == 0:
-            return h
-        if ablate_relations:
-            # Capacity-matched control: average over the relation axis so every parameter is still present
-            # and still trained, but the operator is forced to be relation-INVARIANT.
-            diag = self.rel_diag.mean(0, keepdim=True).expand(rel.shape[0], -1)
-            U = self.rel_U.mean(0, keepdim=True).expand(rel.shape[0], -1, -1)
-            V = self.rel_V.mean(0, keepdim=True).expand(rel.shape[0], -1, -1)
-        else:
-            diag, U, V = self.rel_diag[rel], self.rel_U[rel], self.rel_V[rel]
-
-        hs = h[src]                                                              # [E, d]
-        base = diag * hs                                                         # typed, multiplicative
-        msg = base
-        if edge_vec is not None and not ablate_edge_vec:
-            g = self.gate(edge_vec)                                              # [E, rank]
-            proj = torch.einsum("ed,edr->er", hs, V) * g                         # bounded low-rank drift
-            drift = torch.einsum("edr,er->ed", U, proj)
-            msg = msg + drift
-            with torch.no_grad():
-                self.last_lowrank_frac = float(drift.norm() / base.norm().clamp_min(1e-6))
-        else:
             self.last_lowrank_frac = 0.0
-        agg = torch.zeros_like(h).index_add_(0, dst, msg)                        # SUM aggregation
-        return h + self.norm(agg)                                                # residual: signal survives
+            return h
+        fwd_base, fwd_drift = self._messages(h, src, rel, edge_vec, self.rel_diag, self.rel_U, self.rel_V,
+                                             ablate_relations, ablate_edge_vec)
+        rev_base, rev_drift = self._messages(h, dst, rel, edge_vec, self.rev_diag, self.rev_U, self.rev_V,
+                                             ablate_relations, ablate_edge_vec)
+        fwd = fwd_base if fwd_drift is None else fwd_base + fwd_drift
+        rev = rev_base if rev_drift is None else rev_base + rev_drift
+
+        agg = torch.zeros_like(h)
+        agg.index_add_(0, dst, fwd)          # hub -> participant
+        agg.index_add_(0, src, rev)          # participant -> hub  (enables entity->event->entity)
+
+        with torch.no_grad():
+            if fwd_drift is None:
+                self.last_lowrank_frac = 0.0
+            else:
+                num = (fwd_drift.norm() + rev_drift.norm())
+                den = (fwd_base.norm() + rev_base.norm()).clamp_min(1e-6)
+                self.last_lowrank_frac = float(num / den)
+        # Scalar gain, NOT LayerNorm: magnitude must survive for sum-aggregation to be injective.
+        return h + self.gain * agg
 
 
 class GraphMixer(nn.Module):
@@ -177,9 +209,7 @@ class GraphMixer(nn.Module):
             src = dst = torch.zeros(0, dtype=torch.long, device=h.device)
             rel = torch.zeros(0, dtype=torch.long, device=h.device)
             e_h = h.new_zeros(0, self.d_mix)
-            e_raw = None
         else:
-            e_raw = edge_vec
             e_h = self.edge_in(edge_vec) if edge_vec is not None else self.rel_emb(rel)
             e_h = e_h + self.rel_emb(rel)
 
@@ -189,11 +219,15 @@ class GraphMixer(nn.Module):
         if e_h.shape[0]:
             e_h = e_h + self.id_proj(torch.cat([pid[src], pid[dst]], dim=-1)) + self.type_emb.weight[1]
 
-        e_mix = self.edge_in(e_raw) if (e_raw is not None and e_h.shape[0]) else None
+        has_edges = e_h.shape[0] > 0
         for layer, mp in zip(self.layers, self.mp):
             x = torch.cat([h, e_h], dim=0)[None]            # one "sequence" of node+edge tokens
-            x = layer(x)[0]
+            x = layer(x)[0]                                 # EDGE UPDATE (attention sees both endpoints)
             h, e_h = x[:n], x[n:]
-            h = mp(h, src, dst, rel, e_mix,
+            # NODE UPDATE conditioned on the JUST-UPDATED edge state. An earlier version passed a static
+            # projection of the raw edge vector to every layer, so the "edge update then node update using
+            # the updated edge" in the docstring was not what ran — the edge tokens were updated and then
+            # ignored by the operators.
+            h = mp(h, src, dst, rel, e_h if has_edges else None,
                    ablate_relations=ablate_relations, ablate_edge_vec=ablate_edge_vec)
         return self.out_norm(h)

@@ -58,6 +58,7 @@ class KVGraphEncoder(nn.Module):
         self.ppr_alpha = float(g("kvg_ppr_alpha", 0.15))
         self.recall_threshold = float(g("kvg_recall_threshold", 0.25))
         self.max_recalls = int(g("kvg_max_recalls", 2))
+        self.archive_cap = int(g("kvg_archive_cap", 512))
         self.head_weight = float(g("kvg_head_weight", 2.0))
         # Mid-stack read: entity/coreference information peaks in the middle of the stack, and the
         # in-forward retrieval literature independently lands on ~2/3 depth.
@@ -72,13 +73,14 @@ class KVGraphEncoder(nn.Module):
                                 n_layers=int(g("kvg_mixer_layers", 4)),
                                 n_heads=int(g("kvg_mixer_heads", 6)),
                                 rank=int(g("kvg_operator_rank", 8)),
-                                d_id=int(g("kvg_d_id", 64)),
+                                d_id=max(int(g("kvg_d_id", 128)), self.storage_budget + 2 * self.n_sinks),
                                 center_inputs=bool(g("kvg_center_inputs", True)))
         self.injector = Injector(self.mixer.d_mix, self.L, self.n_kv, self.head_dim,
                                  rope_mode=str(g("kvg_rope_mode", "compact")),
                                  norm_match=bool(g("kvg_norm_match", True)),
+                                 per_node_norm=bool(g("kvg_per_node_norm", True)),
                                  adapter_rank=int(g("kvg_adapter_rank", 24)))
-        self.capture = KVCapture(base)
+        self.capture = KVCapture(base, keep_layer=self.summary_layer)
         self._parser = None                                   # lazy: spaCy load is slow and not always needed
 
         n_train = sum(p.numel() for p in self.parameters() if p.requires_grad)
@@ -110,11 +112,22 @@ class KVGraphEncoder(nn.Module):
         taught to index."""
         self.pressure = float(max(0.0, min(1.0, p)))
 
+    #: Budget at pressure 0, as a MULTIPLE of the terminal budget. A finite start matters: interpolating
+    #: linearly from 2**20 meant the effective cap only fell below a ~280-node graph at pressure > 0.9998,
+    #: so the "curriculum" was an unbounded run followed by a single-step cliff to 96 — the exact opposite
+    #: of the smooth ramp it was introduced to provide.
+    START_MULT = 8.0
+
     def _budgets(self) -> tuple[int, int]:
-        big = 1 << 20
-        s = int(round(big * (1 - self.pressure) + self.storage_budget * self.pressure))
-        r = int(round(big * (1 - self.pressure) + self.read_budget * self.pressure))
-        return max(s, self.storage_budget), max(r, self.read_budget)
+        """Geometric interpolation from START_MULT x terminal down to terminal.
+
+        Geometric, not linear, because budget pressure is felt MULTIPLICATIVELY — going 768 -> 384 costs the
+        same fraction of the graph as 192 -> 96, whereas a linear schedule spends most of its steps in a
+        regime where nothing is evicted at all.
+        """
+        f = self.START_MULT ** (1.0 - self.pressure)
+        return max(int(round(self.storage_budget * f)), self.storage_budget), \
+            max(int(round(self.read_budget * f)), self.read_budget)
 
     def init_streaming_state(self, batch_size, device, dtype):
         if batch_size != 1:
@@ -123,7 +136,8 @@ class KVGraphEncoder(nn.Module):
             # refusing. Batch by gradient accumulation instead.
             raise ValueError(f"kvgraph requires batch_size=1 (got {batch_size}); accumulate gradients")
         return {"graph": PersistentGraph(storage_budget=self.storage_budget, n_sinks=self.n_sinks,
-                                         recent_windows=self.recent_windows),
+                                         recent_windows=self.recent_windows,
+                                         archive_cap=self.archive_cap),
                 "ids": [], "device": device, "dtype": dtype, "n_windows": 0}
 
     # ------------------------------------------------------------------ write
@@ -176,6 +190,17 @@ class KVGraphEncoder(nn.Module):
         evecs = {id(e): pool_hidden(cap, [list(e.licensing_tokens)], self.summary_layer)[0]
                  for e in win.edges if e.licensing_tokens}
 
+        # Rebase mention token indices onto DOCUMENT-global positions. Without this every window restarts
+        # at 0, so first-mention ordering — which the compact-rank RoPE assignment sorts by — is
+        # window-local and a node from window 5 can sort before one from window 1.
+        if chunk_offset:
+            for nd in win.nodes.values():
+                for m in nd.mentions:
+                    m.token_start += chunk_offset
+                    m.token_end += chunk_offset
+                    if m.head_token >= 0:
+                        m.head_token += chunk_offset
+
         pg.admit(win,
                  kv={n: (K[i], V[i]) for i, n in enumerate(node_ids)},
                  summaries={n: summ[i] for i, n in enumerate(node_ids)},
@@ -195,11 +220,26 @@ class KVGraphEncoder(nn.Module):
         if not pg.g.nodes:
             raise ValueError("kvgraph.finalize_memory: empty graph (no window produced any node)")
 
-        # Retrieval is seeded by the tail of the last ingested window — a non-circular query that streaming
-        # supplies for free. A question embedding, when the harness provides one, is strictly better.
+        # Retrieval seed. It MUST live in the same representation space as `pg.summary`, which holds
+        # mid-stack hidden states — an earlier version cosine-compared raw INPUT EMBEDDINGS against layer-20
+        # hidden states, two unrelated spaces, so the similarity term was close to meaningless. When the
+        # harness supplies a question we run it through the frozen LM to the summary layer; otherwise we
+        # fall back to the tail of the last ingested window, which streaming supplies for free and which is
+        # already in the right space.
+        seed = state.get("last_hidden", torch.zeros(self.d, device=dev))
         q = state.get("question_embeds")
-        seed = q[0].mean(0) if q is not None else state.get(
-            "last_hidden", torch.zeros(self.d, device=dev))
+        if q is not None:
+            qm = state.get("question_mask")
+            with torch.no_grad():
+                hs = self.base.model(inputs_embeds=q.to(next(self.base.parameters()).dtype),
+                                     attention_mask=(qm.long() if qm is not None else None),
+                                     output_hidden_states=True, use_cache=False
+                                     ).hidden_states[self.summary_layer][0]
+            if qm is not None:
+                m = qm[0].bool()
+                seed = hs[m].mean(0) if m.any() else hs.mean(0)   # PAD must not vote on the query
+            else:
+                seed = hs.mean(0)
         storage_budget, read_budget = self._budgets()
         chosen = pg.retrieve(seed, read_budget, alpha=self.ppr_alpha)
 
@@ -208,14 +248,16 @@ class KVGraphEncoder(nn.Module):
         # literature sweep identified as our strongest and most novel. It has to actually run: an eviction
         # that can never be undone is just H2O with a graph in front of it.
         if self.max_recalls > 0 and pg.records:
-            n_done = 0
+            n_nodes_back = 0
             for host, _score in pg.recall_candidates(chosen, seed, self.recall_threshold):
-                if n_done >= self.max_recalls:
+                if n_nodes_back >= self.max_recalls:
                     break
-                # Page in, then contract straight back to budget — a cache-line fill, not a free extension.
-                if pg.recall(host, budget=storage_budget):
-                    n_done += 1
-            if n_done:
+                # Bound on NODES, not record objects: a spilled record can hold arbitrarily many nodes, so
+                # "2 recalls" could page in dozens. Contraction is deferred to AFTER the read (budget=None)
+                # — recalling and immediately re-contracting inside the same finalize evicted roughly as
+                # many nodes as it restored, which is pure churn and can evict what the query just asked for.
+                n_nodes_back += pg.recall(host, budget=None)
+            if n_nodes_back:
                 chosen = pg.retrieve(seed, read_budget, alpha=self.ppr_alpha)   # restored nodes now eligible
         pg.touch(chosen)
 
@@ -254,6 +296,9 @@ class KVGraphEncoder(nn.Module):
         Ks, Vs = self.injector(Kp, Vp, mixed, base_model=self.base, first_tokens=first,
                                k_rms=state.get("k_rms"), v_rms=state.get("v_rms"))
 
+        # Contract back to budget only now that the read is chosen, so a recall cannot evict the very
+        # nodes it just restored.
+        pg.contract_to_budget(storage_budget)
         mm = torch.ones(1, len(chosen), device=dev)
         empty = torch.zeros(1, 0, self.d, device=dev)
         aux = {"past_kv": (Ks, Vs), "memory_mask": mm, "read_mode": "per_layer_kv"}

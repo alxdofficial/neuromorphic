@@ -35,12 +35,17 @@ import torch
 
 
 def participation_ratio(x: torch.Tensor) -> float:
-    """Effective rank of the rows of `x` [N, d]. 1.0 == total collapse; higher is more spread."""
+    """Effective rank of the rows of `x` [N, d]. 1.0 == total collapse; higher is more spread.
+
+    Computed via the [N, N] GRAM matrix, not the [d, d] covariance: the two have identical non-zero spectra,
+    but at a flattened KV dimension of 5,760 the covariance is a 263 MiB transient, and at an 8B-scale
+    32,768 it is 4 GiB — a diagnostic that would OOM the run it is meant to be watching.
+    """
     if x.shape[0] < 2:
         return 0.0
     xc = x.float() - x.float().mean(0, keepdim=True)
-    C = xc.t() @ xc
-    return float(C.diagonal().sum() ** 2 / (C * C).sum().clamp_min(1e-12))
+    G = xc @ xc.t()                                   # [N, N] — N is the node budget, ~100
+    return float(G.diagonal().sum() ** 2 / (G * G).sum().clamp_min(1e-12))
 
 
 def mean_pairwise_cos(x: torch.Tensor) -> float:
@@ -51,6 +56,13 @@ def mean_pairwise_cos(x: torch.Tensor) -> float:
     C = xn @ xn.t()
     n = x.shape[0]
     return float((C.sum() - C.diagonal().sum()) / (n * (n - 1)))
+
+
+def _div(centred: torch.Tensor) -> float:
+    """Divergence of centred rows. 0.0 for an all-zero tensor: undefined, NOT maximal."""
+    if float(centred.abs().sum()) == 0.0:
+        return 0.0
+    return 1.0 - mean_pairwise_cos(centred)
 
 
 def operator_divergence(mp_layers) -> dict[str, float]:
@@ -67,13 +79,14 @@ def operator_divergence(mp_layers) -> dict[str, float]:
         # is ~1 for any perturbation because the shared component dominates — the uncentred measure read a
         # flat 0 for 40 steps and would have reported "the relations never differentiated" forever.
         D = mp.rel_diag.detach()
-        diag_div.append(1.0 - mean_pairwise_cos(D - D.mean(0, keepdim=True)))
+        Dc = D - D.mean(0, keepdim=True)
+        # The all-zero guard must come AFTER centring and apply to BOTH banks. rel_diag is all-ones at init,
+        # so centring makes it all-zero, and normalize()'s 0/0 -> 0 then reports "maximally diverged" — the
+        # exact inversion already fixed on rel_U, recreated here by the centring fix itself.
+        diag_div.append(_div(Dc))
         R = mp.rel_U.shape[0]
         U = mp.rel_U.detach().reshape(R, -1)
-        U = U - U.mean(0, keepdim=True)
-        # An all-zero U (the init) has UNDEFINED pairwise cosine, and normalize() turning 0/0 into 0 would
-        # report it as "maximally diverged" — the exact opposite of the truth. Report 0 until it moves.
-        lr_div.append(0.0 if float(U.abs().sum()) == 0.0 else 1.0 - mean_pairwise_cos(U))
+        lr_div.append(_div(U - U.mean(0, keepdim=True)))
     return {"kvgraph_operator_div": sum(diag_div) / max(len(diag_div), 1),
             "kvgraph_operator_lowrank_div": sum(lr_div) / max(len(lr_div), 1)}
 
@@ -135,4 +148,13 @@ def graph_stats(pg, n_read: int, n_tokens: int) -> dict[str, float]:
         "kvgraph_n_records": float(sum(len(c) for c in pg.records.values())),
         "kvgraph_n_gravestone_edges": float(sum(
             1 for e in pg.g.edges if e.relation.value == "gravestone_pointer")),
+        # Archive size is NOT covered by the resident budget, so it needs its own number or the memory
+        # claim is unfalsifiable from the logs. n_archive_dropped > 0 means the archive cap truncated —
+        # loudly, because a silent cap reads as "everything fit".
+        "kvgraph_n_archived": float(sum(len(r) for c in pg.records.values() for r in c)),
+        "kvgraph_n_archive_dropped": float(pg.n_archive_dropped),
+        "kvgraph_n_archive_hosts": float(len(pg.records)),
+        # Every archive host MUST still be resident; a stranded host is memory holding content nothing can
+        # ever reach. This is the canary for the record-inheritance bug.
+        "kvgraph_n_stranded_hosts": float(sum(1 for h in pg.records if h not in pg.g.nodes)),
     }

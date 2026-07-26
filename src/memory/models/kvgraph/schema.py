@@ -193,6 +193,9 @@ class Edge:
     vec: object | None = None
     #: The token indices that licensed this arc. Where `vec` is pooled from, and debugging provenance.
     licensing_tokens: tuple[int, ...] = ()
+    #: For GRAVESTONE_POINTER edges: the relation this edge replaced when its endpoint was contracted.
+    #: Recoverable DATA, so a contracted `Sale --agent--> Brother` does not degrade to "something was here".
+    original_relation: "Relation | None" = None
     provenance: str = ""    # the dependency arc / rule this came from. Debugging only, never a feature.
 
 

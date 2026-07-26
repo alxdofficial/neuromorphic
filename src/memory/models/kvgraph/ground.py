@@ -23,6 +23,19 @@ from __future__ import annotations
 import torch
 
 
+class _SparseHidden:
+    """Holds only the hidden layers that will actually be indexed, with the same `[i]` interface."""
+
+    def __init__(self, layers: dict[int, "torch.Tensor"]):
+        self._layers = layers
+
+    def __getitem__(self, i):
+        if i not in self._layers:
+            raise KeyError(f"hidden layer {i} was not retained (KVCapture keeps only "
+                           f"{sorted(self._layers)}); widen keep_layer if another layer is needed")
+        return self._layers[i]
+
+
 class KVCapture:
     """Runs the frozen LM once over a window and captures pre-RoPE K/V plus per-layer norm statistics.
 
@@ -30,9 +43,12 @@ class KVCapture:
     end up capturing a different forward than you think you are.
     """
 
-    def __init__(self, base):
+    def __init__(self, base, keep_layer: int | None = None):
         cfg = base.config
         self.base = base
+        #: Only ONE hidden layer is ever read (node summaries + edge vectors). Retaining all of them costs
+        #: L x [T, d] per window for nothing.
+        self.keep_layer = keep_layer
         self.L = cfg.num_hidden_layers
         self.n_kv = getattr(cfg, "num_key_value_heads", None) or cfg.num_attention_heads
         self.head_dim = getattr(cfg, "head_dim", None) or (cfg.hidden_size // cfg.num_attention_heads)
@@ -74,7 +90,11 @@ class KVCapture:
                              for k in kbuf]).sqrt()
         v_rms = torch.stack([((v.float() ** 2) * m).sum() / (m.sum() * self.n_kv * self.head_dim)
                              for v in vbuf]).sqrt()
-        return {"k": kbuf, "v": vbuf, "hidden": out.hidden_states, "k_rms": k_rms, "v_rms": v_rms}
+        hidden = out.hidden_states
+        if self.keep_layer is not None:
+            keep = {self.keep_layer: hidden[self.keep_layer].detach()}
+            hidden = _SparseHidden(keep)
+        return {"k": kbuf, "v": vbuf, "hidden": hidden, "k_rms": k_rms, "v_rms": v_rms}
 
 
 def pool_nodes(cap: dict, node_tokens: list[list[int]], *, head_tokens: list[int] | None = None,

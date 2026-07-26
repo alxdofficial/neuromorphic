@@ -228,7 +228,9 @@ def train_mixed_variant(
     _p_frac = float(getattr(cfg, "kvg_pressure_warmup_frac", 0.3))
     for step in range(start_step, n_steps):
         if _set_pressure is not None:
-            _set_pressure(min(1.0, (step - start_step) / max(1.0, _p_frac * (n_steps - start_step))))
+            # ABSOLUTE progress, not progress-since-resume: keying off (step - start_step) made a resumed
+            # run restart the curriculum from zero pressure and repeat a schedule it had already finished.
+            _set_pressure(min(1.0, step / max(1.0, _p_frac * n_steps)))
         task = mixed_tasks[step % len(mixed_tasks)]   # equal round-robin
         if len(rotation) < 24:
             rotation.append(task)

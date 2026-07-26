@@ -43,12 +43,13 @@ import torch.nn as nn
 
 class Injector(nn.Module):
     def __init__(self, d_mix: int, n_layers: int, n_kv: int, head_dim: int, *,
-                 rope_mode: str = "compact", norm_match: bool = True, adapter_rank: int = 24):
+                 rope_mode: str = "compact", norm_match: bool = True, adapter_rank: int = 24,
+                 per_node_norm: bool = True):
         super().__init__()
         if rope_mode not in ("compact", "none", "original"):
             raise ValueError(f"rope_mode must be compact|none|original, got {rope_mode!r}")
         self.L, self.n_kv, self.head_dim = n_layers, n_kv, head_dim
-        self.rope_mode, self.norm_match = rope_mode, norm_match
+        self.rope_mode, self.norm_match, self.per_node_norm = rope_mode, norm_match, per_node_norm
         kv_dim = n_kv * head_dim
         self.to_k = nn.Linear(d_mix, kv_dim)
         self.to_v = nn.Linear(d_mix, kv_dim)

@@ -143,7 +143,10 @@ def _child_text(parse: ParseResult, arc) -> str:
     for m in parse.mentions + parse.predicates:
         if m.parser_token == arc.child_token:      # parser index space, like every other arc lookup
             return m.text
-    return arc.marker or arc.dep
+    # Bare modifiers ("secretly", "not", "the") are not mentions, so fall back to the token's own SURFACE
+    # TEXT. Falling through to the dependency label stored manner="advmod" instead of manner="secretly",
+    # which is not an attribute value at all.
+    return parse.token_text.get(arc.child_token) or arc.marker or arc.dep
 
 
 def _absorb(g: Graph, *, keep: int, drop: int, tok2node: dict[int, int]) -> None:

@@ -287,6 +287,10 @@ class ReprConfig:
                                      # recoverable eviction — the component the literature sweep found to be
                                      # our strongest and most novel. Set it too high and eviction is
                                      # irreversible, i.e. H2O with a graph in front of it.
+    kvg_archive_cap: int = 512       # max archived NODES held off-GPU. The archive is the "disk" of
+                                     # recoverable eviction; unbounded it grows with every eviction and the
+                                     # resident cap bounds nothing. Overflow drops oldest-first and is
+                                     # counted in kvgraph_n_archive_dropped rather than silently truncated.
     kvg_max_recalls: int = 2         # recalls per read. Unbounded, this degenerates into RAG with extra
                                      # steps; 0 disables recall entirely (the irreversible-eviction control).
     kvg_head_weight: float = 2.0     # extra pooling mass on a span's syntactic head ("farm" in "the family
@@ -315,7 +319,10 @@ class ReprConfig:
                                      # measured raw node summaries at effective rank ~1.0, i.e. the mixer
                                      # was handed almost no signal to route. "All-but-the-Top"
                                      # (Mu & Viswanath ICLR'18); False is the ablation control.
-    kvg_d_id: int = 64               # TokenGT node-identifier width (random orthonormal, resampled/forward).
+    kvg_per_node_norm: bool = True   # norm-match EACH node, not just the layer aggregate. A global RMS
+                                     # leaves per-node imbalance intact while making the canary read 1.00.
+    kvg_d_id: int = 128              # TokenGT node-identifier width; raised to >= the node budget, since
+                                     # you cannot have 96 near-orthogonal identifiers in 64 dimensions (random orthonormal, resampled/forward).
     kvg_rope_mode: str = "compact"   # compact | none | original. `none` reproduces the rest of the harness's
                                      # per-layer-KV arms (unrotated == position 0) for apples-to-apples.
     kvg_norm_match: bool = True      # rescale injected KV to the layer's real-token RMS. Mean-pooling shrinks
