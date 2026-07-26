@@ -333,4 +333,17 @@ def test_end_to_end_stream_read_and_train():
 
     assert live[0] == 0, "mixer had gradient at step 0 — the injector is no longer zero-initialised"
     assert live[-1] > 0.9 * len(mixer_params), f"mixer never woke up: {live}"
-    assert aux["kvgraph_stats"]["n_evicted"] > 0, "budget was never exceeded — the test is not exercising eviction"
+    assert aux["kvgraph_n_evicted"] > 0, "budget was never exceeded — the test is not exercising eviction"
+    # Canaries that must hold by construction, not by luck. Catching these here is what makes a null
+    # experimental result attributable to the hypothesis rather than to a broken injector.
+    assert abs(aux["kvgraph_k_rms_ratio"] - 1.0) < 0.2, \
+        f"injected K is off-distribution vs real tokens: ratio={aux['kvgraph_k_rms_ratio']:.3f}"
+    assert aux["kvgraph_relation_used"] >= 3, "the parse exercised almost none of the relation inventory"
+    # Absolute effective rank is naturally LOW here: LM hidden states are strongly anisotropic (mean
+    # cosine between random tokens ~0.6 in mid layers), and the read budget in this test is tiny. So the
+    # meaningful check is RELATIVE — the mixer must not be the thing destroying the rank it was handed.
+    assert aux["kvgraph_mixed_effrank"] > 1.05, "mixer output fully collapsed to rank 1"
+    assert aux["kvgraph_mixed_effrank"] > 0.3 * aux["kvgraph_node_effrank"], (
+        f"mixer destroyed most of the rank it was given: "
+        f"node={aux['kvgraph_node_effrank']:.2f} -> mixed={aux['kvgraph_mixed_effrank']:.2f} "
+        f"(over-smoothing is the graph-native form of the collapse this project has produced twice)")

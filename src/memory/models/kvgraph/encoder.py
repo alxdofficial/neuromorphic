@@ -252,6 +252,7 @@ class KVGraphEncoder(nn.Module):
         d.update(relation_stats(rel, N_RELATIONS))
         d.update(operator_divergence(self.mixer.mp))
         d.update(injection_stats(Kp, Vp, Ks, Vs, state.get("k_rms"), state.get("v_rms")))
+        d["kvgraph_inject_delta_frac"] = self.injector.last_delta_frac
         # Collapse, measured BOTH before and after the mixer so a flat result is attributable: pooled
         # healthy + mixed flat => the mixer is over-smoothing; both flat => it is upstream in pooling/parse.
         d["kvgraph_pooled_effrank"] = participation_ratio(Kp.reshape(Kp.shape[0], -1))

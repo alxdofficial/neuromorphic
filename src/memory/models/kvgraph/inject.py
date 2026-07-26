@@ -66,6 +66,9 @@ class Injector(nn.Module):
         self.v_scale = nn.Parameter(torch.ones(n_layers, kv_dim))
         self.k_shift = nn.Parameter(torch.zeros(n_layers, kv_dim))
         self.v_shift = nn.Parameter(torch.zeros(n_layers, kv_dim))
+        #: |correction| / |pooled| from the last forward. MUST be 0.0 at step 0 (zero-init); runaway means
+        #: the injector stopped correcting a working compressed cache and started synthesising one.
+        self.last_delta_frac: float = 0.0
 
     @staticmethod
     def _apply_rope(k: torch.Tensor, base_model, positions: torch.Tensor) -> torch.Tensor:
@@ -114,6 +117,13 @@ class Injector(nn.Module):
                    else torch.arange(n, device=K_pooled.device)).long()
         else:
             pos = None
+
+        # Measured BEFORE norm-matching: the rescale changes the tensor even when the correction is
+        # exactly zero, so differencing the FINAL injected KV against the pooled KV would report a large
+        # "delta" at step 0 and the zero-init canary would be meaningless.
+        self.last_delta_frac = float(
+            (dk.detach().norm() + dv.detach().norm())
+            / (K_pooled.reshape(n, -1).norm() + V_pooled.reshape(n, -1).norm()).clamp_min(1e-6))
 
         Ks, Vs = [], []
         for li in range(L):

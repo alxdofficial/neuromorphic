@@ -65,7 +65,10 @@ def operator_divergence(mp_layers) -> dict[str, float]:
     for mp in mp_layers:
         diag_div.append(1.0 - mean_pairwise_cos(mp.rel_diag.detach()))
         R = mp.rel_U.shape[0]
-        lr_div.append(1.0 - mean_pairwise_cos(mp.rel_U.detach().reshape(R, -1)))
+        U = mp.rel_U.detach().reshape(R, -1)
+        # An all-zero U (the init) has UNDEFINED pairwise cosine, and normalize() turning 0/0 into 0 would
+        # report it as "maximally diverged" — the exact opposite of the truth. Report 0 until it moves.
+        lr_div.append(0.0 if float(U.abs().sum()) == 0.0 else 1.0 - mean_pairwise_cos(U))
     return {"kvgraph_operator_div": sum(diag_div) / max(len(diag_div), 1),
             "kvgraph_operator_lowrank_div": sum(lr_div) / max(len(lr_div), 1)}
 
@@ -103,12 +106,6 @@ def injection_stats(K_pooled: torch.Tensor, V_pooled: torch.Tensor,
     if v_rms is not None:
         out["kvgraph_v_rms_ratio"] = float((vf / v_rms.float().clamp_min(1e-6)).mean())
 
-    # |injected - pooled| / |pooled|, in the pooled layout so the comparison is apples to apples.
-    n, L = K_pooled.shape[0], len(Ks)
-    inj_k = torch.stack([Ks[li][0].permute(1, 0, 2).reshape(n, -1) for li in range(L)], dim=1).float()
-    base_k = K_pooled.reshape(n, L, -1).float()
-    out["kvgraph_inject_delta_frac"] = float(
-        (inj_k - base_k).norm() / base_k.norm().clamp_min(1e-6))
     return out
 
 

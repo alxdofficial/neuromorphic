@@ -1620,7 +1620,8 @@ class ReprLearningModel(nn.Module):
         # or babi/continuation drop them).
         for _k, _v in (finalize_aux or {}).items():
             if not (_k.startswith("biomem_") or _k.startswith("slotgraph_")
-                    or _k.startswith("h2o_") or _k.startswith("vqicae_")):
+                    or _k.startswith("h2o_") or _k.startswith("vqicae_")
+                    or _k.startswith("kvgraph_")):
                 continue
             if torch.is_tensor(_v) and _v.numel() == 1:
                 out[_k] = _v.detach()
