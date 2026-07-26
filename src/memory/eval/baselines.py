@@ -19,7 +19,12 @@ import warnings
 
 from .retrieval import retrieve, DenseRetriever
 
-MODES = ("floor", "full_context", "rag_bm25", "rag_dense")
+# Every mode the runner CAN run.
+MODES = ("floor", "full_context", "rag_bm25", "rag_dense", "recursive_compact")
+# The modes a bare `run_api_eval.py` runs. Deliberately NOT all of MODES: recursive_compact spends a
+# multiple of full_context (it re-reads the running summary every round, ~15 rounds per LongMemEval
+# context), so it must be opted into explicitly with --modes rather than inherited by default.
+DEFAULT_MODES = ("floor", "full_context", "rag_bm25", "rag_dense")
 
 SYS_MEM = ("You are a helpful assistant with access to the user's past conversation history across dated "
            "sessions. Answer the question as concisely as possible (a few words when possible), using ONLY "
@@ -114,7 +119,12 @@ def build_messages(mode: str, *, question: str, full_history: str = "", sessions
                 {"truncated": False, "retrieved_idx": None})
 
     retrieved = None
-    if mode == "full_context":
+    if mode == "recursive_compact":
+        # `full_history` has ALREADY been replaced by the recursive summary upstream (run_api_eval computes
+        # it once per distinct context). Nothing is truncated here: the whole point is that the summary is
+        # already inside the memory budget, so any truncation would mean the budget was not honoured.
+        ctx, trunc = full_history, False
+    elif mode == "full_context":
         ctx, trunc = fit_history(full_history, token_budget, char_budget)
     elif mode in ("rag_bm25", "rag_dense"):
         if not sessions:

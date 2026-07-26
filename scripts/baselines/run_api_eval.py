@@ -26,7 +26,7 @@ from src.memory.data.longmemeval import load_longmemeval_text          # noqa: E
 from src.memory.data.memoryagentbench import load_memoryagentbench_text  # noqa: E402
 from src.memory.eval import score_longmemeval, score_memoryagentbench  # noqa: E402
 from src.memory.eval.api_client import OpenRouterClient, DEFAULT_MODELS, PRICING, cost_usd  # noqa: E402
-from src.memory.eval.baselines import build_messages, char_budget_for, MODES, DenseRetriever  # noqa: E402
+from src.memory.eval.baselines import build_messages, char_budget_for, MODES, DEFAULT_MODES, DenseRetriever  # noqa: E402
 from src.memory.eval.results import ResultStore, store_path  # noqa: E402
 
 # dataset -> (text-item loader, scorer). Both scorers share the (records, use_bem=) signature.
@@ -130,7 +130,7 @@ def _proj(r) -> dict:
 
 async def run_one(client, model, mode, items, token_budget, char_budget, bm25_topk, dense, max_tokens,
                   store, scorer, use_bem, concurrency=32, provider=None, provider_slug=None,
-                  warm_by_context=False):
+                  warm_by_context=False, compact_cap=20000, compact_budget=2048):
     """RESUMABLE: skip questions already answered in `store`, request only the rest, appending each result
     the moment it returns (crash-safe). Then score ONLY the currently-selected items — NOT the whole store,
     which may hold answers from a larger earlier run (`--max-examples` is a proper scoping knob) — and fold
@@ -144,6 +144,35 @@ async def run_one(client, model, mode, items, token_budget, char_budget, bm25_to
     want = {str(it["question_id"]) for it in items}
     done = store.done_ids()
     pending = [it for it in items if str(it["question_id"]) not in done]
+
+    if mode == "recursive_compact":
+        # PRE-PASS: replace each item's full_history with a recursive, QUESTION-AGNOSTIC summary. Computed
+        # once per DISTINCT context and reused by every question on it (M+-style encode-once/read-many), so
+        # MemoryAgentBench's ~85 questions per context cost one compaction, not 85.
+        from src.memory.eval.compaction import SummaryStore, compact_context, summary_key
+        sstore = SummaryStore(Path(store.path).parent / "summaries.json")
+        groups: dict = {}
+        for it in pending:
+            groups.setdefault(it.get("full_history", ""), []).append(it)
+        todo = [(ctx, gi) for ctx, gi in groups.items()
+                if sstore.get(summary_key(ctx, model, compact_cap, compact_budget)) is None]
+        print(f"[compact] {len(groups)} distinct context(s); {len(todo)} to compact "
+              f"({len(groups) - len(todo)} cached) · W={compact_cap} B={compact_budget}", flush=True)
+        for n, (ctx, _gi) in enumerate(todo, 1):
+            rec = await compact_context(client, model, ctx, working_cap=compact_cap,
+                                        summary_budget=compact_budget, provider=provider,
+                                        progress_label=f"{n}/{len(todo)}")
+            sstore.put(summary_key(ctx, model, compact_cap, compact_budget), rec)
+            print(f"[compact] {n}/{len(todo)} · {rec['n_rounds']} rounds · "
+                  f"{rec['context_tokens']}→{rec['summary_tokens']} tok "
+                  f"(x{rec['compression_ratio']})" + (f" · ERRORS {rec['errors']}" if rec["errors"] else ""),
+                  flush=True)
+        for ctx, gi in groups.items():
+            rec = sstore.get(summary_key(ctx, model, compact_cap, compact_budget)) or {}
+            for it in gi:
+                it["full_history"] = rec.get("summary", "")
+                it["_compact_meta"] = {k: rec.get(k) for k in
+                                       ("n_rounds", "context_tokens", "summary_tokens", "compression_ratio")}
 
     async def one(it):
         msgs, info = build_messages(mode, question=it["question"], full_history=it.get("full_history", ""),
@@ -162,6 +191,7 @@ async def run_one(client, model, mode, items, token_budget, char_budget, bm25_to
             "provider": provider_slug, "error": r.error, "finish_reason": r.finish_reason,
             "truncated": info["truncated"], "retrieved_idx": info["retrieved_idx"],
             "correct": None, "score_method": None,
+            **({"compact": it["_compact_meta"]} if it.get("_compact_meta") else {}),
         })
 
     # WORKER-POOL (producer/consumer), NOT a batch barrier. `concurrency` workers each pull the next pending
@@ -228,7 +258,16 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dataset", choices=list(DATASETS), default="longmemeval")
     ap.add_argument("--models", nargs="+", default=DEFAULT_MODELS)
-    ap.add_argument("--modes", nargs="+", default=list(MODES), choices=list(MODES))
+    ap.add_argument("--modes", nargs="+", default=list(DEFAULT_MODES), choices=list(MODES),
+                    help="default panel excludes recursive_compact — opt in explicitly (it costs "
+                         "a multiple of full_context).")
+    ap.add_argument("--compact-cap", type=int, default=20000,
+                    help="recursive_compact: WORKING window in tokens — the cap we pretend to have, which "
+                         "forces repeated compaction. NOT the model's real context limit.")
+    ap.add_argument("--compact-budget", type=int, default=2048,
+                    help="recursive_compact: summary budget in tokens = THE MEMORY SIZE. Comparable to "
+                         "H2O's KV cap and M+'s pool; 2048 on a ~124k LongMemEval context is ~61x "
+                         "compression, matching H2O@cap2048's ~51x.")
     ap.add_argument("--variant", default="s")
     ap.add_argument("--max-examples", type=int, default=None)
     ap.add_argument("--concurrency", type=int, default=32,
@@ -320,7 +359,9 @@ def main():
                                               args.bm25_topk, dense, args.max_tokens, store, scorer,
                                               not args.no_bem, concurrency=args.concurrency,
                                               provider=provider, provider_slug=pin_prov,
-                                              warm_by_context=bool(pin_prov))
+                                              warm_by_context=bool(pin_prov),
+                                              compact_cap=args.compact_cap,
+                                              compact_budget=args.compact_budget)
                     print(f"\n=== {tag} ===")
                     _sec = (f"abstention={agg.get('abstention_accuracy')}" if "abstention_accuracy" in agg
                             else f"n_scored={agg.get('n_scored')} n_skipped={agg.get('n_skipped')}")

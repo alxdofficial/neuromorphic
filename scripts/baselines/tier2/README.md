@@ -9,9 +9,9 @@ Unlike Tier-1 (`scripts/baselines/run_api_eval.py`, OpenRouter API), these manip
 internals with real weights — they need a GPU and cannot run via an API. H2O-2048 and KVzip on LME-S can run
 on the local 4090; SnapKV and full-MAB KVzip need larger rented GPUs.
 
-> The **2b agent-memory** baselines (A-MEM / MemoryOS) are NOT here — they run over a frozen LLM via the
-> OpenRouter path with only a CPU embedder: `scripts/baselines/run_agentmem.py --method {a-mem,memoryos}`
-> (`pip install` the framework + `OPENROUTER_API_KEY`; no GPU).
+> The **2b agent-memory** baselines (A-MEM / MemoryOS) are NOT part of the weight-level pod panel — their LLM
+> runs over OpenRouter: `scripts/baselines/run_agentmem.py --method {a-mem,memoryos}`. A-MEM can use either a
+> per-process CPU embedder or one optional shared local GPU embedding service.
 
 Spec + provenance + exact entry points: `docs/baselines/TIER2_GPU_INTEGRATION.md` (§4 LCLM, §5 Cartridges, §6 2b).
 
@@ -140,7 +140,7 @@ python scripts/baselines/tier2/run_kvcompress.py --method snapkv --dataset longm
 python scripts/baselines/tier2/run_memoryllm.py  --dataset longmemeval
 python scripts/baselines/tier2/run_lclm.py       --dataset longmemeval --checkpoint latent-context/0.6b-4b-LCLM-16x
 
-# 2b agent-memory (NO GPU — runs from anywhere with a key; NOT part of the pod panel):
+# 2b agent-memory (OpenRouter LLM; optional shared local GPU embedder; NOT part of the pod panel):
 OPENROUTER_API_KEY=... python scripts/baselines/run_agentmem.py --method a-mem --max-examples 5
 ```
 
@@ -206,6 +206,6 @@ Each run writes `outputs/baselines/<dataset>__<method>__…​.json` (+ a resuma
 - **LCLM** — the context MUST be wrapped in `<|memory_start|> … <|memory_end|>` (the runner does this); the
   checkpoints only load with the repo on PYTHONPATH (`--repo-dir`); ~9–10GB bf16 → fits a 24GB card,
   inference-only. ⚠ **license not stated** — clear redistribution before publishing numbers.
-- **A-MEM / MemoryOS** (`run_agentmem.py`, top-level, no GPU) — point them at OpenRouter (`OPENROUTER_API_KEY`);
-  a-mem retrieves and WE generate the answer via the same panel model; memoryos generates internally. Only the
-  local sentence-embedder runs (CPU-fine). `pip install` the framework first (A-mem repo / `memoryos-pro`).
+- **A-MEM / MemoryOS** (`run_agentmem.py`, top-level) — point them at OpenRouter (`OPENROUTER_API_KEY`);
+  A-MEM retrieves and we generate the answer via the same panel reader, while MemoryOS generates internally.
+  MiniLM may run per-process on CPU or once on the 4090 via `amem_embedding_service.py` for a parallel fleet.

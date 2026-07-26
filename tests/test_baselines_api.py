@@ -4,7 +4,7 @@ The live API path (OpenRouterClient) is not exercised here — it needs a key an
 """
 import pytest
 
-from src.memory.eval.baselines import build_messages, char_budget_for, MODES
+from src.memory.eval.baselines import build_messages, char_budget_for, MODES, DEFAULT_MODES
 from src.memory.eval.retrieval import bm25_topk
 from src.memory.eval.api_client import cost_usd, PRICING, DEFAULT_MODELS
 
@@ -76,6 +76,10 @@ def test_cost_uses_price_table():
 
 
 def test_default_panel_all_priced():
-    assert MODES == ("floor", "full_context", "rag_bm25", "rag_dense")
+    # DEFAULT_MODES is what a bare run executes; MODES is everything it CAN run. recursive_compact is
+    # valid but must be opted into -- it costs a multiple of full_context, so inheriting it by default
+    # would silently multiply the bill of any unflagged run.
+    assert DEFAULT_MODES == ("floor", "full_context", "rag_bm25", "rag_dense")
+    assert "recursive_compact" in MODES and "recursive_compact" not in DEFAULT_MODES
     for m in DEFAULT_MODELS:
         assert m in PRICING, f"{m} missing from PRICING"

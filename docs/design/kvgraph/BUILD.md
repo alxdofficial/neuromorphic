@@ -75,8 +75,9 @@ the concrete reason AMR is the upgrade path rather than a nicety.
 Edges come only from licensed arcs, so `E ≈ 1.4·N` measured on a worked example — the sparse typed topology
 is handed to us, not induced.
 
-**Relations are borrowed, not invented** — the 23 in `schema.py` are the standard thematic roles of
-PropBank / FrameNet / VerbNet / AMR. And correctness matters less than it looks: the relation is an index
+**Relations are borrowed, not invented** — of the 24 in `schema.py`, 22 are standard thematic roles from
+PropBank / FrameNet / VerbNet / AMR; the other two (`SUPERSEDES`, `GRAVESTONE_POINTER`) are **system
+relations** written by our own machinery, never by the parser. And correctness matters less than it looks: the relation is an index
 into an operator bank, so what the design needs is **consistency**, not linguistic truth. A label that is
 slightly wrong but *consistently* wrong still lets its operator learn the right transformation.
 
@@ -89,7 +90,7 @@ the hand-drawn graph captured. So each edge carries both, exactly mirroring the 
 the injection's `K_pooled + W·mixed`:
 
 ```
-edge = relation           # discrete, 1-of-23, shared and stable. What the operator bank indexes.
+edge = relation           # discrete, 1-of-24, shared and stable. What the operator bank indexes.
      + edge_vector        # continuous. Everything the relation throws away.
 ```
 

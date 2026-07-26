@@ -190,7 +190,8 @@ max-gen-tokens · denominator (overall vs task-avg vs abstention).
   + `scripts/baselines/tier2/` runners (KVzip/H2O + M+; the SnapKV and LCLM code paths are retained but
     INACTIVE — both dropped from the panel)
   + `run_agentmem.py`
-  (**A-MEM/MemoryOS**, no GPU). Cartridges dropped (cite-only).
+  (**A-MEM/MemoryOS**, OpenRouter LLM with an optional shared local GPU embedder). Cartridges dropped
+  (cite-only).
 - **Reuse, don't build:** official harness `xiaowu0162/LongMemEval` (MIT) = retrieval + generation +
   judge with pluggable vLLM readers → Panel-B GPT-4o/8B mostly config.
 - **Build:** Panel-A matched-decoder runner (135M reader + BM25/dense RAG + KV-eviction) · MemoryLLM/M+

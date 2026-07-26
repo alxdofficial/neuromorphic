@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """Phase-2 2b baseline: agent-memory frameworks (A-MEM / MemoryOS) over LongMemEval / MemoryAgentBench.
 
-API-based, **NO GPU** — runs on any box (this one): the agent-memory orchestration + a small local
-sentence-embedder run on CPU, and the reader LLM runs over OpenRouter (the SAME panel as run_api_eval.py, so
-the reader is shared with Tier-1). The 2b "agent-memory paradigm" reference (docs/baselines/PHASE2_BASELINES.md
-§2.5): an external memory store + retrieval bolted onto a frozen chat LLM.
+The agent-memory orchestration is local, while both LLM roles run over OpenRouter. MiniLM can either run in
+each worker on CPU or, for a parallel fleet, once on the local GPU behind the shared embedding service. By
+default Mistral Nemo/DekaLLM is the strict-schema A-MEM controller (metadata, evolution, and query rewriting),
+and Llama 3.1 8B/DeepInfra is the shared Phase-2 final-answer reader. The 2b "agent-memory paradigm" reference
+(docs/baselines/PHASE2_BASELINES.md §2.5): an external memory store + retrieval bolted onto a frozen chat LLM.
 
   --method a-mem     A-MEM (Xu et al., NeurIPS'25; github.com/WujiangXu/A-mem, MIT). `AgenticMemorySystem`:
                      add_note(text) ingests (LLM-generates keywords/tags + evolves links), then its evaluation
-                     flow rewrites the query and expands linked neighbors; WE generate the answer via OpenRouter.
+                     flow rewrites the query and expands linked neighbors; WE generate the benchmark-standard
+                     answer through the separately configured OpenRouter reader role.
   --method memoryos  MemoryOS (Kang et al., EMNLP'25; pip memoryos-pro). `Memoryos`: add_memory then
                      get_response(q) which retrieves AND generates internally. ⚠ UNTESTED here (needs its pip
                      package); get_response may mutate state, so per-context reuse is a POD-VERIFY for it.
@@ -22,6 +24,11 @@ MAB = 36 ingests for 3,071 Q (retrieval is read-only, safe to reuse); LongMemEva
 (`--repo-dir`, default ~/tier2_repos/A-mem) + `OPENROUTER_API_KEY`. RESUMABLE + crash-safe.
 
 Example:  OPENROUTER_API_KEY=... python scripts/baselines/run_agentmem.py --method a-mem --dataset longmemeval --max-examples 5
+
+Shared GPU embeddings (start once, then point every lightweight worker at it):
+  python scripts/baselines/amem_embedding_service.py --device cuda --port 8765
+  OPENROUTER_API_KEY=... python scripts/baselines/run_agentmem.py --method a-mem --dataset longmemeval \
+      --embedding-service-url http://127.0.0.1:8765
 """
 from __future__ import annotations
 
@@ -32,6 +39,7 @@ import os
 import re
 import shutil
 import sys
+import time
 from collections import defaultdict
 from pathlib import Path
 
@@ -39,7 +47,10 @@ REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 
 _OPENROUTER_BASE = "https://openrouter.ai/api/v1"
-_DEFAULT_LLM = "meta-llama/llama-3.1-8b-instruct"              # reader LLM (share with the Tier-1 panel)
+_DEFAULT_CONTROLLER_LLM = "mistralai/mistral-nemo"
+_DEFAULT_CONTROLLER_PROVIDER = "dekallm"
+_DEFAULT_ANSWER_LLM = "meta-llama/llama-3.1-8b-instruct"       # shared Phase-2 reader
+_DEFAULT_ANSWER_PROVIDER = "deepinfra"
 _DEFAULT_EMBED = "all-MiniLM-L6-v2"
 _DEFAULT_MAB_NOTE_CHARS = 800  # leaves room for generated attributes under MiniLM's 256-token limit
 _DEFAULT_ANSWER_TOKENS = {"longmemeval": 1024, "memoryagentbench": 256}
@@ -115,6 +126,62 @@ def _validate_openrouter_key(api_key: str) -> None:
         raise RuntimeError(f"OpenRouter rejected OPENROUTER_API_KEY (HTTP {response.status_code})")
 
 
+def _strict_schema_provider_issue(endpoint_payload: dict, provider: str) -> str | None:
+    """Return an actionable incompatibility reason from OpenRouter's public endpoint metadata."""
+    wanted = re.sub(r"[^a-z0-9]", "", provider.lower())
+    endpoints = (endpoint_payload.get("data") or {}).get("endpoints") or []
+    matching = [ep for ep in endpoints
+                if re.sub(r"[^a-z0-9]", "", str(ep.get("provider_name", "")).lower()) == wanted]
+    if not matching:
+        return f"no current endpoint named {provider!r}"
+    if not any("structured_outputs" in (ep.get("supported_parameters") or []) for ep in matching):
+        return (f"provider {provider!r} does not advertise strict structured_outputs required by A-MEM's "
+                "json_schema calls")
+    return None
+
+
+def _answer_provider_issue(endpoint_payload: dict, provider: str) -> str | None:
+    """Final answers need a real endpoint but do not require structured-output support."""
+    wanted = re.sub(r"[^a-z0-9]", "", provider.lower())
+    endpoints = (endpoint_payload.get("data") or {}).get("endpoints") or []
+    if not any(re.sub(r"[^a-z0-9]", "", str(ep.get("provider_name", "")).lower()) == wanted
+               for ep in endpoints):
+        return f"no current endpoint named {provider!r}"
+    return None
+
+
+def _validate_amem_provider(model: str, provider: str | None) -> None:
+    """Fail before model/data loading when a pinned provider cannot run upstream A-MEM's strict schemas."""
+    if not provider:
+        return
+    import httpx
+    try:
+        response = httpx.get(f"{_OPENROUTER_BASE}/models/{model}/endpoints", timeout=20.0)
+        response.raise_for_status()
+        issue = _strict_schema_provider_issue(response.json(), provider)
+    except httpx.HTTPError as exc:
+        print(f"[run_agentmem] WARN: provider capability preflight unavailable: {type(exc).__name__}: {exc}")
+        return
+    if issue:
+        raise RuntimeError(f"OpenRouter provider pin is incompatible: {issue}")
+
+
+def _validate_answer_provider(model: str, provider: str | None) -> None:
+    """Fail early if the pinned final reader endpoint does not exist for the selected model."""
+    if not provider:
+        return
+    import httpx
+    try:
+        response = httpx.get(f"{_OPENROUTER_BASE}/models/{model}/endpoints", timeout=20.0)
+        response.raise_for_status()
+        issue = _answer_provider_issue(response.json(), provider)
+    except httpx.HTTPError as exc:
+        print(f"[run_agentmem] WARN: answer-provider preflight unavailable: {type(exc).__name__}: {exc}")
+        return
+    if issue:
+        raise RuntimeError(f"OpenRouter answer provider pin is incompatible: {issue}")
+
+
 def _phase_for_internal_prompt(prompt: str) -> str:
     if "Generate a structured analysis of the following content" in (prompt or ""):
         return "metadata"
@@ -125,21 +192,96 @@ def _phase_for_internal_prompt(prompt: str) -> str:
     return "internal_other"
 
 
-def _attach_usage_meter(mem, meter: _UsageMeter, provider: str | None = None) -> None:
-    """Meter upstream calls and, when requested, pin every call to one OpenRouter provider."""
+def _json_schema_issue(value, schema: dict, path: str = "$") -> str | None:
+    """Return why a decoded value violates the strict-schema subset used by upstream A-MEM."""
+    expected = schema.get("type")
+    type_ok = {
+        "object": lambda v: isinstance(v, dict),
+        "array": lambda v: isinstance(v, list),
+        "string": lambda v: isinstance(v, str),
+        "integer": lambda v: type(v) is int,
+        "number": lambda v: isinstance(v, (int, float)) and not isinstance(v, bool),
+        "boolean": lambda v: isinstance(v, bool),
+        "null": lambda v: v is None,
+    }
+    if expected in type_ok and not type_ok[expected](value):
+        return f"{path} must be {expected}, got {type(value).__name__}"
+    if expected == "object":
+        for key in schema.get("required", []):
+            if key not in value:
+                return f"{path} missing required property {key!r}"
+        properties = schema.get("properties", {})
+        if schema.get("additionalProperties") is False:
+            extra = set(value) - set(properties)
+            if extra:
+                return f"{path} has unexpected properties {sorted(extra)!r}"
+        for key, child_schema in properties.items():
+            if key in value:
+                issue = _json_schema_issue(value[key], child_schema, f"{path}.{key}")
+                if issue:
+                    return issue
+    elif expected == "array" and schema.get("items"):
+        for idx, item in enumerate(value):
+            issue = _json_schema_issue(item, schema["items"], f"{path}[{idx}]")
+            if issue:
+                return issue
+    return None
+
+
+def _structured_response_issue(response, response_format: dict | None) -> str | None:
+    """Reject syntactically valid but schema-invalid OpenRouter responses (notably JSON ``null``)."""
+    if not response_format or response_format.get("type") != "json_schema":
+        return None
+    try:
+        content = response.choices[0].message.content
+    except (AttributeError, IndexError, TypeError):
+        return "response has no first message content"
+    if not isinstance(content, str):
+        return f"message content must be str, got {type(content).__name__}"
+    cleaned = re.sub(r"^```json\s*|\s*```$", "", content.strip(), flags=re.MULTILINE).strip()
+    try:
+        value = json.loads(cleaned)
+    except (json.JSONDecodeError, TypeError) as exc:
+        return f"message content is not JSON: {exc}"
+    schema = (response_format.get("json_schema") or {}).get("schema") or {}
+    return _json_schema_issue(value, schema)
+
+
+def _attach_usage_meter(mem, meter: _UsageMeter, provider: str | None = None,
+                        retry_max_tokens: int = 4000) -> None:
+    """Meter/retry upstream calls and, when requested, pin every call to one OpenRouter provider."""
     completions = mem.llm_controller.llm.client.chat.completions
     original = completions.create
 
     def create(*args, **kwargs):
+        messages = kwargs.get("messages") or []
+        prompt = "\n".join(str(m.get("content", "")) for m in messages if isinstance(m, dict))
+        phase = _phase_for_internal_prompt(prompt)
         if provider:
             extra_body = dict(kwargs.get("extra_body") or {})
             extra_body["provider"] = {"order": [provider], "allow_fallbacks": False}
             kwargs["extra_body"] = extra_body
-        response = original(*args, **kwargs)
-        messages = kwargs.get("messages") or []
-        prompt = "\n".join(str(m.get("content", "")) for m in messages if isinstance(m, dict))
-        meter.add(_phase_for_internal_prompt(prompt), getattr(response, "usage", None))
-        return response
+        for attempt in range(5):
+            try:
+                response = original(*args, **kwargs)
+                meter.add(phase, getattr(response, "usage", None))
+                issue = _structured_response_issue(response, kwargs.get("response_format"))
+                if issue:
+                    try:
+                        finish_reason = getattr(response.choices[0], "finish_reason", None)
+                    except (AttributeError, IndexError, TypeError):
+                        finish_reason = None
+                    if finish_reason == "length":
+                        current = int(kwargs.get("max_tokens") or 1000)
+                        kwargs["max_tokens"] = min(max(current * 2, current + 1), retry_max_tokens)
+                    raise ValueError(f"schema-invalid controller response: {issue}")
+                return response
+            except Exception as exc:  # noqa: BLE001 — retry transient transport and malformed responses
+                if attempt == 4:
+                    raise
+                print(f"[run_agentmem] controller retry phase={phase} attempt={attempt + 1}/5: "
+                      f"{type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+                time.sleep(2 ** attempt)
 
     completions.create = create
 
@@ -185,6 +327,25 @@ def _generate_query_keywords(mem, question: str) -> str:
         return (response or "").strip() or question
 
 
+def _drop_invalid_amem_links(mem) -> int:
+    """Discard only learned links that cannot name an existing note.
+
+    Upstream asks the controller for integer ``suggested_connections`` but does not constrain their range.
+    A hallucinated index is stored verbatim and later crashes ``find_related_memories_raw``.  Existing note
+    indices are stable because A-MEM appends to an insertion-ordered dict and never deletes notes, so filtering
+    to that range preserves every meaningful learned edge while treating non-existent targets as no edge.
+    """
+    memories = list(getattr(mem, "memories", {}).values())
+    n_memories = len(memories)
+    dropped = 0
+    for note in memories:
+        links = list(getattr(note, "links", []) or [])
+        valid = [link for link in links if type(link) is int and 0 <= link < n_memories]
+        dropped += len(links) - len(valid)
+        note.links = valid
+    return dropped
+
+
 def _retrieve_a_mem(mem, question: str, k: int, query_mode: str, expand_links: bool):
     query = _generate_query_keywords(mem, question) if query_mode == "upstream_keywords" else question
     if expand_links:
@@ -212,13 +373,38 @@ def _answer_token_cap(dataset: str, requested: int | None) -> int:
     return cap
 
 
+def _resolve_amem_llm_roles(args) -> None:
+    """Resolve split-role defaults while retaining the old one-model CLI as an explicit compatibility path."""
+    if args.llm_model and (args.controller_model or args.answer_model):
+        raise ValueError("--llm-model cannot be combined with --controller-model/--answer-model")
+    if args.openrouter_provider and (args.controller_provider or args.answer_provider):
+        raise ValueError("--openrouter-provider cannot be combined with --controller-provider/--answer-provider")
+    if args.llm_model:
+        args.controller_model = args.answer_model = args.llm_model
+    else:
+        args.controller_model = args.controller_model or _DEFAULT_CONTROLLER_LLM
+        args.answer_model = args.answer_model or _DEFAULT_ANSWER_LLM
+    if args.openrouter_provider:
+        args.controller_provider = args.answer_provider = args.openrouter_provider
+    else:
+        args.controller_provider = args.controller_provider or _DEFAULT_CONTROLLER_PROVIDER
+        args.answer_provider = args.answer_provider or _DEFAULT_ANSWER_PROVIDER
+
+
 def _amem_knob_tag(args) -> str:
     emb = hashlib.md5(args.embed_model.encode()).hexdigest()[:6]
-    provider = re.sub(r"[^a-zA-Z0-9_.-]+", "_", args.openrouter_provider or "auto")
+    models = hashlib.md5(f"{args.controller_model}\0{args.answer_model}".encode()).hexdigest()[:8]
+    controller_provider = re.sub(r"[^a-zA-Z0-9_.-]+", "_", args.controller_provider or "auto")
+    answer_provider = re.sub(r"[^a-zA-Z0-9_.-]+", "_", args.answer_provider or "auto")
+    embedding_backend = "svc" if args.embedding_service_url else "local"
+    service_health = getattr(args, "embedding_service_health", {}) or {}
+    embedding_device = service_health.get("device", args.embed_device) if args.embedding_service_url \
+        else args.embed_device
     shard = f"-sh{args.shard_idx}of{args.num_shards}" if args.num_shards > 1 else ""
     return (f"k{args.retrieve_k}-ing{args.ingest_granularity}-q{args.query_mode}-"
-            f"links{int(not args.no_link_expansion)}-emb{emb}-dev{args.embed_device}-"
-            f"c{args.ingest_chunk_chars}-p{provider}{shard}")
+            f"links{int(not args.no_link_expansion)}-emb{emb}-dev{embedding_device}-"
+            f"c{args.ingest_chunk_chars}-eb{embedding_backend}-cr{args.controller_retry_max_tokens}-m{models}-"
+            f"cp{controller_provider}-ap{answer_provider}{shard}")
 
 
 def _shard_items(items: list[dict], dataset: str, args) -> tuple[list[dict], list[int]]:
@@ -300,7 +486,17 @@ def run_a_mem(args, items, api_key, repo_dir, store, dataset, meta_out) -> None:
     """A-MEM with per-context reuse: ingest a context's sessions ONCE (Zettelkasten notes with link-evolution),
     then per question retrieve top-k and generate via OpenRouter. Retrieval is read-only → safe to reuse."""
     sys.path.insert(0, repo_dir)
-    from memory_layer import AgenticMemorySystem
+    if args.embedding_service_url:
+        from src.memory.eval.amem_embeddings import install_lightweight_upstream_imports
+        install_lightweight_upstream_imports(args.embedding_service_url)
+    # Upstream commit 0c8039f calls `re.sub` in MemoryNote.analyze_content without importing `re`. Without
+    # this compatibility shim every valid metadata response is silently discarded and replaced by empty
+    # keywords / "General" context. Injecting the missing stdlib module restores the code's intended path
+    # while leaving the pinned upstream checkout untouched.
+    import memory_layer as amem_memory_layer
+    if not hasattr(amem_memory_layer, "re"):
+        amem_memory_layer.re = re
+    AgenticMemorySystem = amem_memory_layer.AgenticMemorySystem
     from src.memory.eval.tier2_common import group_by_context, run_grouped
     from src.memory.eval.baselines import build_messages
 
@@ -314,8 +510,9 @@ def run_a_mem(args, items, api_key, repo_dir, store, dataset, meta_out) -> None:
 
     def encode_ctx(ctx, first_item):
         mem = AgenticMemorySystem(model_name=args.embed_model, llm_backend="openai",
-                                  llm_model=args.llm_model, api_key=api_key, api_base=_OPENROUTER_BASE)
-        _attach_usage_meter(mem, meter, args.openrouter_provider)
+                                  llm_model=args.controller_model, api_key=api_key,
+                                  api_base=_OPENROUTER_BASE)
+        _attach_usage_meter(mem, meter, args.controller_provider, args.controller_retry_max_tokens)
         with _quiet(args.verbose):
             for note, when in _ingest_units(ctx, first_item):
                 mem.add_note(note, time=when) if when else mem.add_note(note)
@@ -324,6 +521,8 @@ def run_a_mem(args, items, api_key, repo_dir, store, dataset, meta_out) -> None:
     def answer(mem, it):
         # Faithful A-MEM retrieval = LLM keyword rewrite + linked-neighborhood expansion. The final answer
         # prompt stays benchmark-standard so every Phase-2 system uses the same answer protocol.
+        dropped = _drop_invalid_amem_links(mem)
+        meta_out["invalid_links_dropped"] = meta_out.get("invalid_links_dropped", 0) + dropped
         with _quiet(args.verbose):
             query, ctx_str = _retrieve_a_mem(mem, it["question"], args.retrieve_k, args.query_mode,
                                              not args.no_link_expansion)
@@ -332,8 +531,8 @@ def run_a_mem(args, items, api_key, repo_dir, store, dataset, meta_out) -> None:
             samples.append({"question_id": str(it["question_id"]), "query": query,
                             "retrieved_chars": len(ctx_str or "")})
         msgs = _answer_messages(build_messages, it, dataset, ctx_str or "")
-        hyp, err, fr, usage = _openrouter_chat(args.llm_model, msgs, api_key, args.max_new_tokens,
-                                               args.openrouter_provider)
+        hyp, err, fr, usage = _openrouter_chat(args.answer_model, msgs, api_key, args.max_new_tokens,
+                                               args.answer_provider)
         meter.add("answer", usage)
         if err:
             raise RuntimeError(err)                 # let run_grouped record it as an error (retryable)
@@ -351,9 +550,21 @@ def run_a_mem(args, items, api_key, repo_dir, store, dataset, meta_out) -> None:
                          "query_mode": args.query_mode,
                          "expand_links": not args.no_link_expansion,
                          "embedding_model": args.embed_model,
-                         "embedding_device": args.embed_device,
-                         "openrouter_provider": args.openrouter_provider or "auto",
-                         "provider_fallbacks": not bool(args.openrouter_provider),
+                         "embedding_device": (args.embedding_service_health.get("device")
+                                              if args.embedding_service_url else args.embed_device),
+                         "embedding_backend": ("shared_service" if args.embedding_service_url else "local"),
+                         "embedding_service": (args.embedding_service_health if args.embedding_service_url else None),
+                         "controller_model": args.controller_model,
+                         "controller_provider": args.controller_provider or "auto",
+                         "controller_provider_fallbacks": not bool(args.controller_provider),
+                         "controller_retry_max_tokens": args.controller_retry_max_tokens,
+                         "answer_model": args.answer_model,
+                         "answer_provider": args.answer_provider or "auto",
+                         "answer_provider_fallbacks": not bool(args.answer_provider),
+                         "token_usage_phase_roles": {
+                             "controller": ["metadata", "evolution", "query_keywords", "internal_other"],
+                             "answer": ["answer"],
+                         },
                          "answer_prompt": "shared_phase2_benchmark_prompt",
                          "mab_note_policy": "document_chunks_no_canonical_paper_mapping",
                          "mab_chunk_chars": args.ingest_chunk_chars,
@@ -407,16 +618,31 @@ def main():
     ap.add_argument("--method", choices=["a-mem", "memoryos"], required=True)
     ap.add_argument("--dataset", choices=["longmemeval", "memoryagentbench"], default="longmemeval")
     ap.add_argument("--repo-dir", default=_DEFAULT_REPO_DIR, help="cloned A-mem repo (on sys.path)")
-    ap.add_argument("--llm-model", default=_DEFAULT_LLM, help="reader LLM (OpenRouter id; share with Tier-1)")
+    ap.add_argument("--controller-model", default=None,
+                    help=f"A-MEM metadata/evolution/query model (default: {_DEFAULT_CONTROLLER_LLM})")
+    ap.add_argument("--controller-provider", default=None,
+                    help=f"strict-schema controller provider pin (default: {_DEFAULT_CONTROLLER_PROVIDER})")
+    ap.add_argument("--answer-model", default=None,
+                    help=f"shared final-answer reader model (default: {_DEFAULT_ANSWER_LLM})")
+    ap.add_argument("--answer-provider", default=None,
+                    help=f"final-answer provider pin (default: {_DEFAULT_ANSWER_PROVIDER})")
+    ap.add_argument("--llm-model", default=None,
+                    help="legacy compatibility: use one model for both A-MEM control and final answers")
     ap.add_argument("--openrouter-provider", default=None,
-                    help="pin all A-MEM calls to this OpenRouter provider slug with fallbacks disabled "
-                         "(for example: deepinfra); default lets OpenRouter route automatically")
-    ap.add_argument("--embed-model", default=_DEFAULT_EMBED, help="local sentence-embedder (CPU-fine)")
+                    help="legacy compatibility: pin both controller and answer calls to one provider")
+    ap.add_argument("--embed-model", default=_DEFAULT_EMBED,
+                    help="sentence embedder (local CPU, or served once when --embedding-service-url is set)")
+    ap.add_argument("--embedding-service-url", default=None,
+                    help="shared MiniLM service URL (for example http://127.0.0.1:8765); keeps workers "
+                         "torch-free and batches embeddings on one GPU")
     ap.add_argument("--variant", default="s", choices=["s", "m", "oracle"])
     ap.add_argument("--max-examples", type=int, default=None)
     ap.add_argument("--max-new-tokens", type=int, default=None,
                     help="final-answer cap (default: LongMemEval=1024, MAB=256; internal A-MEM structured "
                          "calls retain upstream's 1000-token cap)")
+    ap.add_argument("--controller-retry-max-tokens", type=int, default=4000,
+                    help="only after an upstream 1000-token structured response is length-truncated, retries "
+                         "may double its cap up to this value (default: 4000)")
     ap.add_argument("--retrieve-k", type=int, default=10, help="(a-mem) top-k memories to retrieve")
     ap.add_argument("--query-mode", choices=["upstream_keywords", "raw_question"],
                     default="upstream_keywords",
@@ -441,11 +667,23 @@ def main():
     args = ap.parse_args()
     try:
         args.max_new_tokens = _answer_token_cap(args.dataset, args.max_new_tokens)
+        if args.method == "a-mem":
+            _resolve_amem_llm_roles(args)
+        else:
+            args.llm_model = args.llm_model or _DEFAULT_ANSWER_LLM
     except ValueError as exc:
         ap.error(str(exc))
     if args.num_shards < 1 or not 0 <= args.shard_idx < args.num_shards:
         ap.error("require --num-shards >= 1 and 0 <= --shard-idx < --num-shards")
+    if args.controller_retry_max_tokens < 1000:
+        ap.error("--controller-retry-max-tokens must be >= upstream's initial 1000-token cap")
+    if args.embedding_service_url and args.method != "a-mem":
+        ap.error("--embedding-service-url currently applies only to --method a-mem")
 
+    if args.embedding_service_url:
+        for name in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
+            os.environ[name] = "1"
+        os.environ["TOKENIZERS_PARALLELISM"] = "false"
     if args.embed_device == "cpu":
         # Set before importing sentence-transformers/torch through the upstream repository.
         os.environ["CUDA_VISIBLE_DEVICES"] = ""
@@ -455,6 +693,23 @@ def main():
         sys.exit("[run_agentmem] set OPENROUTER_API_KEY (the reader LLM runs over OpenRouter).")
     try:
         _validate_openrouter_key(api_key)
+        if args.method == "a-mem":
+            _validate_amem_provider(args.controller_model, args.controller_provider)
+            _validate_answer_provider(args.answer_model, args.answer_provider)
+            args.embedding_service_health = {}
+            if args.embedding_service_url:
+                from src.memory.eval.amem_embeddings import RemoteSentenceTransformer
+                live_health = RemoteSentenceTransformer(
+                    args.embed_model, base_url=args.embedding_service_url).health()
+                served_model = str(live_health.get("model", ""))
+                if served_model.split("/")[-1] != args.embed_model.split("/")[-1]:
+                    raise RuntimeError(f"embedding service model {served_model!r} does not match "
+                                       f"--embed-model {args.embed_model!r}")
+                # Request counters are useful operational telemetry, but are volatile and must not become
+                # part of a result protocol/checkpoint identity (or otherwise-identical shards would differ).
+                args.embedding_service_health = {
+                    key: value for key, value in live_health.items() if key != "stats"
+                }
     except RuntimeError as exc:
         sys.exit(f"[run_agentmem] {exc}")
     # A-MEM's `openai` backend (OpenAIController) does NOT accept api_base → route via the openai SDK's
@@ -467,21 +722,32 @@ def main():
     from src.memory.eval.tier2_common import git_commit, load_items, build_tag, finalize
     from src.memory.eval.results import ResultStore
 
-    print(f"[run_agentmem] method={args.method} dataset={args.dataset} llm={args.llm_model} "
+    roles = (f"controller={args.controller_model}@{args.controller_provider or 'auto'} "
+             f"answer={args.answer_model}@{args.answer_provider or 'auto'}") \
+        if args.method == "a-mem" else f"llm={args.llm_model}"
+    print(f"[run_agentmem] method={args.method} dataset={args.dataset} {roles} "
           f"variant={args.variant} max_examples={args.max_examples}")
-    items = load_items(args.dataset, variant=args.variant, max_examples=args.max_examples)
+    if args.method == "a-mem" and args.embedding_service_url:
+        from src.memory.eval.amem_data import load_items as load_lightweight_items
+        items = load_lightweight_items(args.dataset, variant=args.variant, max_examples=args.max_examples)
+    else:
+        items = load_items(args.dataset, variant=args.variant, max_examples=args.max_examples)
     if args.num_shards > 1:
         items, shard_loads = _shard_items(items, args.dataset, args)
         print(f"[run_agentmem] SHARD {args.shard_idx}/{args.num_shards}: {len(items)} questions; "
               f"projected calls={shard_loads[args.shard_idx]} "
               f"(fleet min/max={min(shard_loads)}/{max(shard_loads)})")
+    if args.method == "a-mem" and args.embedding_service_url:
+        from src.memory.eval.amem_data import trim_process_heap
+        trim_process_heap()
     types = {t: sum(1 for i in items if i["question_type"] == t)
              for t in sorted({i["question_type"] for i in items})}
     print(f"[run_agentmem] {len(items)} items; types={types}")
 
     commit = git_commit(REPO)
     knob = _amem_knob_tag(args) if args.method == "a-mem" else f"emb{args.embed_model}"
-    tag = build_tag(args.dataset, args.method, args.llm_model.split("/")[-1], args.variant, len(items),
+    result_model = args.answer_model if args.method == "a-mem" else args.llm_model
+    tag = build_tag(args.dataset, args.method, result_model.split("/")[-1], args.variant, len(items),
                     knob, args.max_new_tokens, 0, commit)
     out_dir = REPO / args.out_dir
     store = ResultStore(out_dir / "cache" / f"{tag}.jsonl")
@@ -493,7 +759,7 @@ def main():
     runner = run_a_mem if args.method == "a-mem" else run_memoryos
     runner(args, items, api_key, repo_dir, store, args.dataset, meta_out)
 
-    finalize(args.dataset, args.method, args.llm_model, items, store, use_bem=not args.no_bem,
+    finalize(args.dataset, args.method, result_model, items, store, use_bem=not args.no_bem,
              extra_meta={"variant": args.variant, "retrieve_k": args.retrieve_k,
                          "max_new_tokens": args.max_new_tokens, "commit": commit,
                          "num_shards": args.num_shards, "shard_idx": args.shard_idx,

@@ -30,6 +30,13 @@ def _sum_usage(payloads: list[dict]) -> dict:
     return phases
 
 
+def _sum_meta_counters(payloads: list[dict]) -> dict:
+    return {
+        key: sum((payload.get("meta", {}).get(key, 0) or 0) for payload in payloads)
+        for key in ("n_contexts", "n_ingest_units", "est_llm_calls", "invalid_links_dropped")
+    }
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("artifacts", nargs="+", type=Path, help="A-MEM per-shard aggregate JSON files")
@@ -92,10 +99,11 @@ def main() -> None:
         store.append(row)
 
     items = load_items(expected["dataset"], variant=expected["variant"], max_examples=args.max_examples)
+    summed_counters = _sum_meta_counters(payloads)
     finalize(expected["dataset"], "a-mem", expected["model"], items, store, use_bem=not args.no_bem,
              extra_meta={**{k: v for k, v in expected.items() if k not in ("dataset", "model", "protocol")},
                          "a_mem_protocol": expected["protocol"], "merged_shards": sorted(shard_ids),
-                         "token_usage": _sum_usage(payloads)},
+                         "token_usage": _sum_usage(payloads), **summed_counters},
              out_dir=out_dir, tag=tag, log_prefix="[merge_agentmem]")
 
 
