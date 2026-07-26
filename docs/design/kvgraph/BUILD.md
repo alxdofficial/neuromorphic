@@ -207,16 +207,47 @@ consistent with §6 anyway.
 ## 6. Staging and the training loop
 
 **Eviction is a precondition of the objective, not a scaling feature.** The gate is *reconstruction-after-
-eviction*; without eviction running during training, Stage 1 is KVzip-with-a-graph and will be loss-neutral
-exactly as predicted. So read-everything applies only to a short warmup.
+eviction*; without eviction running during training, this is KVzip-with-a-graph and will be loss-neutral
+exactly as predicted.
 
 | | setup | reads | purpose |
 |---|---|---|---|
-| **Stage 0 — warmup** | one paragraph (~256–512 tok) | **all** nodes | plumbing: does the decoder reconstruct from graph-KV at all? **M1** |
-| **Stage 1 — streaming** | ctx 2048 = 8 windows, node budget **96**, eviction + retrieval live | retrieved subgraph | the real objective. **M2 / the gate** |
-| **Stage 2 — scale** | long documents, disk offload, recall of evicted subgraphs | retrieved subgraph | scaling, not new science |
+| **smoke test** | one paragraph, **no training** | all nodes | plumbing. **M1** |
+| **Stage 1 — streaming** | ctx 2048 = 8 windows, budget **annealed** to 96/32, dropout on throughout | retrieved subgraph | the real objective. **M2 / the gate** |
+| **Stage 2 — scale** | long documents, disk offload, recall | retrieved subgraph | scaling, not new science |
 
-Warmup teaches **representation**; streaming teaches **selection**. That is a curriculum, not two theories.
+### There is no warmup training stage — and that is deliberate
+
+_Revised 2026-07-26._ An earlier draft had a **Stage 0** that trained on read-all reconstruction before
+turning eviction on, reasoning that "warmup teaches representation, streaming teaches selection." That was
+wrong, and actively harmful: **a mixer trained on read-all is free to smear one fact across several
+co-dependent nodes.** That is a perfectly good solution when everything is always present, and catastrophic
+the moment a subset is retrieved — so a read-all warmup would spend its entire duration installing the exact
+habit random node dropout exists to prevent. Worse than no warmup.
+
+Stage 0 was doing two separable jobs. Split them:
+
+- **Correctness verification → a smoke test, not a training stage.** Pool a single-token node and assert its
+  injected KV is bit-identical to the original entry (catches the alignment bug *and* the RoPE bug at once);
+  dump a graph and read it; reconstruct one paragraph with eviction off. An afternoon, zero training. That is
+  what M1 actually is.
+- **Curriculum → a budget anneal inside Stage 1.** Start with no eviction pressure and full reads, anneal to
+  `storage 96 / read 32`. Same easier-first ordering, no regime switch, no second config or checkpoint to
+  drift, and **dropout is on from step 0** so the smearing habit is never learned. The warmup becomes the
+  first few hundred steps of Stage 1 rather than a separate stage.
+
+Anneal a **single pressure parameter** driving both budgets, not two independent knobs — otherwise there is
+an awkward early regime where storage is loose but `B=32`, so the model reads 11% of a graph it was never
+taught to index.
+
+**The KVzip comparison survives.** An earlier draft claimed read-all training was what made the compression
+comparison matched. Sloppy: evaluation need not match training. Train with dropout under an annealed budget;
+**evaluate** at full read for the headline compression number. Nothing is lost.
+
+**What to watch instead:** with eviction annealing in, the mixer sees a **non-stationary** node distribution —
+the graph keeps changing shape underneath it. That is inherent to the design rather than something staging
+would have fixed, but log node-count and eviction-rate curves alongside loss, because if training
+destabilises that is where it shows first.
 
 ### The Stage-1 loop
 
@@ -224,24 +255,31 @@ The awkward question in training-time retrieval is *what is the query?* — you 
 answer. Streaming supplies a non-circular one for free:
 
 ```
+pressure p: 0 → 1 over training      # ONE knob; drives both budgets together
+    storage(p) = anneal(∞ → 96)      # no eviction pressure at p=0
+    B(p)       = anneal(all → 32)
+
 for window w in 0..7:
-    ingest w         → parse → nodes → merge into the persistent graph
-    evict to budget  → graph never exceeds 96 nodes
+    ingest w          → parse → nodes → coref-merge into the persistent graph
+    contract to budget → LRU + sinks + recent window; coldest-first (§8)
     seed  = tail of window w                     ← genuinely available, not circular
-    read  = PPR(seed) → top-B nodes → mix → inject
+    read  = PPR(seed) → top-B(p) nodes → random node dropout → mix → inject
     loss  = predict window w+1   (and/or reconstruct w from a hinted seed)
 ```
+
+The anneal is what replaces the deleted warmup stage: at `p=0` this *is* the old Stage 0 (full reads, no
+eviction) except that **dropout is already on**, so the smearing habit is never learned in the first place.
 
 This is **streaming continuation from memory**, which the harness already supports (`window_size < ctx` is
 wired; `continuation` is already in the task mix). No new training machinery — only the new encoder. Every
 window is simultaneously a write test and a read test, which is the stability-plasticity axis our eval
 protocol says MAE-style objectives never touch.
 
-**Budget = 96 nodes**, matching `M=96` in the existing sweep regime, so Stage 1 is directly comparable to the
+**Terminal budget = 96 nodes**, matching `M=96` in the existing sweep regime, so Stage 1 is directly comparable to the
 prior slotgraph runs *at the same persistent-state size* — the budget at which the flat bank tied. At ctx
 2048 the accumulated graph wants ~280 nodes, so 96 is ~3× over-subscription: genuine forgetting pressure.
 
-**Train with random node dropout too.** Otherwise the mixer may smear one fact across several co-dependent
+**Random node dropout runs from step 0, not just at the end of the anneal.** Otherwise the mixer may smear one fact across several co-dependent
 nodes — fine under read-all, catastrophic once a subset is retrieved.
 
 **Benchmark asymmetry:** MAB shares ~85 questions per context, so access genuinely accumulates.
@@ -536,12 +574,12 @@ design removes most of the ways this could go unstable.
 
 ## 12. Milestones — do not conflate them
 
-- **M1 (engineering, Stage 0).** The graph forms, injects, and the decoder reconstructs the paragraph
-  sanely. Success ≈ reconstruction in the neighbourhood of KVzip at matched compression. Proves nothing
-  scientific; it is plumbing with clear failure signals.
-- **M2 (science, Stage 1).** Under streaming with a 96-node budget and live eviction, ablating **either**
-  the relation typing **or** the edge vector measurably hurts multi-hop on `factconsolidation_mh`, surviving
-  the SHUF−REAL co-gate.
+- **M1 (engineering — a smoke test, NOT a training stage).** The graph forms, injects, and the decoder
+  reconstructs one paragraph sanely with eviction off. Zero training. Proves nothing scientific; it is
+  plumbing with clear failure signals, and it exists so that a Stage-1 failure is attributable.
+- **M2 (science, Stage 1).** Under streaming with the budget annealed to 96/32 and live eviction, ablating
+  **either** the relation typing **or** the edge vector measurably hurts multi-hop on
+  `factconsolidation_mh`, surviving the SHUF−REAL co-gate.
 
 **Correctness gate for the plumbing:** pool a **single-token** node and assert its injected KV is
 bit-identical to that token's original entry. That one test catches both the alignment bug and the rotation

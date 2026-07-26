@@ -511,14 +511,16 @@ errorful) over global joint coref — an accepted cost that must be measured, no
 
 ## 9. The four stages (each a distinct, separately-falsifiable thesis)
 
-### Stage 0 — Warmup (plumbing only, NOT a regime)
-- One paragraph (~256–512 tokens), graph built per §3, **all** nodes read, reconstruct.
-- Sole purpose: verify the decoder can read graph-KV at all. Teaches **representation** before the streaming
-  stage teaches **selection**. Proves nothing scientific.
+### (No warmup stage — see BUILD.md §6)
+_Revised 2026-07-26._ An earlier draft had a Stage 0 that trained on read-all reconstruction first. Dropped:
+a mixer trained on read-all is free to **smear one fact across co-dependent nodes**, which is fine when
+everything is present and catastrophic under subset retrieval — so a warmup would install exactly the habit
+node-dropout exists to prevent. Plumbing verification becomes a **smoke test** (no training); the curriculum
+becomes a **budget anneal inside Stage 1**.
 
 ### Stage 1 — Streaming compression with live eviction (the gate)
 - Multi-window (ctx 2048 = 8 × 256), one persistent graph, nodes from different windows connect and
-  **merge** (§4); node budget **96**, ~3× over-subscribed, so forgetting is real.
+  **merge** (§4); node budget **annealed** to **96**, ~3× over-subscribed, so forgetting is real.
 - **Eviction is a PRECONDITION of the objective, not a scaling feature.** The crux (§6) is
   reconstruction-*after*-eviction; with eviction deferred, this stage is KVzip-with-a-graph and will be
   loss-neutral exactly as predicted. Read a **retrieved subgraph**, seeded by the preceding window — a

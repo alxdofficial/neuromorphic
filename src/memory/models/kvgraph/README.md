@@ -60,10 +60,14 @@ anti-Goodhart discipline requires.
 
 ## Reading
 
-Stage 0 (warmup, one paragraph) reads **all** nodes — the matched comparison against KVzip/H2O. Stage 1
-(streaming, 96-node budget) retrieves a subset with live eviction, because the gate is
-reconstruction-*after*-eviction and a read-everything stage cannot fire it. Train with **random node dropout**
-too, or the mixer smears a fact across co-dependent nodes and subset retrieval breaks it.
+There is **one training stage**. Stage 1 streams over 8 windows with the budget **annealed** to
+`storage 96 / read 32`, eviction live from the start, and **random node dropout on throughout** — because a
+mixer trained on read-all smears a fact across co-dependent nodes, which breaks the moment a subset is
+retrieved. That is why there is no warmup stage: it would install exactly that habit. Plumbing verification
+is a **smoke test** (no training); the curriculum comes from the budget anneal.
+
+The headline compression number is still measured **at full read** against KVzip/H2O — evaluation need not
+match training.
 
 **Eviction** = LRU + protected attention sinks + protected recent window (policy), then **contraction** into
 the hottest surviving neighbour (mechanism). No supernodes: the survivor's vector is untouched, so nothing is
