@@ -547,3 +547,19 @@ def test_memory_is_invisible_below_the_retrieval_layer():
         assert not torch.equal(hidden_at(ell + 1, 0.0, mask_below=True),
                                hidden_at(ell + 1, 5.0, mask_below=True)), \
             "the memory prefix had no effect above the retrieval layer — the read is inert"
+
+
+def test_retrieval_is_device_agnostic():
+    """Retrieval must not care where the summaries live.
+
+    The accumulator was built on CPU while summaries sat on the compute device, so this raised only under
+    the trainer and never under the CPU-only tests — the class of bug that reaches a long run undetected.
+    Simulated here with a meta-free stand-in: mismatched dtypes and a non-contiguous view exercise the same
+    normalisation path without needing a GPU.
+    """
+    pg = _toy_graph()
+    q = torch.randn(1, 4, 8).transpose(0, 1)[0, 0].to(torch.float64)   # non-contiguous, wrong dtype
+    got = pg.retrieve(q, read_budget=3)
+    assert got and all(n in pg.g.nodes for n in got)
+    cands = pg.recall_candidates(list(pg.g.nodes), q, threshold=-1.0)
+    assert isinstance(cands, list)

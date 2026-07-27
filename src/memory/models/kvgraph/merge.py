@@ -209,6 +209,16 @@ class PersistentGraph:
             if n not in self.sink_ids:
                 self.last_used[n] = self._step
 
+    @staticmethod
+    def _cpu_vec(x: torch.Tensor) -> torch.Tensor:
+        """Detach a vector onto CPU float32.
+
+        Retrieval is a dense solve over ~100 nodes — microseconds on CPU, and keeping it there removes all
+        device coupling. Mixing a CPU accumulator with CUDA summaries raised only under the trainer, never
+        under the CPU-only tests, which is exactly the class of bug that reaches a long run undetected.
+        """
+        return x.detach().float().flatten().cpu()
+
     def _adjacency(self, ids: list[int]) -> torch.Tensor:
         """Symmetrised, row-normalised adjacency over `ids`.
 
@@ -248,12 +258,14 @@ class PersistentGraph:
         ids = [n for n in self.g.nodes if n not in self.sink_ids]
         if not ids:
             return sorted(self.sink_ids)
+        q = self._cpu_vec(query)
         seed = torch.zeros(len(ids))
         for i, n in enumerate(ids):
             s = self.summary.get(n)
             if s is not None:
-                seed[i] = torch.nn.functional.cosine_similarity(
-                    query.float().flatten(), s.float().flatten(), dim=0).clamp(min=0.0)
+                sv = self._cpu_vec(s)
+                if sv.numel() == q.numel():
+                    seed[i] = torch.nn.functional.cosine_similarity(q, sv, dim=0).clamp(min=0.0)
         if seed.sum() <= 0:
             seed[:] = 1.0
         seed = seed / seed.sum()
@@ -430,7 +442,7 @@ class PersistentGraph:
         bounded recall budget spends itself on the best candidates.
         """
         out = []
-        q = query.float().flatten()
+        q = self._cpu_vec(query)
         for nid in resident:
             if nid not in self.records:
                 continue
@@ -438,7 +450,7 @@ class PersistentGraph:
             for e in self.g.edges:
                 if e.src != nid or e.relation is not Relation.GRAVESTONE_POINTER or e.vec is None:
                     continue
-                v = e.vec.float().flatten()
+                v = self._cpu_vec(e.vec)
                 if v.numel() != q.numel():
                     continue
                 best = max(best, float(torch.nn.functional.cosine_similarity(q, v, dim=0)))
