@@ -98,8 +98,13 @@ class KVCapture:
 
 
 def pool_nodes(cap: dict, node_tokens: list[list[int]], *, head_tokens: list[int] | None = None,
-               head_weight: float = 2.0, batch_index: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
-    """-> (K, V), each `[n_nodes, L, n_kv, head_dim]`, pooled over each node's token positions.
+               head_weight: float = 2.0, batch_index: int = 0,
+               layers: range | list[int] | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+    """-> (K, V), each `[n_nodes, len(layers), n_kv, head_dim]`, pooled over each node's token positions.
+
+    `layers` selects WHICH layers to keep. With mid-layer retrieval the memory is only visible from the
+    retrieval layer upward, so layers below it are never read and storing them is pure waste — at layer
+    20 of 30 that is a ~3x cut in resident KV, on top of the node compression.
 
     Head-weighted mean: the syntactic head of a span carries most of its meaning ("farm" in "the family
     farm"), so it gets `head_weight`x the mass of the other tokens. `head_weight=1.0` recovers a plain mean,
@@ -110,12 +115,12 @@ def pool_nodes(cap: dict, node_tokens: list[list[int]], *, head_tokens: list[int
     only holds because events are reified.
     """
     K_all, V_all = cap["k"], cap["v"]
-    L = len(K_all)
+    keep = list(range(len(K_all))) if layers is None else list(layers)
     dev, dt = K_all[0].device, K_all[0].dtype
     n = len(node_tokens)
     n_kv, hd = K_all[0].shape[2], K_all[0].shape[3]
-    K = torch.zeros(n, L, n_kv, hd, device=dev, dtype=dt)
-    V = torch.zeros(n, L, n_kv, hd, device=dev, dtype=dt)
+    K = torch.zeros(n, len(keep), n_kv, hd, device=dev, dtype=dt)
+    V = torch.zeros(n, len(keep), n_kv, hd, device=dev, dtype=dt)
     for i, toks in enumerate(node_tokens):
         if not toks:
             continue
@@ -124,9 +129,9 @@ def pool_nodes(cap: dict, node_tokens: list[list[int]], *, head_tokens: list[int
         if head_tokens is not None and head_tokens[i] in toks:
             w[toks.index(head_tokens[i])] = head_weight
         w = (w / w.sum())[:, None, None]
-        for li in range(L):
-            K[i, li] = (K_all[li][batch_index, idx].float() * w).sum(0).to(dt)
-            V[i, li] = (V_all[li][batch_index, idx].float() * w).sum(0).to(dt)
+        for j, li in enumerate(keep):
+            K[i, j] = (K_all[li][batch_index, idx].float() * w).sum(0).to(dt)
+            V[i, j] = (V_all[li][batch_index, idx].float() * w).sum(0).to(dt)
     return K, V
 
 

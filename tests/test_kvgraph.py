@@ -317,8 +317,12 @@ def test_end_to_end_stream_read_and_train():
             e = min(s + 32, len(ids))
             st, _ = enc.streaming_write(st, emb[:, s:e], torch.ones(1, e - s, dtype=torch.bool),
                                         chunk_offset=s, context_ids=torch.tensor([ids[s:e]]))
+        # The read is query-driven: nothing is selected until the decoder hands us layer-l hidden states.
         _, aux = enc.finalize_memory(st)
-        Ks, Vs = aux["past_kv"]
+        assert aux["read_mode"] == "midlayer_kv"
+        q = torch.randn(1, 8, enc.d)
+        (Ks, Vs), mm, aux2 = aux["retrieve_fn"](q, torch.ones(1, 8, dtype=torch.bool))
+        aux = {**aux, **aux2}
         assert len(Ks) == enc.L and Ks[0].shape[1] == enc.n_kv
         assert Ks[0].shape[2] <= enc.read_budget, "read exceeded its budget"
         m = Ks[0].shape[2]
@@ -419,20 +423,25 @@ def test_single_token_node_roundtrip():
     emb = enc.base.get_input_embeddings()(torch.tensor([ids]))
     cap = enc.capture.run(emb, torch.ones(1, len(ids), dtype=torch.bool))
 
-    # A node covering exactly token 7 must pool to token 7's pre-RoPE K/V, unchanged.
-    K, V = pool_nodes(cap, [[7]], head_tokens=[7], head_weight=2.0)
-    for li in range(enc.L):
-        assert torch.equal(K[0, li], cap["k"][li][0, 7]), f"layer {li}: pooled K != the token's own K"
-        assert torch.equal(V[0, li], cap["v"][li][0, 7]), f"layer {li}: pooled V != the token's own V"
+    # Memory is only ever visible from the retrieval layer up, so only those layers are pooled or injected.
+    live = range(enc.retrieval_layer, enc.L)
+    K, V = pool_nodes(cap, [[7]], head_tokens=[7], head_weight=2.0, layers=live)
+    for j, li in enumerate(live):
+        assert torch.equal(K[0, j], cap["k"][li][0, 7]), f"layer {li}: pooled K != the token's own K"
+        assert torch.equal(V[0, j], cap["v"][li][0, 7]), f"layer {li}: pooled V != the token's own V"
 
     # ...and with rope_mode="none" + norm_match off + zero-init projections, injection is the identity.
     mixed = torch.zeros(1, enc.mixer.d_mix)
     Ks, Vs = enc.injector(K, V, mixed, base_model=enc.base, first_tokens=torch.tensor([7]))
-    for li in range(enc.L):
+    assert len(Ks) == enc.L, "the cache must span every layer even though only the live ones carry content"
+    for li in live:
         assert torch.allclose(Ks[li][0, :, 0, :], cap["k"][li][0, 7].to(Ks[li].dtype), atol=1e-3), \
             f"layer {li}: injected K drifted from the source token — alignment or RoPE is wrong"
         assert torch.allclose(Vs[li][0, :, 0, :], cap["v"][li][0, 7].to(Vs[li].dtype), atol=1e-3), \
             f"layer {li}: injected V drifted from the source token"
+    for li in range(enc.retrieval_layer):
+        assert float(Ks[li].abs().sum()) == 0.0, \
+            f"layer {li} is below the retrieval layer and must carry no memory"
 
 
 def test_archive_hosts_are_never_stranded():
@@ -462,3 +471,79 @@ def test_archive_is_bounded_and_off_gpu():
             for e in rec.entries:
                 if e.kv is not None:
                     assert e.kv[0].device.type == "cpu", "archived KV is still on the compute device"
+
+
+@pytest.mark.slow
+def test_memory_is_invisible_below_the_retrieval_layer():
+    """THE invariant of the mid-layer design.
+
+    Layers 0..l-1 exist to BUILD the query that selects from memory. If they can already see the memory,
+    the query is a function of the thing it is choosing — a circularity the whole design exists to avoid.
+    Asserted behaviourally: layer l's input hidden state must be BIT-IDENTICAL with and without a memory
+    prefix present. A subtly-wrong per-layer mask still produces plausible numbers, so nothing else in the
+    pipeline would notice it leaking.
+    """
+    torch.manual_seed(0)
+    from src.memory.config import ReprConfig
+    from src.memory.decoder import build_prefix_cache
+    from src.memory.model import _mask_prefix_hook
+    from src.memory.models.kvgraph.encoder import KVGraphEncoder
+
+    cfg = ReprConfig(llama_model="HuggingFaceTB/SmolLM2-135M", d_llama=576)
+    try:
+        enc = KVGraphEncoder(cfg).eval()
+    except Exception as exc:  # pragma: no cover - offline
+        pytest.skip(f"backbone unavailable: {exc}")
+
+    base = enc.base
+    ell, T, M = enc.retrieval_layer, 12, 5
+    ids = enc.tok(SENTENCE, add_special_tokens=False)["input_ids"][:T]
+    emb = base.get_input_embeddings()(torch.tensor([ids]))
+    dt = next(base.parameters()).dtype
+
+    def hidden_at(layer, scale, mask_below):
+        """Layer `layer`'s input hidden state, with a prefix whose CONTENT is scaled by `scale`.
+
+        Comparing scale=0 against scale=5 holds the code path, the cache length and every RoPE position
+        fixed and varies only what is IN the memory — so any difference is a genuine leak, not the
+        numerical drift you get from comparing a cached forward against an uncached one.
+        """
+        grab = {}
+
+        def pre(mod, args, kwargs):
+            grab["h"] = (args[0] if args else kwargs.get("hidden_states")).detach().clone()
+            raise RuntimeError("stop")
+
+        torch.manual_seed(7)                                  # identical draw, then scaled
+        K = [torch.randn(1, enc.n_kv, M, enc.head_dim, dtype=dt) * scale for _ in range(enc.L)]
+        V = [torch.randn(1, enc.n_kv, M, enc.head_dim, dtype=dt) * scale for _ in range(enc.L)]
+        handles = [base.model.layers[layer].register_forward_pre_hook(pre, with_kwargs=True)]
+        if mask_below:
+            for li in range(ell):                             # the masking under test
+                handles.append(base.model.layers[li].register_forward_pre_hook(
+                    _mask_prefix_hook(M), with_kwargs=True))
+        try:
+            base.model(inputs_embeds=emb.to(dt), attention_mask=torch.ones(1, M + T, dtype=torch.long),
+                       past_key_values=build_prefix_cache((K, V)), use_cache=True)
+        except RuntimeError as e:
+            if "stop" not in str(e):
+                raise
+        finally:
+            for h in handles:
+                h.remove()
+        return grab["h"]
+
+    assert torch.equal(hidden_at(ell, 0.0, mask_below=True), hidden_at(ell, 5.0, mask_below=True)), (
+        "the memory prefix LEAKED into the layers below the retrieval layer: the query that selects from "
+        "memory is contaminated by the memory it is selecting")
+
+    # The masking must be doing the work — WITHOUT it the same comparison has to differ, or the test is
+    # passing for some unrelated reason and would never catch a real leak.
+    assert not torch.equal(hidden_at(ell, 0.0, mask_below=False), hidden_at(ell, 5.0, mask_below=False)), \
+        "memory content did not affect the lower layers even unmasked — the test cannot detect a leak"
+
+    # ...and it must be visible ABOVE the retrieval layer, or the read is inert.
+    if ell + 1 < enc.L:
+        assert not torch.equal(hidden_at(ell + 1, 0.0, mask_below=True),
+                               hidden_at(ell + 1, 5.0, mask_below=True)), \
+            "the memory prefix had no effect above the retrieval layer — the read is inert"

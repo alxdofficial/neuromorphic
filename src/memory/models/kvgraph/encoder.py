@@ -32,6 +32,11 @@ from .mixer import GraphMixer
 
 class KVGraphEncoder(nn.Module):
     reads_per_layer_kv = True
+    #: The read is MID-LAYER and QUERY-DRIVEN, not a pre-pass. `finalize_memory` therefore returns a
+    #: retrieval CLOSURE instead of a chosen memory: the decoder runs layers 0..l-1 on context alone,
+    #: hands us layer l's hidden states as the queries, and only then do we select and build the cache.
+    #: model.py dispatches on this flag. See BUILD.md 7.
+    reads_midlayer_kv = True
     is_conditioned_read = False
     wants_surprise = False
 
@@ -69,6 +74,12 @@ class KVGraphEncoder(nn.Module):
         self.ablate_edge_vec = bool(g("kvg_ablate_edge_vec", False))
         self.pressure = 1.0                                   # 0 = no budget pressure, 1 = terminal budgets
 
+        # THE retrieval layer. Layers below it see no memory and exist to BUILD the query; layers from it
+        # upward attend over what that query selected. Memorizing Transformers ablated 3/6/9/12 of 12 and
+        # found the middle best (ppl 2.40/2.36/2.37/2.43); Memory Layers at Scale independently ships the
+        # middle FFN. Putting it late also lets the token queries coordinate through self-attention first,
+        # so the top-k union comes out diversified instead of every token asking the same thing.
+        self.retrieval_layer = int(g("kvg_retrieval_layer", 0)) or max(1, int(self.L * 2 / 3))
         self.mixer = GraphMixer(self.d, d_mix=int(g("kvg_d_mix", 384)),
                                 n_layers=int(g("kvg_mixer_layers", 4)),
                                 n_heads=int(g("kvg_mixer_heads", 6)),
@@ -79,14 +90,16 @@ class KVGraphEncoder(nn.Module):
                                  rope_mode=str(g("kvg_rope_mode", "compact")),
                                  norm_match=bool(g("kvg_norm_match", True)),
                                  per_node_norm=bool(g("kvg_per_node_norm", True)),
-                                 adapter_rank=int(g("kvg_adapter_rank", 24)))
+                                 adapter_rank=int(g("kvg_adapter_rank", 24)),
+                                 layer_offset=self.retrieval_layer)
         self.capture = KVCapture(base, keep_layer=self.summary_layer)
         self._parser = None                                   # lazy: spaCy load is slow and not always needed
 
         n_train = sum(p.numel() for p in self.parameters() if p.requires_grad)
         print(f"[kvgraph] storage={self.storage_budget} read={self.read_budget} sinks={self.n_sinks} "
               f"d_mix={self.mixer.d_mix} rope={self.injector.rope_mode} "
-              f"summary_layer={self.summary_layer}/{self.L} | trainable={n_train/1e6:.2f}M")
+              f"summary_layer={self.summary_layer}/{self.L} retrieval_layer={self.retrieval_layer}/{self.L} "
+              f"| trainable={n_train/1e6:.2f}M")
 
     # ------------------------------------------------------------------ plumbing
 
@@ -170,8 +183,9 @@ class KVGraphEncoder(nn.Module):
         # nowhere to park the attention mass it cannot place (StreamingLLM).
         if state["n_windows"] == 0:
             for t in range(min(self.n_sinks, len(ids))):
-                K = torch.stack([cap["k"][li][0, t] for li in range(self.L)])
-                V = torch.stack([cap["v"][li][0, t] for li in range(self.L)])
+                # Only the layers the memory is ever visible at (>= retrieval_layer).
+                K = torch.stack([cap["k"][li][0, t] for li in range(self.retrieval_layer, self.L)])
+                V = torch.stack([cap["v"][li][0, t] for li in range(self.retrieval_layer, self.L)])
                 pg.add_sink(K, V, label=f"<sink{t}>")
 
         parse = self.parser.parse(text)
@@ -183,7 +197,8 @@ class KVGraphEncoder(nn.Module):
         node_ids = sorted(win.nodes)
         toks = [win.nodes[i].token_positions for i in node_ids]
         heads = [max((m.head_token for m in win.nodes[i].mentions), default=-1) for i in node_ids]
-        K, V = pool_nodes(cap, toks, head_tokens=heads, head_weight=self.head_weight)
+        K, V = pool_nodes(cap, toks, head_tokens=heads, head_weight=self.head_weight,
+                          layers=range(self.retrieval_layer, self.L))
         summ = pool_hidden(cap, toks, self.summary_layer)
         # The edge vector is pooled from the tokens that licensed the arc — "merchandise-ness" comes from
         # the actual tokens `sold`/`the farm` in context, with zero trained parameters in v0.
@@ -215,72 +230,74 @@ class KVGraphEncoder(nn.Module):
     # ------------------------------------------------------------------ read
 
     def finalize_memory(self, state):
+        """Return a RETRIEVAL CLOSURE, not a memory.
+
+        Selection depends on the decoder's own layer-l queries, which do not exist until the decode is
+        partway done — so the encoder cannot choose here. `model.py` runs layers 0..l-1 on context alone
+        and calls `retrieve_fn(query_hidden, query_mask)` with the result. That is the whole point of the
+        mid-layer design: retrieval is query-DRIVEN rather than a static pre-selection, and it is what
+        produces the per-node access signal that eviction ranks on.
+        """
         pg: PersistentGraph = state["graph"]
-        dev = state["device"]
         if not pg.g.nodes:
             raise ValueError("kvgraph.finalize_memory: empty graph (no window produced any node)")
+        empty = torch.zeros(1, 0, self.d, device=state["device"])
+        return empty, {"read_mode": "midlayer_kv",
+                       "retrieval_layer": self.retrieval_layer,
+                       "retrieve_fn": lambda qh, qm=None: self._retrieve_and_build(state, qh, qm),
+                       "memory_mask": None}
 
-        # Retrieval seed. It MUST live in the same representation space as `pg.summary`, which holds
-        # mid-stack hidden states — an earlier version cosine-compared raw INPUT EMBEDDINGS against layer-20
-        # hidden states, two unrelated spaces, so the similarity term was close to meaningless. When the
-        # harness supplies a question we run it through the frozen LM to the summary layer; otherwise we
-        # fall back to the tail of the last ingested window, which streaming supplies for free and which is
-        # already in the right space.
-        seed = state.get("last_hidden", torch.zeros(self.d, device=dev))
-        q = state.get("question_embeds")
-        if q is not None:
-            qm = state.get("question_mask")
-            with torch.no_grad():
-                hs = self.base.model(inputs_embeds=q.to(next(self.base.parameters()).dtype),
-                                     attention_mask=(qm.long() if qm is not None else None),
-                                     output_hidden_states=True, use_cache=False
-                                     ).hidden_states[self.summary_layer][0]
-            if qm is not None:
-                m = qm[0].bool()
-                seed = hs[m].mean(0) if m.any() else hs.mean(0)   # PAD must not vote on the query
-            else:
-                seed = hs.mean(0)
+    def _retrieve_and_build(self, state, query_hidden, query_mask=None):
+        """queries `[B, T, d]` at the retrieval layer -> ((Ks, Vs), memory_mask, canaries).
+
+        `query_hidden` is already in the summary layer's space when `retrieval_layer == summary_layer`,
+        which is the default; otherwise it is still a mid-stack hidden state and far closer to the
+        summaries than raw input embeddings ever were.
+        """
+        pg: PersistentGraph = state["graph"]
+        dev = state["device"]
         storage_budget, read_budget = self._budgets()
-        chosen = pg.retrieve(seed, read_budget, alpha=self.ppr_alpha)
 
-        # ── RECALL: page archived subgraphs back in when the query matches their gist ────────────────
-        # This is the half of "recoverable eviction" that makes it recoverable, and it is the component the
-        # literature sweep identified as our strongest and most novel. It has to actually run: an eviction
-        # that can never be undone is just H2O with a graph in front of it.
+        # Per-token queries, mean-pooled over VALID positions only. Every token proposes; the union is
+        # what gets injected. Pooling here rather than per-token top-k keeps the first version simple —
+        # the diversification argument is about the queries being CONTEXTUALISED by layer l, which holds
+        # either way, since each position has already attended to every other.
+        q = query_hidden[0].float()
+        if query_mask is not None:
+            m = query_mask[0].bool()
+            q = q[m] if m.any() else q
+        seed = q.mean(0)
+
+        chosen = pg.retrieve(seed, read_budget, alpha=self.ppr_alpha)
         if self.max_recalls > 0 and pg.records:
-            n_nodes_back = 0
-            for host, _score in pg.recall_candidates(chosen, seed, self.recall_threshold):
-                if n_nodes_back >= self.max_recalls:
+            n_back = 0
+            for host, _s in pg.recall_candidates(chosen, seed, self.recall_threshold):
+                if n_back >= self.max_recalls:
                     break
-                # Bound on NODES, not record objects: a spilled record can hold arbitrarily many nodes, so
-                # "2 recalls" could page in dozens. Contraction is deferred to AFTER the read (budget=None)
-                # — recalling and immediately re-contracting inside the same finalize evicted roughly as
-                # many nodes as it restored, which is pure churn and can evict what the query just asked for.
-                n_nodes_back += pg.recall(host, budget=None)
-            if n_nodes_back:
-                chosen = pg.retrieve(seed, read_budget, alpha=self.ppr_alpha)   # restored nodes now eligible
+                n_back += pg.recall(host, budget=None)
+            if n_back:
+                chosen = pg.retrieve(seed, read_budget, alpha=self.ppr_alpha)
         pg.touch(chosen)
 
         if self.training and self.node_dropout > 0:
-            # Random node dropout, on from step 0. Without it the mixer may smear one fact across several
-            # co-dependent nodes — fine under read-all, catastrophic once a subset is retrieved.
             keep = [n for n in chosen
                     if n in pg.sink_ids or torch.rand(()).item() >= self.node_dropout]
             chosen = keep or chosen[: len(pg.sink_ids) + 1]
-
-        pos = {n: i for i, n in enumerate(chosen)}
-        Kp = torch.stack([pg.kv[n][0] for n in chosen if n in pg.kv])
-        Vp = torch.stack([pg.kv[n][1] for n in chosen if n in pg.kv])
         chosen = [n for n in chosen if n in pg.kv]
+        if not chosen:
+            raise ValueError("kvgraph: retrieval selected no node with KV")
         pos = {n: i for i, n in enumerate(chosen)}
 
+        Kp = torch.stack([pg.kv[n][0] for n in chosen])
+        Vp = torch.stack([pg.kv[n][1] for n in chosen])
         node_vec = torch.stack([pg.summary.get(n, torch.zeros(self.d, device=dev)).to(dev)
                                 for n in chosen]).float()
         sub = [e for e in pg.g.edges if e.src in pos and e.dst in pos]
         if sub and not self.ablate_graph:
+            rels = list(type(sub[0].relation))
             src = torch.tensor([pos[e.src] for e in sub], device=dev)
             dst = torch.tensor([pos[e.dst] for e in sub], device=dev)
-            rel = torch.tensor([list(type(sub[0].relation)).index(e.relation) for e in sub], device=dev)
+            rel = torch.tensor([rels.index(e.relation) for e in sub], device=dev)
             ev = torch.stack([(e.vec if e.vec is not None else torch.zeros(self.d, device=dev)).to(dev)
                               for e in sub]).float()
         else:
@@ -293,17 +310,16 @@ class KVGraphEncoder(nn.Module):
                            ablate_graph=self.ablate_graph)
         first = torch.tensor([min((m.token_start for m in pg.g.nodes[n].mentions), default=0)
                               for n in chosen], device=dev)
+        k_rms = state.get("k_rms")
+        v_rms = state.get("v_rms")
         Ks, Vs = self.injector(Kp, Vp, mixed, base_model=self.base, first_tokens=first,
-                               k_rms=state.get("k_rms"), v_rms=state.get("v_rms"))
-
-        # Contract back to budget only now that the read is chosen, so a recall cannot evict the very
-        # nodes it just restored.
+                               k_rms=None if k_rms is None else k_rms[self.retrieval_layer:],
+                               v_rms=None if v_rms is None else v_rms[self.retrieval_layer:])
+        # Contract only AFTER the read is chosen, so a recall cannot evict what it just restored.
         pg.contract_to_budget(storage_budget)
         mm = torch.ones(1, len(chosen), device=dev)
-        empty = torch.zeros(1, 0, self.d, device=dev)
-        aux = {"past_kv": (Ks, Vs), "memory_mask": mm, "read_mode": "per_layer_kv"}
-        aux.update(self._diagnostics(pg, chosen, node_vec, mixed, rel, Kp, Vp, Ks, Vs, state))
-        return empty, aux
+        canaries = self._diagnostics(pg, chosen, node_vec, mixed, rel, Kp, Vp, Ks, Vs, state)
+        return (Ks, Vs), mm, canaries
 
     @torch.no_grad()
     def _diagnostics(self, pg, chosen, node_vec, mixed, rel, Kp, Vp, Ks, Vs, state) -> dict:
@@ -315,7 +331,11 @@ class KVGraphEncoder(nn.Module):
         d.update(graph_stats(pg, len(chosen), state.get("n_tokens", 0)))
         d.update(relation_stats(rel, N_RELATIONS))
         d.update(operator_divergence(self.mixer.mp))
-        d.update(injection_stats(Kp, Vp, Ks, Vs, state.get("k_rms"), state.get("v_rms")))
+        d.update(injection_stats(Kp, Vp, Ks, Vs,
+                                 None if state.get("k_rms") is None else state["k_rms"][self.retrieval_layer:],
+                                 None if state.get("v_rms") is None else state["v_rms"][self.retrieval_layer:],
+                                 layer_offset=self.retrieval_layer))
+        d["kvgraph_retrieval_layer"] = float(self.retrieval_layer)
         d["kvgraph_inject_delta_frac"] = self.injector.last_delta_frac
         # Collapse, measured BOTH before and after the mixer so a flat result is attributable: pooled
         # healthy + mixed flat => the mixer is over-smoothing; both flat => it is upstream in pooling/parse.

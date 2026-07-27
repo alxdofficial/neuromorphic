@@ -647,6 +647,24 @@ of the sweep.
 | boundary-edge rewriting | → subsumed by contraction: the survivor inherits the evicted node's edges, deduped, retyped `GRAVESTONE_POINTER`. Transferring them is **not** optional — without it, paths break and multi-hop severs as memory fills. |
 | supernode gravestones | → **replaced by contraction into a surviving neighbour** (§8.2). No new node, so no clustering and no `gain()`; nothing superposed on the routing path. **Measure page-back precision as a first-class metric.** M+'s page-back recall is only ~30%. |
 
+### 13.4a Resolved 2026-07-27: the code now implements the documented design
+
+The audit correctly found that the code and this document described different experiments. The code has been
+brought to the document, not the other way round:
+
+| | was built | now |
+|---|---|---|
+| when retrieval happens | a pre-pass before decoding | inside the forward, at layer ℓ |
+| the query | one pooled vector of raw INPUT EMBEDDINGS, cosine-compared against layer-20 hidden states — unrelated spaces | layer ℓ's own hidden states, the same space as the summaries |
+| injected into | all layers `0..L` | layers `ℓ..L`; masked below, and pinned by a test |
+| node KV stored | every layer | only `ℓ..L` — the ~3× storage saving is now real |
+
+What remains a deliberate deviation, and is written here rather than left implicit: the objective is the
+project-wide **behavioral-KL**, not the local attention-reconstruction loss of §13.1. That finding stands —
+Compressive Transformer's ablation says a separate local objective with stopped gradients beats backprop
+through the main loss — but changing the objective changes what every arm in the panel is compared under, so
+it is a panel-level decision rather than a kvgraph one.
+
 ### 13.4 The graph is on probation
 
 This is our least-evidenced component. Three controlled studies find write-time structure is where the money

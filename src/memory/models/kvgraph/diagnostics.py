@@ -109,15 +109,19 @@ def relation_stats(rel: torch.Tensor, n_relations: int) -> dict[str, float]:
 
 def injection_stats(K_pooled: torch.Tensor, V_pooled: torch.Tensor,
                     Ks: list[torch.Tensor], Vs: list[torch.Tensor],
-                    k_rms: torch.Tensor | None, v_rms: torch.Tensor | None) -> dict[str, float]:
+                    k_rms: torch.Tensor | None, v_rms: torch.Tensor | None,
+                    layer_offset: int = 0) -> dict[str, float]:
     """Magnitude sanity on what the frozen decoder actually receives.
 
     `*_rms_ratio` near 1.0 says the injected cache looks like real tokens to the backbone.
     `inject_delta_frac` near 0 says the injection is still a correction to the pooled KV rather than a
     replacement for it.
     """
-    kf = torch.stack([k.float().pow(2).mean() for k in Ks]).sqrt()
-    vf = torch.stack([v.float().pow(2).mean() for v in Vs]).sqrt()
+    # LIVE layers only. Layers below the retrieval layer are deliberately zero (masked out of attention),
+    # and averaging them in drags the ratio toward 0 — the canary would then report a distribution-shift
+    # failure that is actually the design working as intended.
+    kf = torch.stack([k.float().pow(2).mean() for k in Ks[layer_offset:]]).sqrt()
+    vf = torch.stack([v.float().pow(2).mean() for v in Vs[layer_offset:]]).sqrt()
     out = {"kvgraph_k_rms": float(kf.mean()), "kvgraph_v_rms": float(vf.mean())}
     if k_rms is not None:
         out["kvgraph_k_rms_ratio"] = float((kf / k_rms.float().clamp_min(1e-6)).mean())

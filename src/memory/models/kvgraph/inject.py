@@ -44,11 +44,16 @@ import torch.nn as nn
 class Injector(nn.Module):
     def __init__(self, d_mix: int, n_layers: int, n_kv: int, head_dim: int, *,
                  rope_mode: str = "compact", norm_match: bool = True, adapter_rank: int = 24,
-                 per_node_norm: bool = True):
+                 per_node_norm: bool = True, layer_offset: int = 0):
         super().__init__()
         if rope_mode not in ("compact", "none", "original"):
             raise ValueError(f"rope_mode must be compact|none|original, got {rope_mode!r}")
+        # `layer_offset` = the retrieval layer. Memory is invisible below it (the decoder masks it out),
+        # so we hold and correct KV only for layers >= offset and emit zeros below. The zeros are never
+        # attended to; they exist only because a DynamicCache must be uniform in depth.
         self.L, self.n_kv, self.head_dim = n_layers, n_kv, head_dim
+        self.layer_offset = layer_offset
+        self.n_live = n_layers - layer_offset
         self.rope_mode, self.norm_match, self.per_node_norm = rope_mode, norm_match, per_node_norm
         kv_dim = n_kv * head_dim
         self.to_k = nn.Linear(d_mix, kv_dim)
@@ -59,14 +64,15 @@ class Injector(nn.Module):
         # Per-layer low-rank adapters. `A` zero-init keeps step-0 injection exactly the pooled KV while
         # leaving dL/dA non-zero (it depends on B), so these bootstrap in one step — same pattern as the
         # relation operators. `B` at 1/sqrt(fan_in).
-        self.adapt_A_k = nn.Parameter(torch.zeros(n_layers, d_mix, adapter_rank))
-        self.adapt_B_k = nn.Parameter(torch.randn(n_layers, adapter_rank, kv_dim) / adapter_rank ** 0.5)
-        self.adapt_A_v = nn.Parameter(torch.zeros(n_layers, d_mix, adapter_rank))
-        self.adapt_B_v = nn.Parameter(torch.randn(n_layers, adapter_rank, kv_dim) / adapter_rank ** 0.5)
-        self.k_scale = nn.Parameter(torch.ones(n_layers, kv_dim))
-        self.v_scale = nn.Parameter(torch.ones(n_layers, kv_dim))
-        self.k_shift = nn.Parameter(torch.zeros(n_layers, kv_dim))
-        self.v_shift = nn.Parameter(torch.zeros(n_layers, kv_dim))
+        nl = self.n_live
+        self.adapt_A_k = nn.Parameter(torch.zeros(nl, d_mix, adapter_rank))
+        self.adapt_B_k = nn.Parameter(torch.randn(nl, adapter_rank, kv_dim) / adapter_rank ** 0.5)
+        self.adapt_A_v = nn.Parameter(torch.zeros(nl, d_mix, adapter_rank))
+        self.adapt_B_v = nn.Parameter(torch.randn(nl, adapter_rank, kv_dim) / adapter_rank ** 0.5)
+        self.k_scale = nn.Parameter(torch.ones(nl, kv_dim))
+        self.v_scale = nn.Parameter(torch.ones(nl, kv_dim))
+        self.k_shift = nn.Parameter(torch.zeros(nl, kv_dim))
+        self.v_shift = nn.Parameter(torch.zeros(nl, kv_dim))
         #: |correction| / |pooled| from the last forward. MUST be 0.0 at step 0 (zero-init); runaway means
         #: the injector stopped correcting a working compressed cache and started synthesising one.
         self.last_delta_frac: float = 0.0
@@ -98,7 +104,7 @@ class Injector(nn.Module):
         index itself — rotating at the raw index would place a node from 50k tokens ago at position 50k and
         put it in the deep-decay regime, which is the whole thing compact ranking avoids.
         """
-        n, L = K_pooled.shape[0], self.L
+        n = K_pooled.shape[0]
         # The mixer and this module run in fp32 while the backbone's KV is bf16. Do the arithmetic in fp32
         # and cast once at the end: mixing dtypes mid-expression silently downcasts the correction, and a
         # bf16 residual added to a bf16 base loses most of the precision the correction was carrying.
@@ -126,8 +132,9 @@ class Injector(nn.Module):
             (dk.detach().norm() + dv.detach().norm())
             / (K_pooled.reshape(n, -1).norm() + V_pooled.reshape(n, -1).norm()).clamp_min(1e-6))
 
-        Ks, Vs = [], []
-        for li in range(L):
+        Ks: list = [None] * self.layer_offset                    # filled with zeros after the loop
+        Vs: list = [None] * self.layer_offset
+        for li in range(self.n_live):
             k = (K_pooled[:, li].reshape(n, -1)
                  + (dk + (mixed @ self.adapt_A_k[li]) @ self.adapt_B_k[li]) * self.k_scale[li]
                  + self.k_shift[li])
@@ -147,4 +154,9 @@ class Injector(nn.Module):
                 k = self._apply_rope(k, base_model, pos)
             Ks.append(k.permute(1, 0, 2)[None].contiguous())    # [1, n_kv, n, hd]
             Vs.append(v.permute(1, 0, 2)[None].contiguous())
+        if self.layer_offset:
+            z = torch.zeros_like(Ks[self.layer_offset])
+            for li in range(self.layer_offset):
+                Ks[li] = z
+                Vs[li] = z
         return Ks, Vs

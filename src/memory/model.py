@@ -46,6 +46,38 @@ def _participation_ratio(x: Tensor) -> float:
     return float((tr * tr / fro2.clamp_min(1e-12)).item())
 
 
+def _mask_prefix_hook(n_prefix: int):
+    """Pre-hook that blanks the first `n_prefix` KEY columns of a layer's attention mask.
+
+    Used to make the memory prefix invisible to layers below the retrieval layer. If the model handed the
+    layer no mask at all (SDPA's is_causal fast path), one is constructed — returning early in that case
+    would silently leave the memory visible, which is the failure this hook exists to prevent.
+    """
+    def hook(mod, args, kwargs):
+        am = kwargs.get("attention_mask")
+        if am is None or not torch.is_tensor(am):
+            h = args[0] if args else kwargs.get("hidden_states")
+            if h is None:
+                return None
+            b, q = h.shape[0], h.shape[1]
+            am = torch.zeros(b, 1, q, n_prefix + q, dtype=h.dtype, device=h.device)
+            # causal within the text block; the prefix columns are about to be blanked anyway
+            causal = torch.full((q, q), torch.finfo(h.dtype).min, device=h.device, dtype=h.dtype).triu(1)
+            am[:, :, :, n_prefix:] = causal
+        else:
+            am = am.clone()
+        # The mask reaching a layer may be an additive FLOAT mask (sdpa/eager, -inf = blocked) or a
+        # boolean/integer keep-mask (True/1 = attend). Blanking with finfo().min is only correct for the
+        # first; on a long mask it raises, and on a bool mask it would silently do the opposite.
+        if am.is_floating_point():
+            am[..., :n_prefix] = torch.finfo(am.dtype).min
+        else:
+            am[..., :n_prefix] = 0
+        kwargs["attention_mask"] = am
+        return (args, kwargs)
+    return hook
+
+
 class ReprLearningModel(nn.Module):
     """Encoder + frozen Llama decoder, end-to-end.
 
@@ -453,7 +485,13 @@ class ReprLearningModel(nn.Module):
         rnd = torch.rand(B, T, device=device)                          # eval: seeded in run_val
         masked = (rnd < mask_ratio) & batch.context_mask
         dec_in = torch.where(masked.unsqueeze(-1), mask_vec.view(1, 1, -1), ctx_embeds)
-        if getattr(self.encoder, "reads_per_layer_kv", False) and not zero_memory and mem_aux.get("past_kv") is not None:
+        if mem_aux.get("read_mode") == "midlayer_kv" and not zero_memory:
+            # MID-LAYER query-driven read: the encoder has not chosen a memory yet, because selection
+            # depends on the decoder's own layer-l queries. See _midlayer_kv_forward.
+            span_hidden = self._midlayer_kv_forward(
+                dec_in, batch.context_mask, mem_aux,
+                shuffle_memory=shuffle_memory, shuffle_roll=shuffle_roll)
+        elif getattr(self.encoder, "reads_per_layer_kv", False) and not zero_memory and mem_aux.get("past_kv") is not None:
             # per-layer-KV native read (Beacon/MemoryLLM): memory[:, :M] is empty; inject the
             # encoder's per-layer (K,V) as a prefix cache. dec_in stays memory-free (text-only out).
             span_hidden = self._prefix_kv_forward(
@@ -677,6 +715,96 @@ class ReprLearningModel(nn.Module):
         # whole ~2048-token passage with a 30-layer KV prefix and retains it for backward → the
         # per-layer-KV arms (gisting/memoryllm) OOM at B=8 on 24GB. This path installs NO forward
         # hooks, so the recompute is exact (math-identical). K/V carry grad, so checkpoint is active.
+        if self.training and getattr(self.cfg, "grad_checkpoint_decode", True):
+            return torch.utils.checkpoint.checkpoint(
+                _run, inputs_embeds, attn, *K, *V, use_reentrant=False)
+        return _run(inputs_embeds, attn, *K, *V)
+
+    class _StopForward(Exception):
+        """Sentinel used to abort a partial forward once the retrieval layer's input is captured."""
+
+    def _hidden_at_layer(self, inputs_embeds, attn_mask, layer_idx):
+        """Run the frozen decoder up to `layer_idx` and return that layer's INPUT hidden state.
+
+        Implemented by aborting the forward from a pre-hook rather than by re-implementing the layer loop:
+        rebuilding the rotary embeddings, causal mask and cache_position by hand is version-fragile in a way
+        that fails silently (a subtly wrong mask still produces plausible numbers), and this is the query
+        signal the whole read depends on.
+        """
+        grab = {}
+
+        def _pre(mod, args, kwargs):
+            grab["h"] = args[0] if args else kwargs.get("hidden_states")
+            raise ReprLearningModel._StopForward
+
+        h = self.decoder.llama.model.layers[layer_idx].register_forward_pre_hook(_pre, with_kwargs=True)
+        try:
+            self.decoder.llama.model(inputs_embeds=inputs_embeds, attention_mask=attn_mask, use_cache=False)
+        except ReprLearningModel._StopForward:
+            pass
+        finally:
+            h.remove()
+        if "h" not in grab:
+            raise RuntimeError(f"kvgraph: never reached layer {layer_idx} — the backbone has "
+                               f"{len(self.decoder.llama.model.layers)} layers")
+        return grab["h"]
+
+    def _midlayer_kv_forward(self, inputs_embeds, base_mask, mem_aux,
+                             *, shuffle_memory=False, shuffle_roll=1):
+        """MID-LAYER, QUERY-DRIVEN read (BUILD.md 7).
+
+            layers 0..l-1   context alone, memory MASKED OUT. These build the query.
+            layer l         its hidden states ARE the query; the encoder selects on them.
+            layers l..L     attend over [retrieved memory | context].
+
+        Masking below `l` is not a detail: those layers exist to construct the query that selects from
+        memory, so letting them already see the memory makes the query a function of what it is choosing.
+        It also earns the storage saving — the encoder only ever pools KV for layers >= l.
+
+        Two passes over the first `l` layers (once to get the query, once with the prefix in place). The
+        alternative — resuming the second pass from the captured hidden state — needs a hand-rolled layer
+        loop, and a subtly wrong mask or rotary phase there fails silently.
+        """
+        from .decoder import build_prefix_cache
+        retrieve_fn = mem_aux["retrieve_fn"]
+        ell = int(mem_aux["retrieval_layer"])
+
+        # ── pass 1: build the query ─────────────────────────────────────────────────────────────
+        q_hidden = self._hidden_at_layer(inputs_embeds, base_mask, ell)
+
+        # ── select, mix, build the cache ────────────────────────────────────────────────────────
+        (K, V), mm, canaries = retrieve_fn(q_hidden, base_mask)
+        mem_aux.update(canaries)
+        B = inputs_embeds.shape[0]
+        if shuffle_memory:
+            if B == 1:
+                raise ValueError("shuffle_memory (SHUF) requires batch size > 1.")
+            K = [torch.roll(k, shifts=int(shuffle_roll), dims=0) for k in K]
+            V = [torch.roll(v, shifts=int(shuffle_roll), dims=0) for v in V]
+            if mm is not None:
+                mm = torch.roll(mm, shifts=int(shuffle_roll), dims=0)
+        Mmem = K[0].shape[2]
+        if mm is None:
+            mm = torch.ones(B, Mmem, device=inputs_embeds.device)
+        attn = torch.cat([mm[:, :Mmem].to(base_mask.dtype), base_mask.to(base_mask.dtype)], dim=1).long()
+        L = len(K)
+
+        def _run(emb, at, *kv):
+            cache = build_prefix_cache((list(kv[:L]), list(kv[L:])))
+            handles = []
+            # Hide the memory columns from every layer BELOW the retrieval layer. One mask is built for the
+            # whole model, so per-layer visibility has to be installed per layer.
+            for li in range(ell):
+                handles.append(self.decoder.llama.model.layers[li].register_forward_pre_hook(
+                    _mask_prefix_hook(Mmem), with_kwargs=True))
+            try:
+                o = self.decoder.llama.model(inputs_embeds=emb, attention_mask=at,
+                                             past_key_values=cache, use_cache=True)
+            finally:
+                for hh in handles:
+                    hh.remove()
+            return o.last_hidden_state
+
         if self.training and getattr(self.cfg, "grad_checkpoint_decode", True):
             return torch.utils.checkpoint.checkpoint(
                 _run, inputs_embeds, attn, *K, *V, use_reentrant=False)
@@ -1400,7 +1528,11 @@ class ReprLearningModel(nn.Module):
                 # pinned (masked anyway), question at `valid`. No-op for dense-memory compressors
                 # (cumsum of all-ones == arange), so it does not perturb icae/ac/titans.
                 _pos_qa = (attn_mask_full.long().cumsum(dim=1) - 1).clamp_min(0)
-            if (getattr(self.encoder, "reads_per_layer_kv", False) and not zero_memory
+            if finalize_aux.get("read_mode") == "midlayer_kv" and not zero_memory:
+                hidden = self._midlayer_kv_forward(
+                    full_embeds, attn_mask_full, finalize_aux,
+                    shuffle_memory=shuffle_memory, shuffle_roll=shuffle_roll)
+            elif (getattr(self.encoder, "reads_per_layer_kv", False) and not zero_memory
                     and finalize_aux.get("past_kv") is not None):
                 # per-layer-KV native read: M==0 above so full_embeds is memory-free ([pre,q,a]);
                 # inject the encoder's per-layer (K,V) as a prefix cache (memory attended as keys only).
