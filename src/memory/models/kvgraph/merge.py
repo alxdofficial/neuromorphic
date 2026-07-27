@@ -84,6 +84,11 @@ class PersistentGraph:
         # oldest-first, so the memory claim is true rather than aspirational.
         self.archive_cap = archive_cap
         self.archive_device = archive_device
+        #: The COMPUTE device the resident graph lives on, learned from the first KV admitted. Recall must
+        #: bring archived tensors back onto it — otherwise a recalled node returns on CPU, and the very next
+        #: torch.stack over the read set raises. That fires only after an eviction AND a matching query, so
+        #: it is invisible to any short run.
+        self.device = None
         self.n_archive_dropped = 0
 
         self._next_id = 0
@@ -116,6 +121,8 @@ class PersistentGraph:
         node.attrs["sink"] = True
         self.g.add_node(node)
         self.kv[nid] = (K, V)
+        if self.device is None:
+            self.device = K.device
         self.sink_ids.add(nid)
         self.last_used[nid] = 1 << 30                       # never the LRU victim
         self.created_window[nid] = -1
@@ -142,6 +149,8 @@ class PersistentGraph:
             self.g.add_node(node)
             if wid in kv:
                 self.kv[nid] = kv[wid]
+                if self.device is None:
+                    self.device = kv[wid][0].device
             if wid in summaries:
                 self.summary[nid] = summaries[wid]
             self.last_used[nid] = self._step
@@ -477,9 +486,10 @@ class PersistentGraph:
             node = entry.node
             self.g.add_node(node)
             if entry.kv is not None:
-                self.kv[node.node_id] = entry.kv
+                self.kv[node.node_id] = _to_device(entry.kv, self.device or entry.kv[0].device)
             if entry.summary is not None:
-                self.summary[node.node_id] = entry.summary
+                self.summary[node.node_id] = _to_device(entry.summary,
+                                                        self.device or entry.summary.device)
             # Recalled nodes are marked fresh, so the LRU clock does not immediately evict what a query
             # just asked for. That is the thrash guard.
             self.last_used[node.node_id] = self._step

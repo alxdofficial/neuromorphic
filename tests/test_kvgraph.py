@@ -563,3 +563,19 @@ def test_retrieval_is_device_agnostic():
     assert got and all(n in pg.g.nodes for n in got)
     cands = pg.recall_candidates(list(pg.g.nodes), q, threshold=-1.0)
     assert isinstance(cands, list)
+
+
+def test_recall_restores_onto_the_compute_device():
+    """Archived tensors live off the compute device; recall must bring them back onto it.
+
+    Otherwise a recalled node returns on CPU and the very next stack over the read set raises — which only
+    happens after an eviction AND a query that matches it, so no short run would surface it.
+    """
+    pg = _toy_graph()
+    pg.contract_to_budget(4)
+    assert pg.records
+    host = next(iter(pg.records))
+    assert pg.recall(host) > 0
+    devices = {v[0].device for v in pg.kv.values()}
+    assert len(devices) == 1, f"KV is split across devices after recall: {devices}"
+    assert pg.device is None or devices == {pg.device}
